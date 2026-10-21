@@ -29,7 +29,9 @@
 //! own cadence) publishes what the others need — the last handshake, its
 //! round trip and the tick itself — and they read that. What still needs the
 //! lock off the packet path (`force_handshake`, `rebind`) waits for it at most
-//! [`TUNNEL_LOCK_WAIT`].
+//! [`TUNNEL_LOCK_WAIT`]. And neither log sink makes boringtun's own lines wait
+//! any more: the console queues every line, and `birdo.log` queues boringtun's
+//! (MR-690, `utils::console_log::lock_free_for_boringtun`).
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use boringtun::noise::{Tunn, TunnResult};

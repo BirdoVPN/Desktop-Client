@@ -66,8 +66,9 @@
 //! for the call, and the work goes on at that final path. A `%LOCALAPPDATA%`
 //! redirected (or junctioned) onto another account's profile is refused.
 //!
-//! THE USER DATA FOLDER is made the same way (`OwnedDir::hold_open`, inside
-//! its verified parent). If it cannot be verified (a junction in its place),
+//! THE USER DATA FOLDER is made the same way (`OwnedDir::ensure_held`, inside
+//! its verified parent), and held open for the rest of the run like the app's
+//! other folders (MR-2049). If it cannot be verified (a junction in its place),
 //! that is logged, and WebView2 still gets this environment, crash reports
 //! kept on this device: refusing would only open the window on WebView2's
 //! defaults, through the same folder, with crash upload left to Windows.
@@ -355,8 +356,16 @@ pub fn create_environment(
     // very same folder (Tauri and wry use this path too), with crash upload
     // left to Windows. So it is logged (no path in it), and WebView2's crash
     // reports stay on this device regardless.
+    //
+    // MR-2049: and HELD for the rest of the run, like every other folder the
+    // app writes in (`ensure_held`: the held set `file_log::hold_app_dirs`
+    // keeps). WebView2 opens it by path, again and again, from its own
+    // processes; the guard `hold_open` returns used to be dropped at once, so
+    // while the app ran the folder could be renamed and a junction put in its
+    // place, steering where the elevated browser process writes its profile
+    // and its crash dumps. Held, it can be neither renamed nor replaced.
     let user_data = user_data_owned_dir(local_data);
-    if let Err(e) = user_data.hold_open() {
+    if let Err(e) = user_data.ensure_held() {
         tracing::warn!(
             "WebView2: the user data folder could not be verified ({e}); its crash reports stay on this device all the same"
         );
@@ -800,7 +809,42 @@ mod tests {
         assert!(code.contains("let _ = dir.remove_file(name);"));
         // The folder is made verified, and a refusal is logged, not returned:
         // it must not cost the crash option (see the test above).
-        assert!(code.contains("if let Err(e) = user_data.hold_open() {"));
+        // MR-2049: and it is held for the run (`ensure_held` keeps the
+        // guard), never verified and let go (`hold_open`'s guard, dropped).
+        assert!(code.contains("if let Err(e) = user_data.ensure_held() {"));
+        assert!(
+            !code.contains("user_data.hold_open()"),
+            "the user data folder is verified and then let go again"
+        );
+    }
+
+    /// MR-2049: the user data folder as `create_environment` holds it (the
+    /// held set; here a set of the test's own, as `cfg(test)` keeps nothing
+    /// process-wide) cannot be renamed while the app runs, so a junction
+    /// cannot be put in its place; the acceptance check's "renaming
+    /// `%LOCALAPPDATA%\uk.birdo.vpn.desktop` fails with a sharing violation".
+    /// WebView2's own work inside it is unaffected.
+    #[cfg(windows)]
+    #[test]
+    fn the_held_user_data_folder_cannot_be_renamed() {
+        use crate::utils::safe_fs::held;
+        let local = tempfile::tempdir().unwrap();
+        let set: held::Set = std::sync::Mutex::new(Vec::new());
+        let user_data = user_data_owned_dir(local.path());
+        held::ensure_in(&set, &user_data).unwrap();
+        let moved = local.path().join("moved");
+
+        let err = std::fs::rename(user_data.path(), &moved).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(32), "{err}"); // ERROR_SHARING_VIOLATION
+        assert!(user_data.path().is_dir() && !moved.exists());
+        // What WebView2 does in it: folders and files of its own.
+        let ebwebview = user_data.path().join("EBWebView");
+        std::fs::create_dir(&ebwebview).unwrap();
+        std::fs::write(ebwebview.join("Local State"), b"{}").unwrap();
+        std::fs::remove_file(ebwebview.join("Local State")).unwrap();
+
+        drop(set);
+        std::fs::rename(user_data.path(), &moved).unwrap();
     }
 
     /// A link named like a dump is skipped, and what it points at survives.

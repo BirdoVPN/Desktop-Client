@@ -26,6 +26,30 @@ pub mod tunnel_macos;
 // Windows job runs its tests.
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 mod device_fd;
+// The emergency cleanup a dropped tunnel hands to a thread of its own, and the
+// manager's waits for it (MR-823, MR-2039, MR-2036).
+pub(crate) mod emergency_teardown;
+
+/// The emergency cleanups this platform's tunnels hand off, and the longest
+/// one can take (see `emergency_teardown`). macOS hands none off.
+pub(crate) fn emergency_teardowns() -> emergency_teardown::InFlight {
+    #[cfg(target_os = "windows")]
+    {
+        tunnel::emergency_teardowns()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        tunnel_linux::emergency_teardowns()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        static NONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        emergency_teardown::InFlight {
+            count: &NONE,
+            bound: std::time::Duration::ZERO,
+        }
+    }
+}
 
 #[cfg(target_os = "windows")]
 mod tunnel_dns; // netsh DNS reads + their captured-output parsers (Windows only)

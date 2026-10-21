@@ -1455,6 +1455,45 @@ mod lifecycle_tests {
         }
     }
 
+    /// MR-1934: macOS's Cmd+Q, the Dock's Quit and logout reach the end of
+    /// the run (`RunEvent::Exit`) with no exit request before it, and the
+    /// teardown that request runs was skipped: pf's block and the session's
+    /// DNS outlived the app. There, off Windows and unless a restart was let
+    /// through, the same teardown now runs, capped, before the process ends.
+    /// What the helper does is driven in
+    /// `utils::tests::an_exit_that_never_asked_first_runs_the_teardown_once`.
+    #[test]
+    fn an_exit_with_no_exit_request_still_tears_down_off_windows() {
+        let main_rs = include_str!("../main.rs").replace('\r', "");
+        let exit = &main_rs[main_rs
+            .find("if matches!(event, RunEvent::Exit) {")
+            .expect("the RunEvent::Exit arm")..];
+        let exit = &exit[..exit
+            .find("if let RunEvent::ExitRequested")
+            .expect("the arm's end")];
+        order(
+            exit,
+            &[
+                "record_if_exit_kept_the_session(",
+                "#[cfg(not(target_os = \"windows\"))]",
+                "if !EXIT_RESTARTING.load(",
+                "utils::tear_down_unless_started(",
+                "&EXIT_TEARDOWN_STARTED,",
+                "EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN,",
+                "tauri::async_runtime::block_on(",
+                "teardown_for_exit(&app)",
+                "clear_on_exit();",
+            ],
+        );
+        // A restart is let through without the teardown, and says so before
+        // it returns, so the end of its run does not run it either.
+        let restart = &main_rs[main_rs
+            .find("if *code == Some(tauri::RESTART_EXIT_CODE) {")
+            .expect("the restart branch")..];
+        let restart = &restart[..restart.find("return;").expect("the branch's return")];
+        assert!(restart.contains("EXIT_RESTARTING.store(true"));
+    }
+
     /// WIN-FIX-3: a settings reapply is rebuilt on the session's own
     /// transport and never runs the Adaptive Transport retry; a user connect
     /// starts direct and does. The session's settings are recorded at the

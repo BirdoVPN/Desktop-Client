@@ -204,6 +204,29 @@ pub fn exit_unless_torn_down(
     true
 }
 
+/// MR-1934: the exit teardown for an exit that never asked first, apart from
+/// `main.rs` so a test can drive it. On macOS, Cmd+Q, the Dock's Quit and
+/// logging out reach the end of the run (`RunEvent::Exit`, tao's
+/// `applicationWillTerminate`) with no `ExitRequested` before it, so the
+/// teardown that request holds the exit open for never ran, and the pf block
+/// and the DNS the session set outlived the app. Unless `started` says it
+/// already ran (claimed here, so it runs once), `teardown` runs on a helper
+/// thread ([`run_on_helper_for`]) and the caller waits for it at most
+/// `limit`: whatever it waits on, the process still ends. `None` when the
+/// teardown had already started, else whether it finished in time. (Not on
+/// Windows, where that exit keeps the session for the next version, MR-1861.)
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub fn tear_down_unless_started(
+    started: &std::sync::atomic::AtomicBool,
+    limit: std::time::Duration,
+    teardown: impl FnOnce() + Send + 'static,
+) -> Option<bool> {
+    if started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    Some(run_on_helper_for("birdo-exit-teardown", limit, teardown))
+}
+
 /// This install's device identifier: a random `desktop_<uuid-v4>`, persisted
 /// per install and rotated on account deletion (not on sign-out). See
 /// `utils::device_id` for why it is no longer derived from the machine.
@@ -466,6 +489,68 @@ mod bounded_process_tests {
             cleaned.load(Ordering::SeqCst),
             "a quick cleanup was skipped"
         );
+    }
+
+    /// MR-1934: an exit that arrives with the teardown never started (macOS
+    /// Cmd+Q, the Dock's Quit, logout) runs it, once, and the exit waits for
+    /// it; one that comes after the held exit already ran it does not run it
+    /// again; and a wedged teardown costs the limit, never the exit.
+    #[test]
+    fn an_exit_that_never_asked_first_runs_the_teardown_once() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let started = AtomicBool::new(false);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&runs);
+        assert_eq!(
+            super::tear_down_unless_started(&started, Duration::from_secs(5), move || {
+                std::thread::sleep(Duration::from_millis(100));
+                count.fetch_add(1, Ordering::SeqCst);
+            }),
+            Some(true)
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the exit did not wait for the teardown"
+        );
+        assert!(
+            started.load(Ordering::SeqCst),
+            "the teardown is not claimed"
+        );
+
+        // Already ran (the held exit's teardown, or this one): not again.
+        let count = Arc::clone(&runs);
+        assert_eq!(
+            super::tear_down_unless_started(&started, Duration::from_secs(5), move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            }),
+            None
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // A teardown stuck on what it waits for costs the limit.
+        let wedge = Arc::new(Mutex::new(()));
+        let held = wedge.lock().unwrap();
+        let wanted = Arc::clone(&wedge);
+        let begun = Instant::now();
+        assert_eq!(
+            super::tear_down_unless_started(
+                &AtomicBool::new(false),
+                Duration::from_millis(100),
+                move || {
+                    let _wedged = wanted.lock();
+                },
+            ),
+            Some(false)
+        );
+        assert!(
+            begun.elapsed() < Duration::from_secs(5),
+            "the exit waited on the teardown"
+        );
+        drop(held);
     }
 }
 

@@ -7,12 +7,16 @@ use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
+use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
+use tokio::io::Interest;
 use tokio::sync::{mpsc, RwLock};
 
 use super::device_fd::{self, CloseOutcome, DeviceSlot, SharedFd};
+use super::emergency_teardown::{self, ERR_EMERGENCY_CLEANUP_RUNNING};
 use super::wireguard_new::{WgPrivateKey, WireGuardSession};
 use crate::api::types::VpnConfig;
 use crate::utils::redact_ip;
@@ -22,6 +26,68 @@ use crate::vpn::route_journal::{self, GatewayRoute, RouteDelete};
 /// Run a command (no special flags needed on Linux — no console window issue)
 fn cmd(program: &str) -> Command {
     crate::utils::hidden_cmd(program)
+}
+
+/// The cap on one subprocess of a teardown that may run on the emergency
+/// cleanup's thread (`ip route del`, `resolvectl revert`). A hung resolvectl
+/// (systemd-resolved wedged on D-Bus) used to hold that teardown for good,
+/// and with it — now that start() waits for one — every later connect.
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The longest a dropped tunnel's emergency cleanup takes (MR-2039): the
+/// `resolvectl revert` at its cap, and the route deletes, which are netlink
+/// calls that return in milliseconds but are capped the same way. What the
+/// manager waits for, after a failed build and before it ends a disconnect.
+const EMERGENCY_TEARDOWN_BOUND: Duration = Duration::from_secs(4 * SUBPROCESS_TIMEOUT.as_secs());
+
+/// How long `start()` waits for an in-flight cleanup before it refuses,
+/// retryably. Inside CONNECT_TIMEOUT (30 s), so the user gets that refusal
+/// rather than a generic timeout.
+const START_TEARDOWN_WAIT: Duration = Duration::from_secs(20);
+
+/// Emergency cleanups handed to their own thread and not finished yet
+/// (MR-2039). `start()` and the manager wait on it.
+static EMERGENCY_TEARDOWNS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// The emergency cleanups Linux tunnels hand off, and the longest one can
+/// take: what the manager waits on (MR-2039, MR-2036).
+pub(crate) fn emergency_teardowns() -> emergency_teardown::InFlight {
+    emergency_teardown::InFlight {
+        count: &EMERGENCY_TEARDOWNS_IN_FLIGHT,
+        bound: EMERGENCY_TEARDOWN_BOUND,
+    }
+}
+
+/// What a dropped tunnel still had in place, handed to its emergency cleanup.
+struct Leftovers {
+    /// Routes this session added that nothing has removed yet.
+    routes: Vec<OwnedRoute>,
+    /// Our reference to the TUN device, when stop() never closed it.
+    fd: Option<SharedFd>,
+    /// What DNS looked like before the start pinned it; only taken with `fd`.
+    snapshot: Option<NetworkSnapshot>,
+}
+
+/// What `Drop`'s emergency cleanup and `start()`'s wait for one depend on
+/// (MR-2039): the cleanup it hands off, the counter of cleanups still running
+/// and how long `start()` waits on it. Always [`TeardownHooks::system`]
+/// outside tests; each test builds its own, so none touches the machine or
+/// shares a counter with a test running beside it.
+#[derive(Clone, Copy)]
+struct TeardownHooks {
+    cleanup: fn(Leftovers),
+    in_flight: &'static AtomicUsize,
+    start_wait: Duration,
+}
+
+impl TeardownHooks {
+    fn system() -> Self {
+        Self {
+            cleanup: clean_up_after_drop,
+            in_flight: &EMERGENCY_TEARDOWNS_IN_FLIGHT,
+            start_wait: START_TEARDOWN_WAIT,
+        }
+    }
 }
 
 /// TUN device name prefix
@@ -183,10 +249,13 @@ pub struct LinuxTunnel {
     /// JoinHandle of the spawned packet loop.
     ///
     /// P1-dk-tun-fd-close-race: stop() JOINS this task before closing the TUN
-    /// fd. Joining the task alone did not join the blocking reads/writes it
-    /// had already handed off (MR-820); those now hold the fd themselves, and
-    /// the close waits for them (`device_fd::close_when_idle`).
+    /// fd. The loop reads and writes the device inline now, through a
+    /// reference of its own (MR-2040), and the close waits for every holder
+    /// to let go (`device_fd::close_when_idle`, MR-820).
     packet_loop: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// What `Drop`'s emergency cleanup and `start()`'s wait for one depend
+    /// on (MR-2039).
+    teardown: TeardownHooks,
 }
 
 impl LinuxTunnel {
@@ -212,6 +281,7 @@ impl LinuxTunnel {
             local_network_sharing,
             owned_routes: Arc::new(OwnedRoutes::default()),
             packet_loop: Arc::new(RwLock::new(None)),
+            teardown: TeardownHooks::system(),
         })
     }
 
@@ -225,6 +295,21 @@ impl LinuxTunnel {
 
         if !crate::utils::elevation::is_elevated() {
             tracing::warn!("Tunnel requires root privileges for TUN/route configuration");
+        }
+
+        // MR-2039: a dropped tunnel's emergency cleanup runs on its own thread
+        // now. Never start underneath one: it deletes ITS routes — the
+        // endpoint route this start is about to add is the same route when
+        // the relay and the gateway are — it holds the TUN device that owns
+        // `birdo0` (TUNSETIFF would find it busy), and it may still put back
+        // a resolv.conf it pinned, over the one this start pins. Wait for it,
+        // and if it is still running, refuse BEFORE the first change,
+        // retryably (it maps to AdapterFailed): the next attempt finds it done.
+        if !emergency_teardown::settled(self.teardown.in_flight, self.teardown.start_wait).await {
+            return Err(format!(
+                "{}: a previous tunnel's cleanup is still running; try again in a moment",
+                ERR_EMERGENCY_CLEANUP_RUNNING
+            ));
         }
 
         // Snapshot current network config for restoration
@@ -455,10 +540,12 @@ impl LinuxTunnel {
         // a stuck loop must not leave the device alive owning the half-default
         // routes (that is the frozen-switch blackhole).
         //
-        // MR-820: the task join does not cover a read the loop had already
-        // handed to the blocking pool (the select! detaches it when shutdown
-        // wins). Each of those holds its own reference to the fd now, and the
-        // close at the end of stop() waits for them.
+        // MR-820 / MR-2040: the loop reads and writes the device inline,
+        // through its own reference to the fd (its `AsyncFd`), which it drops
+        // as it ends; no read is handed to the blocking pool any more, so none
+        // is left detached. The close at the end of stop() still waits for
+        // every other holder to let go (an aborted loop's, while its task is
+        // being dropped).
         if let Some(handle) = self.packet_loop.write().await.take() {
             let abort = handle.abort_handle();
             if tokio::time::timeout(std::time::Duration::from_secs(5), handle)
@@ -552,19 +639,23 @@ impl LinuxTunnel {
     ///
     /// Linux TUN with IFF_NO_PI provides raw IP packets — no protocol header unlike macOS utun.
     ///
-    /// OPEN-WORK F6: the TUN read reuses ONE owned buffer across iterations
-    /// (the macOS loop's pattern, tunnel_macos.rs) instead of allocating a
-    /// fresh 64 KiB `Vec` per iteration. The loop spins once per packet in
-    /// either direction and — before idle backoff kicks in — once per
-    /// EAGAIN poll, so the old `vec![0u8; MAX_PACKET_SIZE]` inside the
-    /// per-iteration `spawn_blocking` closure was a 64 KiB alloc + free (and
-    /// on every non-idle iteration a page fault or memset for the pages the
-    /// kernel actually filled) per packet, on the hot path, for the whole
-    /// session. See [`tun_read_owned`].
+    /// MR-2040: EVENT-DRIVEN. The loop used to poll: a `spawn_blocking` read
+    /// of the O_NONBLOCK fd and a `try_recv` on the relay socket every
+    /// iteration, and once idle a 500 µs, then 5 ms, sleep between rounds —
+    /// about 200 blocking-pool reads and 712 wakeups a second on a tunnel
+    /// carrying nothing (agent L-1's measurement, 2026-10-14). Now it waits
+    /// for work: the TUN fd is registered with Tokio's reactor ([`AsyncFd`])
+    /// and the relay socket already is, so the loop wakes for a packet in
+    /// either direction or for boringtun's timer tick, and an idle tunnel
+    /// costs the four ticks a second and nothing else. The device is read and
+    /// written inline, on the non-blocking fd: no read is handed to the
+    /// blocking pool, so none can be left detached when the loop stops.
     ///
-    /// MR-820: every blocking read/write gets its own clone of `tun_fd` and
-    /// holds it for the length of the syscall, so the descriptor cannot be
-    /// closed (and its number recycled) under one the loop has detached.
+    /// OPEN-WORK F6: the TUN read reuses ONE buffer for the whole session.
+    ///
+    /// MR-820: the loop's [`AsyncFd`] holds its own clone of `tun_fd`, so the
+    /// descriptor cannot be closed (and its number recycled) under a read or
+    /// write; stop() joins the loop, which drops it, before the close.
     #[allow(clippy::too_many_arguments)] // shared session handles, moved into the task once
     async fn packet_loop(
         tun_fd: SharedFd,
@@ -579,44 +670,57 @@ impl LinuxTunnel {
         tracing::info!("Packet loop started on TUN fd={}", tun_fd.as_raw_fd());
 
         const MAX_PACKET_SIZE: usize = 65536;
-
+        // Up to this many packets per wake in each direction, so a burst is
+        // not paced one packet per wake, and neither direction can hold the
+        // loop away from the other (or from the timer) for long.
+        const MAX_BATCH_SIZE: usize = 64;
         // Same cadence Windows uses (tunnel.rs). 250ms is comfortably finer than
         // boringtun's shortest timer, so no deadline is ever missed.
-        // Idle backoff, mirroring Windows (tunnel.rs). Both fds are O_NONBLOCK
-        // and recv_packet returns Ok(None) immediately on WouldBlock, so an idle
-        // tunnel previously spun a core at 100% and churned the blocking pool
-        // with a spawn_blocking round trip per iteration, forever. Any packet in
-        // either direction resets the counter, so only the FIRST packet after a
-        // sustained idle pays the extra latency.
-        let mut idle_cycles: u32 = 0;
-        const IDLE_THRESHOLD: u32 = 100;
-        const DEEP_IDLE_THRESHOLD: u32 = 2_000;
-        const SLOW_POLL_US: u64 = 500;
-        const DEEP_POLL_US: u64 = 5_000;
-        // Drain up to this many decrypted packets per wake, so a burst is not
-        // paced one packet per loop iteration.
-        const MAX_BATCH_SIZE: usize = 64;
-        let mut last_timer_update = std::time::Instant::now();
-        const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        const TIMER_INTERVAL: Duration = Duration::from_millis(250);
 
-        // The one read buffer for the whole session (F6). It is moved into the
-        // blocking read task each iteration and handed back with the byte count.
+        // Reads only: a TUN write never waits (the kernel queues the packet
+        // or refuses it), so it is issued directly ([`tun_write`]).
+        let tun = match AsyncFd::with_interest(tun_fd, Interest::READABLE) {
+            Ok(tun) => tun,
+            Err(e) => {
+                tracing::error!("Packet loop: the TUN fd could not be watched: {}", e);
+                return;
+            }
+        };
+        // The relay socket. The Linux session never rebinds it (a network
+        // change is a re-dial here), so the loop takes it once.
+        let Some(socket) = wg_session.read().await.as_ref().map(|s| s.socket()) else {
+            tracing::warn!("Packet loop: no WireGuard session — exiting");
+            return;
+        };
+
+        // Drive boringtun's timers — WITHOUT this the session dies.
+        //
+        // boringtun advances all session state inside update_timers():
+        // persistent keepalives, REKEY_AFTER_TIME rekeys, and dead-peer
+        // detection. `encapsulate` reads the current keypair with no age
+        // check, so once the server discards it at REJECT_AFTER_TIME the
+        // client keeps happily encrypting to a session that no longer exists
+        // — upload appears to work, download stops, and there is no
+        // client-side recovery. Windows found this (FIX-DL, tunnel.rs:1834)
+        // and fixed it; the Unix tunnels were never given the same tick, so
+        // the keepalive plumbed in at start() was never actually emitted.
+        //
+        // Its own arm below, so it fires on a completely idle tunnel — which
+        // is exactly when it matters — and under load alike.
+        let mut timers = tokio::time::interval(TIMER_INTERVAL);
+        timers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // The one read buffer for the whole session (F6).
         let mut read_buf = vec![0u8; MAX_PACKET_SIZE];
+        // Cleared if the device ever reports end of file: its readiness then
+        // stays set for good, and waiting on it would spin the loop.
+        let mut tun_open = true;
 
         loop {
-            let mut did_work = false;
             if !running.load(Ordering::SeqCst) {
                 tracing::info!("Packet loop: running flag cleared, exiting");
                 break;
-            }
-
-            // The buffer normally comes back from the blocking task. If it did
-            // not (the task failed to join — the shutdown arm breaks the loop, so
-            // it never reaches here), restore it so `read` is never issued
-            // against a zero-length slice; that would return 0 forever and read
-            // as a silent EOF.
-            if read_buf.len() != MAX_PACKET_SIZE {
-                read_buf = vec![0u8; MAX_PACKET_SIZE];
             }
 
             tokio::select! {
@@ -624,124 +728,85 @@ impl LinuxTunnel {
                     tracing::info!("Packet loop: shutdown signal received");
                     break;
                 }
-                // Read from TUN (async via spawn_blocking for the fd read). The
-                // owned buffer is moved in and returned, never reallocated.
-                // The closure owns a reference to the fd until the read returns
-                // (MR-820): when shutdown wins this select!, it is detached, not
-                // cancelled.
-                result = tokio::task::spawn_blocking({
-                    let fd = Arc::clone(&tun_fd);
-                    let buf = std::mem::take(&mut read_buf);
-                    move || tun_read_owned(fd.as_raw_fd(), buf)
-                }) => {
-                    if let Ok((buf, n)) = result {
-                        // Hand the buffer back for the next iteration BEFORE
-                        // looking at the result, so every path reuses it.
-                        read_buf = buf;
-                        if let Some(n) = n {
-                            did_work = true;
-                            // Linux TUN with IFF_NO_PI: data is already a raw IP packet
-                            let ip_packet = &read_buf[..n];
-                            let packet_len = ip_packet.len() as u64;
-
-                            if let Some(session) = wg_session.read().await.as_ref() {
-                                match session.send_packet(ip_packet).await {
-                                    Ok(_) => {
-                                        bytes_sent.fetch_add(packet_len, Ordering::Relaxed);
-                                        packets_sent.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!("Failed to send WG packet: {}", e);
-                                    }
+                // Outbound: the kernel queued packets on birdo0.
+                ready = tun.readable(), if tun_open => {
+                    let mut ready = match ready {
+                        Ok(ready) => ready,
+                        Err(e) => {
+                            tracing::error!("Packet loop: the TUN fd failed: {}", e);
+                            break;
+                        }
+                    };
+                    for _ in 0..MAX_BATCH_SIZE {
+                        let n = match read_ready(&mut ready, &mut read_buf) {
+                            TunRead::Packet(n) => n,
+                            TunRead::Drained => break,
+                            TunRead::Closed => {
+                                tracing::warn!(
+                                    "Packet loop: the TUN device reported end of file — no \
+                                     longer reading it"
+                                );
+                                tun_open = false;
+                                break;
+                            }
+                        };
+                        // Linux TUN with IFF_NO_PI: data is already a raw IP packet
+                        let ip_packet = &read_buf[..n];
+                        let packet_len = ip_packet.len() as u64;
+                        if let Some(session) = wg_session.read().await.as_ref() {
+                            match session.send_packet(ip_packet).await {
+                                Ok(_) => {
+                                    bytes_sent.fetch_add(packet_len, Ordering::Relaxed);
+                                    packets_sent.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    tracing::debug!("Failed to send WG packet: {}", e);
                                 }
                             }
                         }
                     }
                 }
-            }
-
-            // Read from WireGuard and write decrypted packets to TUN
-            for _ in 0..MAX_BATCH_SIZE {
-                if let Some(session) = wg_session.read().await.as_ref() {
-                    if let Ok(Some(decrypted)) = session.recv_packet().await {
-                        did_work = true;
-                        let packet_len = decrypted.len() as u64;
-
+                // Inbound: datagrams from the relay. `recv_packet` reads with
+                // `try_recv`, whose WouldBlock clears the socket's readiness;
+                // a datagram that carried no IP packet (a handshake answer,
+                // a keepalive) also ends the batch, and the readiness it left
+                // set brings the loop straight back for the rest.
+                ready = socket.readable() => {
+                    if let Err(e) = ready {
+                        tracing::error!("Packet loop: the relay socket failed: {}", e);
+                        break;
+                    }
+                    for _ in 0..MAX_BATCH_SIZE {
+                        let decrypted = match wg_session.read().await.as_ref() {
+                            Some(session) => session.recv_packet().await,
+                            None => break,
+                        };
+                        let Ok(Some(decrypted)) = decrypted else {
+                            break; // nothing (more) queued
+                        };
                         // Linux TUN with IFF_NO_PI: write raw IP packet directly (no header)
-                        let fd = Arc::clone(&tun_fd);
-                        let buf = decrypted;
-                        let buf_len = buf.len();
-                        let write_result = tokio::task::spawn_blocking(move || {
-                            let written = unsafe {
-                                libc::write(
-                                    fd.as_raw_fd(),
-                                    buf.as_ptr() as *const libc::c_void,
-                                    buf.len(),
-                                )
-                            };
-                            if written < 0 {
-                                tracing::debug!(
-                                    "TUN write error: {}",
-                                    std::io::Error::last_os_error()
-                                );
-                            } else if (written as usize) < buf.len() {
-                                tracing::warn!(
-                                    "Partial TUN write: {} of {} bytes",
-                                    written,
-                                    buf.len()
-                                );
-                            }
-                            written
-                        })
-                        .await;
-
-                        // Only count statistics when the full packet was written to TUN.
-                        // Partial writes or errors must not inflate received counters.
-                        if let Ok(written) = write_result {
-                            if written >= 0 && (written as usize) == buf_len {
-                                bytes_received.fetch_add(packet_len, Ordering::Relaxed);
+                        match tun_write(tun.get_ref().as_raw_fd(), &decrypted) {
+                            // Only count statistics when the full packet was written to TUN.
+                            // Partial writes or errors must not inflate received counters.
+                            Ok(written) if written == decrypted.len() => {
+                                bytes_received.fetch_add(written as u64, Ordering::Relaxed);
                                 packets_received.fetch_add(1, Ordering::Relaxed);
                             }
+                            Ok(written) => tracing::warn!(
+                                "Partial TUN write: {} of {} bytes",
+                                written,
+                                decrypted.len()
+                            ),
+                            Err(e) => tracing::debug!("TUN write error: {}", e),
                         }
-                    } else {
-                        break; // nothing queued — stop draining
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            // Drive boringtun's timers — WITHOUT this the session dies.
-            //
-            // boringtun advances all session state inside update_timers():
-            // persistent keepalives, REKEY_AFTER_TIME rekeys, and dead-peer
-            // detection. `encapsulate` reads the current keypair with no age
-            // check, so once the server discards it at REJECT_AFTER_TIME the
-            // client keeps happily encrypting to a session that no longer exists
-            // — upload appears to work, download stops, and there is no
-            // client-side recovery. Windows found this (FIX-DL, tunnel.rs:1834)
-            // and fixed it; the Unix tunnels were never given the same tick, so
-            // the keepalive plumbed in at start() was never actually emitted.
-            //
-            // The fd is O_NONBLOCK, so this is reached every iteration even when
-            // the tunnel is completely idle — which is exactly when it matters.
-            if last_timer_update.elapsed() >= TIMER_INTERVAL {
-                last_timer_update = std::time::Instant::now();
-                if let Some(session) = wg_session.read().await.as_ref() {
-                    if let Err(e) = session.update_timers().await {
-                        tracing::trace!("Timer update error: {}", e);
                     }
                 }
-            }
-
-            if did_work {
-                idle_cycles = 0;
-            } else {
-                idle_cycles = idle_cycles.saturating_add(1);
-                if idle_cycles > DEEP_IDLE_THRESHOLD {
-                    tokio::time::sleep(std::time::Duration::from_micros(DEEP_POLL_US)).await;
-                } else if idle_cycles > IDLE_THRESHOLD {
-                    tokio::time::sleep(std::time::Duration::from_micros(SLOW_POLL_US)).await;
+                _ = timers.tick() => {
+                    if let Some(session) = wg_session.read().await.as_ref() {
+                        if let Err(e) = session.update_timers().await {
+                            tracing::trace!("Timer update error: {}", e);
+                        }
+                    }
                 }
             }
         }
@@ -750,39 +815,75 @@ impl LinuxTunnel {
     }
 }
 
-/// One blocking TUN read into an OWNED buffer that is handed straight back,
-/// so the packet loop reuses a single allocation for the whole session (F6).
-///
-/// Returns `(buf, Some(n))` when `n > 0` bytes landed in `buf[..n]`, and
-/// `(buf, None)` on EAGAIN (nothing queued on the O_NONBLOCK fd), EOF, or an
-/// error (logged unless it is EAGAIN). `buf` comes back with its length and
-/// allocation untouched in every case — the caller slices `&buf[..n]`
-/// instead of truncating, which is what keeps the next read full-size
-/// without a reallocation.
-fn tun_read_owned(fd: i32, mut buf: Vec<u8>) -> (Vec<u8>, Option<usize>) {
+/// One `read(2)` of the TUN device into `buf`, never waiting: the fd is
+/// O_NONBLOCK, so nothing queued is `WouldBlock`. `Ok(n)`: `n` bytes in
+/// `buf[..n]` (0 is end-of-file). The buffer is the caller's, reused for the
+/// whole session (F6).
+fn tun_read(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
+    // SAFETY: `buf` is valid for `buf.len()` bytes of writes for the call.
     let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    let got = if n > 0 {
-        Some(n as usize)
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
     } else {
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EAGAIN) {
-                tracing::debug!("TUN read error: {}", err);
-            }
-        }
-        None
-    };
-    (buf, got)
+        Ok(n as usize)
+    }
 }
 
-/// F6: the packet loop's read helper must reuse its buffer. Exercised on a
-/// pipe (any fd works for `read(2)`) on the ubuntu leg of tests.yml — no TUN
-/// device or root needed. MR-820's fd-lifetime tests live here too, for the
-/// same reason (`device_fd`'s own tests cover the protocol on every platform),
-/// as does the TUN fd's close-on-exec check (the clone device opens unprivileged).
+/// One `write(2)` of an IP packet to the TUN device, never waiting (MR-2040):
+/// the fd is O_NONBLOCK, and the kernel either takes the packet into its
+/// stack or refuses it, as a full NIC queue drops one. Returns the bytes
+/// written.
+fn tun_write(fd: i32, packet: &[u8]) -> std::io::Result<usize> {
+    // SAFETY: `packet` is valid for `packet.len()` bytes of reads for the call.
+    let n = unsafe { libc::write(fd, packet.as_ptr() as *const libc::c_void, packet.len()) };
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// What one [`read_ready`] got.
+#[derive(Debug, PartialEq, Eq)]
+enum TunRead {
+    /// A packet in `buf[..n]`.
+    Packet(usize),
+    /// Nothing more to read until the kernel queues the next packet.
+    Drained,
+    /// End of file: the device will never deliver a packet again.
+    Closed,
+}
+
+/// One read of the TUN device while Tokio reports it readable (MR-2040).
+/// On EAGAIN the readiness is cleared, so the loop sleeps until the kernel
+/// queues the next packet; a read error clears it too (and is logged), so a
+/// device that keeps failing cannot spin the loop. End of file is reported as
+/// such: Tokio keeps a closed fd's readiness set for good, so the caller must
+/// stop waiting on it.
+fn read_ready(ready: &mut AsyncFdReadyGuard<'_, SharedFd>, buf: &mut [u8]) -> TunRead {
+    match ready.try_io(|tun| tun_read(tun.get_ref().as_raw_fd(), buf)) {
+        Ok(Ok(0)) => TunRead::Closed,
+        Ok(Ok(n)) => TunRead::Packet(n),
+        Ok(Err(e)) => {
+            tracing::debug!("TUN read error: {}", e);
+            ready.clear_ready();
+            TunRead::Drained
+        }
+        // WouldBlock: `try_io` cleared the readiness itself.
+        Err(_would_block) => TunRead::Drained,
+    }
+}
+
+/// F6 + MR-2040: the packet loop's read and write helpers, and the wait for a
+/// readable device that replaced its polling. Exercised on a pipe (any fd
+/// works for `read(2)` and for the reactor) on the ubuntu leg of tests.yml —
+/// no TUN device or root needed. MR-820's fd-lifetime tests live here too, for
+/// the same reason (`device_fd`'s own tests cover the protocol on every
+/// platform), as does the TUN fd's close-on-exec check (the clone device opens
+/// unprivileged).
 #[cfg(test)]
 mod tun_read_tests {
-    use super::tun_read_owned;
+    use super::{read_ready, tun_read, tun_write, TunRead};
 
     /// (read_fd, write_fd), both O_CLOEXEC. The xray tests in the same run
     /// spawn child processes, and a child forked while a plain pipe() end is
@@ -811,12 +912,11 @@ mod tun_read_tests {
         assert_eq!(n as usize, bytes.len());
     }
 
-    /// The regression this helper exists to prevent: the old closure built a
-    /// fresh 64 KiB Vec per iteration and `truncate`d it to the packet. Across
-    /// many reads the SAME allocation must come back, full length, with the
-    /// packet in its prefix.
+    /// F6: every read lands in the caller's one buffer, which keeps its full
+    /// length and allocation (the old closure built a fresh 64 KiB Vec per
+    /// iteration and `truncate`d it to the packet).
     #[test]
-    fn buffer_is_reused_across_reads_without_reallocation_or_truncation() {
+    fn reads_land_in_the_callers_buffer_which_keeps_its_length() {
         const CAP: usize = 65536;
         let (r, w) = nonblocking_pipe();
         let mut buf = vec![0u8; CAP];
@@ -825,9 +925,8 @@ mod tun_read_tests {
         for i in 0..1_000u32 {
             let packet = i.to_le_bytes();
             write_all(w, &packet);
-            let (returned, n) = tun_read_owned(r, buf);
-            buf = returned;
-            assert_eq!(n, Some(4), "iteration {i}");
+            let n = tun_read(r, &mut buf).expect("a queued packet");
+            assert_eq!(n, 4, "iteration {i}");
             assert_eq!(&buf[..4], &packet, "iteration {i}");
             assert_eq!(buf.len(), CAP, "iteration {i}: length must not shrink");
             assert!(
@@ -842,27 +941,150 @@ mod tun_read_tests {
         }
     }
 
-    /// An idle O_NONBLOCK fd (EAGAIN) and a closed writer (EOF) both yield
-    /// None — and still hand the buffer back intact, so the idle-poll path
-    /// (the most frequent one before backoff) allocates nothing either.
+    /// An idle O_NONBLOCK fd reads as WouldBlock — what clears the reactor's
+    /// readiness, so the loop sleeps (MR-2040) — and a closed writer as end of
+    /// file (0).
     #[test]
-    fn eagain_and_eof_return_none_but_keep_the_buffer() {
+    fn eagain_reads_as_would_block_and_eof_as_zero() {
         let (r, w) = nonblocking_pipe();
-        let buf = vec![0u8; 4096];
-        let ptr = buf.as_ptr();
+        let mut buf = vec![0u8; 4096];
 
-        let (buf, n) = tun_read_owned(r, buf);
-        assert_eq!(n, None, "nothing written yet: EAGAIN");
-        assert_eq!(buf.len(), 4096);
-        assert!(std::ptr::eq(buf.as_ptr(), ptr));
+        let err = tun_read(r, &mut buf).expect_err("nothing written yet: EAGAIN");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
 
         unsafe { libc::close(w) };
-        let (buf, n) = tun_read_owned(r, buf);
-        assert_eq!(n, None, "writer closed: EOF");
-        assert_eq!(buf.len(), 4096);
-        assert!(std::ptr::eq(buf.as_ptr(), ptr));
+        assert_eq!(tun_read(r, &mut buf).expect("writer closed"), 0, "EOF");
 
         unsafe { libc::close(r) };
+    }
+
+    /// The write helper puts the whole packet on the device in one call.
+    #[test]
+    fn a_write_puts_the_whole_packet_on_the_device() {
+        let (r, w) = nonblocking_pipe();
+        assert_eq!(tun_write(w, b"decrypted").expect("write"), 9);
+        let mut buf = [0u8; 16];
+        assert_eq!(tun_read(r, &mut buf).expect("read"), 9);
+        assert_eq!(&buf[..9], b"decrypted");
+        unsafe {
+            libc::close(w);
+            libc::close(r);
+        }
+    }
+
+    /// `(AsyncFd over a non-blocking pipe's read end, its write end)`: what
+    /// the packet loop watches, with a pipe standing in for the TUN fd.
+    fn watched_pipe() -> (tokio::io::unix::AsyncFd<super::SharedFd>, i32) {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let (r, w) = nonblocking_pipe();
+        let fd: super::SharedFd = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(r) });
+        let watched =
+            tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE).unwrap();
+        (watched, w)
+    }
+
+    /// MR-2040: the regression. The Linux loop polled an idle tunnel — a
+    /// `spawn_blocking` read every round and 500 µs / 5 ms sleeps between
+    /// rounds, 712 wakeups a second with nothing to carry. Waiting on the
+    /// device the way the loop now does, an idle device wakes the reader
+    /// NEVER, a packet wakes it once, and once the packet is read it sleeps
+    /// again until the next.
+    #[tokio::test]
+    async fn an_idle_device_never_wakes_the_reader() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let (tun, w) = watched_pipe();
+        let wakeups = Arc::new(AtomicUsize::new(0));
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let reader = tokio::spawn({
+            let (wakeups, got) = (Arc::clone(&wakeups), Arc::clone(&got));
+            async move {
+                let mut buf = vec![0u8; 64];
+                loop {
+                    let mut ready = tun.readable().await.unwrap();
+                    wakeups.fetch_add(1, Ordering::SeqCst);
+                    while let TunRead::Packet(n) = read_ready(&mut ready, &mut buf) {
+                        got.lock().unwrap().extend_from_slice(&buf[..n]);
+                    }
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            wakeups.load(Ordering::SeqCst),
+            0,
+            "an idle device woke the reader"
+        );
+
+        write_all(w, b"packet");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while got.lock().unwrap().as_slice() != b"packet" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the packet was never read"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let woken = wakeups.load(Ordering::SeqCst);
+        assert!((1..=2).contains(&woken), "one packet, {woken} wakeups");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            wakeups.load(Ordering::SeqCst),
+            woken,
+            "idle again, and the reader still woke for nothing"
+        );
+
+        reader.abort();
+        unsafe { libc::close(w) };
+    }
+
+    /// MR-2040: end of file is reported as such — Tokio keeps a closed fd
+    /// readable for good, so the loop stops waiting on it rather than spin —
+    /// and a packet read before it still comes through.
+    #[tokio::test]
+    async fn end_of_file_is_reported_not_spun_on() {
+        let (tun, w) = watched_pipe();
+        write_all(w, b"last");
+        unsafe { libc::close(w) };
+        let mut buf = vec![0u8; 64];
+        let mut ready = tun.readable().await.unwrap();
+        assert_eq!(read_ready(&mut ready, &mut buf), TunRead::Packet(4));
+        assert_eq!(read_ready(&mut ready, &mut buf), TunRead::Closed);
+    }
+
+    /// MR-2040: the packet loop waits for work. Its body watches the device
+    /// and the relay socket and ticks boringtun's timers in arms of one
+    /// `select!`, and neither polls the device from the blocking pool nor
+    /// sleeps between rounds.
+    #[test]
+    fn the_packet_loop_waits_for_work_instead_of_polling() {
+        let source = include_str!("tunnel_linux.rs").replace('\r', "");
+        let body = &source[source
+            .find("    async fn packet_loop(")
+            .expect("the packet loop")..];
+        let body = &body[..body.find("\n    }\n}\n").expect("its end")];
+        for needle in [
+            "AsyncFd::with_interest(",
+            "tun.readable(), if tun_open =>",
+            "socket.readable() =>",
+            "timers.tick() =>",
+        ] {
+            assert!(body.contains(needle), "`{needle}` missing from the loop");
+        }
+        // Built at run time so this test does not match its own needles.
+        for polling in [
+            ["spawn_", "blocking"].concat(),
+            ["time::", "sleep("].concat(),
+        ] {
+            assert!(
+                !body.contains(&polling),
+                "the loop polls again: `{polling}`"
+            );
+        }
     }
 
     /// A packet larger than the buffer is clipped to the buffer (read(2)
@@ -871,8 +1093,8 @@ mod tun_read_tests {
     fn read_never_reports_more_than_the_buffer_holds() {
         let (r, w) = nonblocking_pipe();
         write_all(w, &[0xAB; 100]);
-        let (buf, n) = tun_read_owned(r, vec![0u8; 64]);
-        assert_eq!(n, Some(64));
+        let mut buf = vec![0u8; 64];
+        assert_eq!(tun_read(r, &mut buf).expect("a queued packet"), 64);
         assert!(buf.iter().all(|&b| b == 0xAB));
         unsafe {
             libc::close(w);
@@ -932,8 +1154,9 @@ mod tun_read_tests {
 
         // The detached read still reads ITS device, not a newcomer.
         write_all(w, b"x");
-        let (buf, n) = tun_read_owned(in_flight.as_raw_fd(), vec![0u8; 8]);
-        assert_eq!((n, buf[0]), (Some(1), b'x'));
+        let mut buf = vec![0u8; 8];
+        let n = tun_read(in_flight.as_raw_fd(), &mut buf).expect("the held device");
+        assert_eq!((n, buf[0]), (1, b'x'));
 
         drop(in_flight); // the last holder closes it
         assert!(read_end_is_closed(w));
@@ -969,8 +1192,8 @@ mod tun_read_tests {
             "O_NONBLOCK was not set"
         );
         let started = std::time::Instant::now();
-        let (_, n) = tun_read_owned(r, vec![0u8; 8]);
-        assert_eq!(n, None, "an idle read must come back empty (EAGAIN)");
+        let err = tun_read(r, &mut [0u8; 8]).expect_err("an idle read must come back empty");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock, "EAGAIN");
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
 
         unsafe {
@@ -1021,7 +1244,9 @@ mod tun_read_tests {
         let fd = Arc::clone(slot.read().await.as_ref().unwrap());
         let read = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            tun_read_owned(fd.as_raw_fd(), vec![0u8; 8])
+            let mut buf = vec![0u8; 8];
+            let n = tun_read(fd.as_raw_fd(), &mut buf);
+            (buf, n)
         });
 
         let started = std::time::Instant::now();
@@ -1034,7 +1259,7 @@ mod tun_read_tests {
             "closed before the detached read ran"
         );
         let (buf, n) = read.join().unwrap();
-        assert_eq!((n, buf[0]), (Some(1), b'x'));
+        assert_eq!((n.expect("the held device"), buf[0]), (1, b'x'));
         assert!(read_end_is_closed(w));
         unsafe { libc::close(w) };
     }
@@ -1049,6 +1274,14 @@ mod tun_read_tests {
 /// user cannot recover from inside the app, plus one leaked descriptor per
 /// failed connect. Closing the fd destroys the device and the kernel withdraws
 /// every route through it.
+///
+/// MR-2039: Drop only COLLECTS what is left (the routes, the fd, the DNS
+/// snapshot) and hands the cleanup itself to a thread of its own
+/// ([`clean_up_after_drop`], via `vpn::emergency_teardown::dispatch`), the
+/// Linux twin of the Windows fix (MR-823). Run inline, its `ip route del`s,
+/// `resolvectl revert` and resolv.conf rewrite blocked whatever thread dropped
+/// the tunnel — a Tokio worker when the manager's CONNECT_TIMEOUT drops a
+/// half-built start(), and every task queued on that worker with it.
 impl Drop for LinuxTunnel {
     fn drop(&mut self) {
         // A packet loop still running (a tunnel dropped without stop()) holds
@@ -1060,15 +1293,8 @@ impl Drop for LinuxTunnel {
         // routes THROUGH the device, but not the endpoint host route (relay
         // /32 via the uplink) or the LAN-sharing routes, which used to outlive
         // every such drop pointing at whatever gateway the host had then.
-        // Removed first, as stop() does, and qualified the same way.
+        // Taken here, removed first by the cleanup, as stop() does.
         let routes = take_owned_routes(&self.owned_routes);
-        if !routes.is_empty() {
-            tracing::warn!(
-                "LinuxTunnel dropped with {} route(s) still installed — removing them",
-                routes.len()
-            );
-            remove_owned_routes(routes);
-        }
         // Drop cannot await. try_write is enough: by the time the tunnel is
         // being dropped nothing else legitimately holds this lock, and failing
         // to acquire it must never panic or block a teardown.
@@ -1076,37 +1302,64 @@ impl Drop for LinuxTunnel {
             Ok(mut guard) => guard.take(),
             Err(_) => None,
         };
-        let Some(fd) = fd else {
-            return; // stop()/unwind already ran — nothing leaked
+        // The DNS restore is owed only by a start that never reached stop()
+        // or its unwind — the ones that still had the fd.
+        let snapshot = if fd.is_some() {
+            self.network_snapshot
+                .try_read()
+                .ok()
+                .and_then(|guard| guard.clone())
+        } else {
+            None
         };
-        // Drop cannot wait for in-flight I/O (no await), and with the fd
-        // shared it does not need to (MR-820): letting go of our reference
-        // closes it now, or — if a blocking read/write or the exiting loop
-        // still holds it — the moment that returns. Never under a syscall that
-        // is still using the number, and never twice. This used to close the
-        // raw fd outright and accept the recycle race as the price of not
-        // leaving the device alive (a guaranteed IPv4 blackhole).
-        drop(fd);
-        tracing::warn!(
-            "LinuxTunnel dropped with the TUN fd still open — released it to \
-             destroy the device and release its routes"
-        );
-        // A cancellation can also strike after /etc/resolv.conf was pinned but
-        // before running ever became true — the pinned file outlives the
-        // device and leaves every lookup on the machine pointing at tunnel
-        // resolvers that no longer exist. Restore the backup, but only when
-        // the file is provably ours.
-        if resolv_conf_is_ours() {
-            if let Ok(guard) = self.network_snapshot.try_read() {
-                if let Some(snap) = guard.as_ref() {
-                    let mut snap = snap.clone();
-                    snap.resolv_conf_pinned = true;
-                    crate::vpn::dns_journal::settle(
-                        restore_dns(&snap),
-                        crate::vpn::dns_journal::clear,
-                    );
-                }
-            }
+        if routes.is_empty() && fd.is_none() {
+            return; // stop()/unwind already ran — nothing leaked
+        }
+        if !routes.is_empty() {
+            tracing::warn!(
+                "LinuxTunnel dropped with {} route(s) still installed — removing them",
+                routes.len()
+            );
+        }
+        let cleanup = self.teardown.cleanup;
+        emergency_teardown::dispatch(self.teardown.in_flight, move || {
+            cleanup(Leftovers {
+                routes,
+                fd,
+                snapshot,
+            })
+        });
+    }
+}
+
+/// The cleanup a [`LinuxTunnel`] dropped with state still installed hands off
+/// (MR-2039), in the order the inline Drop ran it: the routes, the device,
+/// then DNS. Each subprocess is bounded ([`SUBPROCESS_TIMEOUT`]).
+fn clean_up_after_drop(left: Leftovers) {
+    // Removed first, as stop() does, and qualified exactly as they were added.
+    remove_owned_routes(left.routes);
+    let Some(fd) = left.fd else {
+        return;
+    };
+    // With the fd shared (MR-820), letting go of our reference closes it now,
+    // or — if the exiting loop still holds it — the moment that lets go.
+    // Never under a syscall that is still using the number, and never twice.
+    // This used to close the raw fd outright and accept the recycle race as
+    // the price of not leaving the device alive (a guaranteed IPv4 blackhole).
+    drop(fd);
+    tracing::warn!(
+        "LinuxTunnel dropped with the TUN fd still open — released it to destroy the device and \
+         release its routes"
+    );
+    // A cancellation can also strike after /etc/resolv.conf was pinned but
+    // before running ever became true — the pinned file outlives the device
+    // and leaves every lookup on the machine pointing at tunnel resolvers that
+    // no longer exist. Restore the backup, but only when the file is provably
+    // ours.
+    if resolv_conf_is_ours() {
+        if let Some(mut snap) = left.snapshot {
+            snap.resolv_conf_pinned = true;
+            crate::vpn::dns_journal::settle(restore_dns(&snap), crate::vpn::dns_journal::clear);
         }
     }
 }
@@ -1482,7 +1735,8 @@ fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
 /// route is recorded only once its add succeeded, and deleted with the same
 /// `via`/`dev` it was added with, so a delete can only ever match a route of
 /// ours. A route that already existed ("File exists") was not added by us and
-/// is not recorded.
+/// is not recorded — unless it is the endpoint route exactly as this session
+/// adds it, an earlier session's leftover (MR-2051, `adopt_identical_route`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OwnedRoute {
     dst: String,
@@ -1513,9 +1767,10 @@ impl OwnedRoute {
         })
     }
 
-    /// `ip route del` this route, exactly as it was added.
+    /// `ip route del` this route, exactly as it was added. Bounded: it also
+    /// runs on the emergency cleanup's thread (MR-2039).
     fn delete(&self) -> RouteDelete {
-        match cmd("ip").args(self.ip_args("del")).output() {
+        match crate::utils::output_within(cmd("ip").args(self.ip_args("del")), SUBPROCESS_TIMEOUT) {
             Ok(o) => route_journal::ip_route_del_outcome(
                 o.status.success(),
                 &String::from_utf8_lossy(&o.stderr),
@@ -1565,12 +1820,65 @@ fn add_owned_route(route: OwnedRoute, owned: &OwnedRoutes) -> Result<(), String>
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
+    record_owned_route(route, owned);
+    Ok(())
+}
+
+/// Record `route` as this session's: removed at teardown, and (MR-740) on the
+/// crash-recovery record when it outlives the tunnel.
+fn record_owned_route(route: OwnedRoute, owned: &OwnedRoutes) {
     let record = route.gateway_record();
     owned.lock().unwrap_or_else(|e| e.into_inner()).push(route);
     if let Some(record) = record {
         route_journal::remember(&record);
     }
-    Ok(())
+}
+
+/// MR-2051: does `listing` (`ip route show exact <dst>`) hold `route` exactly
+/// as its add would have put it in — the same destination, `via` and `dev`, at
+/// the metric the add collided with (none printed, or 0)? `ip` prints a host
+/// route without its `/32`, and leads a non-unicast route with its type
+/// (`blackhole`, `unreachable`), which is then never a match.
+fn listing_shows_route(listing: &str, route: &OwnedRoute) -> bool {
+    let dst = route.dst.strip_suffix("/32").unwrap_or(&route.dst);
+    listing.lines().any(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let value = |key: &str| {
+            words
+                .windows(2)
+                .find(|pair| pair[0] == key)
+                .map(|pair| pair[1])
+        };
+        words.first() == Some(&dst)
+            && value("via") == route.via.as_deref()
+            && value("dev") == Some(route.dev.as_str())
+            && value("metric").is_none_or(|metric| metric == "0")
+    })
+}
+
+/// MR-2051: the add of `route` hit "File exists". When the route already in
+/// place is EXACTLY this one — same gateway, same interface — it is a leftover
+/// of an earlier session of ours (one killed before its crash-recovery record
+/// was written, or by a build without it, MR-740), and it is taken as this
+/// session's: recorded, so the disconnect, the unwind or Drop removes it, and
+/// put on the crash record. It used to be left as someone else's, outliving
+/// every later session and, after a move to another network, pinning the
+/// relay to a gateway that was gone. Anything else at that destination
+/// (another gateway or interface, another VPN's route) is not provably ours
+/// and is left alone, as before. Returns whether it was taken.
+fn adopt_identical_route(route: OwnedRoute, owned: &OwnedRoutes) -> bool {
+    let listing = match crate::utils::output_within(
+        cmd("ip").args(["route", "show", "exact", route.dst.as_str()]),
+        SUBPROCESS_TIMEOUT,
+    ) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return false,
+    };
+    if !listing_shows_route(&listing, &route) {
+        return false;
+    }
+    record_owned_route(route, owned);
+    true
 }
 
 async fn configure_routes(
@@ -1596,15 +1904,30 @@ async fn configure_routes(
         via: Some(default_gw.clone()),
         dev: default_iface.clone(),
     };
-    if let Err(stderr) = add_owned_route(endpoint_route, owned) {
-        // MUST be fatal (except an existing identical route). Once the default
-        // below is genuinely captured, a missing endpoint route sends WireGuard's
-        // own outer UDP back into the tunnel — an encapsulation loop that reaches
-        // Connected and carries zero traffic. Warning here would convert a visible
-        // failure into an invisible one. An existing route is not ours, so it
-        // is not recorded and teardown leaves it where it was.
+    if let Err(stderr) = add_owned_route(endpoint_route.clone(), owned) {
+        // MUST be fatal (except an existing route). Once the default below is
+        // genuinely captured, a missing endpoint route sends WireGuard's own
+        // outer UDP back into the tunnel — an encapsulation loop that reaches
+        // Connected and carries zero traffic. Warning here would convert a
+        // visible failure into an invisible one.
         if !stderr.contains("File exists") {
             return Err(format!("Failed to pin the endpoint route: {}", stderr));
+        }
+        // MR-2051: an identical route is a leftover of ours and is taken as
+        // this session's; any other is not ours, so it is not recorded and
+        // teardown leaves it where it was. (A leftover via an OLD gateway is
+        // on the crash-recovery record, which the start-up reconcile removed
+        // before this connect could find it, MR-740.)
+        if adopt_identical_route(endpoint_route, owned) {
+            tracing::info!(
+                "The relay's host route was already in place exactly as this session adds it (a \
+                 leftover of an earlier session) — taken as ours, so the disconnect removes it"
+            );
+        } else {
+            tracing::warn!(
+                "A host route to the relay that is not ours is already in place (another \
+                 gateway, interface or VPN) — left alone; WireGuard's packets follow it"
+            );
         }
     }
 
@@ -1941,7 +2264,12 @@ fn restore_dns(snapshot: &NetworkSnapshot) -> DnsRestoreOutcome {
     if snapshot.uses_systemd_resolved {
         // systemd-resolved: revert the TUN interface DNS (device is being torn down,
         // systemd-resolved will automatically drop configuration for removed interfaces)
-        let _ = cmd("resolvectl").args(["revert", TUN_DEVICE_NAME]).output();
+        // Bounded (MR-2039): it talks to resolved over D-Bus, and this also
+        // runs on the emergency cleanup's thread, which start() waits for.
+        let _ = crate::utils::output_within(
+            cmd("resolvectl").args(["revert", TUN_DEVICE_NAME]),
+            SUBPROCESS_TIMEOUT,
+        );
         tracing::info!("Reverted systemd-resolved DNS for {}", TUN_DEVICE_NAME);
     }
 
@@ -2905,7 +3233,14 @@ mod resolv_conf_restore_tests {
 /// Pure, so it runs unprivileged in the Linux loop of tests.yml.
 #[cfg(test)]
 mod owned_route_tests {
-    use super::{take_owned_routes, OwnedRoute, OwnedRoutes};
+    use super::{
+        take_owned_routes, Leftovers, LinuxTunnel, OwnedRoute, OwnedRoutes, TeardownHooks,
+    };
+    use crate::api::types::VpnConfig;
+    use crate::vpn::emergency_teardown::{settled, ERR_EMERGENCY_CLEANUP_RUNNING};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn the_delete_is_qualified_exactly_as_the_add() {
@@ -2981,6 +3316,179 @@ mod owned_route_tests {
         });
         assert_eq!(take_owned_routes(&owned).len(), 1);
         assert!(take_owned_routes(&owned).is_empty());
+    }
+
+    fn endpoint() -> OwnedRoute {
+        OwnedRoute {
+            dst: "203.0.113.7/32".into(),
+            via: Some("192.168.1.1".into()),
+            dev: "eth0".into(),
+        }
+    }
+
+    /// MR-2051: only the route exactly as this session adds it — same
+    /// destination, gateway and interface, at the metric the add collided
+    /// with — is recognised as an earlier session's leftover. Whatever else
+    /// `ip route show exact` lists there is someone else's.
+    #[test]
+    fn only_the_identical_endpoint_route_is_recognised_as_ours() {
+        use super::listing_shows_route;
+        let ours = endpoint();
+        for listing in [
+            // `ip` prints a host route without its /32.
+            "203.0.113.7 via 192.168.1.1 dev eth0 \n",
+            "203.0.113.7 via 192.168.1.1 dev eth0 proto static \n",
+            "203.0.113.7 via 192.168.1.1 dev eth0 metric 0 \n",
+            // One of several routes at that destination.
+            "203.0.113.7 via 10.0.0.1 dev wlan0 metric 600 \n203.0.113.7 via 192.168.1.1 dev eth0 \n",
+        ] {
+            assert!(listing_shows_route(listing, &ours), "{listing:?}");
+        }
+        for listing in [
+            "",
+            // A leftover via an OLD gateway, or on another interface: not
+            // provably ours (MR-740's record is what removes those).
+            "203.0.113.7 via 192.168.1.254 dev eth0 \n",
+            "203.0.113.7 via 192.168.1.1 dev eth1 \n",
+            // Another VPN's host route to the relay (bug B's setup).
+            "203.0.113.7 dev othervpn scope link \n",
+            // Not the route the add collided with.
+            "203.0.113.7 via 192.168.1.1 dev eth0 metric 100 \n",
+            "blackhole 203.0.113.7 \n",
+            // A longer address that merely starts with ours.
+            "203.0.113.70 via 192.168.1.1 dev eth0 \n",
+        ] {
+            assert!(!listing_shows_route(listing, &ours), "{listing:?}");
+        }
+    }
+
+    // MR-2039: a LinuxTunnel dropped on a runtime worker hands its cleanup
+    // to a thread of its own, and start() never runs underneath one. Each
+    // test builds its own `TeardownHooks`: none touches the machine or a
+    // counter another test shares.
+
+    fn config() -> VpnConfig {
+        VpnConfig {
+            server_id: "mr2039".into(),
+            key_id: "mr2039".into(),
+            public_key: String::new(),
+            server_public_key: String::new(),
+            preshared_key: None,
+            endpoint: "192.0.2.1:51820".into(),
+            allowed_ips: vec!["0.0.0.0/0".into()],
+            dns: vec![],
+            custom_dns: false,
+            client_ip: "10.0.0.2".into(),
+            client_ipv6: None,
+            allowed_ips_v6: vec![],
+            mtu: 1420,
+            persistent_keepalive: 25,
+        }
+    }
+
+    /// What the stand-in cleanup was handed: (routes, fd held), once it ran.
+    static HANDED: Mutex<Option<(Vec<OwnedRoute>, bool)>> = Mutex::new(None);
+
+    /// Stands in for `clean_up_after_drop`: as slow as a wedged resolvectl,
+    /// and touching nothing.
+    fn slow_cleanup(left: Leftovers) {
+        std::thread::sleep(Duration::from_millis(1500));
+        *HANDED.lock().unwrap() = Some((left.routes, left.fd.is_some()));
+    }
+
+    /// The regression: Drop ran the route deletes, the device close and the
+    /// resolv.conf restore inline, so the worker that dropped the tunnel
+    /// stalled for as long as they took. Drop must now return at once, with
+    /// the cleanup counted, and the cleanup must still get everything left.
+    #[tokio::test]
+    async fn drop_on_a_runtime_worker_returns_before_the_cleanup_finishes() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        let mut tunnel = LinuxTunnel::create(config(), false).await.unwrap();
+        tunnel.teardown = TeardownHooks {
+            cleanup: slow_cleanup,
+            in_flight: &IN_FLIGHT,
+            start_wait: Duration::from_millis(50),
+        };
+        tunnel.owned_routes.lock().unwrap().push(endpoint());
+        // A device a cancelled start() never closed (a pipe stands in).
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        *tunnel.tun_fd.try_write().unwrap() =
+            Some(std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(fds[0]) }));
+
+        let started = Instant::now();
+        drop(tunnel);
+        let took = started.elapsed();
+
+        assert!(
+            took < Duration::from_millis(500),
+            "Drop blocked the worker for {took:?} on the cleanup"
+        );
+        assert!(HANDED.lock().unwrap().is_none(), "the cleanup ran inline");
+        assert_eq!(
+            IN_FLIGHT.load(Ordering::SeqCst),
+            1,
+            "the cleanup is not counted"
+        );
+
+        assert!(
+            settled(&IN_FLIGHT, Duration::from_secs(10)).await,
+            "the cleanup never finished"
+        );
+        assert_eq!(
+            HANDED.lock().unwrap().take(),
+            Some((vec![endpoint()], true)),
+            "the cleanup did not get the routes and the device"
+        );
+        unsafe { libc::close(fds[1]) };
+    }
+
+    /// A tunnel stop() already took down leaves nothing to hand off.
+    #[tokio::test]
+    async fn a_dropped_tunnel_with_nothing_left_hands_nothing_off() {
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        let mut tunnel = LinuxTunnel::create(config(), false).await.unwrap();
+        tunnel.teardown = TeardownHooks {
+            cleanup: |_| panic!("nothing was left to clean up"),
+            in_flight: &IN_FLIGHT,
+            start_wait: Duration::from_millis(50),
+        };
+        drop(tunnel);
+        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 0);
+    }
+
+    /// A start() that went ahead while a dropped tunnel's cleanup still ran
+    /// would add routes and pin resolv.conf underneath a cleanup that is
+    /// about to delete its twins and put the old file back. It must refuse
+    /// BEFORE its first change, and retryably.
+    #[tokio::test]
+    async fn start_refuses_retryably_while_a_cleanup_runs() {
+        // One cleanup still running, as far as this tunnel's counter knows.
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(1);
+        let mut tunnel = LinuxTunnel::create(config(), false).await.unwrap();
+        tunnel.teardown = TeardownHooks {
+            cleanup: |_| {},
+            in_flight: &IN_FLIGHT,
+            start_wait: Duration::from_millis(100),
+        };
+
+        let started = Instant::now();
+        let err = tunnel
+            .start(crate::vpn::WgPrivateKey::generate())
+            .await
+            .expect_err("start() went ahead while a cleanup was running");
+
+        assert!(err.contains(ERR_EMERGENCY_CLEANUP_RUNNING), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            tunnel.network_snapshot.read().await.is_none(),
+            "start() got as far as its snapshot"
+        );
+        assert!(
+            crate::commands::ipc_error::IpcError::from_tunnel_failure(&err).retryable,
+            "the refusal must be retryable"
+        );
     }
 }
 
@@ -3482,6 +3990,12 @@ mod netns_teardown_tests {
             "the start task was not cancelled: {joined:?}"
         );
         drop(guard);
+        // MR-2039: Drop hands its cleanup to a thread of its own, and the
+        // manager waits for that before it reports or starts anything.
+        assert!(
+            super::emergency_teardowns().settled().await,
+            "the dropped tunnel's cleanup never finished"
+        );
 
         let after = net();
         assert!(
@@ -3737,5 +4251,51 @@ mod netns_teardown_tests {
             !Path::new("/run/birdovpn/routes.json").exists(),
             "the crash record outlived the routes it describes"
         );
+    }
+
+    /// MR-2051: an earlier session left the endpoint route EXACTLY as this
+    /// one adds it — killed before its crash record was written, or by a
+    /// build without one — so this start's add hits "File exists". It used to
+    /// be taken for someone else's route and outlive every later session
+    /// (after a move to another network, pinning the relay to a gateway that
+    /// was gone). It is ours: on the crash record while connected, and gone
+    /// after the disconnect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn an_identical_endpoint_route_an_earlier_session_left_is_removed_at_disconnect() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+        // What start() adds: the relay via the namespace's default gateway.
+        let leftover = format!("{RELAY}/32");
+        let (ok, out) = ip(&[
+            "route",
+            "add",
+            &leftover,
+            "via",
+            "10.99.0.1",
+            "dev",
+            "uplink0",
+        ]);
+        assert!(ok, "precondition: the leftover endpoint route: {out}");
+
+        let (tunnel, key, _relay) = tunnel().await;
+        tunnel
+            .start(key)
+            .await
+            .expect("start() against the namespace's dummy uplink");
+        let record = std::fs::read_to_string("/run/birdovpn/routes.json").unwrap_or_default();
+        assert!(
+            record.contains(RELAY),
+            "the leftover was not taken as ours: it is not on the crash record: {record:?}"
+        );
+
+        tunnel.stop().await.expect("stop()");
+        let after = net();
+        assert!(
+            after.nothing_of_ours(),
+            "the endpoint route an earlier session left survived the disconnect: {after:?}"
+        );
+        assert_eq!(resolv_conf(), before);
     }
 }

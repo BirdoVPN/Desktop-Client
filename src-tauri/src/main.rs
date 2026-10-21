@@ -40,6 +40,9 @@ static EXIT_TEARDOWN_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static EXIT_TEARDOWN_DONE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// A restart was let through without the teardown (see
+/// `RunEvent::ExitRequested`): the end of the run must not run it either.
+static EXIT_RESTARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Hard cap over the whole exit teardown: quitting must never hang. The steps
 /// inside `end_session` carry their own tighter budgets (auto-reconnect 3 s,
@@ -321,9 +324,21 @@ fn main() {
         // negligible. Owner-only on multi-user Unix hosts (P6-CLI-D-08).
         // Gated on the user's choice (MR-808), which setup() applies.
         let log = crate::utils::file_log::install(dir, crate::utils::file_log::LOG_FILE_NAME);
+        // MR-690: boringtun logs from inside the session lock the packet path
+        // needs, so its lines are queued for a thread of their own; a stalled
+        // birdo.log write must never stall the tunnel. Every other line is
+        // written as before (see utils::console_log).
+        let off_the_lock = crate::utils::console_log::ConsoleLog::queued(
+            "birdo-file-log",
+            "birdo.log",
+            move || log.writer(),
+        );
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
-            .with_writer(move || log.writer())
+            .with_writer(crate::utils::console_log::lock_free_for_boringtun(
+                off_the_lock,
+                move || log.writer(),
+            ))
             // CLAMP THE PERSISTENT LOG. The redaction strategy leans on
             // "debug never ships": `redact_ip`/`redact_hostname` are
             // pass-throughs under `debug_assertions`, and several
@@ -850,6 +865,42 @@ fn main() {
                     app_handle,
                     EXIT_TEARDOWN_STARTED.load(std::sync::atomic::Ordering::SeqCst),
                 );
+                // MR-1934: macOS's Cmd+Q, the Dock's Quit and logout come
+                // here with no ExitRequested before them (tao's
+                // applicationWillTerminate), so the teardown below never ran
+                // and the pf block and the session's DNS outlived the app
+                // (the hazard at the top of this file). Run it now, before
+                // the process ends: on a helper thread, on the async runtime
+                // that is still alive, and waited for here at most the cap
+                // plus its margin, so quitting still never hangs. Not on
+                // Windows, where this path is Restart Manager's installer
+                // shutdown, whose live session the next version resumes
+                // (MR-1861), and the WFP block goes with the process anyway.
+                // Not after a restart was let through (no teardown, by design).
+                #[cfg(not(target_os = "windows"))]
+                if !EXIT_RESTARTING.load(std::sync::atomic::Ordering::SeqCst) {
+                    let app = app_handle.clone();
+                    let ran = utils::tear_down_unless_started(
+                        &EXIT_TEARDOWN_STARTED,
+                        EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN,
+                        move || {
+                            tauri::async_runtime::block_on(async move {
+                                if tokio::time::timeout(EXIT_TEARDOWN_CAP, teardown_for_exit(&app))
+                                    .await
+                                    .is_err()
+                                {
+                                    error!("Exit teardown timed out — exiting anyway");
+                                }
+                            });
+                        },
+                    );
+                    if let Some(finished) = ran {
+                        info!(
+                            "Exit with no exit request — the teardown ran first (finished: {})",
+                            finished
+                        );
+                    }
+                }
                 // MR-2013: a copied account number whose one-minute clear has
                 // not run yet would outlive the process on the clipboard.
                 commands::clipboard::clear_on_exit();
@@ -865,6 +916,8 @@ fn main() {
                 // here — its install calls std::process::exit(0) — which is why
                 // install_update ends the session before installing.)
                 if *code == Some(tauri::RESTART_EXIT_CODE) {
+                    // MR-1934: nor at the end of the run that follows.
+                    EXIT_RESTARTING.store(true, std::sync::atomic::Ordering::SeqCst);
                     // The full teardown cannot run here. Nothing this build
                     // does to DNS outlives the process (the DNS guard is a
                     // dynamic WFP filter, and routes are journaled), but an

@@ -254,9 +254,12 @@ jobs:
         env:
           OS: ${{ matrix.os }}
           # Linux: resolv_conf_restore_tests + tun_read_tests (F6: the packet
-          # loop's buffer-reuse helper, run on a pipe fd; and the TUN fd's
-          # close-on-exec check) + owned_route_tests (bug B: a route is deleted
-          # exactly as it was added). macOS: dns_journal_restore_tests
+          # loop's buffer-reuse helper, run on a pipe fd; MR-2040: an idle
+          # device never wakes the reader; and the TUN fd's close-on-exec
+          # check) + owned_route_tests (bug B: a route is deleted exactly as
+          # it was added; MR-2051: only the identical endpoint route is taken
+          # as a leftover of ours; MR-2039: Drop hands its cleanup to a thread
+          # and start() refuses while one runs). macOS: dns_journal_restore_tests
           # (restore_services_pass, interpret_dns_query, dns_write_verified),
           # utun_fd_tests (the utun socket is close-on-exec, checked
           # unprivileged) and owned_route_tests (MR-2088: a route is deleted
@@ -500,7 +503,9 @@ jobs:
       # symlinked /etc/resolv.conf is the same symlink after a disconnect and
       # after the journal-driven crash recovery. MR-740: the endpoint route a
       # killed session left via the uplink is removed by the next start's
-      # recovery. The tests refuse to run outside that namespace.
+      # recovery. MR-2051: an endpoint route an earlier session left exactly
+      # as a start adds it is taken as ours and removed at the disconnect.
+      # The tests refuse to run outside that namespace.
       - name: Tunnel teardown tests (Linux, root, private net+mount namespace)
         if: matrix.os == 'linux'
         working-directory: src-tauri
@@ -513,10 +518,10 @@ jobs:
             exit 1
           }
           echo "$out"
-          # Six tests, all required: an --ignored filter that matches nothing
-          # still exits 0.
-          if ! grep -qE 'test result: ok\. 6 passed' <<<"$out"; then
-            echo "::error::netns_teardown_tests did not run all six tests"
+          # Seven tests, all required: an --ignored filter that matches
+          # nothing still exits 0.
+          if ! grep -qE 'test result: ok\. 7 passed' <<<"$out"; then
+            echo "::error::netns_teardown_tests did not run all seven tests"
             exit 1
           fi
 
