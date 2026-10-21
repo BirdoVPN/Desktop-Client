@@ -505,6 +505,8 @@ jobs:
       # killed session left via the uplink is removed by the next start's
       # recovery. MR-2051: an endpoint route an earlier session left exactly
       # as a start adds it is taken as ours and removed at the disconnect.
+      # MR-2040: an idle tunnel reads birdo0 under 10 times a second and does
+      # not wake in a loop (the old loop: ~200 reads, ~712 wakeups a second).
       # The tests refuse to run outside that namespace.
       - name: Tunnel teardown tests (Linux, root, private net+mount namespace)
         if: matrix.os == 'linux'
@@ -518,10 +520,10 @@ jobs:
             exit 1
           }
           echo "$out"
-          # Seven tests, all required: an --ignored filter that matches
+          # Eight tests, all required: an --ignored filter that matches
           # nothing still exits 0.
-          if ! grep -qE 'test result: ok\. 7 passed' <<<"$out"; then
-            echo "::error::netns_teardown_tests did not run all seven tests"
+          if ! grep -qE 'test result: ok\. 8 passed' <<<"$out"; then
+            echo "::error::netns_teardown_tests did not run all eight tests"
             exit 1
           fi
 

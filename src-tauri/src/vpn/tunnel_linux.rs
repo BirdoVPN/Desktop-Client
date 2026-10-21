@@ -3707,7 +3707,8 @@ mod configure_ipv6_tests {
 // ─────────────────────────────────────────────────────────────────────────────
 // Teardown on a real Linux network stack: MR-764 (a dropped or failed start
 // leaves no birdo0), bug B (a failed start leaves another VPN's routes alone)
-// and MR-2018 (a symlinked /etc/resolv.conf comes back as the same symlink).
+// and MR-2018 (a symlinked /etc/resolv.conf comes back as the same symlink);
+// and, with a tunnel up, MR-2040 (an idle one neither polls nor wakes in a loop).
 //
 // These create birdo0, add and delete routes and rewrite /etc/resolv.conf, so
 // they run ONLY inside a private network + mount namespace that
@@ -4298,6 +4299,95 @@ mod netns_teardown_tests {
             after.nothing_of_ours(),
             "the endpoint route an earlier session left survived the disconnect: {after:?}"
         );
+        assert_eq!(resolv_conf(), before);
+    }
+
+    /// read(2)-family syscalls this process has made (`syscr`), what `perf
+    /// stat -e syscalls:sys_enter_read` counts.
+    fn read_syscalls() -> u64 {
+        let io = std::fs::read_to_string("/proc/self/io").expect("/proc/self/io");
+        io.lines()
+            .find_map(|line| line.strip_prefix("syscr:"))
+            .and_then(|count| count.trim().parse().ok())
+            .expect("syscr in /proc/self/io")
+    }
+
+    /// Context switches over every thread this process has run, exited ones
+    /// included: each is a thread going to sleep until it is woken again, or
+    /// being put aside.
+    fn context_switches() -> u64 {
+        // SAFETY: an all-zero rusage is valid, and getrusage only fills it.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+        (usage.ru_nvcsw + usage.ru_nivcsw) as u64
+    }
+
+    /// MR-2040, measured on a real device: a tunnel that is up and carries
+    /// nothing. The old loop polled — a blocking-pool read of birdo0 every
+    /// round and 500 µs / 5 ms sleeps between rounds, about 200 reads and
+    /// 712 wakeups a second (agent L-1, 2026-10-14). The event-driven loop
+    /// reads the device only when the kernel queued a packet, and otherwise
+    /// wakes for boringtun's four timer ticks a second: under 10 reads a
+    /// second (the audit's check: `perf stat -e syscalls:sys_enter_read` over
+    /// an idle minute) and a few dozen wakeups at most. A datagram sent into
+    /// birdo0 first proves the loop reads the real device. `BIRDO_IDLE_SECS`
+    /// sets the idle window: 10 s by default, the audit's 60 s by hand.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn an_idle_tunnel_neither_polls_its_device_nor_wakes_in_a_loop() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+        let (tunnel, key, _relay) = tunnel().await;
+        tunnel
+            .start(key)
+            .await
+            .expect("start() against the namespace's dummy uplink");
+
+        // 1000 bytes of UDP to the tunnel's DNS address, routed into birdo0 by
+        // the halves: a 1028-byte IP packet the loop must read and encrypt.
+        let sent = tunnel.get_stats().0;
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("a probe socket");
+        probe
+            .send_to(&[0x5a; 1000], "10.66.0.53:53")
+            .expect("send into the tunnel");
+        let encrypted = || tunnel.get_stats().0 >= sent + 1028;
+        assert!(
+            wait_until(Duration::from_secs(5), encrypted).await,
+            "the packet loop never read the datagram from birdo0: {:?}",
+            tunnel.get_stats()
+        );
+
+        let secs = std::env::var("BIRDO_IDLE_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(10);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // `/proc/self/io` is read last on the way in and first on the way
+        // out, so the window counts none of the measuring's own reads.
+        let switches_at = context_switches();
+        let reads_at = read_syscalls();
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        let reads = read_syscalls() - reads_at;
+        let switches = context_switches() - switches_at;
+        let reads_per_s = reads as f64 / secs as f64;
+        let wakeups_per_s = switches as f64 / secs as f64;
+        eprintln!(
+            "MR-2040: an idle tunnel over {secs} s: {reads} read syscalls ({reads_per_s:.1}/s), \
+             {switches} context switches ({wakeups_per_s:.1}/s)"
+        );
+        assert!(
+            reads_per_s < 10.0,
+            "the idle tunnel still polls birdo0: {reads_per_s:.1} reads/s"
+        );
+        assert!(
+            wakeups_per_s < 50.0,
+            "the idle tunnel still wakes in a loop: {wakeups_per_s:.1} context switches/s"
+        );
+
+        tunnel.stop().await.expect("stop()");
+        let after = net();
+        assert!(after.nothing_of_ours(), "{after:?}");
         assert_eq!(resolv_conf(), before);
     }
 }
