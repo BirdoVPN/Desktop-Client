@@ -10,6 +10,8 @@
  *  - Background errors are shown with the canonical copy and a way forward
  *    (W2-008, P1-parity-020/021/040); the kill-switch chips (P1-parity-019).
  *  - Locked servers explain the upgrade; offline ones say so (W2-015);
+ *    each server is named once, in the sheet and on the card (owner,
+ *    2026-10-21: "prints the server names twice just different sizes");
  *    Multi-Hop's route is frozen while a session is up (W2-010);
  *    the synthetic anonymous address is never shown (P1-parity-007).
  *
@@ -20,7 +22,7 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { Dashboard } from '@/components/Dashboard';
-import { connectCta, statusPill } from '@/lib/vpn-display';
+import { connectCta, serverSubtitle, serverTitle, statusPill } from '@/lib/vpn-display';
 import { parseVpnStatus, type VpnState } from '@/lib/ipc';
 import { PQ_FAILED_COPY, REVOKED_COPY } from '@/lib/errors';
 import { defaultSettings, useAppStore, type Server } from '@/store/app-store';
@@ -195,6 +197,30 @@ describe('Dashboard: errors with a way forward', () => {
   });
 });
 
+describe('serverTitle / serverSubtitle — a row never repeats its own name (pure)', () => {
+  const N = (name: string, city: string, country: string) => ({ name, city, country });
+  it.each<[ReturnType<typeof N>, string, string]>([
+    // Nodes are named after their city: the subtitle keeps only what is new.
+    [N('birdo-vpn-frankfurt', 'Frankfurt', 'Germany'), 'birdo-vpn-frankfurt', 'Germany'],
+    [N('birdo-vpn-losangeles', 'Los Angeles', 'United States'), 'birdo-vpn-losangeles', 'United States'],
+    [N('birdo-vpn-saopaulo', 'São Paulo', 'Brazil'), 'birdo-vpn-saopaulo', 'Brazil'],
+    [N('Frankfurt #1', 'Frankfurt', 'Germany'), 'Frankfurt #1', 'Germany'],
+    // A city the name does not carry is information, and stays.
+    [N('birdo-vpn-newyork', 'New Jersey', 'United States'), 'birdo-vpn-newyork', 'New Jersey, United States'],
+    [N('birdo-vpn-tokyo', '東京', 'Japan'), 'birdo-vpn-tokyo', '東京, Japan'],
+    // Whole words only: "Nice" is not said by "venice".
+    [N('birdo-vpn-venice', 'Nice', 'France'), 'birdo-vpn-venice', 'Nice, France'],
+    // Everything already said: no subtitle at all.
+    [N('birdo-vpn-singapore', 'Singapore', 'Singapore'), 'birdo-vpn-singapore', ''],
+    // No name: the place is the title, and is not repeated under it.
+    [N('', 'Tokyo', 'Japan'), 'Tokyo', 'Japan'],
+    [N('', '', 'Japan'), 'Japan', ''],
+  ])('%o → %s / %s', (server, title, subtitle) => {
+    expect(serverTitle(server)).toBe(title);
+    expect(serverSubtitle(server)).toBe(subtitle);
+  });
+});
+
 describe('Dashboard: the server sheet', () => {
   it('a plan-locked row is reachable and explains the upgrade; an offline row says "Offline" (W2-015)', async () => {
     useAppStore.setState({
@@ -228,6 +254,36 @@ describe('Dashboard: the server sheet', () => {
     const before = callsTo('get_servers').length;
     await userEvent.click(within(sheet).getByRole('button', { name: 'Retry' }));
     await waitFor(() => expect(callsTo('get_servers').length).toBe(before + 1));
+  });
+
+  // Owner 2026-10-21: the picker "prints the server names twice just
+  // different sizes" — "birdo-vpn-frankfurt" over "Frankfurt, Germany", under
+  // a pinned "Fastest server" row that named the same server a third time.
+  it('names each server once: no pinned "Fastest server" row, and no row or card repeats a name', async () => {
+    useAppStore.setState({
+      servers: [
+        S('fra', { name: 'birdo-vpn-frankfurt', city: 'Frankfurt', country: 'Germany', load: 5 }),
+        S('nyc', { name: 'birdo-vpn-newyork', city: 'New Jersey', country: 'United States', countryCode: 'US' }),
+      ],
+    });
+    setStatus({ state: 'disconnected' });
+    render(<Dashboard />);
+    // The card: the automatic pick, its server named once (W2-028 keeps the title).
+    const card = screen.getByTestId('server-selector');
+    expect(within(card).getByText('Fastest server')).toBeInTheDocument();
+    expect(within(card).getByText('birdo-vpn-frankfurt · Germany')).toBeInTheDocument();
+    expect(card.textContent?.match(/frankfurt/gi)).toHaveLength(1);
+
+    await userEvent.click(card);
+    const sheet = await screen.findByRole('dialog', { name: 'Choose a server' });
+    expect(within(sheet).queryByText('Fastest server')).not.toBeInTheDocument();
+    const rows = within(sheet).getAllByRole('listitem');
+    expect(rows).toHaveLength(2);
+    expect(rows[0].textContent?.match(/frankfurt/gi)).toHaveLength(1);
+    expect(within(rows[0]).getByText('birdo-vpn-frankfurt')).toBeInTheDocument();
+    expect(within(rows[0]).getByText('Germany')).toBeInTheDocument();
+    expect(within(rows[0]).getByRole('button', { name: 'Connect to birdo-vpn-frankfurt, Germany' })).toBeInTheDocument();
+    expect(within(rows[1]).getByText('New Jersey, United States')).toBeInTheDocument();
   });
 });
 

@@ -3,6 +3,7 @@ import {
   settingsFromRust,
   settingsToRust,
   formatBytes,
+  formatDataCap,
   formatUptime,
   formatDate,
   anonymityPatch,
@@ -183,6 +184,22 @@ describe('formatting (iOS / Android FormatUtils parity, W2-031)', () => {
     expect(formatBytes(1536)).toBe('1.5 KB');
     expect(formatBytes(5 * 1024 * 1024)).toBe('5.0 MB');
     expect(formatBytes(1.5 * 1024 ** 3)).toBe('1.50 GB');
+  });
+
+  it('data cap: /auth/me sends BYTES, the chip says whole GB, and no cap is "Unlimited data"', () => {
+    // The live free plan: 50 GB × 2^30. Printed raw it read "53687091200 GB / month".
+    expect(formatDataCap(53_687_091_200)).toBe('50 GB / month');
+    expect(formatDataCap(50 * 1024 ** 3)).toBe('50 GB / month');
+    // 1 TiB stays in GB, as Android and the Limit tab print a 1024 GB cap.
+    expect(formatDataCap(1024 ** 4)).toBe('1024 GB / month');
+    expect(formatDataCap(1.5 * 1024 ** 3)).toBe('1.5 GB / month');
+    // No cap: the backend's null is stored as 0.
+    expect(formatDataCap(0)).toBe('Unlimited data');
+    expect(formatDataCap(null)).toBe('Unlimited data');
+    expect(formatDataCap(undefined)).toBe('Unlimited data');
+    expect(formatDataCap(-1)).toBe('Unlimited data');
+    expect(formatDataCap(Number.NaN)).toBe('Unlimited data');
+    expect(formatDataCap(Number.POSITIVE_INFINITY)).toBe('Unlimited data');
   });
 
   it('dates read "MMM d, yyyy", and a bare calendar date is not shifted a day by the timezone', () => {

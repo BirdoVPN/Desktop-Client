@@ -32,6 +32,25 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(1024, i)).toFixed(places)} ${units[i]}`;
 }
 
+/** One "GB" of a data cap: the backend sends `bandwidthLimitGb × 1_073_741_824`. */
+const CAP_BYTES_PER_GB = 1024 ** 3;
+
+/**
+ * The plan's monthly data cap as the Profile chip shows it: "50 GB / month",
+ * or "Unlimited data" when there is none (0, null, or nothing usable).
+ *
+ * `bytes` is `/auth/me`'s `bandwidthLimit`, which is in BYTES: the backend
+ * multiplies the plan's whole-GB `bandwidthLimitGb` by 2^30 (null = no cap).
+ * It was printed as if it were GB — "53687091200 GB / month" for the 50 GB free
+ * plan. Whole GB, as Android's `data_gb_per_month` and the Limit tab print the
+ * same cap, so one account reads the same number on every screen and client.
+ */
+export function formatDataCap(bytes: number | null | undefined): string {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) return 'Unlimited data';
+  const gb = bytes / CAP_BYTES_PER_GB;
+  return `${Number.isInteger(gb) ? gb : Number(gb.toFixed(1))} GB / month`;
+}
+
 /** Session duration as MM:SS under an hour, H:MM:SS above (iOS HomeView). */
 export function formatUptime(seconds: number): string {
   const total = Math.max(0, Math.floor(seconds));
