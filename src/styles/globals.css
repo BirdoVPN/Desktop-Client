@@ -456,6 +456,16 @@ input::-ms-clear {
   .birdo-radio-dot {
     border-color: CanvasText !important;
   }
+  /* The MTU "Automatic" checkbox (SettingsRows.tsx): its fill is its state. */
+  .birdo-check {
+    border-color: CanvasText !important;
+  }
+  .birdo-check[data-checked] {
+    forced-color-adjust: none;
+    background-color: Highlight !important;
+    border-color: Highlight !important;
+    color: HighlightText;
+  }
   .birdo-radio[aria-checked='true'] .birdo-radio-dot > span {
     forced-color-adjust: none;
     background-color: Highlight !important;

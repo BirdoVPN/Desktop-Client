@@ -1,14 +1,19 @@
 /**
- * Settings — the Settings TAB ROOT, mirroring iOS SettingsView / Android
- * SettingsScreen.
+ * Settings — the Settings TAB ROOT, laid out as Android's SettingsScreen.kt
+ * (owner, 2026-10-21: "exactly the same design as the mobile").
  *
  * Sections in the canonical order (P1-parity "Settings names and help text"):
  * Appearance (window position) · Privacy & Security (Kill Switch, Always-on
  * Kill Switch, Quantum Protection, Hide App Contents, Crash Reports, Save
  * Diagnostic Logs, Delete Logs Now) ·
  * Connection (Auto-Connect, Launch at Login, Start Minimized) · Notifications ·
- * VPN (VPN Settings, Custom DNS Servers, Port Forwarding) · Speed Test · About.
- * Every row says what it does and when it applies (W2-029).
+ * VPN (VPN Settings, Custom DNS Servers, Port Forwarding, Kill Switch
+ * Exceptions) · Speed Test · About. The desktop-only rows sit where mobile
+ * would put them.
+ *
+ * One row per card: an icon chip, the title and the control. No row carries a
+ * description (owner, 2026-10-21; this replaces W2-029's "every row says what
+ * it does"). A row only says why it cannot be used, while it cannot.
  *
  * Every write goes through `persistSettings` (session/settings-persist.ts):
  * optimistic, full-object `save_settings`, rolled back and reported when the
@@ -24,22 +29,23 @@ import {
   Bell,
   EyeOff,
   Shield,
+  ShieldPlus,
   Lock,
   Zap,
   Monitor,
+  Minimize2,
   SlidersHorizontal,
   Globe,
+  MapPin,
+  Server,
   ArrowLeftRight,
-  ExternalLink,
+  Split,
   ShieldCheck,
   FileText,
+  LayoutDashboard,
   Info,
   Gauge,
-  ArrowUpLeft,
-  ArrowUpRight,
-  ArrowDownLeft,
-  ArrowDownRight,
-  Move,
+  BadgeCheck,
   Bug,
   ScrollText,
   Trash2,
@@ -48,17 +54,22 @@ import {
 import { useAppStore } from '@/store/app-store';
 import { isMacPlatform, isPrivateDnsAddress, isValidDnsAddress, isWindowsPlatform } from '@/utils/helpers';
 import {
-  BirdoCard,
-  BirdoSectionHeader,
-  BirdoListItem,
-  BirdoToggleRow,
-  BirdoNavRow,
+  AppIconMark,
+  BirdoTopBar,
   BirdoTextField,
   BirdoButton,
   BirdoDialog,
   BirdoRadioGroup,
   type RadioOption,
 } from '@/components/birdo';
+import {
+  SettingIconChip,
+  SettingsCard,
+  SettingsLink,
+  SettingsNote,
+  SettingsSectionHeader,
+  SettingsToggle,
+} from './settings/SettingsRows';
 import { UpdateChecker } from './UpdateChecker';
 import { brand, status as statusTokens, white } from '@/lib/birdo-theme';
 import { persistSettings, setKillSwitch, showSaveFailure } from '@/session/settings-persist';
@@ -83,12 +94,13 @@ interface SpeedTestResult {
   latencyMs: number;
 }
 
+// Labels only, as mobile's segmented Theme control.
 const CORNER_OPTIONS: RadioOption<WindowCorner>[] = [
-  { value: 'top-left', label: 'Top left', icon: ArrowUpLeft },
-  { value: 'top-right', label: 'Top right', icon: ArrowUpRight },
-  { value: 'bottom-left', label: 'Bottom left', icon: ArrowDownLeft },
-  { value: 'bottom-right', label: 'Bottom right', icon: ArrowDownRight },
-  { value: 'free', label: 'Free (draggable)', icon: Move },
+  { value: 'top-left', label: 'Top left' },
+  { value: 'top-right', label: 'Top right' },
+  { value: 'bottom-left', label: 'Bottom left' },
+  { value: 'bottom-right', label: 'Bottom right' },
+  { value: 'free', label: 'Free (draggable)' },
 ];
 
 /** iOS / Android's shared disable-confirm text (P1-parity-031). */
@@ -97,34 +109,21 @@ export const KILL_SWITCH_DISABLE_BODY =
   'unencrypted connection and can expose your real IP address and DNS queries until it ' +
   'reconnects. For the strongest protection, keep it on.';
 
-/** Under the Custom DNS fields (MR-689). */
-export const CUSTOM_DNS_NOT_LAN_COPY =
-  'A DNS server at a carrier-grade NAT address (100.64.x.x) or a public address is not ' +
-  'treated as on your own network, so Local Network Sharing does not apply to it.';
-
 /**
  * macOS only (MR-1124): the IPv6 block `tunnel_macos.rs` installs for every
  * session, kill switch on or off, until macOS routes IPv6 (the F-001 block
  * there). The wording was drafted in tunnel_macos.rs (MR-1124); it goes when
- * the block does.
+ * the block does. A note on its own, not a row's description: it is no
+ * setting's doing.
  */
 export const MACOS_IPV6_NOTE =
   "On macOS, IPv6 is blocked while you're connected, so your real address can't leak over it. " +
   "Sites that only work over IPv6 won't load until you disconnect.";
 
 /**
- * MR-808: the diagnostic log kept on this device (`birdo.log` and the crash
- * files, `utils::file_log` in Rust). What it holds, how long, that the app
- * never sends it, and what "off" does and does not do. Applied live, so no
- * restart note.
+ * MR-808: "Delete Logs Now" asks first, and the confirmation says what goes
+ * (`birdo.log` and the crash files, `utils::file_log` in Rust).
  */
-export const FILE_LOGGING_COPY =
-  'Keeps a log of connection events, errors and crashes on this device, trimmed to the last ' +
-  '7 days each time the app starts. The app never sends it. Turning this off stops new ' +
-  'entries but does not delete existing logs.';
-
-export const DELETE_LOGS_COPY = 'Deletes the diagnostic log and crash files from this device.';
-
 export const DELETE_LOGS_CONFIRM_BODY =
   "This deletes the diagnostic log and crash files on this device. It can't be undone.";
 
@@ -153,13 +152,12 @@ export function deleteLogsNotice(result: DeleteLogsResult): Omit<Notice, 'id'> {
 }
 
 export function Settings() {
-  const { settings, windowCorner, setWindowCorner, pushRoute, connected, customDnsOffered } = useAppStore(
+  const { settings, windowCorner, setWindowCorner, pushRoute, customDnsOffered } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
       windowCorner: s.windowCorner,
       setWindowCorner: s.setWindowCorner,
       pushRoute: s.pushRoute,
-      connected: s.connectionState === 'connected',
       customDnsOffered: customDnsAvailable(s.account.plan, s.customDnsByPlan),
     })),
   );
@@ -262,7 +260,6 @@ export function Settings() {
   }, []);
 
   // ── Hide App Contents (the biometric cover) ─────────────────────────────
-  const authName = biometric?.method === 'touch_id' ? 'Touch ID' : 'Windows Hello';
   const handleBiometric = useCallback(async (value: boolean) => {
     setBiometricError(null);
     // When enabling, confirm the user can actually authenticate first.
@@ -291,28 +288,21 @@ export function Settings() {
   return (
     // `relative` so the kill-switch confirmation can cover the tab, and OUTSIDE
     // the scroller so it stays centred no matter how far the list is scrolled.
-    <div className="relative h-full">
-      {/* Transparent so the App-level PixelCanvas backdrop shows through. */}
-      <div className="h-full overflow-y-auto">
-        {/* Tab-root header (no back button) */}
-        <div className="px-5 pb-2 pt-6">
-          <h1 className="text-[22px] font-semibold" style={{ color: '#FFFFFF' }}>
-            Settings
-          </h1>
-        </div>
+    <div className="relative flex h-full flex-col">
+      {/* Tab-root header (no back button), as mobile's BirdoTopBar. */}
+      <BirdoTopBar title="Settings" subtitle="App preferences & account" />
 
-        <div className="flex flex-col gap-1 px-5 pb-12 pt-2">
+      {/* Transparent so the App-level PixelCanvas backdrop shows through. */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="flex flex-col gap-3 px-5 pb-8 pt-4">
           {/* ── APPEARANCE ─────────────────────────────────────────────── */}
-          <BirdoSectionHeader title="Appearance" />
-          <BirdoCard className="mt-1">
-            <div className="mb-3 flex items-center gap-3.5">
-              <div
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
-                style={{ backgroundColor: white.w05 }}
-              >
-                <Monitor size={18} color={brand.accent} aria-hidden />
+          <SettingsSectionHeader title="Appearance" />
+          <SettingsCard padding="14px">
+            <div className="mb-3 flex items-center gap-3">
+              <SettingIconChip icon={Monitor} tint={brand.accent} />
+              <div className="text-[14px] font-semibold" style={{ color: white.w100 }}>
+                Window position
               </div>
-              <div className="text-[15px] font-medium text-white">Window position</div>
             </div>
             <BirdoRadioGroup
               label="Window position"
@@ -322,252 +312,210 @@ export function Settings() {
               value={windowCorner}
               onChange={setWindowCorner}
             />
-          </BirdoCard>
+          </SettingsCard>
 
           {/* ── PRIVACY & SECURITY ─────────────────────────────────────── */}
-          <BirdoSectionHeader title="Privacy & Security" className="mt-2" />
-          <BirdoCard padding="0.25rem">
-            {/* Copy per the 2026-09-29 audit (D-7): no "never leaks" absolute.
-                The WFP / pf / iptables block lives in this process, so it
-                protects only while the app is running. After 10 failed
-                reconnects auto_reconnect releases the block unless Windows
-                lockdown ("always-on") is on, so say so there.
-                macOS blocks ALL IPv6 for the whole connection, kill switch on
-                or off, so IPv6-only sites fail there. It is not this toggle's
-                doing, so it is not in this subtitle: MACOS_IPV6_NOTE says it
-                below, on macOS only (MR-1124). */}
-            <BirdoToggleRow
-              title="Kill Switch"
-              subtitle={
-                'If the tunnel drops unexpectedly, the app blocks traffic until it reconnects. ' +
-                'Protection applies while the app is running.' +
-                (!isWindowsPlatform() || !settings.lockdownMode
-                  ? ' If reconnecting keeps failing, the app stops blocking.'
-                  : '')
-              }
-              subtitleWrap
-              leadingIcon={Shield}
-              leadingTint={brand.accent}
-              checked={settings.killSwitchEnabled}
-              onCheckedChange={(v) => {
-                // Enabling is immediate; disabling removes leak protection, so
-                // require an explicit confirmation first (mobile parity).
-                if (v) void setKillSwitch(true);
-                else setShowKsConfirm(true);
-              }}
+          <SettingsSectionHeader title="Privacy & Security" />
+          {/* The WFP / pf / iptables block lives in this process, so it
+              protects only while the app is running, and after 10 failed
+              reconnects auto_reconnect releases it unless Windows lockdown
+              ("always-on") is on. The row no longer says so (owner,
+              2026-10-21: no descriptions); the disable confirmation below
+              still states what turning it off risks. */}
+          <SettingsToggle
+            icon={Shield}
+            iconColor={brand.accent}
+            title="Kill Switch"
+            checked={settings.killSwitchEnabled}
+            onCheckedChange={(v) => {
+              // Enabling is immediate; disabling removes leak protection, so
+              // require an explicit confirmation first (mobile parity).
+              if (v) void setKillSwitch(true);
+              else setShowKsConfirm(true);
+            }}
+          />
+          {/* LOCKDOWN (D-21). Windows-only (the flag is hard false elsewhere)
+              and only meaningful with the kill switch on. Persisted WITHOUT a
+              live reapply: it takes effect from the next connection, so a
+              toggle can never rebuild a live session's firewall state. */}
+          {isWindowsPlatform() && settings.killSwitchEnabled && (
+            <SettingsToggle
+              icon={ShieldPlus}
+              iconColor={brand.accent}
+              title="Always-on Kill Switch"
+              checked={settings.lockdownMode}
+              onCheckedChange={(v) => void persistSettings({ lockdownMode: v })}
             />
-            {/* LOCKDOWN (D-21). Windows-only (the flag is hard false elsewhere)
-                and only meaningful with the kill switch on. Persisted WITHOUT a
-                live reapply: it takes effect from the next connection, so a
-                toggle can never rebuild a live session's firewall state. */}
-            {isWindowsPlatform() && settings.killSwitchEnabled && (
-              <BirdoToggleRow
-                title="Always-on Kill Switch"
-                subtitle="Keeps traffic outside the tunnel blocked for the whole session, including while reconnecting. Applies from your next connection."
-                subtitleWrap
-                leadingIcon={Lock}
-                leadingTint={brand.accent}
-                checked={settings.lockdownMode}
-                onCheckedChange={(v) => void persistSettings({ lockdownMode: v })}
+          )}
+          {/* macOS blocks ALL IPv6 for the whole connection, kill switch on
+              or off (MR-1124). Not a description of a setting: a platform
+              limit, shown as a note like mobile's VPN Settings note. */}
+          {isMacPlatform() && <SettingsNote icon={Info}>{MACOS_IPV6_NOTE}</SettingsNote>}
+          <SettingsToggle
+            icon={Lock}
+            iconColor={brand.accent}
+            title="Quantum Protection"
+            checked={settings.quantumProtection}
+            onCheckedChange={(v) => void persistSettings({ quantumProtection: v }, { reapply: true })}
+          />
+          {/* The availability gate is on this ROW, not the section: the OS
+              may have no enrolled authenticator, but everything else here
+              always applies. Honest naming (iOS): it covers the screen and
+              protects no data — it used to read "Biometric Unlock" under
+              Security with a green icon (W2-026). */}
+          {biometric?.available && (
+            <>
+              <SettingsToggle
+                icon={EyeOff}
+                iconColor={white.w60}
+                title="Hide App Contents"
+                checked={biometric.enabled}
+                onCheckedChange={handleBiometric}
               />
-            )}
-            {isMacPlatform() && (
-              <p className="px-3.5 pb-2.5 text-xs" style={{ color: white.w60 }}>
-                {MACOS_IPV6_NOTE}
-              </p>
-            )}
-            <BirdoToggleRow
-              title="Quantum Protection"
-              subtitle={
-                'Adds a WireGuard pre-shared key derived with ML-KEM-1024 (BirdoPQ) to each connection.' +
-                (connected ? ' Reconnects briefly to apply.' : '')
-              }
-              subtitleWrap
-              leadingIcon={Lock}
-              leadingTint={brand.accent}
-              checked={settings.quantumProtection}
-              onCheckedChange={(v) => void persistSettings({ quantumProtection: v }, { reapply: true })}
-            />
-            {/* The availability gate is on this ROW, not the section: the OS
-                may have no enrolled authenticator, but everything else here
-                always applies. Honest naming (iOS): it covers the screen and
-                protects no data — it used to read "Biometric Unlock" under
-                Security with a green icon (W2-026). */}
-            {biometric?.available && (
-              <>
-                <BirdoToggleRow
-                  title="Hide App Contents"
-                  subtitle={
-                    `Covers the screen with a ${authName} prompt when you open the app. Hides what is ` +
-                    'on screen only — it protects no data, and the VPN keeps running behind it, ' +
-                    'including Auto-Connect.'
-                  }
-                  subtitleWrap
-                  leadingIcon={EyeOff}
-                  leadingTint={white.w60}
-                  checked={biometric.enabled}
-                  onCheckedChange={handleBiometric}
-                />
-                {biometricError && (
-                  <p role="alert" className="px-3.5 pb-2.5 text-xs" style={{ color: statusTokens.red }}>
-                    {biometricError}
-                  </p>
-                )}
-              </>
-            )}
-            {/* Crash reports are OPT-IN (audit C-3). The dedicated command
-                persists the one field and applies it live in both directions. */}
-            <BirdoToggleRow
-              title="Crash Reports"
-              subtitle="Off by default. When on, the app sends crash and error reports to Sentry: crashes, and errors when an app feature such as connecting fails, with the app and OS version and device model. No account details, IP address or browsing data."
-              subtitleWrap
-              leadingIcon={Bug}
-              leadingTint={white.w60}
-              checked={settings.crashReportsEnabled}
-              onCheckedChange={handleCrashReports}
-            />
-            {/* MR-808: the log kept on this device, which Crash Reports above
-                (network, opt-in) is not. Saved like any setting and applied
-                live by Rust, in both directions. */}
-            <BirdoToggleRow
-              title="Save Diagnostic Logs"
-              subtitle={FILE_LOGGING_COPY}
-              subtitleWrap
-              leadingIcon={ScrollText}
-              leadingTint={white.w60}
-              checked={settings.fileLoggingEnabled}
-              onCheckedChange={(v) => void persistSettings({ fileLoggingEnabled: v })}
-            />
-            <BirdoListItem
-              title="Delete Logs Now"
-              subtitle={DELETE_LOGS_COPY}
-              subtitleWrap
-              leadingIcon={Trash2}
-              leadingTint={white.w60}
-              onClick={() => setShowDeleteLogs(true)}
-            />
-          </BirdoCard>
+              {biometricError && (
+                <p role="alert" className="px-1 text-xs" style={{ color: statusTokens.red }}>
+                  {biometricError}
+                </p>
+              )}
+            </>
+          )}
+          {/* Crash reports are OPT-IN (audit C-3). The dedicated command
+              persists the one field and applies it live in both directions. */}
+          <SettingsToggle
+            icon={Bug}
+            iconColor={white.w60}
+            title="Crash Reports"
+            checked={settings.crashReportsEnabled}
+            onCheckedChange={handleCrashReports}
+          />
+          {/* MR-808: the log kept on this device, which Crash Reports above
+              (network, opt-in) is not. Saved like any setting and applied
+              live by Rust, in both directions. */}
+          <SettingsToggle
+            icon={ScrollText}
+            iconColor={white.w60}
+            title="Save Diagnostic Logs"
+            checked={settings.fileLoggingEnabled}
+            onCheckedChange={(v) => void persistSettings({ fileLoggingEnabled: v })}
+          />
+          <SettingsLink
+            icon={Trash2}
+            iconColor={white.w60}
+            title="Delete Logs Now"
+            onClick={() => setShowDeleteLogs(true)}
+          />
 
           {/* ── CONNECTION ─────────────────────────────────────────────── */}
-          <BirdoSectionHeader title="Connection" className="mt-2" />
-          <BirdoCard padding="0.25rem">
-            <BirdoToggleRow
-              title="Auto-Connect"
-              subtitle="Connect to VPN on app startup."
-              leadingIcon={Wifi}
-              leadingTint={statusTokens.blue}
-              checked={settings.autoConnect}
-              onCheckedChange={(v) => void persistSettings({ autoConnect: v })}
-            />
-            <BirdoToggleRow
-              title="Launch at Login"
-              subtitle="Start BirdoVPN when you sign in to your computer."
-              subtitleWrap
-              leadingIcon={Zap}
-              leadingTint={brand.accent}
-              checked={settings.autostart}
-              onCheckedChange={handleAutostart}
-            />
-            <BirdoToggleRow
-              title="Start Minimized"
-              subtitle="Open in the system tray."
-              leadingIcon={Monitor}
-              leadingTint={white.w60}
-              checked={settings.startMinimized}
-              onCheckedChange={(v) => void persistSettings({ startMinimized: v })}
-            />
-          </BirdoCard>
+          <SettingsSectionHeader title="Connection" />
+          <SettingsToggle
+            icon={Wifi}
+            iconColor={statusTokens.blue}
+            title="Auto-Connect"
+            checked={settings.autoConnect}
+            onCheckedChange={(v) => void persistSettings({ autoConnect: v })}
+          />
+          <SettingsToggle
+            icon={Zap}
+            iconColor={brand.accent}
+            title="Launch at Login"
+            checked={settings.autostart}
+            onCheckedChange={handleAutostart}
+          />
+          <SettingsToggle
+            icon={Minimize2}
+            iconColor={white.w60}
+            title="Start Minimized"
+            checked={settings.startMinimized}
+            onCheckedChange={(v) => void persistSettings({ startMinimized: v })}
+          />
 
           {/* ── NOTIFICATIONS ──────────────────────────────────────────── */}
-          <BirdoSectionHeader title="Notifications" className="mt-2" />
-          <BirdoCard padding="0.25rem">
-            <BirdoToggleRow
-              title="Notifications"
-              subtitle="Show connection notifications."
-              leadingIcon={Bell}
-              leadingTint={statusTokens.yellow}
-              checked={settings.notifications}
-              onCheckedChange={(v) => void persistSettings({ notifications: v })}
-            />
-            {/* Both sub-toggles only shape the CONTENT of a connection
-                notification, so they stay hidden while notifications are off. */}
-            {settings.notifications && (
-              <>
-                <BirdoToggleRow
-                  title="Show IP Address"
-                  leadingIcon={Bell}
-                  leadingTint={white.w60}
-                  checked={settings.showIpInNotification}
-                  onCheckedChange={(v) => void persistSettings({ showIpInNotification: v })}
-                />
-                <BirdoToggleRow
-                  title="Show Server Location"
-                  leadingIcon={Bell}
-                  leadingTint={white.w60}
-                  checked={settings.showLocationInNotification}
-                  onCheckedChange={(v) => void persistSettings({ showLocationInNotification: v })}
-                />
-              </>
-            )}
-          </BirdoCard>
+          <SettingsSectionHeader title="Notifications" />
+          <SettingsToggle
+            icon={Bell}
+            iconColor={statusTokens.yellow}
+            title="Notifications"
+            checked={settings.notifications}
+            onCheckedChange={(v) => void persistSettings({ notifications: v })}
+          />
+          {/* Both sub-toggles only shape the CONTENT of a connection
+              notification, so they stay hidden while notifications are off. */}
+          {settings.notifications && (
+            <>
+              <SettingsToggle
+                icon={Globe}
+                iconColor={white.w60}
+                title="Show IP Address"
+                checked={settings.showIpInNotification}
+                onCheckedChange={(v) => void persistSettings({ showIpInNotification: v })}
+              />
+              <SettingsToggle
+                icon={MapPin}
+                iconColor={white.w60}
+                title="Show Server Location"
+                checked={settings.showLocationInNotification}
+                onCheckedChange={(v) => void persistSettings({ showLocationInNotification: v })}
+              />
+            </>
+          )}
 
           {/* ── VPN ────────────────────────────────────────────────────── */}
-          <BirdoSectionHeader title="VPN" className="mt-2" />
-          <BirdoCard padding="0.25rem">
-            <BirdoNavRow
-              title="VPN Settings"
-              subtitle="Local network, port, and MTU"
-              leadingIcon={SlidersHorizontal}
-              leadingTint={statusTokens.blue}
-              onClick={() => pushRoute('vpnSettings')}
+          <SettingsSectionHeader title="VPN" />
+          <SettingsLink
+            icon={SlidersHorizontal}
+            iconColor={statusTokens.blue}
+            title="VPN Settings"
+            onClick={() => pushRoute('vpnSettings')}
+          />
+          {/* On every plan (owner decision D6): no lock and no upsell. Only
+              an explicit `false` from the server for this plan (item 40)
+              turns it off, and `useCustomDnsGate` then switches it off in
+              Rust too, so the row never reads differently from the tunnel.
+              The row then says why it cannot be switched on. */}
+          <SettingsToggle
+            icon={Server}
+            iconColor={brand.accent}
+            title="Custom DNS Servers"
+            status={customDnsOffered ? undefined : 'Custom DNS is not available on your plan right now.'}
+            enabled={customDnsOffered}
+            checked={settings.customDnsEnabled && customDnsOffered}
+            // Switching off keeps the addresses (P1-parity-042); it only
+            // stops sending them, which is a tunnel change when any exist.
+            onCheckedChange={(v) =>
+              void persistSettings(
+                { customDnsEnabled: v },
+                { reapply: (settings.customDns ?? []).length > 0 },
+              )
+            }
+          />
+          {settings.customDnsEnabled && customDnsOffered && <CustomDnsFields />}
+          <SettingsLink
+            icon={ArrowLeftRight}
+            iconColor={statusTokens.blue}
+            title="Port Forwarding"
+            onClick={() => pushRoute('portForward')}
+          />
+          {/* Where mobile has Split Tunneling. WFP enforcement is
+              Windows-only. Presented as "Kill Switch Exceptions", not "Split
+              Tunneling": WFP permit filters exempt an app from the
+              kill-switch block — they cannot route it outside the VPN (that
+              needs a signed redirect callout driver). */}
+          {isWindowsPlatform() && (
+            <SettingsLink
+              icon={Split}
+              iconColor={white.w60}
+              title="Kill Switch Exceptions"
+              onClick={() => pushRoute('splitTunnel')}
             />
-            {/* On every plan (owner decision D6): no lock and no upsell. Only
-                an explicit `false` from the server for this plan (item 40)
-                turns it off, and `useCustomDnsGate` then switches it off in
-                Rust too, so the row never reads differently from the tunnel. */}
-            <BirdoToggleRow
-              title="Custom DNS Servers"
-              subtitle={
-                customDnsOffered
-                  ? 'Use your own DNS servers instead of the VPN defaults.'
-                  : 'Custom DNS is not available on your plan right now.'
-              }
-              subtitleWrap
-              leadingIcon={Globe}
-              leadingTint={brand.accent}
-              enabled={customDnsOffered}
-              checked={settings.customDnsEnabled && customDnsOffered}
-              // Switching off keeps the addresses (P1-parity-042); it only
-              // stops sending them, which is a tunnel change when any exist.
-              onCheckedChange={(v) =>
-                void persistSettings(
-                  { customDnsEnabled: v },
-                  { reapply: (settings.customDns ?? []).length > 0 },
-                )
-              }
-            />
-            {settings.customDnsEnabled && customDnsOffered && <CustomDnsFields />}
-            <BirdoNavRow
-              title="Port Forwarding"
-              subtitle="Expose ports through your VPN tunnel."
-              leadingIcon={ArrowLeftRight}
-              leadingTint={statusTokens.blue}
-              onClick={() => pushRoute('portForward')}
-            />
-          </BirdoCard>
+          )}
 
           {/* ── SPEED TEST ─────────────────────────────────────────────── */}
-          <BirdoSectionHeader title="Speed Test" className="mt-2" />
-          <BirdoCard>
-            <div className="flex items-center gap-3.5">
-              <div
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
-                style={{ backgroundColor: white.w05 }}
-              >
-                <Gauge size={18} color={brand.accentLight} aria-hidden />
-              </div>
+          <SettingsSectionHeader title="Speed Test" />
+          <SettingsCard padding="14px">
+            <div className="flex items-center gap-3">
+              <SettingIconChip icon={Gauge} tint={brand.accentLight} />
               <div className="min-w-0 flex-1">
-                <div className="text-[15px] font-medium" style={{ color: white.w100 }}>
+                <div className="text-[14px] font-semibold" style={{ color: white.w100 }}>
                   Connection Speed
                 </div>
                 {speedTestResult && (
@@ -591,53 +539,58 @@ export function Settings() {
                 {speedTestError}
               </div>
             )}
-          </BirdoCard>
+          </SettingsCard>
 
           {/* ── ABOUT ──────────────────────────────────────────────────── */}
-          <BirdoSectionHeader title="About" className="mt-2" />
+          <SettingsSectionHeader title="About" />
+          {/* Mobile's About card: the app, its version, a verified mark. */}
+          <SettingsCard padding="16px">
+            <div className="flex items-center gap-3.5">
+              <span aria-hidden className="shrink-0">
+                <AppIconMark size={44} />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="text-[15px] font-semibold" style={{ color: white.w100 }}>
+                  BirdoVPN
+                </div>
+                <div className="mt-px text-xs" style={{ color: white.w60 }}>
+                  Version {appVersion || '…'}
+                </div>
+              </div>
+              <BadgeCheck size={20} color={brand.accent} aria-hidden className="shrink-0" />
+            </div>
+          </SettingsCard>
 
           <UpdateChecker />
 
-          <div className="h-1" />
-          <BirdoCard padding="0.25rem">
-            <BirdoNavRow
-              title="Privacy Policy"
-              subtitle="birdo.app/privacy"
-              leadingIcon={ShieldCheck}
-              leadingTint={brand.accentSoft}
-              onClick={() => openExternal(PRIVACY_URL).catch(() => {})}
-            />
-            <BirdoNavRow
-              title="Terms of Service"
-              subtitle="birdo.app/terms"
-              leadingIcon={FileText}
-              leadingTint={brand.accentSoft}
-              onClick={() => openExternal(TERMS_URL).catch(() => {})}
-            />
-            <BirdoNavRow
-              title="Manage on web"
-              subtitle="dashboard.birdo.app"
-              leadingIcon={ExternalLink}
-              leadingTint={brand.accentSoft}
-              onClick={() => openExternal(DASHBOARD_URL).catch(() => {})}
-            />
-            {/* MR-1685: the third-party notices this package ships. */}
-            <BirdoNavRow
-              title="Licences"
-              subtitle="Third-party software notices"
-              leadingIcon={Scale}
-              leadingTint={brand.accentSoft}
-              onClick={() => pushRoute('licences')}
-            />
-          </BirdoCard>
-
-          {/* App version footer */}
-          <div className="mt-3 flex items-center gap-2 px-1">
-            <Info size={14} color={white.w40} aria-hidden />
-            <span className="text-xs" style={{ color: white.w60 }}>
-              BirdoVPN · v{appVersion || '…'}
-            </span>
-          </div>
+          <SettingsLink
+            icon={ShieldCheck}
+            iconColor={white.w60}
+            title="Privacy Policy"
+            trailing="external"
+            onClick={() => openExternal(PRIVACY_URL).catch(() => {})}
+          />
+          <SettingsLink
+            icon={FileText}
+            iconColor={white.w60}
+            title="Terms of Service"
+            trailing="external"
+            onClick={() => openExternal(TERMS_URL).catch(() => {})}
+          />
+          <SettingsLink
+            icon={LayoutDashboard}
+            iconColor={white.w60}
+            title="Manage on web"
+            trailing="external"
+            onClick={() => openExternal(DASHBOARD_URL).catch(() => {})}
+          />
+          {/* MR-1685: the third-party notices this package ships. */}
+          <SettingsLink
+            icon={Scale}
+            iconColor={white.w60}
+            title="Licences"
+            onClick={() => pushRoute('licences')}
+          />
         </div>
       </div>
 
@@ -735,8 +688,12 @@ function CustomDnsFields() {
     if (e.key === 'Enter') commit();
   };
 
+  // Mobile shows the two fields as list items under the switch, each with its
+  // label and placeholder only. The static helpers that sat under them (the
+  // popular resolvers, the CGNAT note of MR-689) went with the owner's
+  // no-descriptions rule; the warning about an address actually typed stays.
   return (
-    <div className="space-y-3 px-3.5 pb-3.5 pt-1">
+    <div className="space-y-3">
       <BirdoTextField
         label="Primary DNS"
         placeholder="e.g. 1.1.1.1"
@@ -761,22 +718,11 @@ function CustomDnsFields() {
         onKeyDown={onEnter}
         errorText={errors.secondary}
       />
-      <p className="text-xs" style={{ color: white.w60 }}>
-        Popular: 1.1.1.1 (Cloudflare), 8.8.8.8 (Google), 9.9.9.9 (Quad9). Saved when you leave a field.
-      </p>
-      {/* MR-689: "your own network" means the ranges Local Network Sharing
-          opens, on every platform: 10/8, 172.16/12, 192.168/16 and
-          link-local. A LAN numbered from carrier-grade NAT space (100.64/10)
-          or a public range is not one of them, and a public-range LAN
-          resolver cannot be told from an internet one, so this is said up
-          front rather than per address. */}
-      <p className="text-xs" style={{ color: white.w60 }}>
-        {CUSTOM_DNS_NOT_LAN_COPY}
-      </p>
       {/* REVIEW-WIN2-006: a resolver on the user's own network is reached
-          outside the tunnel, and only with Local Network Sharing on. */}
+          outside the tunnel, and only with Local Network Sharing on. Shown
+          only for an address the user typed, like a validation message. */}
       {[primary, secondary].some((v) => isPrivateDnsAddress(v.trim())) && (
-        <p className="text-xs" style={{ color: white.w60 }}>
+        <p className="px-1 text-xs" style={{ color: white.w60 }}>
           {lanSharing
             ? 'A DNS server on your own network is reached directly, outside the VPN tunnel.'
             : 'A DNS server on your own network can be reached only with Local Network Sharing on.'}

@@ -18,10 +18,8 @@ import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import {
   DELETE_LOGS_CONFIRM_BODY,
-  DELETE_LOGS_COPY,
   DELETE_LOGS_FAILED_COPY,
   DELETE_LOGS_STILL_ON_NOTE,
-  FILE_LOGGING_COPY,
   Settings,
   deleteLogsNotice,
 } from '@/components/Settings';
@@ -74,16 +72,14 @@ const logSwitch = () => screen.getByRole('switch', { name: 'Save Diagnostic Logs
 const deleteRow = () => screen.getByRole('button', { name: /Delete Logs Now/ });
 
 describe('Save Diagnostic Logs', () => {
-  it('is on by default, under Privacy & Security, and says what it keeps and what off does', () => {
+  // Owner, 2026-10-21: no description under a setting, so the row no longer
+  // says what the log keeps; the Delete confirmation still says what goes.
+  it('is on by default, under Privacy & Security, title and switch only', () => {
     render(<Settings />);
     expect(logSwitch()).toHaveAttribute('aria-checked', 'true');
-    expect(screen.getByText(FILE_LOGGING_COPY)).toBeInTheDocument();
-    expect(FILE_LOGGING_COPY).toMatch(/on this device/);
-    expect(FILE_LOGGING_COPY).toMatch(/last 7 days/);
-    expect(FILE_LOGGING_COPY).toMatch(/never sends it/);
-    expect(FILE_LOGGING_COPY).toMatch(/does not delete existing logs/);
-    // Rust applies it live in both directions: no restart note.
-    expect(FILE_LOGGING_COPY).not.toMatch(/restart/i);
+    expect(logSwitch()).toHaveTextContent(/^Save Diagnostic Logs$/);
+    expect(logSwitch()).toHaveAccessibleDescription('');
+    expect(screen.queryByText(/Keeps a log of connection events/)).not.toBeInTheDocument();
     // In Privacy & Security, after Crash Reports and before Connection.
     const follows = (a: Element, b: Element) =>
       Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
@@ -131,9 +127,10 @@ describe('Save Diagnostic Logs', () => {
 });
 
 describe('Delete Logs Now', () => {
-  it('says what it deletes, and asks before deleting anything', async () => {
+  it('is a plain row (no description) that asks before deleting anything', async () => {
     render(<Settings />);
-    expect(screen.getByText(DELETE_LOGS_COPY)).toBeInTheDocument();
+    expect(deleteRow()).toHaveTextContent(/^Delete Logs Now$/);
+    expect(screen.queryByText(/Deletes the diagnostic log/)).not.toBeInTheDocument();
     await userEvent.click(deleteRow());
     expect(await screen.findByText('Delete logs?')).toBeInTheDocument();
     expect(deletes()).toHaveLength(0);

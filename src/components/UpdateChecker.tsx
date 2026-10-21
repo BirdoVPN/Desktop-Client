@@ -10,7 +10,7 @@ import { useEffect, useState } from 'react';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { Download, Check, LoaderCircle, RefreshCw } from 'lucide-react';
 import { BirdoButton, BirdoCard, BirdoDialog } from '@/components/birdo';
-import { brand, status, surface, white } from '@/lib/birdo-theme';
+import { brand, hairline, status, surface, white } from '@/lib/birdo-theme';
 import { useAppStore } from '@/store/app-store';
 import { selectTunnelActive } from '@/store/selectors';
 import {
@@ -56,15 +56,20 @@ export function UpdateChecker() {
     : phase === 'waiting' ? UPDATE_WAITING_COPY
     : phase === 'ready' ? 'Restart to apply the update'
     : phase === 'error' ? error ?? ''
-    : restartError ?? 'Check for new versions';
+    // Nothing under an idle row (owner, 2026-10-21: no descriptions): the
+    // title and the Check button say it all.
+    : restartError ?? '';
 
   return (
-    <BirdoCard>
-      <div className="flex items-center gap-3.5">
+    // Styled as a Settings row (SettingsRows.tsx, mobile SettingsScreen.kt).
+    <BirdoCard padding="14px">
+      <div className="flex items-center gap-3">
         <div
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
+          className="flex h-9 w-9 shrink-0 items-center justify-center"
           style={{
-            backgroundColor: phase === 'available' || phase === 'waiting' || phase === 'ready' ? brand.accentBg : white.w05,
+            borderRadius: 10,
+            border: `1px solid ${hairline.soft}`,
+            backgroundColor: phase === 'available' || phase === 'waiting' || phase === 'ready' ? brand.accentBg : surface.s2,
           }}
         >
           {phase === 'checking' || phase === 'installing' ? (
@@ -78,10 +83,14 @@ export function UpdateChecker() {
           )}
         </div>
         <div className="min-w-0 flex-1" aria-live="polite">
-          <div className="text-[15px] font-medium text-white">{title}</div>
-          <div className="mt-0.5 text-xs" style={{ color: phase === 'error' ? status.red : white.w60 }}>
-            {subtitle}
+          <div className="text-[14px] font-semibold" style={{ color: white.w100 }}>
+            {title}
           </div>
+          {subtitle && (
+            <div className="mt-0.5 text-xs" style={{ color: phase === 'error' ? status.red : white.w60 }}>
+              {subtitle}
+            </div>
+          )}
         </div>
         {/* The install ended the VPN session and then failed (REVIEW-WIN-002):
             putting the user back on their server comes before a retry. */}
