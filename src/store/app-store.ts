@@ -61,6 +61,11 @@ export interface AccountInfo {
   activeDevices: number;
   expiresAt: string | null;
   bandwidthUsed: number;
+  /**
+   * The plan's monthly data cap in BYTES — `/auth/me`'s `bandwidthLimit` is
+   * `bandwidthLimitGb × 2^30` — and 0 for none. Not GB: format it with
+   * `formatDataCap`. (The Limit tab's `usage.bandwidthLimitGb` IS in GB.)
+   */
   bandwidthLimit: number;
   status: 'active' | 'expired' | 'cancelled' | 'unknown';
   /**

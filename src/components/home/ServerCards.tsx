@@ -5,10 +5,9 @@
 import { ArrowDown, ChevronRight, Info } from 'lucide-react';
 import { BirdoCard } from '@/components/birdo';
 import { brand, hairline, status, white } from '@/lib/birdo-theme';
+import { serverLabel, serverSubtitle, serverTitle } from '@/lib/vpn-display';
 import type { LoadStatus, Server } from '@/store/app-store';
 import { countryCodeToFlag } from '@/utils/helpers';
-
-const place = (s: Server) => [s.city, s.country].filter(Boolean).join(', ');
 
 interface ServerSelectorCardProps {
   /** What Connect will dial: the chosen server, or the fastest one. */
@@ -30,12 +29,14 @@ export function ServerSelectorCard({
   disabled,
   onClick,
 }: ServerSelectorCardProps) {
-  // Row title = the server's name, subtitle = "City, Country" (canonical).
+  // Title = the server's name, subtitle = where it is, never repeating the
+  // name (`serverSubtitle`); the automatic pick names its server once, below
+  // "Fastest server".
   let title: string;
   let subtitle: string;
   if (server) {
-    title = isFastest ? 'Fastest server' : server.name || server.city;
-    subtitle = switching ? 'Switching…' : isFastest ? `${server.name} · ${place(server)}` : place(server);
+    title = isFastest ? 'Fastest server' : serverTitle(server);
+    subtitle = switching ? 'Switching…' : isFastest ? serverLabel(server, ' · ') : serverSubtitle(server);
   } else if (serversStatus === 'loading' || serversStatus === 'idle') {
     title = 'Loading servers…';
     subtitle = 'Browse locations';
@@ -52,7 +53,7 @@ export function ServerSelectorCard({
       data-testid="server-selector"
       onClick={onClick}
       disabled={disabled}
-      aria-label={`${title}. ${subtitle}. Change server`}
+      aria-label={`${[title, subtitle].filter(Boolean).join('. ')}. Change server`}
       className="w-full text-left transition-opacity disabled:opacity-50"
     >
       <BirdoCard cornerRadius={16} padding="0.875rem">
@@ -68,12 +69,14 @@ export function ServerSelectorCard({
             <div className="truncate text-sm font-semibold" style={{ color: white.w100 }}>
               {title}
             </div>
-            <div
-              className="truncate text-xs"
-              style={{ color: serversStatus === 'error' && !server ? status.red : white.w60 }}
-            >
-              {subtitle}
-            </div>
+            {subtitle && (
+              <div
+                className="truncate text-xs"
+                style={{ color: serversStatus === 'error' && !server ? status.red : white.w60 }}
+              >
+                {subtitle}
+              </div>
+            )}
           </div>
           <ChevronRight size={18} color={white.w40} aria-hidden />
         </div>
@@ -147,7 +150,7 @@ function MultiHopServerCard({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      aria-label={`${label}: ${server ? `${server.name}, ${place(server)}` : 'not chosen'}`}
+      aria-label={`${label}: ${server ? serverLabel(server) : 'not chosen'}`}
       className="w-full text-left transition-opacity disabled:opacity-60"
     >
       <BirdoCard cornerRadius={16} padding="0.75rem">
@@ -164,11 +167,11 @@ function MultiHopServerCard({
               {label}
             </div>
             <div className="mt-0.5 truncate text-sm font-semibold" style={{ color: white.w100 }}>
-              {server ? server.name : 'Choose…'}
+              {server ? serverTitle(server) : 'Choose…'}
             </div>
-            {server && (
+            {server && serverSubtitle(server) && (
               <div className="truncate text-xs" style={{ color: white.w60 }}>
-                {place(server)}
+                {serverSubtitle(server)}
               </div>
             )}
           </div>

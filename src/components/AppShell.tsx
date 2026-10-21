@@ -6,9 +6,10 @@
  * sub-screens layered on top (VPN Settings, Kill Switch Exceptions, Port
  * Forwarding, Plans & Pricing).
  *
- * Visually: the whole Tauri window is pure black (with PixelCanvas behind, owned
- * by App.tsx); this shell renders a centered ~420px column so the desktop app
- * reads like "a phone on a desk" — matching the portrait mobile layout.
+ * Visually: the whole Tauri window is pure black (with PixelCanvas behind every
+ * tab but Connect, owned by App.tsx); this shell renders a centered ~420px
+ * column so the desktop app reads like "a phone on a desk" — matching the
+ * portrait mobile layout.
  *
  * The shell owns navigation only. Connection state, tray actions and data
  * loading belong to the session controller App mounts above it, because tab

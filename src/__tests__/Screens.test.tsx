@@ -40,7 +40,7 @@ import {
   UPDATE_WAITING_COPY,
   useUpdater,
 } from '@/session/updater';
-import { resetSessionData } from '@/session/session-data';
+import { loadSubscription, resetSessionData } from '@/session/session-data';
 
 vi.mock('@tauri-apps/api/core');
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn().mockResolvedValue(undefined) }));
@@ -256,6 +256,24 @@ describe('Profile', () => {
     }
     expect(screen.getByText('Manage Subscription')).toBeInTheDocument();
     expect(screen.getByText('Delete Account')).toBeInTheDocument();
+  });
+
+  // Owner 2026-10-21: the free plan read "53687091200 GB / month". `/auth/me`
+  // sends `bandwidthLimit` in BYTES (`bandwidthLimitGb × 2^30`; null = none).
+  it.each([
+    [53_687_091_200, '50 GB / month'],
+    [1024 ** 4, '1024 GB / month'],
+    [null, 'Unlimited data'],
+  ])("shows /auth/me's bandwidthLimit %s (bytes) as %s", async (bandwidthLimit, chip) => {
+    mockedInvoke.mockImplementation(async (cmd: string) =>
+      cmd === 'get_subscription_status'
+        ? { plan: 'recon', status: 'active', expiresAt: null, devicesUsed: 0, devicesLimit: 1, bandwidthLimit }
+        : undefined,
+    );
+    await loadSubscription(true);
+    render(<Profile />);
+    expect(screen.getByText(chip)).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/\d{5,} GB/);
   });
 
   // Account API contract 2026-10-01, item 86.

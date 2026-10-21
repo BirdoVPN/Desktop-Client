@@ -1,7 +1,7 @@
 /**
- * What each connection state LOOKS like and what the main button DOES — pure
- * functions, so every state is pinned by a table test instead of by reading a
- * 1700-line component.
+ * What each connection state LOOKS like, what the main button DOES and how a
+ * server is labelled — pure functions, so every case is pinned by a table test
+ * instead of by reading a 1700-line component.
  *
  * Wording is the canonical table in P1-parity.md ("Connection states"): the
  * pill never shows an engine phase ("Authenticating", "Rekeying") or a bare
@@ -9,6 +9,62 @@
  * setting, not "you are blocked" — is gone in favour of a separate chip.
  */
 import type { VpnState } from '@/lib/ipc';
+
+// ── Server labels ───────────────────────────────────────────────────────────
+
+/** The fields a server row is labelled from (a `Server` fits). */
+export interface ServerNaming {
+  name: string;
+  city: string;
+  country: string;
+}
+
+/** Letters and digits only, lower case, accents dropped: "São Paulo" → "saopaulo". */
+const squash = (s: string) =>
+  s
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, '');
+
+/** A server's row title: its name, as on Android and iOS (city, then country, if it has none). */
+export function serverTitle(s: ServerNaming): string {
+  return s.name.trim() || s.city.trim() || s.country.trim();
+}
+
+/**
+ * The line under a server's title: where it is, minus whatever the title
+ * already says. Nodes are named after their city, so every row read
+ * "birdo-vpn-frankfurt" over "Frankfurt, Germany" — the server's name twice,
+ * in two sizes (owner, 2026-10-21). Now that row reads "birdo-vpn-frankfurt"
+ * over "Germany", and a city the name does not carry stays
+ * ("birdo-vpn-newyork" over "New Jersey, United States"). Empty when the title
+ * already says it all.
+ */
+export function serverSubtitle(s: ServerNaming): string {
+  // The title's words ("birdo", "vpn", "losangeles"). A part is already said
+  // when it spells a run of whole words — "Los Angeles" is, "Nice" is not said
+  // by "birdo-vpn-venice".
+  const words = serverTitle(s).split(/[^\p{L}\p{N}]+/u).map(squash).filter(Boolean);
+  const said = (part: string) => {
+    const key = squash(part);
+    if (!key) return false;
+    for (let i = 0; i < words.length; i++) {
+      let run = '';
+      for (let j = i; j < words.length && run.length < key.length; j++) {
+        run += words[j];
+        if (run === key) return true;
+      }
+    }
+    return false;
+  };
+  return [s.city.trim(), s.country.trim()].filter((part) => part !== '' && !said(part)).join(', ');
+}
+
+/** Title and subtitle as one phrase, for an accessible name or a one-line summary. */
+export function serverLabel(s: ServerNaming, separator = ', '): string {
+  return [serverTitle(s), serverSubtitle(s)].filter(Boolean).join(separator);
+}
 
 export type PillTone = 'neutral' | 'success' | 'warning' | 'danger';
 export type PillIcon = 'wifi-off' | 'sync' | 'alert' | null;

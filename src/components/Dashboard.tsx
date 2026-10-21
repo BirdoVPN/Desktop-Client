@@ -30,7 +30,6 @@ import { hairline, motion as motionTokens, white } from '@/lib/birdo-theme';
 import { connectCta } from '@/lib/vpn-display';
 import { lowestPlanWith, planHasFeature, planName, titleCasePlan } from '@/lib/plan';
 import type { ErrorAction } from '@/lib/errors';
-import { pickBestServer } from '@/lib/ipc';
 import { useAppStore, type Server } from '@/store/app-store';
 import { selectDisplayState, selectTunnelActive } from '@/store/selectors';
 import {
@@ -74,6 +73,7 @@ export function Dashboard() {
     exitId,
     pendingAction,
     toggleFavorite,
+    covered,
   } = useAppStore(
     useShallow((s) => ({
       display: selectDisplayState(s),
@@ -99,6 +99,9 @@ export function Dashboard() {
       exitId: s.settings.multiHopExitNodeId,
       pendingAction: s.pendingAction,
       toggleFavorite: s.toggleFavorite,
+      // A pushed sub-screen (Plans & Pricing) is drawn opaque over this tab,
+      // which stays mounted underneath it.
+      covered: s.navStack.length > 0,
     })),
   );
 
@@ -212,7 +215,8 @@ export function Dashboard() {
   const sheetOpen = showServerSheet || multiHopPickerTarget !== null;
 
   return (
-    // Transparent root so the App-level PixelCanvas backdrop shows through.
+    // No ambient pixel grid behind this tab (App.tsx, as on Android): the
+    // globe is the backdrop, over the window's black.
     <div className="relative h-full overflow-hidden">
       {/* Globe background — hidden while a sheet is open to avoid flicker */}
       {!sheetOpen && (
@@ -222,8 +226,9 @@ export function Dashboard() {
           isConnected={isConnected}
           // Rotate only while idle. Connected is the steady state a VPN client
           // sits in for days; an infinite transform there means the compositor
-          // never idles, for a decoration nobody is watching.
-          autoRotate={!isConnected}
+          // never idles, for a decoration nobody is watching. Nor while a
+          // sub-screen covers it: nobody can see it then either.
+          autoRotate={!isConnected && !covered}
         />
       )}
 
@@ -326,7 +331,6 @@ export function Dashboard() {
         status={serversStatus}
         pings={serverPings}
         selectedServerId={(isConnected ? liveServer : currentServer)?.id ?? null}
-        fastestServer={pickBestServer(servers)}
         favoriteServers={favoriteServers}
         onSelect={handlePickServer}
         onSelectLocked={upsellLocked}
