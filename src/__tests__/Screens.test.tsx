@@ -2,7 +2,8 @@
  * Loading, empty and error states per screen, and the canonical wording.
  *
  *  - Limit tab (P1-parity-009): loading, error + Retry, unlimited, capped,
- *    near-cap, never synced — Profile's old card rendered nothing for most.
+ *    near-cap, never synced — Profile's old card rendered nothing for most;
+ *    and (owner 2026-10-21) mobile's layout with the speed-dial gauge.
  *  - Profile (W2-011, P1-parity-033): an unknown plan is not "Free plan";
  *    the connection status row; "MMM d, yyyy" dates; canonical chips.
  *  - Port Forwarding (W2-030): a failed load is not "No rules yet".
@@ -16,8 +17,8 @@
  *
  * Run: npx vitest run src/__tests__/Screens.test.tsx
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, act } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, waitFor, act, cleanup } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { Limit } from '@/screens/Limit';
@@ -60,6 +61,13 @@ beforeEach(() => {
 });
 
 describe('Limit tab', () => {
+  // The plan table is not an account field, so logout() leaves it: reset it
+  // here, once the screen is gone (a reset under a mounted screen re-renders it).
+  afterEach(() => {
+    cleanup();
+    useAppStore.setState({ planPrices: {} });
+  });
+
   const usage = (fields: Record<string, unknown>) => {
     mockedInvoke.mockImplementation(async (cmd: string) =>
       cmd === 'get_usage_stats'
@@ -93,23 +101,117 @@ describe('Limit tab', () => {
     expect(screen.getByText('Your plan has no data cap — use as much as you like.')).toBeInTheDocument();
   });
 
-  it('a capped plan shows the meter, the freshness line, Refresh, and the plans link', async () => {
+  it('a capped plan shows the gauge, the freshness line, Refresh, and the upgrade card', async () => {
     usage({});
     render(<Limit />);
     const meter = await screen.findByRole('meter', { name: 'Data used this month' });
     expect(meter).toHaveAttribute('aria-valuenow', '40');
+    expect(meter).toHaveAttribute('aria-valuetext', '4.0 of 10 GB used, 40%');
     expect(screen.getByText('Updated just now')).toBeInTheDocument();
     expect(screen.getByText('Need more data?')).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Refresh usage' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Refresh usage' }));
     await waitFor(() => expect(callsTo('get_usage_stats')).toHaveLength(2));
-    await userEvent.click(screen.getByRole('button', { name: 'View plans' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Upgrade for unlimited' }));
     expect(useAppStore.getState().navStack).toEqual(['pricing']);
+  });
+
+  // Owner 2026-10-21: the Limit tab as on mobile (Android LimitScreen.kt /
+  // iOS LimitView.swift), with the speed-dial gauge.
+  it('is laid out as mobile: plan header, speed-dial gauge, stat cells, upgrade card', async () => {
+    usage({ bandwidthLimitGb: 50, bandwidthUsedGb: 12.4 });
+    const { container } = render(<Limit />);
+    const meter = await screen.findByRole('meter', { name: 'Data used this month' });
+    // The dial: a 270° track, the used share dashed onto the same arc, the
+    // knob a one-dot dash at the reading, the figure in the centre, % in the gap.
+    const track = container.querySelector('.birdo-gauge__track') as SVGPathElement;
+    const fill = container.querySelector('.birdo-gauge__fill') as SVGPathElement;
+    expect(track.getAttribute('stroke-width')).toBe('18');
+    expect(fill.getAttribute('d')).toBe(track.getAttribute('d'));
+    expect(fill.getAttribute('pathLength')).toBe('1');
+    expect(fill.getAttribute('stroke-dasharray')).toBe('1 2');
+    expect(Number(fill.style.strokeDashoffset)).toBeCloseTo(1 - 12.4 / 50, 6);
+    const knob = [...container.querySelectorAll('.birdo-gauge__knob')] as SVGPathElement[];
+    expect(knob.map((k) => k.getAttribute('stroke-width'))).toEqual(['26', '11']);
+    for (const k of knob) {
+      expect(k.getAttribute('d')).toBe(track.getAttribute('d'));
+      expect(k.getAttribute('stroke-dasharray')).toBe('0 2');
+      expect(Number(k.style.strokeDashoffset)).toBeCloseTo(-12.4 / 50, 6);
+    }
+    expect(meter).toHaveTextContent('12');
+    expect(meter).toHaveTextContent('of 50 GB used');
+    expect(meter).toHaveTextContent('25%');
+    // Plan header and the pill.
+    expect(screen.getByRole('heading', { name: 'Your plan' })).toBeInTheDocument();
+    expect(screen.getByText('Free plan')).toBeInTheDocument();
+    expect(screen.getByText('50 GB / month')).toBeInTheDocument();
+    // Used / Left / Resets.
+    expect(screen.getByText('12 GB')).toBeInTheDocument();
+    expect(screen.getByText('38 GB')).toBeInTheDocument();
+    expect(screen.getByText('Oct 31')).toBeInTheDocument();
+    expect(screen.getByText('Counts uploads and downloads · Updates about every minute')).toBeInTheDocument();
+    // Mobile's upgrade copy, while the server's plan table says Operative is uncapped.
+    expect(
+      screen.getByText(
+        'Free accounts include 50 GB per month. Upgrade to Operative for unlimited data on every server.',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('does not promise unlimited data when no paid plan is uncapped (MR-2030)', async () => {
+    useAppStore.setState({
+      planPrices: {
+        OPERATIVE: { monthlyPrice: 3.99, yearlyPrice: 38, currency: 'GBP', bandwidthLimitGb: 500 },
+        SOVEREIGN: { monthlyPrice: 9.99, yearlyPrice: 99, currency: 'GBP', bandwidthLimitGb: 2000 },
+      },
+    });
+    usage({});
+    render(<Limit />);
+    expect(await screen.findByText('Free accounts include 10 GB per month. Paid plans include more data.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'View plans' })).toBeInTheDocument();
+    expect(screen.queryByText(/unlimited/i)).not.toBeInTheDocument();
+  });
+
+  it('Refresh says it is updating while the request is out', async () => {
+    usage({});
+    render(<Limit />);
+    const refresh = await screen.findByRole('button', { name: 'Refresh usage' });
+    const reading = await mockedInvoke('get_usage_stats');
+    let release: (v: unknown) => void = () => {};
+    mockedInvoke.mockImplementation(() => new Promise((r) => { release = r; }));
+    await userEvent.click(refresh);
+    expect(screen.getByRole('button', { name: 'Updating…' })).toBeDisabled();
+    await act(async () => release(reading));
+    expect(await screen.findByRole('button', { name: 'Refresh usage' })).toBeEnabled();
   });
 
   it('warns before the cap', async () => {
     usage({ bandwidthUsedGb: 9.6 });
     render(<Limit />);
     expect(await screen.findByText("You're almost out of data")).toBeInTheDocument();
+  });
+
+  it('over the cap: the gauge is full and red, and nothing is left', async () => {
+    usage({ bandwidthLimitGb: 50, bandwidthUsedGb: 63.4 });
+    const { container } = render(<Limit />);
+    const meter = await screen.findByRole('meter', { name: 'Data used this month' });
+    expect(meter).toHaveAttribute('aria-valuenow', '100');
+    expect(meter).toHaveTextContent('100%');
+    expect((container.querySelector('.birdo-gauge__fill') as SVGPathElement).getAttribute('stroke')).toBe('#F87171');
+    expect(screen.getByText('0.0 GB')).toBeInTheDocument();
+    expect(screen.getByText("You're almost out of data")).toBeInTheDocument();
+  });
+
+  it('a held reading stays up when a refresh fails, with the reason above it', async () => {
+    usage({});
+    render(<Limit />);
+    await screen.findByRole('meter', { name: 'Data used this month' });
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_usage_stats') throw 'offline';
+      return undefined;
+    });
+    await userEvent.click(await screen.findByRole('button', { name: 'Refresh usage' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent("Couldn't refresh your usage. Showing the last reading.");
+    expect(screen.getByRole('meter', { name: 'Data used this month' })).toHaveAttribute('aria-valuenow', '40');
   });
 
   it('a never-synced node says so rather than showing a frozen 0', async () => {
