@@ -1166,11 +1166,13 @@ impl WintunTunnel {
             }
         }
 
-        // Validate MTU is in sane range
-        if self.config.mtu < 576 || self.config.mtu > 9000 {
+        // Validate MTU is in sane range. MR-2116: the one upper bound the
+        // queued-packet buffers are sized against.
+        let max_mtu = super::buffer_pool::MAX_MTU;
+        if self.config.mtu < 576 || self.config.mtu > max_mtu {
             return Err(format!(
-                "Invalid MTU: {} (expected 576-9000)",
-                self.config.mtu
+                "Invalid MTU: {} (expected 576-{})",
+                self.config.mtu, max_mtu
             ));
         }
 

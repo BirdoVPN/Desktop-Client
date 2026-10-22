@@ -573,6 +573,9 @@ jobs:
       # MR-2040: an idle tunnel reads birdo0 under 10 times a second and does
       # not wake in a loop (the old loop: ~200 reads, ~712 wakeups a second),
       # and a packet the relay sends down the tunnel is decrypted onto birdo0.
+      # MR-2115: with resolved active (the stand-ins play it for one test), a
+      # failed `resolvectl domain birdo0 ~.` fails the connect and the unwind
+      # leaves nothing behind.
       # The tests refuse to run outside that namespace.
       - name: Tunnel teardown tests (Linux, root, private net+mount namespace)
         if: matrix.os == 'linux'
@@ -586,10 +589,10 @@ jobs:
             exit 1
           }
           echo "$out"
-          # Nine tests, all required: an --ignored filter that matches
+          # Ten tests, all required: an --ignored filter that matches
           # nothing still exits 0.
-          if ! grep -qE 'test result: ok\. 9 passed' <<<"$out"; then
-            echo "::error::netns_teardown_tests did not run all nine tests"
+          if ! grep -qE 'test result: ok\. 10 passed' <<<"$out"; then
+            echo "::error::netns_teardown_tests did not run all ten tests"
             exit 1
           fi
 

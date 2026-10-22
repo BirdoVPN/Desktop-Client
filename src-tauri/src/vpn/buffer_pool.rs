@@ -33,6 +33,28 @@ pub const MAX_PACKET_SIZE: usize = 16384;
 /// exact per-packet data-message overhead.
 pub const WIREGUARD_OVERHEAD: usize = 148;
 
+/// The largest tunnel MTU a connect accepts (jumbo frames). The ONE bound all
+/// three platforms' `validate_config` use (MR-2116): the queued-packet
+/// buffers below are sized against it.
+pub const MAX_MTU: u16 = 9000;
+
+/// The exact on-wire overhead of a WireGuard data message: type 4, receiver
+/// index 4, counter 8, Poly1305 tag 16 (boringtun's `DATA_OVERHEAD_SZ`).
+pub const DATA_MESSAGE_OVERHEAD: usize = 32;
+
+/// MR-2116 (AUD-1016-DATAPLANE-4). boringtun PANICS — and a release build,
+/// `panic = "abort"`, exits — when the buffer it encrypts a packet into is
+/// shorter than the packet plus [`DATA_MESSAGE_OVERHEAD`]
+/// (`format_packet_data`, boringtun 0.7.1 `session.rs`). The packets it
+/// queued behind a handshake are encrypted into MAX_PACKET_SIZE buffers
+/// (`next_queued`), and one is at most the MTU. Raising [`MAX_MTU`] past this
+/// stops the build here instead of handing anyone who can make the client
+/// queue one large packet a way to end it.
+const _: () = assert!(
+    MAX_PACKET_SIZE >= MAX_MTU as usize + DATA_MESSAGE_OVERHEAD,
+    "MAX_PACKET_SIZE must fit a queued MAX_MTU packet and its data-message overhead"
+);
+
 /// A WireGuard handshake-initiation message is exactly 148 bytes, and
 /// `update_timers` hands boringtun a buffer of WIREGUARD_OVERHEAD to write one
 /// into (wireguard_new.rs). Shrinking this constant below 148 would make every

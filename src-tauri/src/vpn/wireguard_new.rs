@@ -45,7 +45,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use super::buffer_pool::WIREGUARD_OVERHEAD;
+use super::buffer_pool::{MAX_PACKET_SIZE, WIREGUARD_OVERHEAD};
 
 /// The longest anything outside the packet path waits for boringtun's lock.
 /// The packet path holds it for microseconds per packet; a holder that keeps
@@ -262,6 +262,21 @@ const KEEPALIVE_MAX_SECS: u16 = 120;
 /// 1420 + 32 bytes of overhead is the real ceiling; 9000 leaves jumbo-frame
 /// headroom). Dropped as anomalous rather than handed to boringtun.
 const MAX_ACCEPTED_DATAGRAM: usize = 9000;
+
+// MR-2116 (AUD-1016-DATAPLANE-4). boringtun PANICS — and a release build,
+// `panic = "abort"`, exits — when the buffer it decrypts a datagram into is
+// shorter than the datagram's ciphertext, and it checks that BEFORE the
+// receiver index or the tag (`receive_packet_data`, boringtun 0.7.1
+// `session.rs`): one datagram on the relay's 4-tuple would do, from anyone.
+// `open` lets nothing larger than MAX_ACCEPTED_DATAGRAM through, so every
+// buffer a datagram is received or decrypted into is tied to it: the unix
+// `recv_packet` decrypts into a MAX_ACCEPTED_DATAGRAM buffer (the constant,
+// not a literal of its own), and the Windows data plane receives and
+// decrypts into MAX_PACKET_SIZE ones, as `recv_packet` receives.
+const _: () = assert!(
+    MAX_PACKET_SIZE >= MAX_ACCEPTED_DATAGRAM,
+    "a MAX_PACKET_SIZE buffer must hold any datagram open() accepts"
+);
 
 /// How long one establish-time handshake attempt waits for the answer.
 const HANDSHAKE_RESPONSE_TIMEOUT: Duration = if cfg!(test) {
@@ -560,6 +575,26 @@ crate::utils::assert_not_impl_any!(
     serde::de::DeserializeOwned
 );
 
+/// MR-2114 (AUD-1016-DATAPLANE-2): the index a session's `Tunn` builds its
+/// handshake and data indices from. boringtun makes each one
+/// `index << 8 | counter`, the counter going 1, 2, 3, … per handshake, and
+/// both the sender index of our initiations and the receiver index of the
+/// relay's packets travel in clear. A fixed 0 made every session's first
+/// initiation carry sender index 1: a mark of this client on the wire, and a
+/// count of its rekeys. A random nonzero 24-bit value (24, so the shift
+/// loses none of it) from the OS CSPRNG, as boringtun's own device seeds each
+/// peer (`device/mod.rs`, `IndexLfsr`).
+fn random_session_index() -> u32 {
+    loop {
+        let mut bytes = [0u8; 4];
+        crate::utils::os_rng::fill(&mut bytes);
+        let index = u32::from_le_bytes(bytes) & 0x00ff_ffff;
+        if index != 0 {
+            return index;
+        }
+    }
+}
+
 /// A UDP socket `connect()`ed to the relay, with the large buffers a VPN
 /// needs. The kernel picks the source address when it connects, from the
 /// route to `endpoint` at that moment — which is why a roam (W1-003) makes a
@@ -792,10 +827,10 @@ impl WireGuardSession {
         let tunnel = Tunn::new(
             StaticSecret::clone(&private_key.0),
             PublicKey::from(server_key_arr),
-            psk_arr,   // Preshared key for additional security
-            keepalive, // Persistent keepalive (seconds); None = disabled
-            0,         // Tunnel index
-            None,      // Rate limiter
+            psk_arr,                // Preshared key for additional security
+            keepalive,              // Persistent keepalive (seconds); None = disabled
+            random_session_index(), // MR-2114: never a fixed index
+            None,                   // Rate limiter
         );
         drop(private_key);
 
@@ -1260,7 +1295,9 @@ impl WireGuardSession {
             Err(e) => return Err(format!("Receive error: {}", e)),
         };
         // FIX-R2: sized for any decapsulated output, jumbo frames included.
-        let mut dst = [0u8; 9000];
+        // MR-2116: from the cap `open` enforces, never a literal: boringtun
+        // panics on a destination shorter than the ciphertext.
+        let mut dst = [0u8; MAX_ACCEPTED_DATAGRAM];
         match self.open(&raw[..n], &mut dst) {
             Opened::Packet(data) => Ok(Some(data.to_vec())),
             Opened::Reply(data) => {
@@ -1725,6 +1762,9 @@ mod handshake_tests {
         server_public_b64: String,
         client_secret: StaticSecret,
         initiations_seen: Arc<AtomicUsize>,
+        /// The sender index of every initiation, as it crossed the wire
+        /// (bytes 4..8, little-endian).
+        sender_indices: Arc<FastMutex<Vec<u32>>>,
     }
 
     /// A WireGuard responder on 127.0.0.1. `under_load` makes it demand a
@@ -1742,6 +1782,8 @@ mod handshake_tests {
         let endpoint = socket.local_addr().unwrap().to_string();
         let seen = Arc::new(AtomicUsize::new(0));
         let seen_task = Arc::clone(&seen);
+        let indices = Arc::new(FastMutex::new(Vec::new()));
+        let indices_task = Arc::clone(&indices);
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             let mut out = [0u8; 2048];
@@ -1749,6 +1791,10 @@ mod handshake_tests {
                 let Ok((n, from)) = socket.recv_from(&mut buf).await else {
                     return;
                 };
+                if n == 148 {
+                    let index = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                    indices_task.lock().push(index);
+                }
                 if n == 148 && seen_task.fetch_add(1, Ordering::SeqCst) < ignore_first {
                     continue;
                 }
@@ -1764,6 +1810,7 @@ mod handshake_tests {
             server_public_b64: BASE64.encode(server_public.as_bytes()),
             client_secret,
             initiations_seen: seen,
+            sender_indices: indices,
         }
     }
 
@@ -1783,6 +1830,27 @@ mod handshake_tests {
         let r = responder(false, 0).await;
         let session = connect(&r).await.expect("handshake");
         assert!(session.tunnel.lock().time_since_last_handshake().is_some());
+    }
+
+    /// MR-2114: a session's first initiation carries a sender index of its
+    /// own, read off the wire. With boringtun's index fixed at 0 it was 1 in
+    /// every session (`0 << 8 | 1`), which marked this client to anyone on
+    /// the path and counted its rekeys.
+    #[tokio::test]
+    async fn every_session_starts_from_a_random_sender_index() {
+        let mut first = Vec::new();
+        for _ in 0..2 {
+            let r = responder(false, 0).await;
+            let _session = connect(&r).await.expect("handshake");
+            let index = r.sender_indices.lock().first().copied();
+            first.push(index.expect("the responder saw no initiation"));
+        }
+        assert!(
+            first.iter().all(|&index| index != 1),
+            "a fixed first sender index: {first:#x?}"
+        );
+        // Two random 24-bit indices collide with probability 2^-24.
+        assert_ne!(first[0], first[1], "two sessions, one sender index");
     }
 
     /// W1-033: a relay under load answers the first initiation with a cookie
