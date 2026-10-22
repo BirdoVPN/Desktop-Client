@@ -66,7 +66,7 @@
 //! for the call, and the work goes on at that final path. A `%LOCALAPPDATA%`
 //! redirected (or junctioned) onto another account's profile is refused.
 //!
-//! THE USER DATA FOLDER is made the same way (`OwnedDir::ensure_held`, inside
+//! THE USER DATA FOLDER is made the same way (`OwnedDir::keep_held`, inside
 //! its verified parent), and held open for the rest of the run like the app's
 //! other folders (MR-2049). If it cannot be verified (a junction in its place),
 //! that is logged, and WebView2 still gets this environment, crash reports
@@ -358,14 +358,17 @@ pub fn create_environment(
     // reports stay on this device regardless.
     //
     // MR-2049: and HELD for the rest of the run, like every other folder the
-    // app writes in (`ensure_held`: the held set `file_log::hold_app_dirs`
-    // keeps). WebView2 opens it by path, again and again, from its own
-    // processes; the guard `hold_open` returns used to be dropped at once, so
-    // while the app ran the folder could be renamed and a junction put in its
-    // place, steering where the elevated browser process writes its profile
-    // and its crash dumps. Held, it can be neither renamed nor replaced.
+    // app writes in (the held set `file_log::hold_app_dirs` keeps). WebView2
+    // opens it by path, again and again, from its own processes; the guard
+    // `hold_open` returns used to be dropped at once, so while the app ran
+    // the folder could be renamed and a junction put in its place, steering
+    // where the elevated browser process writes its profile and its crash
+    // dumps. Held, it can be neither renamed nor replaced. `keep_held`, not
+    // `ensure_held`: this is its only hold, so it waits for the set if a
+    // writer has it rather than skip the keep (this is not the log writer or
+    // the panic hook, which must never wait for it).
     let user_data = user_data_owned_dir(local_data);
-    if let Err(e) = user_data.ensure_held() {
+    if let Err(e) = user_data.keep_held() {
         tracing::warn!(
             "WebView2: the user data folder could not be verified ({e}); its crash reports stay on this device all the same"
         );
@@ -809,9 +812,11 @@ mod tests {
         assert!(code.contains("let _ = dir.remove_file(name);"));
         // The folder is made verified, and a refusal is logged, not returned:
         // it must not cost the crash option (see the test above).
-        // MR-2049: and it is held for the run (`ensure_held` keeps the
-        // guard), never verified and let go (`hold_open`'s guard, dropped).
-        assert!(code.contains("if let Err(e) = user_data.ensure_held() {"));
+        // MR-2049: and it is held for the run (`keep_held` keeps the guard,
+        // waiting for the held set if a writer has it), never verified and
+        // let go (`hold_open`'s guard, dropped; `ensure_held` under
+        // contention).
+        assert!(code.contains("if let Err(e) = user_data.keep_held() {"));
         assert!(
             !code.contains("user_data.hold_open()"),
             "the user data folder is verified and then let go again"
@@ -831,7 +836,7 @@ mod tests {
         let local = tempfile::tempdir().unwrap();
         let set: held::Set = std::sync::Mutex::new(Vec::new());
         let user_data = user_data_owned_dir(local.path());
-        held::ensure_in(&set, &user_data).unwrap();
+        held::wait_and_ensure_in(&set, &user_data).unwrap();
         let moved = local.path().join("moved");
 
         let err = std::fs::rename(user_data.path(), &moved).unwrap_err();

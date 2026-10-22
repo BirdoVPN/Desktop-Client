@@ -2486,8 +2486,9 @@ static EMERGENCY_TEARDOWNS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// The most one emergency cleanup can take: its three subprocesses, each
 /// bounded by SUBPROCESS_TIMEOUT, plus the release (native calls). What the
-/// manager's failed-build arm waits for before it lifts the IPv6 block.
-const EMERGENCY_TEARDOWN_BOUND: Duration =
+/// manager's failed-build arm waits for before it lifts the IPv6 block, and
+/// a disconnect whose stop() timed out before it ends (MR-2036).
+pub(super) const EMERGENCY_TEARDOWN_BOUND: Duration =
     Duration::from_secs(3 * SUBPROCESS_TIMEOUT.as_secs() + 5);
 
 /// How long `start()` waits for an in-flight cleanup before it refuses,

@@ -34,7 +34,8 @@ pub(crate) const ERR_EMERGENCY_CLEANUP_RUNNING: &str =
 pub(crate) struct InFlight {
     /// Cleanups handed to their own thread and not finished yet.
     pub(crate) count: &'static AtomicUsize,
-    /// The most one cleanup can take: what a wait for them is bounded by.
+    /// The longest one cleanup is expected to take: what a wait for them is
+    /// bounded by (a cleanup past it is left running, see each platform's).
     pub(crate) bound: Duration,
 }
 

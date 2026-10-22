@@ -154,6 +154,17 @@ impl OwnedDir {
         held::ensure(self)
     }
 
+    /// [`OwnedDir::ensure_held`] for a caller that is never inside the log
+    /// writer or the panic hook: it WAITS for the held set when another
+    /// thread has it, where `ensure_held` verifies the directory and lets it
+    /// go. For a directory nothing else holds (MR-2049: the WebView2 user
+    /// data folder, whose one hold is `webview2::create_environment`), a
+    /// writer holding the set at that moment left it unheld for the run.
+    #[cfg_attr(not(windows), allow(dead_code))] // its one caller is Windows-only
+    pub fn keep_held(&self) -> io::Result<()> {
+        held::keep_waiting(self)
+    }
+
     /// Delete `name`, a real directory directly in this one, with everything
     /// in it (R2: the updater's `updates\`). The directory is opened without
     /// following a reparse point and must resolve to exactly this one's
@@ -194,11 +205,37 @@ pub(crate) mod held {
         // reaches; a panic that struck while this thread held the lock must
         // not deadlock it. Contended or not, the directory is still verified
         // (and held for the call's duration); it is just not kept.
-        let mut held = match set.try_lock() {
+        let held = match set.try_lock() {
             Ok(held) => held,
             Err(TryLockError::Poisoned(e)) => e.into_inner(),
             Err(TryLockError::WouldBlock) => return dir.hold_open().map(drop),
         };
+        keep_unless_held(held, dir)
+    }
+
+    /// `OwnedDir::keep_held`: [`ensure_in`], waiting for the set instead
+    /// of skipping the keep when another thread has it.
+    #[cfg_attr(not(windows), allow(dead_code))] // `keep_held`'s one caller is Windows-only
+    pub(super) fn keep_waiting(dir: &OwnedDir) -> io::Result<()> {
+        if cfg!(test) {
+            return dir.hold_open().map(drop);
+        }
+        wait_and_ensure_in(&HELD, dir)
+    }
+
+    /// [`ensure_in`] for a caller outside the log writer and the panic hook.
+    /// Safe to wait: the set is only ever held for one directory's
+    /// verify-and-open, and nothing done under it waits for it again (a line
+    /// logged meanwhile reaches the writer's `ensure_in`, which does not
+    /// wait).
+    pub(crate) fn wait_and_ensure_in(set: &Set, dir: &OwnedDir) -> io::Result<()> {
+        keep_unless_held(set.lock().unwrap_or_else(|e| e.into_inner()), dir)
+    }
+
+    fn keep_unless_held(
+        mut held: std::sync::MutexGuard<'_, Vec<(PathBuf, DirGuard)>>,
+        dir: &OwnedDir,
+    ) -> io::Result<()> {
         if held.iter().any(|(path, _)| path == dir.path()) {
             return Ok(());
         }
@@ -1110,6 +1147,33 @@ pub(crate) mod tests {
         assert_eq!(set.lock().unwrap().len(), 1);
         drop(set);
         std::fs::rename(logs.path(), root.path().join("moved")).unwrap();
+    }
+
+    /// MR-2049 (review of #335): `keep_held` keeps the directory even when
+    /// another thread has the held set at that moment — a writer's
+    /// `ensure_held` mid-call. `ensure_in` verifies and lets go then (right
+    /// for the log writer, which the panic hook reaches); for the WebView2
+    /// user data folder, which nothing else holds, that cost the hold for
+    /// the whole run. (The process-wide set, in a set of the test's own.)
+    #[test]
+    fn a_kept_hold_waits_for_a_held_set_another_thread_has() {
+        let root = tempfile::tempdir().unwrap();
+        let set: held::Set = std::sync::Mutex::new(Vec::new());
+        let user_data = OwnedDir::new(root.path(), &["uk.birdo.vpn.desktop"]);
+        let writer = set.lock().unwrap();
+        std::thread::scope(|s| {
+            let keeper = s.spawn(|| held::wait_and_ensure_in(&set, &user_data));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                !keeper.is_finished(),
+                "it did not wait for the set: the directory was verified and let go"
+            );
+            drop(writer);
+            keeper.join().unwrap().unwrap();
+        });
+        let held = set.lock().unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].0, user_data.path());
     }
 
     /// `hold_open_if_present` never creates: not the leaf, not a parent.

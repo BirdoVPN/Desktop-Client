@@ -34,11 +34,18 @@ fn cmd(program: &str) -> Command {
 /// and with it — now that start() waits for one — every later connect.
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The longest a dropped tunnel's emergency cleanup takes (MR-2039): the
-/// `resolvectl revert` at its cap, and the route deletes, which are netlink
-/// calls that return in milliseconds but are capped the same way. What the
-/// manager waits for, after a failed build and before it ends a disconnect.
-const EMERGENCY_TEARDOWN_BOUND: Duration = Duration::from_secs(4 * SUBPROCESS_TIMEOUT.as_secs());
+/// How long the manager waits for a dropped tunnel's emergency cleanup
+/// (MR-2039), after a failed build and before it ends a disconnect: the
+/// EXPECTED bound, not a hard one. The cleanup deletes every route the tunnel
+/// owned (the endpoint route, the allowed-IP halves, any LAN-sharing CIDRs),
+/// then reverts resolvectl, each step capped at [`SUBPROCESS_TIMEOUT`]. The
+/// route deletes are netlink calls that return in milliseconds, so this
+/// covers the revert at its cap with room for three more; a wedged `ip` on a
+/// tunnel with more routes can run past it. The wait then ends with the
+/// cleanup still running (logged), and the next start() waits for it
+/// ([`START_TEARDOWN_WAIT`]) or refuses retryably.
+pub(super) const EMERGENCY_TEARDOWN_BOUND: Duration =
+    Duration::from_secs(4 * SUBPROCESS_TIMEOUT.as_secs());
 
 /// How long `start()` waits for an in-flight cleanup before it refuses,
 /// retryably. Inside CONNECT_TIMEOUT (30 s), so the user gets that refusal
@@ -1836,9 +1843,13 @@ fn record_owned_route(route: OwnedRoute, owned: &OwnedRoutes) {
 
 /// MR-2051: does `listing` (`ip route show exact <dst>`) hold `route` exactly
 /// as its add would have put it in — the same destination, `via` and `dev`, at
-/// the metric the add collided with (none printed, or 0)? `ip` prints a host
-/// route without its `/32`, and leads a non-unicast route with its type
-/// (`blackhole`, `unreachable`), which is then never a match.
+/// the metric the add collided with (none printed, or 0), and with the
+/// protocol our `ip route add` gives it: none named, so `boot`, which `ip`
+/// does not print? A route an admin, NetworkManager or a routing daemon put
+/// there says so (`proto static`, `proto dhcp`, ...) and is not ours, however
+/// alike. `ip` prints a host route without its `/32`, and leads a non-unicast
+/// route with its type (`blackhole`, `unreachable`), which is then never a
+/// match.
 fn listing_shows_route(listing: &str, route: &OwnedRoute) -> bool {
     let dst = route.dst.strip_suffix("/32").unwrap_or(&route.dst);
     listing.lines().any(|line| {
@@ -1853,6 +1864,7 @@ fn listing_shows_route(listing: &str, route: &OwnedRoute) -> bool {
             && value("via") == route.via.as_deref()
             && value("dev") == Some(route.dev.as_str())
             && value("metric").is_none_or(|metric| metric == "0")
+            && value("proto").is_none_or(|proto| proto == "boot")
     })
 }
 
@@ -1915,9 +1927,11 @@ async fn configure_routes(
         }
         // MR-2051: an identical route is a leftover of ours and is taken as
         // this session's; any other is not ours, so it is not recorded and
-        // teardown leaves it where it was. (A leftover via an OLD gateway is
-        // on the crash-recovery record, which the start-up reconcile removed
-        // before this connect could find it, MR-740.)
+        // teardown leaves it where it was. (A leftover via an OLD gateway
+        // that the crash-recovery record names was removed by the start-up
+        // reconcile before this connect could find it, MR-740; one left by a
+        // build before that record is not provably ours and stays, warned
+        // about below.)
         if adopt_identical_route(endpoint_route, owned) {
             tracing::info!(
                 "The relay's host route was already in place exactly as this session adds it (a \
@@ -3328,8 +3342,9 @@ mod owned_route_tests {
 
     /// MR-2051: only the route exactly as this session adds it — same
     /// destination, gateway and interface, at the metric the add collided
-    /// with — is recognised as an earlier session's leftover. Whatever else
-    /// `ip route show exact` lists there is someone else's.
+    /// with, and with the protocol a plain `ip route add` gives it (`boot`,
+    /// not printed) — is recognised as an earlier session's leftover.
+    /// Whatever else `ip route show exact` lists there is someone else's.
     #[test]
     fn only_the_identical_endpoint_route_is_recognised_as_ours() {
         use super::listing_shows_route;
@@ -3337,8 +3352,9 @@ mod owned_route_tests {
         for listing in [
             // `ip` prints a host route without its /32.
             "203.0.113.7 via 192.168.1.1 dev eth0 \n",
-            "203.0.113.7 via 192.168.1.1 dev eth0 proto static \n",
             "203.0.113.7 via 192.168.1.1 dev eth0 metric 0 \n",
+            // The protocol named, as it is ours (`ip` itself leaves boot out).
+            "203.0.113.7 via 192.168.1.1 dev eth0 proto boot \n",
             // One of several routes at that destination.
             "203.0.113.7 via 10.0.0.1 dev wlan0 metric 600 \n203.0.113.7 via 192.168.1.1 dev eth0 \n",
         ] {
@@ -3355,6 +3371,10 @@ mod owned_route_tests {
             // Not the route the add collided with.
             "203.0.113.7 via 192.168.1.1 dev eth0 metric 100 \n",
             "blackhole 203.0.113.7 \n",
+            // The same via and dev, put there by an admin, NetworkManager
+            // or a routing daemon (our add names no protocol).
+            "203.0.113.7 via 192.168.1.1 dev eth0 proto static \n",
+            "203.0.113.7 via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.20 metric 0 \n",
             // A longer address that merely starts with ours.
             "203.0.113.70 via 192.168.1.1 dev eth0 \n",
         ] {
@@ -3809,6 +3829,11 @@ mod netns_teardown_tests {
     /// failed with "Handshake timeout" and no test reached the teardown it is
     /// about. Same responder as wireguard_new's handshake_tests, bound on
     /// RELAY. Aborted on drop.
+    ///
+    /// Once the session carries data it also ECHOES every UDP datagram it
+    /// receives through the tunnel back down it ([`udp_echo`]), encrypted, so
+    /// the packet loop's inbound half (the relay socket's readiness -> decrypt
+    /// -> birdo0) carries a packet of its own in these tests (MR-2040).
     struct Relay {
         endpoint: String,
         server_public_b64: String,
@@ -3834,14 +3859,28 @@ mod netns_teardown_tests {
         let task = tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             let mut out = [0u8; 2048];
+            let mut sealed = [0u8; 2048];
             loop {
                 let Ok((n, from)) = socket.recv_from(&mut buf).await else {
                     return;
                 };
-                if let TunnResult::WriteToNetwork(reply) =
-                    tunn.decapsulate(Some(from.ip()), &buf[..n], &mut out)
-                {
-                    let _ = socket.send_to(reply, from).await;
+                match tunn.decapsulate(Some(from.ip()), &buf[..n], &mut out) {
+                    TunnResult::WriteToNetwork(reply) => {
+                        let _ = socket.send_to(reply, from).await;
+                    }
+                    // A data packet: the session is current, so it can carry
+                    // one back.
+                    TunnResult::WriteToTunnelV4(packet, _) => {
+                        let Some(echo) = udp_echo(packet) else {
+                            continue;
+                        };
+                        if let TunnResult::WriteToNetwork(data) =
+                            tunn.encapsulate(&echo, &mut sealed)
+                        {
+                            let _ = socket.send_to(data, from).await;
+                        }
+                    }
+                    _ => {}
                 }
             }
         });
@@ -3851,6 +3890,33 @@ mod netns_teardown_tests {
                 .encode(server_public.as_bytes()),
             task,
         }
+    }
+
+    /// The answer to an IPv4/UDP `packet` that came through the tunnel: the
+    /// same datagram from where it was sent to back to its sender (addresses
+    /// and ports swapped), with a fresh header checksum and no UDP checksum
+    /// (optional over IPv4). `None` for anything else.
+    fn udp_echo(packet: &[u8]) -> Option<Vec<u8>> {
+        let ihl = usize::from(packet.first()? & 0x0f) * 4;
+        if packet[0] >> 4 != 4 || ihl < 20 || packet.len() < ihl + 8 || packet[9] != 17 {
+            return None;
+        }
+        let mut echo = packet.to_vec();
+        echo[12..16].copy_from_slice(&packet[16..20]);
+        echo[16..20].copy_from_slice(&packet[12..16]);
+        echo[ihl..ihl + 2].copy_from_slice(&packet[ihl + 2..ihl + 4]);
+        echo[ihl + 2..ihl + 4].copy_from_slice(&packet[ihl..ihl + 2]);
+        echo[ihl + 6..ihl + 8].fill(0);
+        echo[8] = 64; // TTL
+        echo[10..12].fill(0);
+        let sum = echo[..ihl]
+            .chunks(2)
+            .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
+            .sum::<u32>();
+        let folded = (sum & 0xffff) + (sum >> 16);
+        let checksum = !(((folded & 0xffff) + (folded >> 16)) as u16);
+        echo[10..12].copy_from_slice(&checksum.to_be_bytes());
+        Some(echo)
     }
 
     fn config(relay: &Relay) -> VpnConfig {
@@ -4386,6 +4452,60 @@ mod netns_teardown_tests {
         );
 
         tunnel.stop().await.expect("stop()");
+        let after = net();
+        assert!(after.nothing_of_ours(), "{after:?}");
+        assert_eq!(resolv_conf(), before);
+    }
+
+    /// MR-2040, the inbound half: a packet the relay sends down the tunnel.
+    /// The loop's relay-socket arm must wake on the socket's readiness,
+    /// decrypt the datagram and write the packet to birdo0, where the kernel
+    /// hands it to the local socket it is addressed to — the half downloads
+    /// depend on. Nothing else here gives that arm a packet: start()'s
+    /// handshake reads its own answer, and the idle windows never reach a
+    /// rekey. The relay echoes the datagram the probe sends into the tunnel;
+    /// the echo must come out of birdo0, and the tunnel must count it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_packet_from_the_relay_is_decrypted_onto_birdo0() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+        let (tunnel, key, _relay) = tunnel().await;
+        tunnel
+            .start(key)
+            .await
+            .expect("start() against the namespace's dummy uplink");
+
+        let (_, received, _, packets) = tunnel.get_stats();
+        // 1000 bytes of UDP to the tunnel's DNS address, routed into birdo0
+        // by the halves; the relay sends the same 1028-byte packet back,
+        // from 10.66.0.53:53 to this socket.
+        let probe = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .expect("a probe socket");
+        probe
+            .send_to(&[0xa5; 1000], "10.66.0.53:53")
+            .await
+            .expect("send into the tunnel");
+        let mut buf = [0u8; 2048];
+        let echo = tokio::time::timeout(Duration::from_secs(5), probe.recv_from(&mut buf)).await;
+        let stats = tunnel.get_stats();
+        tunnel.stop().await.expect("stop()");
+
+        let Ok(echo) = echo else {
+            panic!(
+                "the relay's packet never came out of birdo0: the packet loop did not decrypt \
+                 it onto the device ({stats:?})"
+            );
+        };
+        let (n, from) = echo.expect("receive the echo");
+        assert_eq!(from.to_string(), "10.66.0.53:53");
+        assert_eq!(&buf[..n], &[0xa5; 1000][..]);
+        assert!(
+            stats.1 >= received + 1028 && stats.3 > packets,
+            "the tunnel did not count the packet it wrote to birdo0: {stats:?}"
+        );
         let after = net();
         assert!(after.nothing_of_ours(), "{after:?}");
         assert_eq!(resolv_conf(), before);

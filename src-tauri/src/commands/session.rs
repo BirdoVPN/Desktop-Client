@@ -1130,9 +1130,16 @@ pub enum EndReason {
 
 /// The longest a session end waits for its teardown before it releases the
 /// block anyway (WIN-FIX-3). Every step of the teardown has its own bound,
-/// the reconnect loop's stop grace (35 s) the longest, so this fires only on
-/// an engine that is wedged — and then the user's Disconnect still frees the
-/// machine instead of waiting on it.
+/// the reconnect loop's stop grace (35 s) usually the longest, so this fires
+/// only on an engine that is wedged — and then the user's Disconnect still
+/// frees the machine instead of waiting on it.
+///
+/// One wedged case can now outlast it by design (MR-2036): a disconnect
+/// whose tunnel stop() timed out (15 s) also waits for the cleanup that stop
+/// handed to a thread of its own, up to the platform's emergency bound
+/// (`vpn::EMERGENCY_TEARDOWN_BOUND`, 65 s on Windows). The release then fires
+/// here, and the teardown carries on behind it under the commit lock until
+/// that cleanup ends or its bound is spent; a new connect waits for it there.
 const RELEASE_DEADLINE: Duration = Duration::from_secs(40);
 
 /// End the session from ANY state (contract §3.1): cancel an in-flight

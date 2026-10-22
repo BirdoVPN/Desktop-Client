@@ -108,7 +108,10 @@ pub async fn run_bounded(
 /// `limit`, killing the child if it has not exited by then. For short-output
 /// tools (the pipes are drained once the child exits, so a child that fills
 /// one first would read as hung and be cut off at the limit).
-#[cfg_attr(not(windows), allow(dead_code))] // schtasks is its one caller
+// Called on Windows (schtasks, the emergency cleanup's netsh) and on Linux
+// (the teardown's `ip route` and `resolvectl revert`, MR-2039); nothing on
+// macOS calls it.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn output_within(
     cmd: &mut std::process::Command,
     limit: std::time::Duration,
