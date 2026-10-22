@@ -121,9 +121,10 @@ fn reconcile_and_exit() -> ! {
 
 /// The uninstaller's PREUNINSTALL hook (nsis-hooks.nsh) runs the exe with this
 /// flag after the reconcile, on a real uninstall only (R2), and adds
-/// [`WITH_APP_DATA`] when "Delete the application data" is ticked.
+/// [`WITH_APP_DATA`] when "Delete the application data" is ticked. On macOS and
+/// Linux, which have no uninstaller, the user runs it with [`WITH_APP_DATA`]
+/// before deleting the app (MR-654, docs/UNINSTALL.md).
 const REMOVE_LEFTOVERS_AND_EXIT: &str = "--remove-leftovers-and-exit";
-#[cfg_attr(not(windows), allow(dead_code))]
 const WITH_APP_DATA: &str = "--with-app-data";
 
 /// R2 (#287 follow-up L2): remove the updater's `updates\` and the squatted
@@ -157,6 +158,30 @@ fn remove_leftovers_and_exit() -> ! {
             done.app_data,
             done.failed
         );
+    }
+    // MR-654: macOS/Linux keep no leftovers of their own (no updates folder,
+    // nothing set aside); with WITH_APP_DATA the account's data goes: the
+    // keystore entries and the per-user folders, never following a link
+    // (`utils::app_data_removal`). Run as the app is run (as root), so the
+    // folders are the ones it used.
+    #[cfg(unix)]
+    {
+        if std::env::args().any(|arg| arg == WITH_APP_DATA) {
+            let done = crate::utils::app_data_removal::remove_app_data();
+            eprintln!(
+                "{} {}: removed {} folder(s) and {} keystore entr(ies); {} failed",
+                REMOVE_LEFTOVERS_AND_EXIT,
+                WITH_APP_DATA,
+                done.folders,
+                done.keystore_entries,
+                done.failed
+            );
+        } else {
+            eprintln!(
+                "{}: nothing to remove without {}",
+                REMOVE_LEFTOVERS_AND_EXIT, WITH_APP_DATA
+            );
+        }
     }
     std::process::exit(0)
 }

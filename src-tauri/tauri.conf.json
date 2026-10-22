@@ -73,7 +73,8 @@
       "deb": {
         "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libayatana-appindicator3-1", "iptables", "iproute2"],
         "section": "net",
-        "priority": "optional"
+        "priority": "optional",
+        "postRemoveScript": "linux/postrm.sh"
       },
       "appimage": {
         "bundleMediaFramework": false

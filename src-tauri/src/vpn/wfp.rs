@@ -35,6 +35,14 @@
 //! created in the dynamic session, so nothing survives the process — see
 //! AUDIT-L below for what that costs.
 //!
+//! Every object names ONE provider, `BIRDO_PROVIDER_KEY` (MR-837): the
+//! sublayer and each filter carry it as their `providerKey`, so
+//! `netsh wfp show filters` (and any WFP tool) can tell ours from every other
+//! product's, and find and clear them by that key. The provider is itself a
+//! dynamic-session object with no flags, added with the first filter set and
+//! removed with the last, so it changes nothing about what survives the
+//! process (owner decision D1: no persistent WFP objects).
+//!
 //! ## AUDIT-L (design trade-off): fail-OPEN on app crash
 //!
 //! `FWPM_SESSION_FLAG_DYNAMIC` is a deliberate UX/security trade-off. Pros:
@@ -95,6 +103,11 @@ use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
 /// Sublayer that groups every Birdo VPN filter.
 const BIRDO_SUBLAYER_KEY: GUID = GUID::from_u128(0xe5f4c3b2_8f9d_5ea0_c1b6_000023456789);
+
+/// The provider every Birdo VPN WFP object names as its `providerKey`
+/// (MR-837): what identifies our filters to `netsh wfp show filters` and to
+/// anything that has to find or clear them.
+const BIRDO_PROVIDER_KEY: GUID = GUID::from_u128(0x44acc82b_0d60_4371_9249_d311808f89e1);
 
 // ── Global state ─────────────────────────────────────────────────────
 static IS_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -179,6 +192,8 @@ struct WfpEngine {
     handle: HANDLE,
     /// Each installed filter's id, and whether it blocks or permits.
     filter_ids: Vec<(u64, Action)>,
+    /// Our provider (MR-837) and sublayer are in place: they go in and come
+    /// out together.
     sublayer_added: bool,
     /// What `filter_ids` implements. Every change starts from this.
     installed: Policy,
@@ -359,19 +374,45 @@ impl FilterKernel for Kernel<'_> {
         }
     }
 
+    fn add_provider(&mut self) -> Result<(), String> {
+        let name = wide_nul(PROVIDER_NAME);
+        let desc = wide_nul(PROVIDER_DESCRIPTION);
+        let provider = provider_record(&name, &desc);
+
+        // SAFETY: `self.handle` is a valid WFP engine handle. `provider` is a
+        // stack-allocated struct whose `name`/`description` borrow `wide_nul`
+        // locals that outlive this call; WFP copies it. `None` makes
+        // windows-rs pass a null `PSECURITY_DESCRIPTOR` (inherited security).
+        let err = unsafe { FwpmProviderAdd0(self.handle, &provider, None) };
+        // FWP_E_ALREADY_EXISTS — benign during re-init, as for the sublayer
+        if err != 0 && err != FWP_E_ALREADY_EXISTS {
+            return Err(format!("FwpmProviderAdd0 failed: 0x{:08X}", err));
+        }
+        Ok(())
+    }
+
+    fn delete_provider(&mut self) {
+        // SAFETY: `self.handle` is a valid WFP engine handle.
+        // `BIRDO_PROVIDER_KEY` is a static GUID with 'static lifetime.
+        let err = unsafe { FwpmProviderDeleteByKey0(self.handle, &BIRDO_PROVIDER_KEY) };
+        // FWP_E_PROVIDER_NOT_FOUND — benign. Anything else (FWP_E_IN_USE: an
+        // object still names it) leaves a provider that the end of the dynamic
+        // session removes anyway.
+        if err != 0 && err != FWP_E_PROVIDER_NOT_FOUND {
+            tracing::warn!("FwpmProviderDeleteByKey0 failed: 0x{:08X}", err);
+        }
+    }
+
     fn add_sublayer(&mut self) -> Result<(), String> {
         let name = wide_nul("Birdo VPN Kill Switch");
         let desc = wide_nul("Blocks non-VPN traffic to prevent IP and DNS leaks");
-
-        let mut sublayer = FWPM_SUBLAYER0::default();
-        sublayer.subLayerKey = BIRDO_SUBLAYER_KEY;
-        sublayer.displayData.name = windows::core::PWSTR(name.as_ptr() as *mut u16);
-        sublayer.displayData.description = windows::core::PWSTR(desc.as_ptr() as *mut u16);
-        sublayer.weight = 0xFFFF; // highest priority sublayer
+        let mut provider_key = BIRDO_PROVIDER_KEY;
+        let sublayer = sublayer_record(&name, &desc, &mut provider_key);
 
         // SAFETY: `self.handle` is a valid WFP engine handle.  `sublayer` is a
         // stack-allocated struct whose `name`/`description` borrow `wide_nul` locals
-        // that outlive this call.  `None` makes windows-rs pass a null
+        // and whose `providerKey` points at `provider_key`, all of which outlive
+        // this call.  `None` makes windows-rs pass a null
         // `PSECURITY_DESCRIPTOR`, requesting inherited security.
         let err = unsafe {
             FwpmSubLayerAdd0(
@@ -380,8 +421,8 @@ impl FilterKernel for Kernel<'_> {
                 None, // a null PSECURITY_DESCRIPTOR, as before
             )
         };
-        // 0x80320009 = FWP_E_ALREADY_EXISTS — benign during re-init
-        if err != 0 && err != 0x80320009 {
+        // FWP_E_ALREADY_EXISTS — benign during re-init
+        if err != 0 && err != FWP_E_ALREADY_EXISTS {
             return Err(format!("FwpmSubLayerAdd0 failed: 0x{:08X}", err));
         }
         Ok(())
@@ -491,17 +532,8 @@ impl FilterKernel for Kernel<'_> {
             conditions.push(c);
         }
 
-        let mut filter = FWPM_FILTER0::default();
-        filter.displayData.name = windows::core::PWSTR(name.as_ptr() as *mut u16);
-        filter.flags = FWPM_FILTER_FLAG_NONE;
-        filter.layerKey = layer_key(spec.layer);
-        filter.subLayerKey = BIRDO_SUBLAYER_KEY;
-        filter.weight.r#type = FWP_UINT8;
-        filter.weight.Anonymous.uint8 = spec.weight;
-        filter.action.r#type = match spec.action {
-            Action::Permit => FWP_ACTION_PERMIT,
-            Action::Block => FWP_ACTION_BLOCK,
-        };
+        let mut provider_key = BIRDO_PROVIDER_KEY;
+        let mut filter = filter_record(spec, &name, &mut provider_key);
         filter.numFilterConditions = conditions.len() as u32;
         filter.filterCondition = if conditions.is_empty() {
             std::ptr::null_mut()
@@ -511,9 +543,10 @@ impl FilterKernel for Kernel<'_> {
 
         let mut id: u64 = 0;
         // SAFETY: `self.handle` is a valid WFP engine handle. `filter` and every
-        // pointer inside it (name, conditions, and the boxed values and app
-        // blobs they point to) stay alive until this call returns; WFP copies
-        // the filter. `id` receives the new filter's id, tracked for removal.
+        // pointer inside it (name, provider key, conditions, and the boxed
+        // values and app blobs they point to) stay alive until this call
+        // returns; WFP copies the filter. `id` receives the new filter's id,
+        // tracked for removal.
         let err = unsafe {
             FwpmFilterAdd0(
                 self.handle,
@@ -582,6 +615,61 @@ fn wide_nul(s: &str) -> Vec<u16> {
 /// delete asks for.
 const FWP_E_FILTER_NOT_FOUND: u32 = 0x8032_0003;
 
+/// `FWP_E_PROVIDER_NOT_FOUND`: the provider is already gone.
+const FWP_E_PROVIDER_NOT_FOUND: u32 = 0x8032_0005;
+
+/// `FWP_E_ALREADY_EXISTS`: the provider or sublayer is in place already.
+const FWP_E_ALREADY_EXISTS: u32 = 0x8032_0009;
+
+/// What `netsh wfp show providers` calls the provider.
+const PROVIDER_NAME: &str = "Birdo VPN";
+const PROVIDER_DESCRIPTION: &str = "Birdo VPN kill switch, IPv6 leak block and DNS guard";
+
+/// The provider record (MR-837). No flags: the persistent one would make it
+/// outlive the session (D1; `lifetime_tests` keeps its name out of this
+/// file), and a dynamic session cannot add a persistent object anyway.
+/// `name`/`description` are NUL-ended UTF-16 ([`wide_nul`]) that must outlive
+/// the record's use.
+fn provider_record(name: &[u16], description: &[u16]) -> FWPM_PROVIDER0 {
+    let mut provider = FWPM_PROVIDER0::default();
+    provider.providerKey = BIRDO_PROVIDER_KEY;
+    provider.displayData.name = windows::core::PWSTR(name.as_ptr() as *mut u16);
+    provider.displayData.description = windows::core::PWSTR(description.as_ptr() as *mut u16);
+    provider
+}
+
+/// The sublayer record, naming the provider through `provider_key` (which
+/// must hold [`BIRDO_PROVIDER_KEY`] and outlive the record's use).
+fn sublayer_record(name: &[u16], description: &[u16], provider_key: &mut GUID) -> FWPM_SUBLAYER0 {
+    let mut sublayer = FWPM_SUBLAYER0::default();
+    sublayer.subLayerKey = BIRDO_SUBLAYER_KEY;
+    sublayer.displayData.name = windows::core::PWSTR(name.as_ptr() as *mut u16);
+    sublayer.displayData.description = windows::core::PWSTR(description.as_ptr() as *mut u16);
+    sublayer.providerKey = provider_key;
+    sublayer.weight = 0xFFFF; // highest priority sublayer
+    sublayer
+}
+
+/// One filter's record without its conditions (`add_filter` points those
+/// in): in our sublayer, naming our provider through `provider_key` (which
+/// must hold [`BIRDO_PROVIDER_KEY`] and outlive the record's use), and with no
+/// flags, so neither persistent nor boot-time.
+fn filter_record(spec: &FilterSpec, name: &[u16], provider_key: &mut GUID) -> FWPM_FILTER0 {
+    let mut filter = FWPM_FILTER0::default();
+    filter.displayData.name = windows::core::PWSTR(name.as_ptr() as *mut u16);
+    filter.flags = FWPM_FILTER_FLAG_NONE;
+    filter.providerKey = provider_key;
+    filter.layerKey = layer_key(spec.layer);
+    filter.subLayerKey = BIRDO_SUBLAYER_KEY;
+    filter.weight.r#type = FWP_UINT8;
+    filter.weight.Anonymous.uint8 = spec.weight;
+    filter.action.r#type = match spec.action {
+        Action::Permit => FWP_ACTION_PERMIT,
+        Action::Block => FWP_ACTION_BLOCK,
+    };
+    filter
+}
+
 /// The kernel calls one policy change makes, in the order [`commit_policy`]
 /// makes them. [`Kernel`] is the FWPM API; the tests use a fake that can fail
 /// any of them, so the rules are tested without an elevated WFP session (CI
@@ -590,6 +678,10 @@ trait FilterKernel {
     fn begin(&mut self) -> Result<(), String>;
     fn commit(&mut self) -> Result<(), String>;
     fn abort(&mut self);
+    /// The provider every object names (MR-837); idempotent.
+    fn add_provider(&mut self) -> Result<(), String>;
+    fn delete_provider(&mut self);
+    /// Idempotent, as `add_provider`.
     fn add_sublayer(&mut self) -> Result<(), String>;
     fn delete_sublayer(&mut self);
     /// `FwpmFilterDeleteById0`'s Win32 code; 0 on success.
@@ -716,10 +808,14 @@ fn commit_policy(
         if specs.is_empty() {
             if ids.is_empty() && *sublayer_added {
                 kernel.delete_sublayer();
+                // After the sublayer, which names it (MR-837).
+                kernel.delete_provider();
                 *sublayer_added = false;
             }
             return Ok(());
         }
+        // MR-837: the provider first — the sublayer and every filter name it.
+        kernel.add_provider()?; // idempotent (ignores ALREADY_EXISTS)
         kernel.add_sublayer()?; // idempotent (ignores ALREADY_EXISTS)
         *sublayer_added = true;
         for spec in specs {
@@ -1518,10 +1614,12 @@ mod split_tunnel_resolution_tests {
     }
 }
 
-/// Nothing WFP holds may outlive the process: no provider, no persistent or
-/// boot-time object, one DYNAMIC session. That is what makes a crash, an End
-/// task or an uninstall of a killed app unable to leave a filter (or the DNS
-/// guard) behind, and why the uninstaller has none to remove (W1-008).
+/// Nothing WFP holds may outlive the process: no persistent or boot-time
+/// object, one DYNAMIC session — the provider included (MR-837 registers it
+/// to identify our filters, not to keep anything). That is what makes a
+/// crash, an End task or an uninstall of a killed app unable to leave a
+/// filter (or the DNS guard) behind, and why the uninstaller has none to
+/// remove (W1-008).
 #[cfg(test)]
 mod lifetime_tests {
     #[test]
@@ -1530,12 +1628,37 @@ mod lifetime_tests {
         assert!(text.contains("session.flags = FWPM_SESSION_FLAG_DYNAMIC;"));
         // Built at run time so this file does not match its own needles.
         for needle in [
-            ["FwpmProvider", "Add0"].concat(),
+            ["FWPM_PROVIDER_FLAG_", "PERSISTENT"].concat(),
             ["FWPM_FILTER_FLAG_", "PERSISTENT"].concat(),
             ["FWPM_FILTER_FLAG_", "BOOTTIME"].concat(),
             ["FWPM_SUBLAYER_FLAG_", "PERSISTENT"].concat(),
         ] {
             assert!(!text.contains(&needle), "wfp.rs uses {needle}");
+        }
+    }
+
+    /// MR-837: a provider is registered, and the FWPM calls add the sublayer
+    /// and every filter from the records that name it (`tests` checks the
+    /// records themselves: `the_sublayer_and_every_filter_name_our_provider`).
+    #[test]
+    fn our_objects_name_a_registered_provider() {
+        let text = include_str!("wfp.rs");
+        for needle in [
+            ["FwpmProvider", "Add0(self.handle, &provider, None)"].concat(),
+            [
+                "let sublayer = sublayer_",
+                "record(&name, &desc, &mut provider_key);",
+            ]
+            .concat(),
+            [
+                "let mut filter = filter_",
+                "record(spec, &name, &mut provider_key);",
+            ]
+            .concat(),
+            ["sublayer.providerKey = ", "provider_key;"].concat(),
+            ["filter.providerKey = ", "provider_key;"].concat(),
+        ] {
+            assert!(text.contains(&needle), "wfp.rs lacks {needle}");
         }
     }
 }
@@ -1864,11 +1987,23 @@ mod tests {
         aborted: u32,
         /// The kernel as it was when the open transaction began.
         snapshot: Vec<u64>,
+        /// Our provider and sublayer are in the kernel (MR-837).
+        provider: bool,
+        sublayer: bool,
+        /// `provider` and `sublayer` when the open transaction began.
+        snapshot_objects: (bool, bool),
+        /// Filters added with no provider or no sublayer in place, which WFP
+        /// refuses (FWP_E_PROVIDER_NOT_FOUND, FWP_E_SUBLAYER_NOT_FOUND).
+        orphan_filters: u32,
+        /// Provider deletes while the sublayer or a filter still named it,
+        /// which WFP refuses (FWP_E_IN_USE).
+        provider_deletes_in_use: u32,
     }
 
     impl FilterKernel for FakeKernel {
         fn begin(&mut self) -> Result<(), String> {
             self.snapshot = self.filters.clone();
+            self.snapshot_objects = (self.provider, self.sublayer);
             Ok(())
         }
         fn commit(&mut self) -> Result<(), String> {
@@ -1878,11 +2013,26 @@ mod tests {
         fn abort(&mut self) {
             self.aborted += 1;
             self.filters = self.snapshot.clone();
+            (self.provider, self.sublayer) = self.snapshot_objects;
         }
-        fn add_sublayer(&mut self) -> Result<(), String> {
+        fn add_provider(&mut self) -> Result<(), String> {
+            self.provider = true;
             Ok(())
         }
-        fn delete_sublayer(&mut self) {}
+        fn delete_provider(&mut self) {
+            if self.sublayer || !self.filters.is_empty() {
+                self.provider_deletes_in_use += 1;
+            } else {
+                self.provider = false;
+            }
+        }
+        fn add_sublayer(&mut self) -> Result<(), String> {
+            self.sublayer = true;
+            Ok(())
+        }
+        fn delete_sublayer(&mut self) {
+            self.sublayer = false;
+        }
         fn delete_filter(&mut self, id: u64) -> u32 {
             const ERROR_ACCESS_DENIED: u32 = 5;
             if self.nothing_deletes || self.undeletable.contains(&id) {
@@ -1897,6 +2047,9 @@ mod tests {
             }
         }
         fn add_filter(&mut self, _spec: &FilterSpec) -> Result<u64, String> {
+            if !(self.provider && self.sublayer) {
+                self.orphan_filters += 1;
+            }
             self.next_id += 1;
             self.filters.push(100 + self.next_id);
             Ok(100 + self.next_id)
@@ -1930,6 +2083,117 @@ mod tests {
         lift: false,
         keeps_block_all: true,
     };
+
+    /// MR-837: the provider is a plain dynamic-session object under our own
+    /// key — no flag, so not persistent (D1).
+    #[test]
+    fn the_provider_is_ours_and_not_persistent() {
+        let (name, desc) = (wide_nul(PROVIDER_NAME), wide_nul(PROVIDER_DESCRIPTION));
+        let provider = provider_record(&name, &desc);
+        assert_eq!(provider.providerKey, BIRDO_PROVIDER_KEY);
+        assert_eq!(provider.flags, 0, "a provider flag (PERSISTENT) is set");
+        assert_eq!(provider.displayData.name.0.cast_const(), name.as_ptr());
+        assert_ne!(BIRDO_PROVIDER_KEY, BIRDO_SUBLAYER_KEY);
+    }
+
+    /// MR-837: the sublayer and every filter a session can hold name our
+    /// provider, so `netsh wfp show filters` lists each with its key; and no
+    /// filter is persistent or boot-time.
+    #[test]
+    fn the_sublayer_and_every_filter_name_our_provider() {
+        let (name, desc) = (wide_nul("sublayer"), wide_nul("description"));
+        let mut key = BIRDO_PROVIDER_KEY;
+        let sublayer = sublayer_record(&name, &desc, &mut key);
+        assert_eq!(sublayer.subLayerKey, BIRDO_SUBLAYER_KEY);
+        assert_eq!(sublayer.flags, 0);
+        assert!(!sublayer.providerKey.is_null());
+        // SAFETY: `providerKey` points at `key`, alive here.
+        assert_eq!(unsafe { *sublayer.providerKey }, BIRDO_PROVIDER_KEY);
+
+        const TUNNEL: u64 = 0x0035_0000_0009;
+        let lockdown = Policy {
+            block_all: Some(BlockAll {
+                self_exe: Some(r"C:\Program Files\BirdoVPN\birdo-vpn-desktop.exe".to_string()),
+                tunnel_luid: Some(TUNNEL),
+                lan_sharing: true,
+                exceptions: vec![r"C:\Apps\excepted.exe".to_string()],
+                ..BlockAll::default()
+            }),
+            v6_block: false,
+            dns_guard: Some(DnsGuard {
+                resolvers: vec![std::net::Ipv4Addr::new(10, 13, 13, 1)],
+                lan_resolvers: vec![],
+                tunnel_luid: TUNNEL,
+                lan_sharing: true,
+                relay: None,
+                self_exe: None,
+            }),
+        };
+        let v6_only = Policy {
+            v6_block: true,
+            ..Policy::default()
+        };
+        let mut checked = 0;
+        for policy in [&lockdown, &v6_only] {
+            for spec in filter_specs(policy, &|_| true) {
+                let name = wide_nul(&spec.name);
+                let mut key = BIRDO_PROVIDER_KEY;
+                let filter = filter_record(&spec, &name, &mut key);
+                assert!(!filter.providerKey.is_null(), "{}", spec.name);
+                // SAFETY: `providerKey` points at `key`, alive here.
+                assert_eq!(unsafe { *filter.providerKey }, BIRDO_PROVIDER_KEY);
+                assert_eq!(filter.subLayerKey, BIRDO_SUBLAYER_KEY, "{}", spec.name);
+                assert_eq!(filter.flags, FWPM_FILTER_FLAG_NONE, "{}", spec.name);
+                checked += 1;
+            }
+        }
+        assert!(checked > 10, "only {checked} filters checked");
+    }
+
+    /// MR-837: the provider is in the kernel before the sublayer and every
+    /// filter that names it, and leaves only after them: with the last
+    /// filter, never while one that could not be deleted still names it.
+    #[test]
+    fn the_provider_comes_first_and_goes_last() {
+        let mut kernel = FakeKernel::default();
+        let mut ids = Vec::new();
+        let mut sublayer_added = false;
+        let first = commit_policy(
+            &mut kernel,
+            &mut ids,
+            &mut sublayer_added,
+            &some_specs(3),
+            OTHER,
+        );
+        assert_eq!(first, Ok(()));
+        assert!(kernel.provider && kernel.sublayer && sublayer_added);
+        assert_eq!(kernel.orphan_filters, 0, "a filter went in before them");
+
+        // A lift that cannot delete a permit: the permit stays, and so do
+        // the sublayer and the provider it names.
+        let mut kernel = FakeKernel {
+            filters: vec![1, 2],
+            undeletable: vec![2],
+            provider: true,
+            sublayer: true,
+            ..FakeKernel::default()
+        };
+        let mut ids = vec![(1, B), (2, P)];
+        let mut sublayer_added = true;
+        let lift = commit_policy(&mut kernel, &mut ids, &mut sublayer_added, &[], LIFT);
+        assert_eq!(lift, Ok(()));
+        assert_eq!(ids, vec![(2, P)]);
+        assert!(kernel.provider && kernel.sublayer && sublayer_added);
+
+        // The next lift deletes it: the sublayer goes, then the provider.
+        kernel.undeletable.clear();
+        let lift = commit_policy(&mut kernel, &mut ids, &mut sublayer_added, &[], LIFT);
+        assert_eq!(lift, Ok(()));
+        assert!(ids.is_empty() && !sublayer_added);
+        assert!(!kernel.sublayer);
+        assert!(!kernel.provider, "the provider outlived the last filter");
+        assert_eq!(kernel.provider_deletes_in_use, 0, "deleted while named");
+    }
 
     /// Review of #222, P1: an ACTIVATION (here the block-all going up in a
     /// reconnect gap) commits even though an old filter will not delete. It

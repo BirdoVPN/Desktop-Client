@@ -30,6 +30,12 @@ npm run test:run       # vitest
 npm run tauri:build    # produces installers under src-tauri/target/release/bundle/
 ```
 
+## Uninstall
+Removing the app keeps its data (keys, tokens, logs, crash reports) unless you
+ask for it to go: the Windows uninstaller's **Delete the application data**
+box, `apt purge` for the .deb, and on macOS and the AppImage the app's own
+cleanup flag. See [`docs/UNINSTALL.md`](docs/UNINSTALL.md).
+
 ## Release
 Pushing a `v*` tag triggers the unified Windows/macOS/Linux release build that is
 published as the **Latest** auto-update release. See [`docs/CODE_SIGNING.md`](docs/CODE_SIGNING.md),
