@@ -116,7 +116,12 @@ socket2 = "0.6"
 # D-Bus backend (dbus-secret-service, `crypto-rust`) also links sha2 0.10 +
 # hkdf 0.12 at runtime. Corrected after review — the first draft said
 # "build-time only", which was true for two of three targets.
-sha2 = "0.11"  # DLL integrity verification
+# `zeroize` (MR-2112): the SHA-256 states inside the HMAC that BirdoPQ's HKDF
+# keys with the shared-secret-derived PRK wipe themselves on drop only with it
+# (sha2 0.11 `Sha256VarCore`'s Drop is empty without it). A feature of crates
+# already in the graph (digest, block-buffer, zeroize), not a new dependency;
+# held at compile time in src/vpn/birdo_pq.rs.
+sha2 = { version = "0.11", features = ["zeroize"] }  # DLL integrity verification, BirdoPQ HKDF
 hmac = "0.13"  # FIX-1-7: Settings file HMAC integrity (boringtun still carries hmac 0.12 internally)
 hex = "0.4"    # FIX-1-7: Hex encoding for HMAC key storage
 # Key material: the WireGuard X25519 secret, the ML-KEM seed and the OAuth

@@ -886,8 +886,13 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
         }
     }
 
-    if config.mtu < 576 || config.mtu > 9000 {
-        return Err(format!("Invalid MTU: {} (expected 576-9000)", config.mtu));
+    // MR-2116: the one bound the queued-packet buffers are sized against.
+    let max_mtu = super::buffer_pool::MAX_MTU;
+    if config.mtu < 576 || config.mtu > max_mtu {
+        return Err(format!(
+            "Invalid MTU: {} (expected 576-{})",
+            config.mtu, max_mtu
+        ));
     }
 
     // P1-dk-allowedips-no-default-coverage: the CIDRs above are only

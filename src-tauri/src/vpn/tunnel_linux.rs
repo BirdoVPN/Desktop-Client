@@ -1420,8 +1420,13 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
         }
     }
 
-    if config.mtu < 576 || config.mtu > 9000 {
-        return Err(format!("Invalid MTU: {} (expected 576-9000)", config.mtu));
+    // MR-2116: the one bound the queued-packet buffers are sized against.
+    let max_mtu = super::buffer_pool::MAX_MTU;
+    if config.mtu < 576 || config.mtu > max_mtu {
+        return Err(format!(
+            "Invalid MTU: {} (expected 576-{})",
+            config.mtu, max_mtu
+        ));
     }
 
     // P1-dk-allowedips-no-default-coverage: the CIDRs above are only
@@ -2123,7 +2128,17 @@ async fn configure_dns(
             return Err(format!("resolvectl dns failed: {}", stderr));
         }
 
-        // Set our TUN as the default route for DNS (highest priority)
+        // Set our TUN as the default route for DNS (highest priority).
+        //
+        // MR-2115 (AUD-1016-DATAPLANE-3): fatal, like the `dns` step above.
+        // Without the `~.` routing domain the tun is just one more link with
+        // DNS servers, and systemd-resolved also sends lookups to the
+        // physical link's resolvers: a LAN router's is on-link, so they leave
+        // outside the tunnel (stub and nss-resolve hosts alike; the pinned
+        // resolv.conf covers neither). It used to be a warning, and the
+        // connect went on leaking DNS with the kill switch off. The Err makes
+        // start() unwind (`unwind_failed_start`), which reverts the link and
+        // puts resolv.conf back.
         let output = cmd("resolvectl")
             .args(["domain", tun_name, "~."])
             .output()
@@ -2131,7 +2146,7 @@ async fn configure_dns(
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("resolvectl domain warning: {}", stderr);
+            return Err(format!("resolvectl domain failed: {}", stderr));
         }
 
         tracing::info!(
@@ -4169,6 +4184,68 @@ mod netns_teardown_tests {
             );
         }
         assert_eq!(resolv_conf(), before);
+    }
+
+    /// The script's stand-ins play an ACTIVE systemd-resolved while this is
+    /// alive: `systemctl is-active` succeeds, and so do the resolvectl verbs
+    /// it names; every other verb fails. Removed on drop, so the tests after
+    /// it see resolved inactive again.
+    struct ResolvedStandIn;
+
+    const RESOLVED_STAND_IN: &str = "/run/birdo-netns-resolved";
+
+    impl ResolvedStandIn {
+        fn succeeding(verbs: &[&str]) -> Self {
+            std::fs::write(RESOLVED_STAND_IN, verbs.join("\n") + "\n")
+                .expect("configure the resolved stand-in");
+            ResolvedStandIn
+        }
+    }
+
+    impl Drop for ResolvedStandIn {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(RESOLVED_STAND_IN);
+        }
+    }
+
+    /// MR-2115: without the `~.` routing domain birdo0 is one more DNS link,
+    /// and systemd-resolved also asks the physical link's resolvers, outside
+    /// the tunnel. A failed `resolvectl domain` used to be a warning, and the
+    /// connect went on; it fails the connect now, and the unwind leaves no
+    /// birdo0, no route of ours and /etc/resolv.conf as it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_failed_resolvectl_domain_fails_the_connect() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+        // The link's servers go in and the revert works; the routing domain
+        // does not.
+        let _resolved = ResolvedStandIn::succeeding(&["dns", "revert"]);
+
+        let (tunnel, key, _relay) = tunnel().await;
+        let result = tunnel.start(key).await;
+        if result.is_ok() {
+            // Connected without the routing domain: torn down before the
+            // test fails, so the tests after it start clean.
+            let _ = tunnel.stop().await;
+        }
+        let err = result.expect_err("connected without the ~. routing domain on birdo0");
+        assert!(
+            err.contains("resolvectl domain"),
+            "failed for another reason: {err}"
+        );
+
+        let after = net();
+        assert!(
+            after.nothing_of_ours(),
+            "the unwind left state behind: {after:?}"
+        );
+        assert_eq!(
+            resolv_conf(),
+            before,
+            "the unwind did not put /etc/resolv.conf back"
+        );
     }
 
     /// MR-2018: a symlinked /etc/resolv.conf is the SAME symlink after a

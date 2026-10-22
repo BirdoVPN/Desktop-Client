@@ -583,6 +583,34 @@ mod buffer_pool_tests {
         let standard_wireguard_mtu = 1420;
         assert!(standard_wireguard_mtu + WIREGUARD_OVERHEAD <= MAX_PACKET_SIZE);
     }
+
+    /// MR-2116: what keeps boringtun's short-buffer panics (an abort in a
+    /// release build) out of reach is constants tied together at compile
+    /// time (`buffer_pool.rs`, `wireguard_new.rs`), not literals of their
+    /// own. These were four bare 9000s that nothing connected: the unix
+    /// receive buffer and the three platforms' MTU caps.
+    #[test]
+    fn no_receive_buffer_or_mtu_cap_is_a_literal_of_its_own() {
+        for (file, source) in [
+            ("wireguard_new.rs", include_str!("wireguard_new.rs")),
+            ("tunnel.rs", include_str!("tunnel.rs")),
+            ("tunnel_linux.rs", include_str!("tunnel_linux.rs")),
+            ("tunnel_macos.rs", include_str!("tunnel_macos.rs")),
+        ] {
+            for line in source.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                assert!(!line.contains("[0u8; 9000]"), "{file}: {line}");
+                assert!(!line.contains("mtu > 9000"), "{file}: {line}");
+            }
+            if file != "wireguard_new.rs" {
+                assert!(
+                    source.contains("let max_mtu = super::buffer_pool::MAX_MTU;"),
+                    "{file}: validate_config does not use the shared MAX_MTU"
+                );
+            }
+        }
+        assert!(include_str!("wireguard_new.rs")
+            .contains("let mut dst = [0u8; MAX_ACCEPTED_DATAGRAM];"));
+    }
 }
 
 // ── AutoReconnect service tests ─────────────────────────────────

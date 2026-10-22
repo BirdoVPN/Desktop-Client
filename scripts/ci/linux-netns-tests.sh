@@ -9,7 +9,9 @@
 # in /run/birdovpn - the namespace's private /run below; MR-2051: an endpoint
 # route an earlier session left exactly as a start adds it is taken as ours
 # and removed at the disconnect; MR-2040: an idle tunnel neither polls birdo0
-# nor wakes in a loop, and a packet from the relay is decrypted onto birdo0).
+# nor wakes in a loop, and a packet from the relay is decrypted onto birdo0;
+# MR-2115: a failed `resolvectl domain birdo0 ~.` fails the connect, and the
+# unwind leaves nothing behind).
 #
 # Those tests create birdo0, add and delete routes and rewrite
 # /etc/resolv.conf, so they run only in the private namespace built here, and
@@ -59,8 +61,23 @@ rm -f /var/lib/.birdo-netns-probe
 mount -t tmpfs birdo-run /run
 
 # systemd-resolved is "inactive" here; resolvectl must never reach the host's.
-printf '#!/bin/sh\nexit 3\n' > "$scratch/bin/systemctl"
-printf '#!/bin/sh\necho "resolvectl is not available in the test namespace" >&2\nexit 1\n' > "$scratch/bin/resolvectl"
+# MR-2115: a test that needs resolved "active" writes the resolvectl verbs
+# that are to succeed, one per line, to /run/birdo-netns-resolved (the
+# namespace's private /run, below); every other verb still fails. Either way
+# the stand-ins only exit: nothing reaches the host's systemd-resolved.
+cat > "$scratch/bin/systemctl" <<'EOF'
+#!/bin/sh
+[ -f /run/birdo-netns-resolved ] && exit 0
+exit 3
+EOF
+cat > "$scratch/bin/resolvectl" <<'EOF'
+#!/bin/sh
+if [ -f /run/birdo-netns-resolved ] && grep -qxF -- "$1" /run/birdo-netns-resolved; then
+  exit 0
+fi
+echo "resolvectl is not available in the test namespace" >&2
+exit 1
+EOF
 chmod 755 "$scratch/bin/systemctl" "$scratch/bin/resolvectl"
 export PATH="$scratch/bin:$PATH"
 [ "$(command -v resolvectl)" = "$scratch/bin/resolvectl" ] || die "the resolvectl stand-in is not first on PATH"

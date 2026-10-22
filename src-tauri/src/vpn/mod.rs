@@ -1801,6 +1801,34 @@ pub mod dns_journal {
             assert!(windows.contains("migrate_legacy_once(&path)"));
             assert!(!windows.contains("data_dir"), "{windows}");
         }
+
+        /// MR-2113 (macOS) and MR-2050 (Linux): off Windows the journal is
+        /// read and written only in the fixed root-only state directory,
+        /// never in one HOME names. It was `dirs::data_dir()/BirdoVPN`: under
+        /// a kept HOME that is the user's `~/Library/Application Support`,
+        /// where any process of theirs could plant a journal that root, at
+        /// the next start, applied to every network service of the Mac. The
+        /// old folder is only ever the source of a one-time takeover of a
+        /// journal root wrote (`adopt_legacy_once`).
+        #[test]
+        fn the_unix_journal_lives_in_the_root_only_state_directory() {
+            let src = include_str!("mod.rs").replace('\r', "");
+            let path_fn = &src[src
+                .find("    fn path() -> Option<std::path::PathBuf> {")
+                .expect("path()")..];
+            let unix = &path_fn[path_fn.find("#[cfg(not(windows))]").unwrap()..];
+            let unix = &unix[..unix.find("\n    }\n").unwrap()];
+            assert!(
+                unix.contains("std::path::Path::new(crate::utils::root_state::STATE_DIR)"),
+                "{unix}"
+            );
+            assert!(
+                unix.contains("crate::utils::root_state::ensure_private_dir(dir)"),
+                "{unix}"
+            );
+            assert!(unix.contains("adopt_legacy_once(&path)"), "{unix}");
+            assert!(!unix.contains("data_dir"), "{unix}");
+        }
     }
 
     /// W1-008: the uninstaller restores what the journal describes BEFORE it
@@ -2545,6 +2573,39 @@ pub mod dns_journal {
                 assert!(read_at(&path).is_none(), "{wider:o}");
                 assert!(path.exists(), "{wider:o}: refused, not set aside");
             }
+        }
+
+        /// MR-2113 (macOS) / MR-2050 (Linux), on this OS's real file system:
+        /// the journal's directory is persistent storage, not /run or
+        /// /var/run (the service DNS and the resolv.conf pin it undoes
+        /// survive a reboot, so the record must too), and its parent is a
+        /// system folder only root can write (`/var/db`, `/var/lib`), so
+        /// nobody else can swap the directory between root's check and a
+        /// use (`root_state`).
+        #[test]
+        fn the_state_directory_is_persistent_and_its_parent_root_only() {
+            use std::os::unix::fs::MetadataExt;
+            let dir = std::path::Path::new(crate::utils::root_state::STATE_DIR);
+            assert!(dir.is_absolute(), "{}", dir.display());
+            for volatile in [
+                "/run",
+                "/var/run",
+                "/private/var/run",
+                "/tmp",
+                "/private/tmp",
+            ] {
+                assert!(!dir.starts_with(volatile), "{}", dir.display());
+            }
+            let parent = dir.parent().expect("the state directory's parent");
+            let meta = std::fs::metadata(parent).expect("the state directory's parent exists");
+            assert!(meta.is_dir(), "{}", parent.display());
+            assert_eq!(meta.uid(), 0, "{} is not root's", parent.display());
+            assert_eq!(
+                meta.mode() & 0o022,
+                0,
+                "{} is writable by others",
+                parent.display()
+            );
         }
     }
 }

@@ -380,16 +380,34 @@ pub fn derive_psk(
 }
 
 fn hkdf_to_psk(shared_secret: &[u8], nonce: &[u8]) -> Result<Zeroizing<[u8; PSK_LEN]>, String> {
-    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret);
+    // MR-2112 (AUD-1016-CRYPTO-5): extract + expand, not `Hkdf::new`. `new`
+    // is `let (_, hkdf) = Self::extract(..)` (hkdf 0.13): it dropped the PRK,
+    // HMAC(salt, ss), unwiped, and from it and the nonce anyone gets this
+    // session's PSK. The PRK is wiped here, on the error path too; the HMAC
+    // keyed with it wipes its own state on drop (sha2's `zeroize`, held at
+    // compile time below).
+    let (mut prk, hk) = Hkdf::<Sha256>::extract(Some(HKDF_SALT), shared_secret);
     let mut psk = Zeroizing::new([0u8; PSK_LEN]);
     // PFA-D1: HKDF expansion size of 32 bytes is always within the
     // L = 8160-byte maximum for SHA-256, so this branch should never
     // trigger; we still propagate Err rather than panicking so a future
     // refactor that bumps PSK_LEN cannot turn this into a DoS panic.
-    hk.expand(nonce, psk.as_mut_slice())
-        .map_err(|e| format!("HKDF expand failed: {e}"))?;
+    let expanded = hk.expand(nonce, psk.as_mut_slice());
+    prk.as_mut_slice().zeroize();
+    expanded.map_err(|e| format!("HKDF expand failed: {e}"))?;
     Ok(psk)
 }
+
+// MR-2112, held at compile time. The HMAC that HKDF keeps (`hk` above) holds
+// two SHA-256 states keyed with the PRK (hmac 0.13 `HmacCore`: the inner and
+// outer digests, each `<Sha256 as EagerHash>::Core`). They wipe themselves on
+// drop only when sha2's `zeroize` feature is on (sha2 0.11 `block_api.rs`,
+// `Sha256VarCore`'s Drop). A dependency change that turned the wipe off stops
+// the build here instead of shipping.
+const _: fn() = || {
+    fn wipes_itself_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    wipes_itself_on_drop::<<Sha256 as hmac::EagerHash>::Core>();
+};
 
 // ── Persistence ───────────────────────────────────────────────────────────
 
@@ -1257,6 +1275,30 @@ mod tests {
         let a = derive_psk(&kp.secret_key, &ct, b"nonce-A").unwrap();
         let b = derive_psk(&kp.secret_key, &ct, b"nonce-B").unwrap();
         assert_ne!(a.as_slice(), b.as_slice());
+    }
+
+    /// MR-2112: the PRK HKDF extracts from the shared secret is wiped before
+    /// any return, not dropped unwiped inside `Hkdf::new`. No test can see
+    /// a stack value's wipe after the fact, so the shape is pinned here
+    /// (`kat_vs_noble` pins that the PSK is unchanged; the HMAC's own wipe is
+    /// the compile-time assertion beside `hkdf_to_psk`).
+    #[test]
+    fn the_hkdf_prk_is_wiped_before_any_return() {
+        let source = include_str!("birdo_pq.rs").replace('\r', "");
+        let body = &source[source.find("fn hkdf_to_psk(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(!body.contains("Hkdf::<Sha256>::new("), "{body}");
+        let extract = body
+            .find("let (mut prk, hk) = Hkdf::<Sha256>::extract(")
+            .expect("the PRK is kept to be wiped");
+        let wipe = body
+            .find("prk.as_mut_slice().zeroize();")
+            .expect("the PRK is wiped");
+        let first_return = body.find("?;").expect("the expand error is returned");
+        assert!(
+            extract < wipe && wipe < first_return,
+            "the PRK must be wiped before the first return: {body}"
+        );
     }
 
     #[test]
