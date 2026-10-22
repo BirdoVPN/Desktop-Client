@@ -245,13 +245,26 @@ const WATCHDOG_TICKS: u32 = 6;
 
 /// What a teardown (or a give-up) may take before the watchdog acts: the
 /// operation lock (30 s), the tunnel stop (15 s), the state writes and the
-/// old-key probe, with room to spare.
-const TEARDOWN_ALLOWANCE: Duration = Duration::from_secs(90);
+/// old-key probe, with room to spare — plus, when the stop timed out, the
+/// wait for the cleanup it handed to a thread of its own, up to the
+/// platform's [`EMERGENCY_TEARDOWN_BOUND`] (MR-2036: 65 s on Windows). That
+/// case is a wedged netsh, the very one the wait is for; without it in the
+/// allowance the watchdog took the loop for stuck and aborted it mid-wait.
+///
+/// [`EMERGENCY_TEARDOWN_BOUND`]: crate::vpn::EMERGENCY_TEARDOWN_BOUND
+const TEARDOWN_ALLOWANCE: Duration =
+    Duration::from_secs(90).saturating_add(crate::vpn::EMERGENCY_TEARDOWN_BOUND);
 
 /// What a re-dial may take after its backoff: the DNS flush (5 s),
 /// [`REDIAL_API_TIMEOUT`], the stealth helper's start, and `connect` (the
-/// operation lock, 30 s, then `CONNECT_TIMEOUT`, 30 s), with room to spare.
-const DIAL_ALLOWANCE: Duration = Duration::from_secs(150);
+/// operation lock, 30 s, then `CONNECT_TIMEOUT`, 30 s), with room to spare —
+/// plus, when the build failed, the wait for the dropped tunnel's cleanup
+/// (MR-823; Linux too since MR-2039), up to the platform's
+/// [`EMERGENCY_TEARDOWN_BOUND`].
+///
+/// [`EMERGENCY_TEARDOWN_BOUND`]: crate::vpn::EMERGENCY_TEARDOWN_BOUND
+const DIAL_ALLOWANCE: Duration =
+    Duration::from_secs(150).saturating_add(crate::vpn::EMERGENCY_TEARDOWN_BOUND);
 
 /// Emitted once per session when the heartbeat reports the Free allowance used
 /// up inside its grace window (birdo-web #590, contract v2 §4). The session
@@ -2228,8 +2241,15 @@ mod tests {
         assert_eq!(WATCHDOG_TICKS, 6);
         // The allowances cover the steps they announce.
         assert!(HEARTBEAT_TIMEOUT < Duration::from_secs(5) * WATCHDOG_TICKS);
-        assert!(REDIAL_API_TIMEOUT + Duration::from_secs(60 + 5) < DIAL_ALLOWANCE);
-        assert!(Duration::from_secs(30 + 15 + 5) + OLD_KEY_PROBE_TIMEOUT < TEARDOWN_ALLOWANCE);
+        // MR-2036 (review): a stop() that timed out, or a build that failed,
+        // is followed by the manager's wait for the dropped tunnel's cleanup,
+        // as long as the bound the manager waits on (65 s on Windows).
+        let cleanup = crate::vpn::emergency_teardowns().bound;
+        assert_eq!(cleanup, crate::vpn::EMERGENCY_TEARDOWN_BOUND);
+        assert!(REDIAL_API_TIMEOUT + Duration::from_secs(60 + 5) + cleanup < DIAL_ALLOWANCE);
+        assert!(
+            Duration::from_secs(30 + 15 + 5) + cleanup + OLD_KEY_PROBE_TIMEOUT < TEARDOWN_ALLOWANCE
+        );
     }
 
     /// WIN3-003: a standby is not a stuck loop. The watchdog's sleep stops

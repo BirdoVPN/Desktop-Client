@@ -26,6 +26,44 @@ pub mod tunnel_macos;
 // Windows job runs its tests.
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 mod device_fd;
+// The emergency cleanup a dropped tunnel hands to a thread of its own, and the
+// manager's waits for it (MR-823, MR-2039, MR-2036).
+pub(crate) mod emergency_teardown;
+
+/// The emergency cleanups this platform's tunnels hand off, and the longest
+/// one can take (see `emergency_teardown`). macOS hands none off.
+pub(crate) fn emergency_teardowns() -> emergency_teardown::InFlight {
+    #[cfg(target_os = "windows")]
+    {
+        tunnel::emergency_teardowns()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        tunnel_linux::emergency_teardowns()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        static NONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        emergency_teardown::InFlight {
+            count: &NONE,
+            bound: EMERGENCY_TEARDOWN_BOUND,
+        }
+    }
+}
+
+/// The longest one of this platform's handed-off emergency cleanups is
+/// expected to take, what the manager's waits for one are bounded by
+/// (`emergency_teardowns().bound`), as a constant for the budgets built on
+/// it: a disconnect whose stop() timed out, and a connect whose build failed,
+/// wait up to this much longer (MR-2036, MR-823), so the reconnect loop's
+/// allowances for them must cover it (`auto_reconnect`).
+#[cfg(target_os = "windows")]
+pub(crate) const EMERGENCY_TEARDOWN_BOUND: std::time::Duration = tunnel::EMERGENCY_TEARDOWN_BOUND;
+#[cfg(target_os = "linux")]
+pub(crate) const EMERGENCY_TEARDOWN_BOUND: std::time::Duration =
+    tunnel_linux::EMERGENCY_TEARDOWN_BOUND;
+#[cfg(target_os = "macos")]
+pub(crate) const EMERGENCY_TEARDOWN_BOUND: std::time::Duration = std::time::Duration::ZERO;
 
 #[cfg(target_os = "windows")]
 mod tunnel_dns; // netsh DNS reads + their captured-output parsers (Windows only)

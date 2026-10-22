@@ -388,6 +388,11 @@ pub struct VpnManager {
     /// a tunnel is coming up can never be followed by an `arm()` that
     /// re-installs a block nobody will remove.
     commit_lock: Arc<TokioMutex<()>>,
+    /// The emergency cleanups a dropped tunnel hands to a thread of its own
+    /// (MR-823, MR-2039), which a failed build and a disconnect wait for
+    /// (MR-2036). Always the platform's (`vpn::emergency_teardowns`) outside
+    /// tests.
+    emergency_teardowns: crate::vpn::emergency_teardown::InFlight,
 }
 
 /// SM-002: Error type for VPN operations
@@ -463,6 +468,7 @@ impl VpnManager {
             status: Arc::new(StatusBus::new(probe)),
             epoch: Arc::new(epoch),
             commit_lock: Arc::new(TokioMutex::new(())),
+            emergency_teardowns: crate::vpn::emergency_teardowns(),
         }
     }
 
@@ -954,10 +960,10 @@ impl VpnManager {
         // before any failure arm: the machine state is released BEFORE the
         // IPv6 block is lifted (the #114 order below), and an exit that
         // cancelled into the build does not end the process under it.
-        #[cfg(target_os = "windows")]
-        if !matches!(tunnel_result, Some(Ok(Ok(_))))
-            && !crate::vpn::tunnel::wait_for_emergency_teardowns().await
-        {
+        // MR-2039: Linux hands its cleanup (routes, the TUN fd, resolv.conf)
+        // off the same way now; macOS hands nothing off, and this returns at
+        // once there.
+        if !matches!(tunnel_result, Some(Ok(Ok(_)))) && !self.emergency_teardowns.settled().await {
             tracing::warn!("Continuing with a dropped tunnel's cleanup still running");
         }
 
@@ -1233,6 +1239,22 @@ impl VpnManager {
             }
         };
 
+        // MR-2036: a stop() that timed out (or failed part-way) dropped the
+        // tunnel above, and its Drop handed the cleanup it still owed — the
+        // routes, DNS — to a thread of its own (MR-823, MR-2039). Wait for
+        // that, bounded by the longest one can take, BEFORE the end state is
+        // published: a "Disconnected" with the old routes and resolvers still
+        // being taken down would let the next connect set up underneath them
+        // (start() refuses then, but only after waiting itself), and an exit
+        // could end the process under the cleanup. Returns at once when
+        // nothing was handed off, which is every clean stop.
+        if !self.emergency_teardowns.settled().await {
+            tracing::warn!(
+                "Ending the disconnect with a dropped tunnel's cleanup still running — the next \
+                 start retries what it leaves"
+            );
+        }
+
         // Update stats with timeout
         match timeout(STATE_LOCK_TIMEOUT, self.stats.write()).await {
             Ok(mut stats) => {
@@ -1481,6 +1503,7 @@ impl VpnManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     fn not_blocking() -> BlockProbe {
         BlockProbe {
@@ -1915,5 +1938,59 @@ mod tests {
         assert_eq!(p.state, ConnectionState::Disconnected);
         assert_eq!(p.server_id, None);
         assert_eq!(p.multi_hop, None);
+    }
+
+    /// A manager whose disconnect waits on `count` (one cleanup "running"
+    /// while it is 1) for at most `bound`, instead of the platform's counter.
+    fn with_cleanups(count: &'static AtomicUsize, bound: Duration) -> VpnManager {
+        let mut mgr = VpnManager::with_block_probe(not_blocking);
+        mgr.emergency_teardowns = crate::vpn::emergency_teardown::InFlight { count, bound };
+        mgr
+    }
+
+    /// MR-2036: a stop() that timed out dropped its tunnel, whose Drop handed
+    /// the cleanup it still owed (routes, DNS) to a thread. The disconnect
+    /// used to publish `Disconnected` at once, with that cleanup still taking
+    /// the old session's machine state down. It must wait for it first.
+    #[tokio::test]
+    async fn a_disconnect_ends_only_once_a_handed_off_cleanup_finished() {
+        static RUNNING: AtomicUsize = AtomicUsize::new(1);
+        let mgr = with_cleanups(&RUNNING, Duration::from_secs(10));
+        mgr.set_state(ConnectionState::Connected).await.unwrap();
+
+        let disconnect = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.disconnect().await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            mgr.published().state,
+            ConnectionState::Disconnecting,
+            "Disconnected was published while the dropped tunnel's cleanup still ran"
+        );
+        assert!(!disconnect.is_finished());
+
+        RUNNING.store(0, AtomicOrdering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), disconnect)
+            .await
+            .expect("the disconnect did not end once the cleanup finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(mgr.published().state, ConnectionState::Disconnected);
+    }
+
+    /// MR-2036: and the wait is bounded. A cleanup that never ends costs its
+    /// bound, and the disconnect still reaches its end state (STATE-FIX: a
+    /// stuck Disconnecting blocks every later operation).
+    #[tokio::test]
+    async fn a_disconnect_waits_for_a_stuck_cleanup_no_longer_than_its_bound() {
+        static STUCK: AtomicUsize = AtomicUsize::new(1);
+        let mgr = with_cleanups(&STUCK, Duration::from_millis(200));
+        mgr.set_state(ConnectionState::Connected).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), mgr.disconnect())
+            .await
+            .expect("the disconnect waited past the cleanup's bound")
+            .unwrap();
+        assert_eq!(mgr.published().state, ConnectionState::Disconnected);
     }
 }

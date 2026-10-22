@@ -1130,9 +1130,16 @@ pub enum EndReason {
 
 /// The longest a session end waits for its teardown before it releases the
 /// block anyway (WIN-FIX-3). Every step of the teardown has its own bound,
-/// the reconnect loop's stop grace (35 s) the longest, so this fires only on
-/// an engine that is wedged — and then the user's Disconnect still frees the
-/// machine instead of waiting on it.
+/// the reconnect loop's stop grace (35 s) usually the longest, so this fires
+/// only on an engine that is wedged — and then the user's Disconnect still
+/// frees the machine instead of waiting on it.
+///
+/// One wedged case can now outlast it by design (MR-2036): a disconnect
+/// whose tunnel stop() timed out (15 s) also waits for the cleanup that stop
+/// handed to a thread of its own, up to the platform's emergency bound
+/// (`vpn::EMERGENCY_TEARDOWN_BOUND`, 65 s on Windows). The release then fires
+/// here, and the teardown carries on behind it under the commit lock until
+/// that cleanup ends or its bound is spent; a new connect waits for it there.
 const RELEASE_DEADLINE: Duration = Duration::from_secs(40);
 
 /// End the session from ANY state (contract §3.1): cancel an in-flight
@@ -1453,6 +1460,45 @@ mod lifecycle_tests {
         for blocking in ["error!(", "release_dns_at_exit", "restore_dns_blocking"] {
             assert!(!before_decision.contains(blocking), "{blocking}");
         }
+    }
+
+    /// MR-1934: macOS's Cmd+Q, the Dock's Quit and logout reach the end of
+    /// the run (`RunEvent::Exit`) with no exit request before it, and the
+    /// teardown that request runs was skipped: pf's block and the session's
+    /// DNS outlived the app. There, off Windows and unless a restart was let
+    /// through, the same teardown now runs, capped, before the process ends.
+    /// What the helper does is driven in
+    /// `utils::tests::an_exit_that_never_asked_first_runs_the_teardown_once`.
+    #[test]
+    fn an_exit_with_no_exit_request_still_tears_down_off_windows() {
+        let main_rs = include_str!("../main.rs").replace('\r', "");
+        let exit = &main_rs[main_rs
+            .find("if matches!(event, RunEvent::Exit) {")
+            .expect("the RunEvent::Exit arm")..];
+        let exit = &exit[..exit
+            .find("if let RunEvent::ExitRequested")
+            .expect("the arm's end")];
+        order(
+            exit,
+            &[
+                "record_if_exit_kept_the_session(",
+                "#[cfg(not(target_os = \"windows\"))]",
+                "if !EXIT_RESTARTING.load(",
+                "utils::tear_down_unless_started(",
+                "&EXIT_TEARDOWN_STARTED,",
+                "EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN,",
+                "tauri::async_runtime::block_on(",
+                "teardown_for_exit(&app)",
+                "clear_on_exit();",
+            ],
+        );
+        // A restart is let through without the teardown, and says so before
+        // it returns, so the end of its run does not run it either.
+        let restart = &main_rs[main_rs
+            .find("if *code == Some(tauri::RESTART_EXIT_CODE) {")
+            .expect("the restart branch")..];
+        let restart = &restart[..restart.find("return;").expect("the branch's return")];
+        assert!(restart.contains("EXIT_RESTARTING.store(true"));
     }
 
     /// WIN-FIX-3: a settings reapply is rebuilt on the session's own

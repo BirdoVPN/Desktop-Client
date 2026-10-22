@@ -6,7 +6,10 @@
 # /etc/resolv.conf comes back as the same symlink, after a disconnect and after
 # a journal-driven crash recovery; MR-740: that recovery also removes the
 # endpoint route a killed session left via the uplink, whose record it keeps
-# in /run/birdovpn - the namespace's private /run below).
+# in /run/birdovpn - the namespace's private /run below; MR-2051: an endpoint
+# route an earlier session left exactly as a start adds it is taken as ours
+# and removed at the disconnect; MR-2040: an idle tunnel neither polls birdo0
+# nor wakes in a loop, and a packet from the relay is decrypted onto birdo0).
 #
 # Those tests create birdo0, add and delete routes and rewrite
 # /etc/resolv.conf, so they run only in the private namespace built here, and

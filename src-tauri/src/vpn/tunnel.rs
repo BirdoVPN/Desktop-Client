@@ -2481,13 +2481,14 @@ fn emergency_teardown_steps(
 }
 
 /// Emergency cleanups handed to their own thread and not finished yet
-/// (MR-823). `start()` and the manager's failed-build arm wait on it.
+/// (MR-823). `start()` and the manager wait on it.
 static EMERGENCY_TEARDOWNS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// The most one emergency cleanup can take: its three subprocesses, each
 /// bounded by SUBPROCESS_TIMEOUT, plus the release (native calls). What the
-/// manager's failed-build arm waits for before it lifts the IPv6 block.
-const EMERGENCY_TEARDOWN_BOUND: Duration =
+/// manager's failed-build arm waits for before it lifts the IPv6 block, and
+/// a disconnect whose stop() timed out before it ends (MR-2036).
+pub(super) const EMERGENCY_TEARDOWN_BOUND: Duration =
     Duration::from_secs(3 * SUBPROCESS_TIMEOUT.as_secs() + 5);
 
 /// How long `start()` waits for an in-flight cleanup before it refuses,
@@ -2495,99 +2496,36 @@ const EMERGENCY_TEARDOWN_BOUND: Duration =
 /// rather than a generic timeout.
 const START_TEARDOWN_WAIT: Duration = Duration::from_secs(20);
 
-/// Marks a `start()` refused because an emergency cleanup was still running
-/// (MR-823). Not a handshake marker, so it surfaces as AdapterFailed, which is
-/// retryable.
-const ERR_EMERGENCY_CLEANUP_RUNNING: &str = "the previous tunnel is still being cleaned up";
+// A dropped tunnel's emergency cleanup runs off the dropping thread (MR-823),
+// counted in `in_flight` until it ends: see `vpn::emergency_teardown`.
+// `start()` refuses to claim the machine state while one runs, and the
+// manager waits for it (`emergency_teardowns`) after a failed build and
+// before it publishes the end of a disconnect (MR-2036), so the next tunnel
+// is never set up underneath it.
+//
+// The trade-off left is accepted rather than hidden: a cleanup handed to a
+// thread just before the process exits from inside the runtime, by any path
+// that does not wait for it, can be cut short. None of it is lost for good —
+// the routes are journaled when installed and the startup reconcile deletes
+// what is left (W1-041), the DNS guard is WFP dynamic-session state that dies
+// with the process, and the next connect rewrites the adapter's DNS. Nothing
+// here leaves a half-written file behind either: the steps are subprocesses
+// and the owner's record.
+use super::emergency_teardown::{
+    dispatch as dispatch_emergency_teardown, settled as emergency_teardowns_settled,
+    ERR_EMERGENCY_CLEANUP_RUNNING,
+};
 
-/// Run a dropped tunnel's emergency cleanup off the dropping thread (MR-823),
-/// counted in `in_flight` until it ends.
-///
-/// - Inside a Tokio runtime — the case that matters: a worker dropping a
-///   half-built tunnel — it runs on a dedicated thread and `Drop` returns at
-///   once. `start()` refuses to claim the machine state while it runs, and the
-///   manager's failed-build arm waits for it (`wait_for_emergency_teardowns`),
-///   so the next tunnel is never set up underneath it.
-/// - Outside a runtime there is no async worker to stall, and the usual
-///   reason is process exit (the runtime is already gone), where a detached
-///   thread would be killed mid-netsh. It runs inline, to completion, exactly
-///   as it always did.
-/// - If the thread cannot be started it runs inline too: blocking a worker is
-///   the lesser harm than skipping the cleanup.
-///
-/// The trade-off left is accepted rather than hidden: a cleanup handed to a
-/// thread just before the process exits from inside the runtime, by any path
-/// that does not wait for it, can be cut short. None of it is lost for good —
-/// the routes are journaled when installed and the startup reconcile deletes
-/// what is left (W1-041), the DNS guard is WFP dynamic-session state that dies
-/// with the process, and the next connect rewrites the adapter's DNS. Nothing
-/// here leaves a half-written file behind either: the steps are subprocesses
-/// and the owner's record.
-fn dispatch_emergency_teardown(
-    in_flight: &'static AtomicUsize,
-    teardown: impl FnOnce() + Send + 'static,
-) {
-    if tokio::runtime::Handle::try_current().is_err() {
-        teardown();
-        return;
+/// The emergency cleanups Windows tunnels hand off, and the longest one can
+/// take: what the manager waits on (MR-823, MR-2036). Its release of the
+/// machine state must come before the failed-build arm lifts the IPv6 block
+/// (the #114 order), and an exit that cancelled into that arm must not end the
+/// process under it.
+pub(crate) fn emergency_teardowns() -> super::emergency_teardown::InFlight {
+    super::emergency_teardown::InFlight {
+        count: &EMERGENCY_TEARDOWNS_IN_FLIGHT,
+        bound: EMERGENCY_TEARDOWN_BOUND,
     }
-
-    /// Counts the cleanup as in flight until its thread ends, however it ends
-    /// (a panic included), or until a failed spawn drops it unrun.
-    struct InFlight(&'static AtomicUsize);
-    impl Drop for InFlight {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-    in_flight.fetch_add(1, Ordering::SeqCst);
-    let in_flight = InFlight(in_flight);
-
-    // Shared so a failed spawn can still run it: `spawn` drops its closure.
-    let job = Arc::new(std::sync::Mutex::new(Some(teardown)));
-    let for_thread = Arc::clone(&job);
-    let spawned = std::thread::Builder::new()
-        .name("birdo-emergency-teardown".to_string())
-        .spawn(move || {
-            let _in_flight = in_flight;
-            let teardown = for_thread.lock().ok().and_then(|mut t| t.take());
-            if let Some(teardown) = teardown {
-                teardown();
-            }
-        });
-    if let Err(e) = spawned {
-        tracing::warn!("Could not start the emergency-cleanup thread ({e}) — running it inline");
-        let teardown = job.lock().ok().and_then(|mut t| t.take());
-        if let Some(teardown) = teardown {
-            teardown();
-        }
-    }
-}
-
-/// Wait up to `limit` for the cleanups counted in `in_flight` to finish
-/// (MR-823). Returns whether none is left.
-async fn emergency_teardowns_settled(in_flight: &AtomicUsize, limit: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + limit;
-    while in_flight.load(Ordering::SeqCst) > 0 {
-        if tokio::time::Instant::now() >= deadline {
-            tracing::warn!(
-                "A dropped tunnel's emergency cleanup is still running after {:?}",
-                limit
-            );
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    true
-}
-
-/// For the manager's failed-build arm (MR-823): wait, as long as one can take,
-/// for any emergency cleanup a dropped tunnel handed off. Its release of the
-/// machine state must come before the arm lifts the IPv6 block (the #114
-/// order), and an exit that cancelled into that arm must not end the process
-/// under it. Returns whether none is left.
-pub(crate) async fn wait_for_emergency_teardowns() -> bool {
-    emergency_teardowns_settled(&EMERGENCY_TEARDOWNS_IN_FLIGHT, EMERGENCY_TEARDOWN_BOUND).await
 }
 
 /// MR-823: `Drop` must hand the emergency cleanup off, not run it on the
@@ -2711,17 +2649,8 @@ mod emergency_teardown_tests {
         );
     }
 
-    /// Process exit: no runtime left, so the cleanup runs inline and is done
-    /// when the dispatch returns — a detached thread would be killed.
-    #[test]
-    fn without_a_runtime_the_cleanup_runs_inline() {
-        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-        let ran = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&ran);
-        dispatch_emergency_teardown(&IN_FLIGHT, move || flag.store(true, Ordering::SeqCst));
-        assert!(ran.load(Ordering::SeqCst));
-        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 0);
-    }
+    // Process exit (no runtime: the cleanup runs inline) is tested with the
+    // dispatch itself, in `vpn::emergency_teardown`.
 
     /// The steps run against a scripted owner probe; returns the subprocesses
     /// they ran and how often they released.
@@ -2796,7 +2725,7 @@ mod emergency_teardown_tests {
             .expect("the build race");
         let after = &source[build..];
         let wait = after
-            .find("tunnel::wait_for_emergency_teardowns()")
+            .find("self.emergency_teardowns.settled()")
             .expect("the manager does not wait for a handed-off cleanup");
         let arms = after.find("match tunnel_result").expect("the arms");
         assert!(wait < arms, "the wait must come before the failure arms");
