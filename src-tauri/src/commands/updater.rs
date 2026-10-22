@@ -110,7 +110,7 @@ fn pinned_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, Stri
         // retries DNS an older build left parked, if a teardown timed out.
         //
         // REVIEW-WIN-002: the hook runs BEFORE `ShellExecuteW` launches the
-        // installer (tauri-plugin-updater 2.13.3, unchanged since 2.11.0,
+        // installer (tauri-plugin-updater 2.14.0, unchanged since 2.11.0,
         // updater.rs `install_inner`: extract → hook → ShellExecuteW → Err if
         // it failed, else exit(0)), so it must do nothing a failed launch
         // cannot undo. Setting the hook replaces the plugin's own, which is
@@ -462,9 +462,10 @@ pub async fn install_update(app: AppHandle) -> Result<bool, UpdateFailure> {
 /// admin-only folder (`%ProgramData%\BirdoVPN\updates`) for as long as the
 /// guard lives.
 ///
-/// WHY THE ENVIRONMENT. tauri-plugin-updater 2.13.3 offers no way to choose
+/// WHY THE ENVIRONMENT. tauri-plugin-updater 2.14.0 offers no way to choose
 /// where the installer goes, or to launch it ourselves with what `install`
-/// passes it: on Windows `Update::install` -> `extract` -> `write_to_temp` ->
+/// passes it: on Windows `Update::install` (which re-verifies the bytes in
+/// memory first, since 2.14.0) -> `extract` -> `write_to_temp` ->
 /// `make_temp_dir` makes `tempfile::Builder::new().tempdir()`, which is
 /// `std::env::temp_dir()` (tempfile 3.27, no override set), which is
 /// `GetTempPath2W` — `%TMP%`, then `%TEMP%` — for a process that is not
@@ -592,7 +593,7 @@ mod tests {
         assert_eq!(made_in, target.canonicalize().unwrap());
     }
 
-    /// MR-1722 depends on how tauri-plugin-updater 2.13.3 places the
+    /// MR-1722 depends on how tauri-plugin-updater 2.14.0 places the
     /// installer (see `AdminOnlyTemp`). A different version must be checked
     /// again before it ships: confirm its Windows `install` still writes the
     /// installer under `std::env::temp_dir()` (or now offers a directory, or
@@ -605,7 +606,7 @@ mod tests {
             .expect("tauri-plugin-updater in Cargo.lock")..];
         let version = entry.lines().nth(1).unwrap();
         assert_eq!(
-            version, "version = \"2.13.3\"",
+            version, "version = \"2.14.0\"",
             "tauri-plugin-updater moved: re-verify MR-1722 (AdminOnlyTemp) against its Windows install"
         );
     }
@@ -765,7 +766,7 @@ mod tests {
     }
 
     /// W1-038: the updater plugin (v2) reads only endpoints, pubkey, windows,
-    /// the dangerous_* switches and, in 2.13.3, allowDowngrades and
+    /// the dangerous_* switches and, in 2.14.0, allowDowngrades and
     /// requireSignedVersion. The v1 `active` / `dialog` keys did nothing,
     /// while suggesting an update dialog that does not exist.
     #[test]
@@ -788,8 +789,9 @@ mod tests {
     /// that names no version (every release up to 1.4.45) skips that check.
     ///
     /// The flag is enforced by the RUNNING app on the update it downloads
-    /// (tauri-plugin-updater 2.13.3: `Update::download` -> `verify_signature`
-    /// with the announced version), and this app takes only a strictly newer
+    /// (tauri-plugin-updater 2.14.0: `Update::download`, and `Update::install`
+    /// again, call `Update::verify` -> `verify_signature` with the announced
+    /// version), and this app takes only a strictly newer
     /// release: no custom version comparator, allowDowngrades off. So every
     /// update a build with the flag can take is a release signed by
     /// @tauri-apps/cli 2.12 or later, which writes `version:<x.y.z>` (the
