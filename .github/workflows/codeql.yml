@@ -20,9 +20,15 @@ on:
     branches: [main]
     paths-ignore: ["docs/**", "**/*.md"]
   # Every base branch: stacked PRs (e.g. #221/#222 on overhaul/windows) are
-  # scanned too. Docs-only changes cannot change a finding.
+  # scanned too.
+  #
+  # Every PR, docs-only ones included (MR-2059). Docs cannot change a finding,
+  # but branch protection requires "Analyze (rust)" and "CodeQL", and only an
+  # analysis reports them: "CodeQL" is code scanning's verdict on the results
+  # this job uploads, so a job skipped by a `changes` job (as in tests.yml)
+  # would still leave it missing, and a docs-only PR admin-merge only. The
+  # scan costs a few runner minutes; the repo is public, so they are free.
   pull_request:
-    paths-ignore: ["docs/**", "**/*.md"]
   schedule:
     # Weekly catch-all so new CodeQL queries run even without a push.
     - cron: "27 3 * * 1"

@@ -10,7 +10,8 @@ name: Tests
 # suite, so a broken test can never silently land again.
 #
 # Shape (2026-10-06 rebuild): every job is independent, so they all start at
-# once and the slowest one sets the wall time. Rust caches are written by
+# once (after the few-second `changes` job, MR-2059) and the slowest one sets
+# the wall time; `all-checks` reports their combined result. Rust caches are written by
 # main only (`save-if`); PRs restore main's cache read-only. PR-scoped copies
 # used to push the repo to 14 GB of caches (10 GB cap) and evict main's.
 # Every cargo invocation is `--locked`: CI tests the exact dependency graph
@@ -21,11 +22,14 @@ on:
     branches: [main]
     paths-ignore: ["docs/**", "**/*.md"]
   # Every base branch, not only main: stacked PRs (e.g. #221/#222 on
-  # overhaul/windows) get the same signal. No branch protection or required
-  # checks exist on this repo; if required checks are ever added, replace
-  # paths-ignore with a `changes` job so docs-only PRs still report.
+  # overhaul/windows) get the same signal.
+  #
+  # No paths filter on PRs (MR-2059). Branch protection on main requires
+  # checks this workflow produces, and a workflow its trigger filters out
+  # reports none of them, so a docs-only PR could only be admin-merged. The
+  # `changes` job below decides instead: on a docs-only PR it skips every job
+  # (a skipped job counts as passed) and `all-checks` still reports.
   pull_request:
-    paths-ignore: ["docs/**", "**/*.md"]
   workflow_dispatch:
 
 permissions: {}
@@ -45,9 +49,62 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # MR-2059: whether this run has anything but docs to test. A PR whose every
+  # changed file is under docs/ or a *.md (the filter the pull_request trigger
+  # used to carry) skips every job below; a push to main is filtered by its
+  # trigger as before, and a push or a dispatch that runs tests everything.
+  changes:
+    name: Changes - docs-only PRs skip the test jobs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      # A PR's checkout is its merge commit; depth 2 brings its first parent,
+      # the base branch it merges into, so the diff is what the PR changes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Anything but docs changed?
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != pull_request ]; then
+            echo "code=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # --no-renames: a file moved from src/ into docs/ is a change to
+          # src/ as well, and must not read as docs-only. Written to a file
+          # first so a failing diff fails this job (and with it all-checks)
+          # instead of reading as "nothing changed".
+          changed="$RUNNER_TEMP/changed-files"
+          git diff -z --no-renames --name-only HEAD^1 HEAD >"$changed"
+          code=false
+          while IFS= read -r -d '' f; do
+            case "$f" in
+              docs/* | *.md) ;;
+              *)
+                code=true
+                echo "not docs: $f"
+                break
+                ;;
+            esac
+          done <"$changed"
+          echo "code=$code" >>"$GITHUB_OUTPUT"
+          echo "code=$code"
+
   # rustfmt + clippy, split from the test job so the two run in parallel.
   rust-lint:
     name: Rust lint (Windows) - rustfmt + clippy
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-2025
     timeout-minutes: 20
     permissions:
@@ -97,6 +154,8 @@ jobs:
 
   rust-tests:
     name: Rust unit tests (Windows)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-2025
     timeout-minutes: 25
     permissions:
@@ -162,6 +221,8 @@ jobs:
   # release. `cargo check` (no bundling, no run) is fast and catches them on PRs.
   cross-check:
     name: Cross-platform compile check
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -279,10 +340,14 @@ jobs:
           # Unix-only; and MR-2089/MR-2050's root_write_tests (the DNS journal,
           # the settings key and settings.json, macOS's pf reference record and
           # utils::root_state: never written through a planted link, owner-only
-          # from creation, a folder others can write refused), #[cfg(unix)] too.
+          # from creation, a folder others can write refused), #[cfg(unix)] too;
+          # and MR-654's app_data_removal::tests (--with-app-data removes the
+          # account's folders and keystore entries without following a planted
+          # link, and the .deb's postrm removes the same folders), a #[cfg(unix)]
+          # module.
           # Space-separated: libtest
           # runs every test matching ANY of the filters after `--`.
-          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests owned_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests' || 'resolv_conf_restore_tests tun_read_tests owned_route_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests' }}
+          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests owned_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests app_data_removal::tests' || 'resolv_conf_restore_tests tun_read_tests owned_route_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests app_data_removal::tests' }}
           # The cfg-gated file those tests live in.
           SRC: ${{ matrix.os == 'macos' && 'src/vpn/tunnel_macos.rs' || 'src/vpn/tunnel_linux.rs' }}
           # Every test module in $SRC that some step of THIS job executes -
@@ -529,6 +594,8 @@ jobs:
   # leg is cached (main writes, PRs read); see the cache step for why only it.
   msrv:
     name: MSRV check (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -591,6 +658,8 @@ jobs:
 
   frontend-tests:
     name: Frontend unit tests
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -695,6 +764,8 @@ jobs:
   # command line before a release, so this does, in about a minute.
   release-cli-contract:
     name: Release build command passes --locked to cargo (Windows, pwsh)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-2025
     timeout-minutes: 10
     permissions:
@@ -763,6 +834,8 @@ jobs:
   # failure paths still fails, using fake installers 7z extracts like NSIS.
   xray-gate-selftest:
     name: Bundled-xray hash gate self-test (Windows)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-2025
     timeout-minutes: 10
     permissions:
@@ -784,6 +857,8 @@ jobs:
   # the published v1.4.45 artifacts when the gate was written.
   xray-gate-selftest-unix:
     name: Bundled-xray gate self-test (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -815,6 +890,8 @@ jobs:
   # fails, and the gate's check 8 accepts exactly what the generator lists.
   appimage-notices-selftest:
     name: AppImage library notices self-test (fake dpkg)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -844,6 +921,8 @@ jobs:
   # publishes.
   updater-signature-gate-selftest:
     name: Updater signature gate self-test (throwaway keys)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -879,6 +958,8 @@ jobs:
   # release day.
   third-party-notices:
     name: Third-party notices + corresponding-source asset for every release target
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -1016,6 +1097,8 @@ jobs:
   # [package].version out of the TOML with a scoped regex (no TOML dep needed).
   version-consistency:
     name: Version consistency
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -1102,3 +1185,71 @@ jobs:
           }
           console.log('OK - every Tauri crate/npm pair shares major.minor');
           EOF
+
+  # MR-2059: the ONE check branch protection should require from this
+  # workflow, in place of the job names. Two of those carry a runner image
+  # ("Cross-platform compile check (ubuntu-24.04, linux)", "(macos-26,
+  # macos)"), so a runner bump renames them and strands the requirement; and
+  # a matrix job that `changes` skips does not report under its expanded
+  # name at all. This passes when every job passed, or when `changes` found a
+  # docs-only PR and every job was skipped; anything else (a failure, a
+  # cancellation, a job skipped on a code change) fails it.
+  #
+  # Every job of this workflow belongs in `needs`: one left out is not gated.
+  all-checks:
+    name: All checks
+    if: always()
+    needs:
+      - changes
+      - rust-lint
+      - rust-tests
+      - cross-check
+      - msrv
+      - frontend-tests
+      - release-cli-contract
+      - xray-gate-selftest
+      - xray-gate-selftest-unix
+      - appimage-notices-selftest
+      - updater-signature-gate-selftest
+      - third-party-notices
+      - version-consistency
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every job passed, or a docs-only PR skipped them all
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          changes=$(jq -r '.changes.result' <<<"$NEEDS")
+          code=$(jq -r '.changes.outputs.code // ""' <<<"$NEEDS")
+          if [ "$changes" != success ]; then
+            echo "::error::the changes job did not succeed ($changes)"
+            exit 1
+          fi
+          case "$code" in
+            true) want=success ;;
+            false) want=skipped ;;
+            *)
+              echo "::error::the changes job gave no answer ('$code')"
+              exit 1
+              ;;
+          esac
+          # A variable, not a process substitution: a jq that failed there
+          # would read as "no job failed".
+          results=$(jq -r 'to_entries[] | select(.key != "changes") | "\(.key) \(.value.result)"' <<<"$NEEDS")
+          if [ -z "$results" ]; then
+            echo "::error::no job results to check"
+            exit 1
+          fi
+          bad=0
+          while read -r job result; do
+            if [ "$result" = "$want" ]; then
+              echo "ok      $job: $result"
+            else
+              echo "::error::$job: $result (expected $want)"
+              bad=1
+            fi
+          done <<<"$results"
+          exit "$bad"

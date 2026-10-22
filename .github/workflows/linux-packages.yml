@@ -212,6 +212,70 @@ jobs:
           fi
           bash scripts/ci/verify-bundled-xray.sh "${XRAY_BINARY_SHA256:-}" "${debs[0]}" "${appimages[0]}"
 
+      # MR-654: `apt purge` removes the app data BirdoVPN kept for root (the
+      # .deb's postrm, src-tauri/linux/postrm.sh); `apt remove` keeps it. On
+      # the real package: installed, its data planted in root's home with a
+      # link to a folder outside it, removed (the data stays), then purged
+      # (the data goes; the link's target and /var/lib/birdovpn stay).
+      - name: The .deb's purge removes root's app data and follows no link
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=("$PWD/src-tauri/target/$ARCH/release/bundle/deb"/*.deb)
+          deb=${debs[0]}
+          # The package carries the script (none did before MR-654).
+          dpkg-deb --info "$deb" postrm
+          pkg=$(dpkg-deb --field "$deb" Package)
+          sudo apt-get install -y --no-install-recommends "$deb"
+
+          home=$(getent passwd root | cut -d: -f6)
+          data=(
+            "$home/.config/BirdoVPN/birdo_pq_v1.bin"
+            "$home/.config/BirdoVPN/device_id"
+            "$home/.config/uk.birdo.vpn.desktop/settings.json"
+            "$home/.config/uk.birdo.vpn.desktop/settings_hmac.key"
+            "$home/.local/share/BirdoVPN/logs/birdo.log"
+            "$home/.local/share/Birdo VPN/crashes/crash_1.txt"
+            "$home/.local/share/uk.birdo.vpn.desktop/localstorage"
+            "$home/.cache/uk.birdo.vpn.desktop/cache"
+          )
+          for f in "${data[@]}"; do
+            sudo mkdir -p "$(dirname "$f")"
+            echo fake | sudo tee "$f" >/dev/null
+          done
+          canary="$RUNNER_TEMP/purge-canary"
+          mkdir -p "$canary"
+          echo keep >"$canary/keep"
+          sudo ln -s "$canary" "$home/.local/share/BirdoVPN/logs/planted"
+          sudo mkdir -p /var/lib/birdovpn
+          echo '{}' | sudo tee /var/lib/birdovpn/dns-restore.json >/dev/null
+          there() { sudo test -e "$1" || sudo test -L "$1"; }
+
+          sudo dpkg --remove "$pkg"
+          for f in "${data[@]}"; do
+            if ! there "$f"; then
+              echo "::error::apt remove deleted $f (only a purge may)"
+              exit 1
+            fi
+          done
+
+          sudo dpkg --purge "$pkg"
+          for f in "${data[@]}" "$home/.local/share/BirdoVPN" "$home/.config/BirdoVPN"; do
+            if there "$f"; then
+              echo "::error::$f survived the purge"
+              exit 1
+            fi
+          done
+          if [ "$(cat "$canary/keep")" != keep ]; then
+            echo "::error::the purge followed the planted link"
+            exit 1
+          fi
+          if ! sudo test -f /var/lib/birdovpn/dns-restore.json; then
+            echo "::error::the purge deleted the DNS journal in /var/lib/birdovpn"
+            exit 1
+          fi
+          echo "OK: the purge removed root's app data, followed no link and kept /var/lib/birdovpn"
+
       # The re-bundle replaced the AppImage and its .sig: the .sig must be over
       # the AppImage that ships (checked with node's Ed25519/BLAKE2b, as the
       # in-app updater checks it).

@@ -1,5 +1,8 @@
 //! Utility modules
 
+// MR-654: macOS/Linux "delete the application data" (--with-app-data).
+#[cfg(unix)]
+pub mod app_data_removal;
 pub mod console_log;
 pub mod crash_report;
 pub mod device_id;
