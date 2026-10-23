@@ -210,7 +210,7 @@ pub(crate) fn split_resolvers(
     resolvers
         .iter()
         .copied()
-        .partition(|ip| !(custom && lan_sharing && in_lan_range(*ip)))
+        .partition(|ip| !(custom && lan_sharing && is_lan_resolver(*ip)))
 }
 
 /// A Custom DNS address only the user's side of the tunnel can serve: a Local
