@@ -188,7 +188,11 @@ describe('Custom DNS is on every plan (owner decision D6, Account API item 40)',
     await userEvent.click(toggle);
     expect(screen.getByRole('textbox', { name: 'Primary DNS' })).toBeInTheDocument();
     await waitFor(() => expect(saves()).toHaveLength(1));
-    expect(document.body.textContent).not.toMatch(/sovereign|upgrade|view plans/i);
+    // Nothing upsells Custom DNS. Port Forwarding's lock (MR-1517) is the one
+    // plan name a Free or Operative user sees on this tab.
+    const portForward = screen.getByRole('button', { name: /^Port Forwarding/ });
+    const rest = (document.body.textContent ?? '').replace(portForward.textContent ?? '', '');
+    expect(rest).not.toMatch(/sovereign|upgrade|view plans/i);
   });
 });
 
@@ -240,8 +244,68 @@ describe("Stealth Mode follows the server's plan-gating table", () => {
     });
     render(<VpnSettings />);
     expect(screen.queryByRole('switch', { name: /Stealth Mode/, checked: true })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: /Stealth Mode.*Sovereign/ }));
+    await userEvent.click(screen.getByRole('button', { name: /^Stealth Mode\s*Requires Sovereign$/ }));
     expect(useAppStore.getState().navStack).toEqual(['pricing']);
+  });
+});
+
+/**
+ * MR-1517: Port Forwarding follows the server's plan-gating table too. On
+ * main the row showed no plan at all, and a Free or Operative user's first
+ * add met the backend's refusal as a generic error. A locked row still opens
+ * the screen (the upgrade replaces its add form there, see Screens.test.tsx):
+ * a user who made rules on a higher plan must still see and delete them after
+ * a downgrade (birdo-web MR-1706 keeps them listed, detached).
+ */
+describe("Port Forwarding follows the server's plan-gating table", () => {
+  const setPlan = (plan: string | null) =>
+    useAppStore.setState({ account: { ...useAppStore.getState().account, plan } });
+
+  it('the built-in table without one: locked for an Operative user, naming Sovereign, and it still opens the screen', async () => {
+    render(<Settings />);
+    // The lock is decorative, so the name says what it means.
+    await userEvent.click(screen.getByRole('button', { name: /^Port Forwarding\s*Requires Sovereign$/ }));
+    expect(useAppStore.getState().navStack).toEqual(['portForward']);
+    expect(useAppStore.getState().notice).toBeNull();
+  });
+
+  it('a server that opens it to Operative opens the screen for an Operative user, unlocked', async () => {
+    useAppStore.setState({ planGates: { OPERATIVE: { portForwarding: true } } });
+    render(<Settings />);
+    await userEvent.click(screen.getByRole('button', { name: 'Port Forwarding' }));
+    expect(useAppStore.getState().navStack).toEqual(['portForward']);
+    expect(useAppStore.getState().notice).toBeNull();
+  });
+
+  it("a server that closes it for Sovereign locks it for a Sovereign user (the server's table wins both ways)", async () => {
+    setPlan('SOVEREIGN');
+    useAppStore.setState({ planGates: { SOVEREIGN: { portForwarding: false } } });
+    render(<Settings />);
+    expect(screen.queryByRole('button', { name: 'Port Forwarding' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /^Port Forwarding\s*Requires / }));
+    expect(useAppStore.getState().navStack).toEqual(['portForward']);
+  });
+
+  it("names the lowest plan the server's table gives it", async () => {
+    setPlan('RECON');
+    useAppStore.setState({ planGates: { OPERATIVE: { portForwarding: true } } });
+    render(<Settings />);
+    await userEvent.click(screen.getByRole('button', { name: /^Port Forwarding\s*Requires Operative$/ }));
+    expect(useAppStore.getState().navStack).toEqual(['portForward']);
+  });
+
+  it('a plan that is not known yet: no lock and no upsell (W2-011)', async () => {
+    setPlan(null);
+    render(<Settings />);
+    await userEvent.click(screen.getByRole('button', { name: 'Port Forwarding' }));
+    expect(useAppStore.getState().navStack).toEqual(['portForward']);
+  });
+
+  it('a Sovereign user opens the screen', async () => {
+    setPlan('SOVEREIGN');
+    render(<Settings />);
+    await userEvent.click(screen.getByRole('button', { name: 'Port Forwarding' }));
+    expect(useAppStore.getState().navStack).toEqual(['portForward']);
   });
 });
 
