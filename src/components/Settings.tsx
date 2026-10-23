@@ -495,27 +495,18 @@ export function Settings() {
           />
           {settings.customDnsEnabled && customDnsOffered && <CustomDnsFields />}
           {/* MR-1517: a plan without Port Forwarding sees the row locked,
-              naming the plan it comes with, and goes to the plans, as on
-              Android and iOS: the screen's first add would only meet the
-              backend's refusal. While the plan is not known yet (`null`) the
-              row opens the screen as before: no lock, no upsell (W2-011). */}
+              naming the plan it comes with. It still opens the screen, which
+              shows the upgrade in place of the add form: rules made on a
+              higher plan stay listed after a downgrade (detached, no DNAT:
+              birdo-web MR-1706), and this screen is the only place a user can
+              delete them. While the plan is not known yet (`null`) there is
+              no lock and no upsell (W2-011). */}
           <SettingsLink
             icon={ArrowLeftRight}
             iconColor={statusTokens.blue}
             title="Port Forwarding"
             locked={portForwardUnlocked === false ? { label: portForwardPlan } : undefined}
-            onClick={() => {
-              if (portForwardUnlocked === false) {
-                const article = /^[AEIOU]/.test(portForwardPlan) ? 'an' : 'a';
-                useAppStore.getState().showNotice({
-                  text: `Port Forwarding is ${article} ${portForwardPlan} feature. Upgrade to enable.`,
-                  tone: 'info',
-                });
-                pushRoute('pricing');
-                return;
-              }
-              pushRoute('portForward');
-            }}
+            onClick={() => pushRoute('portForward')}
           />
           {/* Where mobile has Split Tunneling. WFP enforcement is
               Windows-only. Presented as "Kill Switch Exceptions", not "Split

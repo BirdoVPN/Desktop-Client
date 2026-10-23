@@ -16,10 +16,15 @@
  *
  * Rules are loaded on mount via invoke('get_port_forwards') and stored in the
  * zustand `portForwards` slice (camelCase Server/PortForward shape).
+ *
+ * A plan without Port Forwarding (MR-1517) gets the upgrade in place of the
+ * add form, and still sees and can delete its rules: after a downgrade the
+ * backend detaches them (no DNAT) but keeps them listed (birdo-web MR-1706),
+ * and no other surface can delete them.
  */
 import { useState, useEffect, useCallback } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { Plus, Trash, ArrowRightLeft, Network, CircleAlert } from 'lucide-react';
+import { Plus, Trash, ArrowRightLeft, Network, CircleAlert, Lock } from 'lucide-react';
 import {
   BirdoTopBar,
   BirdoSubCard,
@@ -33,6 +38,7 @@ import {
 import { useAppStore, type PortForward as PortForwardRule } from '@/store/app-store';
 import { white, status, hairline, brand } from '@/lib/birdo-theme';
 import { errorCopy } from '@/lib/errors';
+import { lowestPlanWith, planHasFeature, planName } from '@/lib/plan';
 import { toIpcError } from '@/lib/ipc';
 import { command } from '@/session/command';
 
@@ -67,11 +73,16 @@ interface CreatePortForwardResult {
 }
 
 export function PortForward() {
-  const { popRoute, portForwards, setPortForwards } = useAppStore(
+  const { popRoute, pushRoute, portForwards, setPortForwards, addLocked, planWithIt } = useAppStore(
     useShallow((s) => ({
       popRoute: s.popRoute,
+      pushRoute: s.pushRoute,
       portForwards: s.portForwards,
       setPortForwards: s.setPortForwards,
+      // MR-1517: the same gate as the Settings row. Only a KNOWN plan without
+      // it locks the form; `null` (not known yet) keeps it (W2-011).
+      addLocked: planHasFeature(s.account.plan, s.planGates, 'portForwarding') === false,
+      planWithIt: planName(lowestPlanWith('portForwarding', s.planGates) ?? 'SOVEREIGN'),
     }))
   );
 
@@ -177,6 +188,9 @@ export function PortForward() {
     [deletingIds, portForwards, setPortForwards]
   );
 
+  // Multi-Hop's wording (Dashboard), for the plan the server's table names.
+  const upsell = `Port Forwarding is ${/^[AEIOU]/.test(planWithIt) ? 'an' : 'a'} ${planWithIt} feature. Upgrade to enable.`;
+
   return (
     <div className="flex h-full flex-col">
       <BirdoTopBar title="Port Forwarding" onBack={popRoute} />
@@ -199,63 +213,80 @@ export function PortForward() {
 
         {/* ── New rule ─────────────────────────────────────────────────── */}
         <BirdoSectionHeader title="New rule" className="mt-3" />
-        <BirdoSubCard padding="1rem">
-          <BirdoTextField
-            value={portText}
-            onChange={(v) => setPortText(v.replace(/\D/g, '').slice(0, 5))}
-            label="Internal port"
-            placeholder="e.g. 8080"
-            inputMode="numeric"
-            errorText={showPortError ? 'Port must be 1024–65535' : null}
-          />
-
-          {/* Protocol segmented toggle (TCP / UDP) */}
-          <div className="mt-3 flex items-center gap-3">
-            <span className="text-sm" style={{ color: white.w60 }}>
-              Protocol
-            </span>
-            <div
-              className="inline-flex p-0.5"
-              role="group"
-              aria-label="Protocol"
-              style={{
-                borderRadius: 10,
-                backgroundColor: white.w05,
-                border: `1px solid ${white.w20}`,
-              }}
-            >
-              {(['tcp', 'udp'] as const).map((proto) => {
-                const selected = protocol === proto;
-                return (
-                  <button
-                    key={proto}
-                    type="button"
-                    onClick={() => setProtocol(proto)}
-                    aria-pressed={selected}
-                    className="birdo-toggle px-4 py-1 text-xs font-semibold uppercase tracking-wide transition-colors"
-                    style={{
-                      borderRadius: 8,
-                      backgroundColor: selected ? white.w10 : 'transparent',
-                      color: selected ? '#FFFFFF' : white.w60,
-                    }}
-                  >
-                    {proto}
-                  </button>
-                );
-              })}
+        {addLocked ? (
+          <BirdoSubCard padding="1rem">
+            <div className="flex items-start gap-2.5">
+              <Lock size={18} color={white.w60} aria-hidden className="mt-0.5 shrink-0" />
+              <div className="text-[13px]" style={{ color: white.w80 }}>
+                <p>{upsell}</p>
+                {!loading && !loadError && portForwards.length > 0 && (
+                  <p className="mt-1.5" style={{ color: white.w60 }}>
+                    The rules below are paused on your plan. You can still delete them.
+                  </p>
+                )}
+              </div>
             </div>
-          </div>
+            <BirdoButton text="View plans" onClick={() => pushRoute('pricing')} fullWidth className="mt-4" />
+          </BirdoSubCard>
+        ) : (
+          <BirdoSubCard padding="1rem">
+            <BirdoTextField
+              value={portText}
+              onChange={(v) => setPortText(v.replace(/\D/g, '').slice(0, 5))}
+              label="Internal port"
+              placeholder="e.g. 8080"
+              inputMode="numeric"
+              errorText={showPortError ? 'Port must be 1024–65535' : null}
+            />
 
-          <BirdoButton
-            text="Add rule"
-            onClick={handleAdd}
-            icon={Plus}
-            fullWidth
-            isLoading={adding}
-            disabled={!isPortValid || adding}
-            className="mt-4"
-          />
-        </BirdoSubCard>
+            {/* Protocol segmented toggle (TCP / UDP) */}
+            <div className="mt-3 flex items-center gap-3">
+              <span className="text-sm" style={{ color: white.w60 }}>
+                Protocol
+              </span>
+              <div
+                className="inline-flex p-0.5"
+                role="group"
+                aria-label="Protocol"
+                style={{
+                  borderRadius: 10,
+                  backgroundColor: white.w05,
+                  border: `1px solid ${white.w20}`,
+                }}
+              >
+                {(['tcp', 'udp'] as const).map((proto) => {
+                  const selected = protocol === proto;
+                  return (
+                    <button
+                      key={proto}
+                      type="button"
+                      onClick={() => setProtocol(proto)}
+                      aria-pressed={selected}
+                      className="birdo-toggle px-4 py-1 text-xs font-semibold uppercase tracking-wide transition-colors"
+                      style={{
+                        borderRadius: 8,
+                        backgroundColor: selected ? white.w10 : 'transparent',
+                        color: selected ? '#FFFFFF' : white.w60,
+                      }}
+                    >
+                      {proto}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <BirdoButton
+              text="Add rule"
+              onClick={handleAdd}
+              icon={Plus}
+              fullWidth
+              isLoading={adding}
+              disabled={!isPortValid || adding}
+              className="mt-4"
+            />
+          </BirdoSubCard>
+        )}
 
         {/* ── Active rules ─────────────────────────────────────────────── */}
         <BirdoSectionHeader title="Active rules" className="mt-4" />
@@ -284,7 +315,7 @@ export function PortForward() {
             <BirdoEmptyState
               icon={Network}
               title="No port forwarding rules yet"
-              description="Add one above to get started."
+              description={addLocked ? undefined : 'Add one above to get started.'}
             />
           </BirdoSubCard>
         ) : (

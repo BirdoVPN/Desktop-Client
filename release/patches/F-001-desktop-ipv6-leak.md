@@ -493,7 +493,9 @@ Sources:
   STEPS 6 AND 7 PASS".
 - **[S3]** The 2026-08-20 handoff record, "IPv6 — PROVEN END-TO-END 2026-08-20".
 - **[S4]** No result for this row in [S1]–[S3], in the master register (MR-1556:
-  the bench "was never run") or in this file's history.
+  the bench "was never run"), in the audit reports, in the device-results files
+  (they cover the Android emulator only), in the alignment record or in this
+  file's history.
 
 **Overall: not yet run on a client machine.** Rows 1, 6 and 7 hold fleet runs,
 labelled as such: the 2026-09-20 read-only sweep (row 1) and the 2026-09-20

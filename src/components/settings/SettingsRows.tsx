@@ -119,6 +119,27 @@ function Status({ id, text }: { id: string; text: string }) {
   );
 }
 
+/**
+ * A locked row's trailing lock and the plan that has it. The lock is
+ * decorative, so a screen reader also hears "Requires" before the plan:
+ * "Port Forwarding Requires Sovereign", not a bare plan name.
+ */
+function LockedTrailing({ label }: { label?: string }) {
+  return (
+    <span className="ml-2 flex shrink-0 items-center gap-1 text-xs" style={{ color: white.w60 }}>
+      <Lock size={16} aria-hidden />
+      {label ? (
+        <>
+          {/* The space outside: a name computation may trim it inside. */}
+          <span className="sr-only">Requires</span> {label}
+        </>
+      ) : (
+        'View plans'
+      )}
+    </span>
+  );
+}
+
 export interface SettingsToggleProps {
   icon: LucideIcon;
   iconColor: string;
@@ -163,10 +184,7 @@ export function SettingsToggle({
           <div className="min-w-0 flex-1">
             <Title text={title} enabled rowStyle={rowStyle} />
           </div>
-          <span className="ml-2 flex shrink-0 items-center gap-1 text-xs" style={{ color: white.w60 }}>
-            <Lock size={16} aria-hidden />
-            {locked.label ?? 'View plans'}
-          </span>
+          <LockedTrailing label={locked.label} />
         </button>
       </SettingsCard>
     );
@@ -212,7 +230,7 @@ export interface SettingsLinkProps {
   /**
    * The plan does not include it (mobile SettingsLink's `locked`): a dimmed
    * chip, and a lock with the plan that has it instead of the chevron. The
-   * row still takes the click; the caller routes it to the upgrade.
+   * row still takes the click, and the caller decides where it goes.
    */
   locked?: { label: string };
 }
@@ -232,10 +250,7 @@ export function SettingsLink({ icon, iconColor, title, onClick, trailing = 'chev
           <Title text={title} enabled rowStyle="chip" />
         </div>
         {locked ? (
-          <span className="ml-2 flex shrink-0 items-center gap-1 text-xs" style={{ color: white.w60 }}>
-            <Lock size={16} aria-hidden />
-            {locked.label}
-          </span>
+          <LockedTrailing label={locked.label} />
         ) : (
           <Trailing size={18} color={white.w55} aria-hidden className="ml-2 shrink-0" />
         )}

@@ -202,8 +202,9 @@ describe('Settings tab: mobile layout, no descriptions', () => {
   it('a link the plan does not include is locked and names the plan, still one row per card (MR-1517)', () => {
     useAppStore.setState({ account: { ...useAppStore.getState().account, plan: 'OPERATIVE' } });
     render(<Settings />);
-    // The title and the plan that has it: nothing else on the row.
-    const row = screen.getByRole('button', { name: /^Port Forwarding\s*Sovereign$/ });
+    // The title and the plan that has it: nothing else on the row. A screen
+    // reader hears "Requires" before the plan (the lock icon is decorative).
+    const row = screen.getByRole('button', { name: /^Port Forwarding\s*Requires Sovereign$/ });
     expect(within(row).getByText('Sovereign')).toBeInTheDocument();
     expect(within(cardOf(row)).getAllByRole('button')).toHaveLength(1);
   });
