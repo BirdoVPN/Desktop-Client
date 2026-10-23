@@ -209,10 +209,16 @@ export interface SettingsLinkProps {
   onClick: () => void;
   /** `external` opens a web page (mobile's OpenInNew trailing icon). */
   trailing?: 'chevron' | 'external';
+  /**
+   * The plan does not include it (mobile SettingsLink's `locked`): a dimmed
+   * chip, and a lock with the plan that has it instead of the chevron. The
+   * row still takes the click; the caller routes it to the upgrade.
+   */
+  locked?: { label: string };
 }
 
 /** Mobile `SettingsLink`: chip, title, chevron. */
-export function SettingsLink({ icon, iconColor, title, onClick, trailing = 'chevron' }: SettingsLinkProps) {
+export function SettingsLink({ icon, iconColor, title, onClick, trailing = 'chevron', locked }: SettingsLinkProps) {
   const Trailing = trailing === 'external' ? ExternalLink : ChevronRight;
   return (
     <SettingsCard>
@@ -221,11 +227,18 @@ export function SettingsLink({ icon, iconColor, title, onClick, trailing = 'chev
         onClick={onClick}
         className={`flex w-full items-center gap-3 px-3.5 py-3.5 ${ROW_FOCUS.chip} text-left transition-colors hover:bg-white/5`}
       >
-        <SettingIconChip icon={icon} tint={iconColor} />
+        <SettingIconChip icon={icon} tint={locked ? white.w55 : iconColor} />
         <div className="min-w-0 flex-1">
           <Title text={title} enabled rowStyle="chip" />
         </div>
-        <Trailing size={18} color={white.w55} aria-hidden className="ml-2 shrink-0" />
+        {locked ? (
+          <span className="ml-2 flex shrink-0 items-center gap-1 text-xs" style={{ color: white.w60 }}>
+            <Lock size={16} aria-hidden />
+            {locked.label}
+          </span>
+        ) : (
+          <Trailing size={18} color={white.w55} aria-hidden className="ml-2 shrink-0" />
+        )}
       </button>
     </SettingsCard>
   );

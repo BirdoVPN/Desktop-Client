@@ -75,7 +75,7 @@ import { brand, status as statusTokens, white } from '@/lib/birdo-theme';
 import { persistSettings, setKillSwitch, showSaveFailure } from '@/session/settings-persist';
 import { loadAppVersion, useUpdater } from '@/session/updater';
 import { DASHBOARD_URL, PRIVACY_URL, TERMS_URL } from '@/lib/links';
-import { customDnsAvailable } from '@/lib/plan';
+import { customDnsAvailable, lowestPlanWith, planHasFeature, planName } from '@/lib/plan';
 import { parseDeleteLogsResult, type DeleteLogsResult } from '@/lib/ipc';
 import type { Notice, WindowCorner } from '@/store/app-store';
 
@@ -152,15 +152,20 @@ export function deleteLogsNotice(result: DeleteLogsResult): Omit<Notice, 'id'> {
 }
 
 export function Settings() {
-  const { settings, windowCorner, setWindowCorner, pushRoute, customDnsOffered } = useAppStore(
-    useShallow((s) => ({
-      settings: s.settings,
-      windowCorner: s.windowCorner,
-      setWindowCorner: s.setWindowCorner,
-      pushRoute: s.pushRoute,
-      customDnsOffered: customDnsAvailable(s.account.plan, s.customDnsByPlan),
-    })),
-  );
+  const { settings, windowCorner, setWindowCorner, pushRoute, customDnsOffered, portForwardUnlocked, portForwardPlan } =
+    useAppStore(
+      useShallow((s) => ({
+        settings: s.settings,
+        windowCorner: s.windowCorner,
+        setWindowCorner: s.setWindowCorner,
+        pushRoute: s.pushRoute,
+        customDnsOffered: customDnsAvailable(s.account.plan, s.customDnsByPlan),
+        // MR-1517: the server's plan-gating table decides, the built-in one
+        // where it is silent. `null` = the plan is not known yet (W2-011).
+        portForwardUnlocked: planHasFeature(s.account.plan, s.planGates, 'portForwarding'),
+        portForwardPlan: planName(lowestPlanWith('portForwarding', s.planGates) ?? 'SOVEREIGN'),
+      })),
+    );
   const appVersion = useUpdater((s) => s.appVersion);
 
   const [biometric, setBiometric] = useState<BiometricStatus | null>(null);
@@ -489,11 +494,28 @@ export function Settings() {
             }
           />
           {settings.customDnsEnabled && customDnsOffered && <CustomDnsFields />}
+          {/* MR-1517: a plan without Port Forwarding sees the row locked,
+              naming the plan it comes with, and goes to the plans, as on
+              Android and iOS: the screen's first add would only meet the
+              backend's refusal. While the plan is not known yet (`null`) the
+              row opens the screen as before: no lock, no upsell (W2-011). */}
           <SettingsLink
             icon={ArrowLeftRight}
             iconColor={statusTokens.blue}
             title="Port Forwarding"
-            onClick={() => pushRoute('portForward')}
+            locked={portForwardUnlocked === false ? { label: portForwardPlan } : undefined}
+            onClick={() => {
+              if (portForwardUnlocked === false) {
+                const article = /^[AEIOU]/.test(portForwardPlan) ? 'an' : 'a';
+                useAppStore.getState().showNotice({
+                  text: `Port Forwarding is ${article} ${portForwardPlan} feature. Upgrade to enable.`,
+                  tone: 'info',
+                });
+                pushRoute('pricing');
+                return;
+              }
+              pushRoute('portForward');
+            }}
           />
           {/* Where mobile has Split Tunneling. WFP enforcement is
               Windows-only. Presented as "Kill Switch Exceptions", not "Split

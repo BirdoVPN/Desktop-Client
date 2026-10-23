@@ -83,6 +83,20 @@ for "BirdoVPN.exe / xray.exe to anywhere". If an executable's app id cannot be
 resolved, birdo.log says so at ERROR and the relay permit falls back to
 address + protocol + port; its name then ends `any app — app id unavailable`.
 
+**Smart App Control (MR-680): a known limitation, not a leak to fix.** No
+filter permits Windows' own cloud lookups, and none should. While the tunnel
+is up they go through it (`Birdo: Permit the tunnel interface`,
+`Birdo: Permit DNS to the tunnel resolvers`). In a reconnect gap, and behind a
+held lockdown block, they are dropped with everything else
+(`Birdo: Block all outbound IPv4`, `Birdo: Block all outbound IPv6`,
+`Birdo: Block DNS outside the tunnel`). Smart App Control then cannot check a
+**new, unsigned** program, so it blocks it (`os error 4551`, CodeIntegrity
+event 3077) until the tunnel is back or the block is lifted. Signed programs,
+the released BirdoVPN binaries among them, still run. A permit was not added:
+the lookups need DNS and HTTPS to Microsoft outside the tunnel, which is
+exactly what the block exists to stop. What users are told:
+[CODE_SIGNING.md › Windows Smart App Control](./CODE_SIGNING.md#windows-smart-app-control).
+
 **Routes.** The endpoint `/32` and the LAN-sharing routes go via the physical
 gateway. They are written to `%ProgramData%\BirdoVPN\dns-restore.json`
 (admin-only: only an elevated process can read or write it) with the boot

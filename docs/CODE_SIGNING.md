@@ -75,6 +75,41 @@ table in `azure-trusted-signing-setup.md`. The Sigstore bundle answers a
 different question, which neither prompt can: whether the download is the
 file this repo's release workflow built at that tag.
 
+### Windows Smart App Control
+
+Smart App Control (Windows 11) asks Microsoft's cloud about a program the
+first time it starts. Without an answer, it decides by the program's
+signature: a signed program runs, and an unsigned one is treated as untrusted
+and blocked. Windows then says `An Application Control policy has blocked
+this file` (`os error 4551`), and logs event 3077 under Event Viewer ›
+Applications and Services Logs › Microsoft › Windows › CodeIntegrity ›
+Operational.
+
+**While BirdoVPN shows Protected**, the lookup goes through the tunnel like
+any other traffic, and Smart App Control behaves as it does without the VPN.
+
+**Known limitation (MR-680): with the kill switch on, during a reconnect gap
+or while the kill switch holds the block** (the Always-on Kill Switch keeps it
+after reconnecting gives up), nothing leaves the PC except BirdoVPN's own
+traffic (to the VPN server, and its own HTTPS), DHCP, your local network if
+Local Network Sharing is on, and the apps you made Kill Switch Exceptions. DNS outside the tunnel is
+blocked too. Windows cannot reach its cloud, so a **new, unsigned** program
+started in that window is blocked, even one Smart App Control would otherwise
+let run. This fails closed on purpose: the kill switch opens no path outside
+the tunnel for Windows' own lookups.
+
+- Released BirdoVPN builds are Authenticode-signed (`BirdoVPN.exe`,
+  `xray.exe`, the installer), so they are not affected, and neither is any
+  other signed program.
+- A program that is blocked while BirdoVPN shows Protected, or with BirdoVPN
+  off, is blocked by Windows' own policy, not by the VPN. A freshly built
+  unsigned binary that nobody else runs is the usual case (it is what the
+  original `os error 4551` reports turned out to be: unsigned test binaries
+  on a development PC).
+- What to do: wait until BirdoVPN shows Protected again and start the program
+  again. If reconnecting has given up and the block is held, **Disconnect**
+  lifts it.
+
 ### macOS Gatekeeper
 
 The macOS build is unsigned and un-notarised, so macOS users will see a

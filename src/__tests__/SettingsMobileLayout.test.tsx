@@ -47,9 +47,10 @@ beforeEach(() => {
     connectionState: 'disconnected',
     notice: null,
     // Every conditional row showing: always-on (kill switch on), the two
-    // notification rows, the DNS fields.
+    // notification rows, the DNS fields. Sovereign, so no row is locked by
+    // the plan (Port Forwarding is Sovereign's, MR-1517).
     settings: { ...defaultSettings, killSwitchEnabled: true, notifications: true, customDnsEnabled: true },
-    account: { ...useAppStore.getState().account, plan: 'OPERATIVE' },
+    account: { ...useAppStore.getState().account, plan: 'SOVEREIGN' },
     customDnsByPlan: {},
     planGates: {},
     dnsFilteringAvailable: true,
@@ -191,11 +192,20 @@ describe('Settings tab: mobile layout, no descriptions', () => {
   });
 
   it('a row that cannot be used still says why (the one text a row keeps)', () => {
-    useAppStore.setState({ customDnsByPlan: { OPERATIVE: false } });
+    useAppStore.setState({ customDnsByPlan: { SOVEREIGN: false } });
     render(<Settings />);
     const row = screen.getByRole('switch', { name: 'Custom DNS Servers' });
     expect(row).toHaveAttribute('aria-disabled', 'true');
     expect(row).toHaveAccessibleDescription('Custom DNS is not available on your plan right now.');
+  });
+
+  it('a link the plan does not include is locked and names the plan, still one row per card (MR-1517)', () => {
+    useAppStore.setState({ account: { ...useAppStore.getState().account, plan: 'OPERATIVE' } });
+    render(<Settings />);
+    // The title and the plan that has it: nothing else on the row.
+    const row = screen.getByRole('button', { name: /^Port Forwarding\s*Sovereign$/ });
+    expect(within(row).getByText('Sovereign')).toBeInTheDocument();
+    expect(within(cardOf(row)).getAllByRole('button')).toHaveLength(1);
   });
 });
 
