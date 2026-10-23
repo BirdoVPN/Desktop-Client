@@ -464,24 +464,42 @@ which platforms were covered, and note that Android/iOS were checked against the
 
 ## Results
 
+Filled on 2026-10-23 from the recorded results only (MR-1665). **NOT RUN** means
+no record of that check exists: replace it with the result when the bench runs.
+A fleet run is labelled as one: it ran on a relay, not on a client machine, and
+not with this client.
+
 | Step | Result | Date | Notes |
 |---|---|---|---|
-| 1 host has IPv6 | n/a for the fleet | 2026-09-20 | **Fleet sweep: 10/10 relays pass** (2 global addrs, default route, v6 egress, ip6tables). Still to be captured on the bench machine: ISP_V6 = |
-| 2 baseline captured | | | |
-| 3 connected to v6 node | | | node = |
-| 4 configure_ipv6 ran | | | |
-| 5 route is the tunnel's | | | |
-| 6 no leak | **Fleet run, not a client machine:** pass for the relay side | 2026-08-20 | A plain WireGuard peer in an isolated netns on the Frankfurt relay, through London: handshake established, IPv6 egress = London's own global IPv6 (matching the address recorded for London server-side), IPv4 egress = London's IPv4. That proves the relays' in-tunnel v6 egress (NAT66). This client and its `configure_ipv6()` were not involved: still to be run on the bench, observed = |
-| 7 MTU | **Fleet run:** not covered | 2026-08-20 | The netns run made no MTU check. Still to be run on the bench |
-| 8 kill switch after disconnect | | | |
-| 9 clean restore | | | |
-| P1 endpoint host-route pinned | | | |
-| P2 route-add failure is loud | | | |
-| P3 clean teardown | | | |
+| 1 host has IPv6 | **Fleet sweep, not a client machine:** pass on 10/10 relays. On the bench machine: NOT RUN | 2026-09-20 | Read-only on every relay: two global IPv6 addresses, a default v6 route, working v6 egress, `ip6tables` present [S1]. The bench machine's own step 1 has no record, so ISP_V6 was never captured. |
+| 2 baseline captured | NOT RUN | — | No record [S4]. |
+| 3 connected to v6 node | NOT RUN | — | No record [S4]. |
+| 4 configure_ipv6 ran | NOT RUN | — | No record of a dual-stack client connect [S4]. CI executes `configure_ipv6()` on every push (see "What CI now covers"), which is not this step. |
+| 5 route is the tunnel's | NOT RUN | — | No record on a real line [S4]. CI proves the route shape (`::/1` + `8000::/1`, winning per `ip -6 route get`). |
+| 6 no leak | **Fleet run, not a client machine:** pass at the data plane | 2026-09-20 | A plain WireGuard peer, not this client, in an isolated network namespace on the London relay, through one temporary peer on the Amsterdam relay. No relay routing or firewall was changed, and the peer, the namespace and the keys were removed afterwards. Before the tunnel the namespace's traffic left as London's own address. Through it, the handshake completed and both IPv4 and IPv6 egress were the exit node's own addresses, the IPv6 one the node's global address. Server side: forwarding on, NAT66 masquerade for `fd00:b1d0::/64`, FORWARD accepting from `wg0` [S2]. An earlier run on 2026-08-20 (namespace on Frankfurt, through London) gave the same egress result [S3]. Not run: the browser checks (test-ipv6.com, ipleak.net), the control on a node without IPv6, and anything involving this client or its `configure_ipv6()`. |
+| 7 MTU | **Fleet run, not a client machine:** pass | 2026-09-20 | The same namespace run: an IPv6 ping with a 1372-byte payload (1372 + 48 = 1420, the default tunnel MTU) through the tunnel, 2/2 replies, 0% loss, 8.6 ms [S2]. The target is not recorded. The namespace's interface was set up by the test, not by this client, so this step's failure mode (the client not writing the interface MTU) is NOT RUN. |
+| 8 kill switch after disconnect | NOT RUN | — | No record [S4]. |
+| 9 clean restore | NOT RUN | — | No record [S4]. |
+| P1 endpoint host-route pinned | NOT RUN | — | No record [S4]. |
+| P2 route-add failure is loud | NOT RUN | — | No record [S4]. |
+| P3 clean teardown | NOT RUN | — | No record [S4]. |
 
-**Overall: not yet run on a client machine.** Rows 1, 6 and 7 hold fleet runs
-(the 2026-09-20 read-only sweep and the 2026-08-20 netns peer), labelled as such;
-neither ran this client. Step 1's prerequisite is proven
+Sources:
+
+- **[S1]** The open-work register, item F1, entry "ADVANCED 2026-09-20,
+  Desktop#197": step 1 read-only on 10/10 relays. Also "Why this cannot be run
+  on a production relay", above.
+- **[S2]** The open-work register, item F1, entry "DATA PATH PROVEN 2026-09-20 —
+  STEPS 6 AND 7 PASS".
+- **[S3]** The 2026-08-20 handoff record, "IPv6 — PROVEN END-TO-END 2026-08-20".
+- **[S4]** No result for this row in [S1]–[S3], in the master register (MR-1556:
+  the bench "was never run"), in the audit reports, in the device-results files
+  (they cover the Android emulator only), in the alignment record or in this
+  file's history.
+
+**Overall: not yet run on a client machine.** Rows 1, 6 and 7 hold fleet runs,
+labelled as such: the 2026-09-20 read-only sweep (row 1) and the 2026-09-20
+namespace peer (rows 6 and 7). Neither ran this client. Step 1's prerequisite is proven
 across the fleet, and goal 1 — that `configure_ipv6()` executes and installs the
 route shape it claims — is now proven in CI on every push. What remains is the
 part that needs a real dual-stack client: the leak test itself, MTU, and the kill

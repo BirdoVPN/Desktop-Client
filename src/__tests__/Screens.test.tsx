@@ -6,7 +6,8 @@
  *    and (owner 2026-10-21) mobile's layout with the speed-dial gauge.
  *  - Profile (W2-011, P1-parity-033): an unknown plan is not "Free plan";
  *    the connection status row; "MMM d, yyyy" dates; canonical chips.
- *  - Port Forwarding (W2-030): a failed load is not "No rules yet".
+ *  - Port Forwarding (W2-030): a failed load is not "No rules yet". A plan
+ *    without it (MR-1517) still lists and deletes its rules (MR-1706).
  *  - Kill Switch Exceptions (W2-043): the banner does not claim exceptions
  *    are active while the feature is off.
  *  - Offline banner (P1-parity-029), the update wall's Disconnect (W2-025),
@@ -433,6 +434,69 @@ describe('Port Forwarding (W2-030)', () => {
     mockedInvoke.mockImplementation(async () => []);
     await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
     expect(await screen.findByText('No port forwarding rules yet')).toBeInTheDocument();
+  });
+});
+
+/**
+ * MR-1517 with birdo-web MR-1706: a plan without Port Forwarding gets the
+ * upgrade in place of the add form, but still sees and can delete its rules.
+ * After a downgrade the backend detaches a rule (no DNAT) and keeps it listed,
+ * and this screen is the only place a user can delete it.
+ */
+describe('Port Forwarding on a plan without it (MR-1517, MR-1706)', () => {
+  const rule = { id: 'pf-1', externalPort: 40001, internalPort: 8080, protocol: 'tcp', enabled: true };
+  const setPlan = (plan: string | null) =>
+    useAppStore.setState({ account: { ...useAppStore.getState().account, plan } });
+  const rules = (list: unknown[]) =>
+    mockedInvoke.mockImplementation(async (cmd: string) => (cmd === 'get_port_forwards' ? list : undefined));
+
+  // The gating table is not an account field, so logout() leaves it.
+  afterEach(() => {
+    cleanup();
+    useAppStore.setState({ planGates: {} });
+  });
+
+  it('an Operative user still sees a rule made on Sovereign and can delete it; the add form is the upgrade', async () => {
+    setPlan('OPERATIVE');
+    rules([rule]);
+    render(<PortForward />);
+    expect(await screen.findByText('40001')).toBeInTheDocument();
+    expect(screen.getByText('Port Forwarding is a Sovereign feature. Upgrade to enable.')).toBeInTheDocument();
+    expect(screen.getByText('The rules below are paused on your plan. You can still delete them.')).toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Internal port' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Add rule' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Delete rule 40001' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(callsTo('delete_port_forward')).toEqual([['delete_port_forward', { id: 'pf-1' }]]));
+    expect(await screen.findByText('No port forwarding rules yet')).toBeInTheDocument();
+    expect(callsTo('create_port_forward')).toHaveLength(0);
+  });
+
+  it("View plans goes to the plans, naming the lowest plan the server's table gives it", async () => {
+    setPlan('RECON');
+    useAppStore.setState({ planGates: { OPERATIVE: { portForwarding: true } } });
+    rules([]);
+    render(<PortForward />);
+    expect(await screen.findByText('No port forwarding rules yet')).toBeInTheDocument();
+    expect(screen.getByText('Port Forwarding is an Operative feature. Upgrade to enable.')).toBeInTheDocument();
+    // Nothing to pause, and no form "above" to add one with.
+    expect(screen.queryByText(/paused/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Add one above to get started.')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'View plans' }));
+    expect(useAppStore.getState().navStack).toEqual(['pricing']);
+  });
+
+  it('a plan with it, or one not known yet (W2-011), keeps the add form and shows no upsell', async () => {
+    for (const plan of ['SOVEREIGN', null]) {
+      setPlan(plan);
+      rules([]);
+      const { unmount } = render(<PortForward />);
+      expect(await screen.findByText('No port forwarding rules yet')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Add rule' })).toBeInTheDocument();
+      expect(screen.queryByText(/Upgrade to enable/)).not.toBeInTheDocument();
+      unmount();
+    }
   });
 });
 
