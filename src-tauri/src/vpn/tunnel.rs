@@ -1556,7 +1556,9 @@ impl WintunTunnel {
         // which /24 the tunnel address happens to share. The DNS guard only
         // lets DNS out over the tunnel interface, so a missing pin fails
         // closed (no DNS), never open. The user's own LAN resolver is not
-        // pinned (REVIEW-WIN2-006): LAN sharing's route takes it to the LAN.
+        // pinned (REVIEW-WIN2-006): LAN sharing's route takes it to the LAN,
+        // and a CGNAT one (MR-689) goes where the machine's own route for it
+        // points, or into the tunnel when there is none.
         for resolver in self.tunnel_resolvers().0 {
             match add_route_native(resolver, 32, Ipv4Addr::UNSPECIFIED, if_index, 5) {
                 Ok(()) => record_tunnel_route(&resolver.to_string(), "255.255.255.255"),
