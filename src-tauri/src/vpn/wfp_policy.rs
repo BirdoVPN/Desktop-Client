@@ -65,6 +65,11 @@ const LAN_RANGES: [(Ipv4Addr, u8, &str); 4] = [
     (Ipv4Addr::new(169, 254, 0, 0), 16, "link-local"),
 ];
 
+/// Carrier-grade NAT's shared address space (RFC 6598). Not a range Local
+/// Network Sharing opens; a Custom DNS server in it is still the user's own
+/// (MR-689, see [`split_resolvers`]).
+const CGNAT: (Ipv4Addr, u8) = (Ipv4Addr::new(100, 64, 0, 0), 10);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Layer {
     ConnectV4,
@@ -181,6 +186,22 @@ pub(crate) struct DnsGuard {
 /// fleet resolver is itself in 10/8), and without Local Network Sharing a
 /// private Custom DNS server stays pinned to the tunnel — unreachable, but
 /// never reached in the clear.
+///
+/// MR-689: a Custom DNS server in CGNAT space (100.64/10) is the same
+/// exception. No resolver on the internet is there and the relay cannot reach
+/// one, so pinned into the tunnel it too left the session with no DNS. It is
+/// not pinned, so the route the machine already has for that address carries
+/// the query: the LAN's own subnet (a router that numbers its LAN from
+/// 100.64/10) or an overlay network's adapter. With no such route the
+/// tunnel's split routes still take it into the tunnel — never in the clear.
+/// Local Network Sharing itself still opens only the private ranges.
+///
+/// A Custom DNS server on a PUBLIC address stays pinned to the tunnel, even
+/// on the local subnet: any network can number itself from a public range
+/// (TunnelCrack's "LocalNet"), and treating an on-link public address as the
+/// LAN's would hand that network, in the clear, the queries for a public
+/// resolver the user meant to reach through the tunnel. A public-range LAN's
+/// own resolver is a documented limitation (docs/WINDOWS-LEAK-VALIDATION.md).
 pub(crate) fn split_resolvers(
     resolvers: &[Ipv4Addr],
     custom: bool,
@@ -189,14 +210,24 @@ pub(crate) fn split_resolvers(
     resolvers
         .iter()
         .copied()
-        .partition(|ip| !(custom && lan_sharing && in_lan_range(*ip)))
+        .partition(|ip| !(custom && lan_sharing && is_lan_resolver(*ip)))
+}
+
+/// A Custom DNS address only the user's side of the tunnel can serve: a Local
+/// Network Sharing range, or CGNAT space (MR-689).
+fn is_lan_resolver(ip: Ipv4Addr) -> bool {
+    in_lan_range(ip) || in_net(ip, CGNAT.0, CGNAT.1)
 }
 
 fn in_lan_range(ip: Ipv4Addr) -> bool {
-    LAN_RANGES.iter().any(|(net, prefix, _)| {
-        let mask = u32::MAX << (32 - prefix);
-        u32::from(ip) & mask == u32::from(*net) & mask
-    })
+    LAN_RANGES
+        .iter()
+        .any(|(net, prefix, _)| in_net(ip, *net, *prefix))
+}
+
+fn in_net(ip: Ipv4Addr, net: Ipv4Addr, prefix: u8) -> bool {
+    let mask = u32::MAX << (32 - prefix);
+    u32::from(ip) & mask == u32::from(net) & mask
 }
 
 /// The kill switch's block-all and everything it lets through.
@@ -1895,6 +1926,72 @@ mod tests {
         };
         assert_eq!(
             decide(&specs(&gap), &out4(SVCHOST, PIHOLE.octets(), 53, UDP, WIFI)),
+            Some(Action::Block)
+        );
+    }
+
+    /// MR-689: a Custom DNS server in CGNAT space (100.64/10) is the user's
+    /// own as well, with Local Network Sharing on and only then. A public one
+    /// never is, and the range's edges are exact.
+    #[test]
+    fn a_cgnat_custom_resolver_with_lan_sharing_is_the_lans_a_public_one_never() {
+        let cgnat = vec![
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(100, 100, 100, 100),
+            Ipv4Addr::new(100, 127, 255, 254),
+        ];
+        let outside = vec![
+            Ipv4Addr::new(100, 63, 255, 255),
+            Ipv4Addr::new(100, 128, 0, 1),
+            Ipv4Addr::new(9, 9, 9, 9),
+            Ipv4Addr::new(130, 89, 0, 53),
+        ];
+        let all: Vec<Ipv4Addr> = cgnat.iter().chain(&outside).copied().collect();
+
+        assert_eq!(
+            split_resolvers(&all, true, true),
+            (outside.clone(), cgnat.clone())
+        );
+        assert_eq!(split_resolvers(&all, true, false), (all.clone(), vec![]));
+        // The server's own resolvers never leave, CGNAT or not.
+        assert_eq!(split_resolvers(&cgnat, false, true), (cgnat, vec![]));
+    }
+
+    /// MR-689, end to end through the filters: the CGNAT resolver is reached
+    /// on the physical interface, DNS only, and nothing else in 100.64/10 is
+    /// opened (Local Network Sharing's own ranges are unchanged).
+    #[test]
+    fn a_cgnat_lan_resolver_gets_dns_and_cgnat_gets_nothing_else() {
+        let tailnet_dns = Ipv4Addr::new(100, 100, 100, 100);
+        let (resolvers, lan_resolvers) = split_resolvers(&[tailnet_dns], true, true);
+        let policy = Policy {
+            block_all: Some(BlockAll {
+                lan_sharing: true,
+                ..block(Some(wg_relay()))
+            }),
+            v6_block: false,
+            dns_guard: Some(DnsGuard {
+                resolvers,
+                lan_resolvers,
+                ..guard(true)
+            }),
+        };
+        let s = specs(&policy);
+        for (protocol, port) in [(UDP, 53), (TCP, 53)] {
+            assert_eq!(
+                decide(
+                    &s,
+                    &out4(SVCHOST, tailnet_dns.octets(), port, protocol, WIFI)
+                ),
+                Some(Action::Permit)
+            );
+        }
+        assert_eq!(
+            decide(&s, &out4(SVCHOST, [100, 100, 100, 101], 53, UDP, WIFI)),
+            Some(Action::Block)
+        );
+        assert_eq!(
+            decide(&s, &out4(CHROME, tailnet_dns.octets(), 443, TCP, WIFI)),
             Some(Action::Block)
         );
     }
