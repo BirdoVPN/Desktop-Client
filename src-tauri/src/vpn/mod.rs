@@ -567,6 +567,25 @@ pub mod dns_journal {
         marker: &std::path::Path,
         upgrade_window: bool,
     ) -> Migration {
+        migrate_legacy_with(
+            legacy,
+            protected,
+            marker,
+            upgrade_window,
+            sanitize_unverified_journal,
+        )
+    }
+
+    /// [`migrate_legacy`] with the sanitiser passed in, so a test reaches the
+    /// branch where it fails (MR-2017).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn migrate_legacy_with(
+        legacy: &crate::utils::safe_fs::OwnedDir,
+        protected: &std::path::Path,
+        marker: &std::path::Path,
+        upgrade_window: bool,
+        sanitize: fn(&[u8]) -> Option<Vec<u8>>,
+    ) -> Migration {
         use std::io::Read;
         if marker.exists() {
             return Migration::AlreadyDone;
@@ -598,7 +617,7 @@ pub mod dns_journal {
                     let bytes = if upgrade_window {
                         bytes
                     } else {
-                        sanitize_unverified_journal(&bytes).unwrap_or(bytes)
+                        sanitize(&bytes).unwrap_or(bytes)
                     };
                     match write_bytes_atomically(protected, &bytes) {
                         Ok(()) => {
@@ -1588,7 +1607,7 @@ pub mod dns_journal {
     mod legacy_journal_tests {
         #[cfg(windows)]
         use super::DnsJournal;
-        use super::{migrate_legacy, Migration, JOURNAL_FILE};
+        use super::{migrate_legacy, migrate_legacy_with, Migration, JOURNAL_FILE};
         use crate::utils::safe_fs::OwnedDir;
         use std::path::PathBuf;
 
@@ -1753,6 +1772,65 @@ pub mod dns_journal {
                 vec!["203.0.113.53".to_string()]
             );
             assert!(!kept.adapters[0].v4_was_dhcp);
+        }
+
+        /// MR-2017: fail closed. Outside the window only the SANITISED record
+        /// may reach the admin-only directory. When the sanitiser yields none,
+        /// the takeover used to copy the user-writable file's own bytes in
+        /// (`unwrap_or(bytes)`), so whatever an unelevated process planted
+        /// there survived the move unsanitised. Now nothing is taken over:
+        /// the file is left where it is, unused, and that folder is not read
+        /// for a journal again. Inside the window (a genuine upgrade) the
+        /// record is trusted and the sanitiser is never consulted.
+        #[test]
+        fn a_journal_that_cannot_be_sanitised_is_not_taken_over() {
+            let planted = journal(r#","planted":"NOT-A-JOURNAL-FIELD""#);
+            let d = dirs();
+            std::fs::write(d.legacy.join(JOURNAL_FILE), &planted).unwrap();
+            assert_eq!(
+                migrate_legacy_with(&d.legacy, &d.protected, &d.marker, false, |_| None),
+                Migration::LeftInPlace
+            );
+            assert!(
+                !d.protected.exists(),
+                "unsanitised bytes reached the admin-only directory"
+            );
+            assert_eq!(read(&d.legacy.join(JOURNAL_FILE)), planted, "left as it was");
+            assert!(d.marker.exists());
+            assert_eq!(
+                migrate_legacy_with(&d.legacy, &d.protected, &d.marker, false, |_| None),
+                Migration::AlreadyDone
+            );
+            assert!(!d.protected.exists());
+
+            let d2 = dirs();
+            std::fs::write(d2.legacy.join(JOURNAL_FILE), journal("")).unwrap();
+            assert_eq!(
+                migrate_legacy_with(&d2.legacy, &d2.protected, &d2.marker, true, |_| None),
+                Migration::Moved
+            );
+            assert_eq!(read(&d2.protected), journal(""));
+        }
+
+        /// MR-2017 with the real sanitiser, on every target: outside the
+        /// window the admin-only copy is the record as parsed, never the
+        /// file's own bytes, so a field planted beside the record's own is
+        /// dropped.
+        #[test]
+        fn an_unverified_journal_is_written_as_parsed_not_as_its_bytes() {
+            let planted = journal(r#","planted":"NOT-A-JOURNAL-FIELD""#);
+            let d = dirs();
+            std::fs::write(d.legacy.join(JOURNAL_FILE), &planted).unwrap();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, false),
+                Migration::Moved
+            );
+            let got = read(&d.protected);
+            assert!(!got.contains("planted"), "{got}");
+            assert!(
+                got.contains(&format!("\"os\":\"{}\"", std::env::consts::OS)),
+                "{got}"
+            );
         }
 
         /// The machine-wide record already in the admin-only directory is
