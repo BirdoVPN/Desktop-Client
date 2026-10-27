@@ -1996,6 +1996,56 @@ mod tests {
         );
     }
 
+    /// MR-689 (owner decision 2026-10-26): only the private ranges are ever
+    /// the LAN's. A CGNAT or public Custom DNS server stays in the tunnel even
+    /// with Local Network Sharing on, and the range edges are exact.
+    #[test]
+    fn only_a_private_custom_resolver_is_ever_the_lans() {
+        let private = vec![Ipv4Addr::new(192, 168, 1, 2), Ipv4Addr::new(10, 0, 0, 53)];
+        let tunnel = vec![
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(100, 100, 100, 100),
+            Ipv4Addr::new(100, 127, 255, 254),
+            Ipv4Addr::new(9, 9, 9, 9),
+            Ipv4Addr::new(130, 89, 0, 53),
+        ];
+        let all: Vec<Ipv4Addr> = private.iter().chain(&tunnel).copied().collect();
+
+        assert_eq!(split_resolvers(&all, true, true), (tunnel, private));
+        assert_eq!(split_resolvers(&all, true, false), (all.clone(), vec![]));
+    }
+
+    /// MR-689, end to end through the filters: with Custom DNS and Local
+    /// Network Sharing on, DNS to a CGNAT resolver on the physical interface
+    /// is blocked (it may only leave through the tunnel).
+    #[test]
+    fn dns_to_a_cgnat_custom_resolver_never_leaves_outside_the_tunnel() {
+        let tailnet_dns = Ipv4Addr::new(100, 100, 100, 100);
+        let (resolvers, lan_resolvers) = split_resolvers(&[tailnet_dns], true, true);
+        let policy = Policy {
+            block_all: Some(BlockAll {
+                lan_sharing: true,
+                ..block(Some(wg_relay()))
+            }),
+            v6_block: false,
+            dns_guard: Some(DnsGuard {
+                resolvers,
+                lan_resolvers,
+                ..guard(true)
+            }),
+        };
+        let s = specs(&policy);
+        for (protocol, port) in [(UDP, 53), (TCP, 53), (TCP, 853)] {
+            assert_eq!(
+                decide(
+                    &s,
+                    &out4(SVCHOST, tailnet_dns.octets(), port, protocol, WIFI)
+                ),
+                Some(Action::Block)
+            );
+        }
+    }
+
     // ── Ordering and scope ──────────────────────────────────────────────
 
     #[test]
