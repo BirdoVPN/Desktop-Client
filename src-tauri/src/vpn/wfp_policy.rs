@@ -1825,10 +1825,17 @@ mod tests {
         let fleet = Ipv4Addr::new(10, 13, 13, 1);
         let ten = Ipv4Addr::new(10, 0, 0, 53);
         let corp = Ipv4Addr::new(172, 20, 0, 53);
-        let all = [PIHOLE, public, ten, corp];
+        // MR-689 (owner decision 2026-10-26): CGNAT space is never the LAN's,
+        // edges included, and neither is a public address.
+        let cgnat = [
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(100, 100, 100, 100),
+            Ipv4Addr::new(100, 127, 255, 254),
+        ];
+        let all = [PIHOLE, public, ten, corp, cgnat[0], cgnat[1], cgnat[2]];
 
         let (tunnel, lan) = split_resolvers(&all, true, true);
-        assert_eq!(tunnel, vec![public]);
+        assert_eq!(tunnel, vec![public, cgnat[0], cgnat[1], cgnat[2]]);
         assert_eq!(lan, vec![PIHOLE, ten, corp]);
         // Without LAN sharing it stays pinned to the tunnel (unreachable,
         // never in the clear).
@@ -1897,6 +1904,62 @@ mod tests {
             decide(&specs(&gap), &out4(SVCHOST, PIHOLE.octets(), 53, UDP, WIFI)),
             Some(Action::Block)
         );
+    }
+
+    /// MR-689 (owner decision 2026-10-26): a CGNAT or public Custom DNS
+    /// server is only ever reached through the tunnel. With Local Network
+    /// Sharing on, reactive and lockdown alike, DNS to it on the physical
+    /// interface is blocked on every DNS port, and through the tunnel it is the
+    /// session's resolver like any other.
+    #[test]
+    fn a_cgnat_or_public_custom_resolver_is_only_reached_through_the_tunnel() {
+        for resolver in [
+            Ipv4Addr::new(100, 100, 100, 100),
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(9, 9, 9, 9),
+        ] {
+            let (resolvers, lan_resolvers) = split_resolvers(&[resolver], true, true);
+            assert!(lan_resolvers.is_empty(), "{resolver} is never the LAN's");
+            let dns_guard = DnsGuard {
+                resolvers,
+                lan_resolvers,
+                ..guard(true)
+            };
+            let policies = [
+                // Reactive, Connected.
+                Policy {
+                    block_all: None,
+                    v6_block: true,
+                    dns_guard: Some(dns_guard.clone()),
+                },
+                // Lockdown, Connected, LAN sharing on.
+                Policy {
+                    block_all: Some(BlockAll {
+                        lan_sharing: true,
+                        ..block(Some(wg_relay()))
+                    }),
+                    v6_block: false,
+                    dns_guard: Some(dns_guard),
+                },
+            ];
+            for policy in policies {
+                let s = specs(&policy);
+                for (protocol, port) in [(UDP, 53), (TCP, 53), (TCP, 853), (UDP, 853)] {
+                    assert_eq!(
+                        decide(&s, &out4(SVCHOST, resolver.octets(), port, protocol, WIFI)),
+                        Some(Action::Block),
+                        "{resolver}:{port}/{protocol} on Wi-Fi, {policy:?}"
+                    );
+                }
+                for protocol in [UDP, TCP] {
+                    assert_eq!(
+                        decide(&s, &out4(SVCHOST, resolver.octets(), 53, protocol, TUNNEL)),
+                        Some(Action::Permit),
+                        "{resolver}:53/{protocol} through the tunnel, {policy:?}"
+                    );
+                }
+            }
+        }
     }
 
     // ── Ordering and scope ──────────────────────────────────────────────
