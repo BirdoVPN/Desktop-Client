@@ -502,8 +502,9 @@ pub mod dns_journal {
         /// Moved into the admin-only directory.
         Moved,
         /// Left where it is, unread by the app from now on: unreadable, from
-        /// another OS, or a journal is already in the admin-only directory
-        /// (another account's machine state, which is the newer record).
+        /// another OS, a journal is already in the admin-only directory
+        /// (another account's machine state, which is the newer record), or,
+        /// outside the upgrade window, it could not be sanitised (MR-2017).
         LeftInPlace,
         /// The admin-only copy could not be written; tried again next start.
         Failed,
@@ -519,8 +520,9 @@ pub mod dns_journal {
     /// legacy-upgrade window (D6c): drop every route (nothing is deleted on an
     /// unverified record) and heal every recorded adapter to DHCP / automatic
     /// DNS rather than to its journal-supplied resolver values. `None` when the
-    /// bytes do not parse (the caller keeps them as-is; the OS check already
-    /// refused a non-journal). Windows only; a no-op elsewhere.
+    /// bytes do not parse or the record does not serialise again: the caller
+    /// then takes nothing over and never falls back to the bytes as they are
+    /// (MR-2017).
     #[cfg(windows)]
     fn sanitize_unverified_journal(bytes: &[u8]) -> Option<Vec<u8>> {
         let mut journal: DnsJournal = serde_json::from_slice(bytes).ok()?;
@@ -534,9 +536,14 @@ pub mod dns_journal {
         serde_json::to_vec(&journal).ok()
     }
 
+    /// Elsewhere [`migrate_legacy`] has no caller outside the tests (the
+    /// takeover there is `adopt_legacy_once`, which only moves a journal root
+    /// wrote) and this OS's record has no Windows routes or adapters to drop.
+    /// It is still written as parsed, never as the file's own bytes (MR-2017).
     #[cfg(not(windows))]
-    fn sanitize_unverified_journal(_bytes: &[u8]) -> Option<Vec<u8>> {
-        None
+    fn sanitize_unverified_journal(bytes: &[u8]) -> Option<Vec<u8>> {
+        let journal: DnsJournal = serde_json::from_slice(bytes).ok()?;
+        serde_json::to_vec(&journal).ok()
     }
 
     /// D6c (W1-008 vs #293 R1): the journal describes MACHINE state — adapter
@@ -556,7 +563,8 @@ pub mod dns_journal {
     /// every adapter is healed to DHCP/automatic DNS instead of to
     /// journal-supplied resolver values — still enough to lift a park and give
     /// the machine working DNS back, but it cannot be steered to attacker
-    /// values. INSIDE the window (a genuine pre-#287 upgrade) the record is
+    /// values. A record that cannot be sanitised is not taken over at all
+    /// (MR-2017): left in place, unused. INSIDE the window (a genuine pre-#287 upgrade) the record is
     /// trusted as before, routes and resolvers included.
     ///
     /// The old file is read and deleted through checked handles (MR-1945).
@@ -566,6 +574,25 @@ pub mod dns_journal {
         protected: &std::path::Path,
         marker: &std::path::Path,
         upgrade_window: bool,
+    ) -> Migration {
+        migrate_legacy_with(
+            legacy,
+            protected,
+            marker,
+            upgrade_window,
+            sanitize_unverified_journal,
+        )
+    }
+
+    /// [`migrate_legacy`] with the sanitiser passed in, so a test reaches the
+    /// branch where it fails (MR-2017).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn migrate_legacy_with(
+        legacy: &crate::utils::safe_fs::OwnedDir,
+        protected: &std::path::Path,
+        marker: &std::path::Path,
+        upgrade_window: bool,
+        sanitize: fn(&[u8]) -> Option<Vec<u8>>,
     ) -> Migration {
         use std::io::Read;
         if marker.exists() {
@@ -595,20 +622,29 @@ pub mod dns_journal {
                 } else {
                     // Outside the upgrade window the record is unverified: drop
                     // routes and heal to DHCP, never to journal-supplied values.
+                    // MR-2017: and fail closed. With no sanitised record there
+                    // is no takeover: the file's own bytes never reach the
+                    // admin-only directory unsanitised.
                     let bytes = if upgrade_window {
-                        bytes
+                        Some(bytes)
                     } else {
-                        sanitize_unverified_journal(&bytes).unwrap_or(bytes)
+                        sanitize(&bytes)
                     };
-                    match write_bytes_atomically(protected, &bytes) {
-                        Ok(()) => {
+                    match bytes.map(|bytes| write_bytes_atomically(protected, &bytes)) {
+                        None => {
+                            tracing::warn!(
+                                "Left the old DNS journal in %APPDATA% in place, unused: it could not be sanitised (MR-2017)"
+                            );
+                            Migration::LeftInPlace
+                        }
+                        Some(Ok(())) => {
                             if let Err(e) = legacy.remove_file(JOURNAL_FILE) {
                                 tracing::warn!("The old DNS journal was not deleted: {}", e);
                             }
                             tracing::info!("Moved the DNS journal to the admin-only directory");
                             Migration::Moved
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             tracing::warn!(
                                 "Could not move the old DNS journal ({}) — retrying next start",
                                 e
@@ -1588,7 +1624,7 @@ pub mod dns_journal {
     mod legacy_journal_tests {
         #[cfg(windows)]
         use super::DnsJournal;
-        use super::{migrate_legacy, Migration, JOURNAL_FILE};
+        use super::{migrate_legacy, migrate_legacy_with, Migration, JOURNAL_FILE};
         use crate::utils::safe_fs::OwnedDir;
         use std::path::PathBuf;
 
@@ -1753,6 +1789,69 @@ pub mod dns_journal {
                 vec!["203.0.113.53".to_string()]
             );
             assert!(!kept.adapters[0].v4_was_dhcp);
+        }
+
+        /// MR-2017: fail closed. Outside the window only the SANITISED record
+        /// may reach the admin-only directory. When the sanitiser yields none,
+        /// the takeover used to copy the user-writable file's own bytes in
+        /// (`unwrap_or(bytes)`), so whatever an unelevated process planted
+        /// there survived the move unsanitised. Now nothing is taken over:
+        /// the file is left where it is, unused, and that folder is not read
+        /// for a journal again. Inside the window (a genuine upgrade) the
+        /// record is trusted and the sanitiser is never consulted.
+        #[test]
+        fn a_journal_that_cannot_be_sanitised_is_not_taken_over() {
+            let planted = journal(r#","planted":"NOT-A-JOURNAL-FIELD""#);
+            let d = dirs();
+            std::fs::write(d.legacy.join(JOURNAL_FILE), &planted).unwrap();
+            assert_eq!(
+                migrate_legacy_with(&d.legacy, &d.protected, &d.marker, false, |_| None),
+                Migration::LeftInPlace
+            );
+            assert!(
+                !d.protected.exists(),
+                "unsanitised bytes reached the admin-only directory"
+            );
+            assert_eq!(
+                read(&d.legacy.join(JOURNAL_FILE)),
+                planted,
+                "left as it was"
+            );
+            assert!(d.marker.exists());
+            assert_eq!(
+                migrate_legacy_with(&d.legacy, &d.protected, &d.marker, false, |_| None),
+                Migration::AlreadyDone
+            );
+            assert!(!d.protected.exists());
+
+            let d2 = dirs();
+            std::fs::write(d2.legacy.join(JOURNAL_FILE), journal("")).unwrap();
+            assert_eq!(
+                migrate_legacy_with(&d2.legacy, &d2.protected, &d2.marker, true, |_| None),
+                Migration::Moved
+            );
+            assert_eq!(read(&d2.protected), journal(""));
+        }
+
+        /// MR-2017 with the real sanitiser, on every target: outside the
+        /// window the admin-only copy is the record as parsed, never the
+        /// file's own bytes, so a field planted beside the record's own is
+        /// dropped.
+        #[test]
+        fn an_unverified_journal_is_written_as_parsed_not_as_its_bytes() {
+            let planted = journal(r#","planted":"NOT-A-JOURNAL-FIELD""#);
+            let d = dirs();
+            std::fs::write(d.legacy.join(JOURNAL_FILE), &planted).unwrap();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, false),
+                Migration::Moved
+            );
+            let got = read(&d.protected);
+            assert!(!got.contains("planted"), "{got}");
+            assert!(
+                got.contains(&format!("\"os\":\"{}\"", std::env::consts::OS)),
+                "{got}"
+            );
         }
 
         /// The machine-wide record already in the admin-only directory is

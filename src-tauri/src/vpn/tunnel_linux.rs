@@ -687,7 +687,15 @@ impl LinuxTunnel {
 
         // Reads only: a TUN write never waits (the kernel queues the packet
         // or refuses it), so it is issued directly ([`tun_write`]).
-        let tun = match AsyncFd::with_interest(tun_fd, Interest::READABLE) {
+        //
+        // SAFETY: `register_with_interest` (tokio 1.53.3 deprecated the safe
+        // `with_interest` as unsound, tokio#8587) needs the fd open, and the
+        // same fd, for as long as the AsyncFd holds it. `tun_fd` is this
+        // loop's own `Arc<OwnedFd>` (MR-820): the device is closed only when
+        // the last clone drops the `OwnedFd`, never by number, so it stays
+        // open while the AsyncFd owns this clone, and an `OwnedFd` never
+        // changes its fd.
+        let tun = match unsafe { AsyncFd::register_with_interest(tun_fd, Interest::READABLE) } {
             Ok(tun) => tun,
             Err(e) => {
                 tracing::error!("Packet loop: the TUN fd could not be watched: {}", e);
@@ -985,8 +993,12 @@ mod tun_read_tests {
         use std::os::fd::{FromRawFd, OwnedFd};
         let (r, w) = nonblocking_pipe();
         let fd: super::SharedFd = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(r) });
-        let watched =
-            tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE).unwrap();
+        // SAFETY: as in the packet loop — the read end is closed only when the
+        // AsyncFd drops its `OwnedFd`; the tests close the write end alone.
+        let watched = unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE)
+        }
+        .unwrap();
         (watched, w)
     }
 
@@ -1075,7 +1087,7 @@ mod tun_read_tests {
             .expect("the packet loop")..];
         let body = &body[..body.find("\n    }\n}\n").expect("its end")];
         for needle in [
-            "AsyncFd::with_interest(",
+            "AsyncFd::register_with_interest(",
             "tun.readable(), if tun_open =>",
             "socket.readable() =>",
             "timers.tick() =>",
