@@ -150,20 +150,58 @@ pub struct XrayConfig {
 /// how long a stealth session can sit dead under a "Protected" UI.
 const HEALTH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The PID of the xray in the slot, readable without the slot's async lock
-/// (MR-849).
+/// The xray in the slot, reachable without the slot's async lock (MR-849).
 ///
 /// `Drop` cannot await that lock, and losing its `try_lock` used to mean a
-/// warning while xray ran on: Windows ends it with the kill-on-close job, but
-/// macOS and Linux had nothing, so it was orphaned holding the loopback port
-/// and a live Reality session. The PID lets `Drop` kill it anyway — safely,
-/// because a PID may only be signalled while its process is un-reaped (once
-/// reaped, the kernel can hand the number to an unrelated process). Every reap
-/// of xray (`try_wait`/`wait`) therefore happens with this record locked, or
-/// after the record was cleared, so a PID read from the locked record is
-/// xray's and cannot have been recycled. Only ever locked around non-blocking
-/// work, so `Drop` may block on it.
-type PidRecord = std::sync::Mutex<Option<u32>>;
+/// warning while xray ran on: macOS and Linux had nothing, so it was orphaned
+/// holding the loopback port and a live Reality session, and on Windows it ran
+/// until the kill-on-close job ended it with the app. The record lets `Drop`
+/// kill it anyway, and only it:
+///
+/// - macOS/Linux, by PID. A PID may only be signalled while its process is
+///   un-reaped (once reaped, the kernel can hand the number to an unrelated
+///   process). Every reap of xray (`try_wait`/`wait`) therefore happens with
+///   this record locked, or after the record was cleared, so a PID read from
+///   the locked record is xray's and cannot have been recycled.
+/// - Windows, through a handle of the record's own to xray's process,
+///   duplicated from the `Child`'s at spawn. A handle names one process object
+///   for as long as it is open, so it can never reach another process,
+///   whatever has become of the PID.
+///
+/// Only ever locked around non-blocking work, so `Drop` may block on it.
+type PidRecord = std::sync::Mutex<Option<RecordedXray>>;
+
+/// What [`PidRecord`] holds while xray is in the slot.
+struct RecordedXray {
+    pid: u32,
+    /// `None` only if the handle could not be duplicated (logged at spawn);
+    /// `Drop` then leaves xray to the kill-on-close job, as before.
+    #[cfg(target_os = "windows")]
+    process: Option<std::os::windows::io::OwnedHandle>,
+}
+
+impl RecordedXray {
+    fn of(child: &Child) -> Self {
+        Self {
+            pid: child.id(),
+            #[cfg(target_os = "windows")]
+            process: {
+                use std::os::windows::io::AsHandle;
+                child
+                    .as_handle()
+                    .try_clone_to_owned()
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            "Could not keep a handle to xray (PID {}) for Drop: {}",
+                            child.id(),
+                            e
+                        )
+                    })
+                    .ok()
+            },
+        }
+    }
+}
 
 /// How often `Drop` retries the slot before it falls back to the recorded PID,
 /// and how long it waits between tries. While the manager is being dropped the
@@ -176,9 +214,14 @@ const DROP_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(5)
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const XRAY_TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The exit code `Drop`'s Windows fallback terminates xray with: the one
+/// `Child::kill` uses.
+#[cfg(target_os = "windows")]
+const XRAY_KILLED_EXIT_CODE: u32 = 1;
+
 /// Lock the PID record, riding out poisoning: a panic elsewhere must not stop
 /// xray from being reaped or killed.
-fn lock_pid(record: &PidRecord) -> std::sync::MutexGuard<'_, Option<u32>> {
+fn lock_pid(record: &PidRecord) -> std::sync::MutexGuard<'_, Option<RecordedXray>> {
     record
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -220,8 +263,8 @@ fn vacate(slot: &mut Option<Child>, record: &PidRecord) -> Option<Child> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn kill_recorded_xray(record: &PidRecord) -> bool {
     let signal = |sig: libc::c_int| -> bool {
-        let pid = lock_pid(record);
-        let Some(pid) = *pid else {
+        let recorded = lock_pid(record);
+        let Some(pid) = recorded.as_ref().map(|xray| xray.pid) else {
             return false;
         };
         // Never 0 or negative: those address process GROUPS, ours included.
@@ -240,6 +283,41 @@ fn kill_recorded_xray(record: &PidRecord) -> bool {
     std::thread::sleep(XRAY_TERM_GRACE);
     signal(libc::SIGKILL);
     true
+}
+
+/// MR-849, Windows: `Drop`'s fallback when the slot stays locked — terminate
+/// the recorded xray through the record's own handle to it (see
+/// [`PidRecord`]), as `Child::kill` would. `TerminateProcess` returns at once
+/// (the kernel finishes the exit), so nothing here waits. `None` when no xray
+/// is recorded: it already left the slot, and whoever took it kills it.
+///
+/// The killed xray's `Child` stays in the slot nobody could lock, and is
+/// closed with it; a terminated process holds no port and no session.
+#[cfg(target_os = "windows")]
+fn kill_recorded_xray(record: &PidRecord) -> Option<Result<(), String>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+    let recorded = lock_pid(record);
+    let xray = recorded.as_ref()?;
+    let Some(process) = &xray.process else {
+        return Some(Err(format!(
+            "no handle to xray (PID {}) was kept",
+            xray.pid
+        )));
+    };
+    let handle = HANDLE(process.as_raw_handle());
+    // SAFETY: `handle` is the record's own duplicate, open until the record
+    // drops it, which cannot happen while `recorded` is held.
+    let terminated = unsafe { TerminateProcess(handle, XRAY_KILLED_EXIT_CODE) };
+    Some(match terminated {
+        Ok(()) => Ok(()),
+        // An xray that exited on its own refuses termination; it is gone all
+        // the same. SAFETY: as above; a zero timeout only asks.
+        Err(_) if unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0 => Ok(()),
+        Err(e) => Err(format!("TerminateProcess (PID {}): {}", xray.pid, e)),
+    })
 }
 
 /// Manages the lifecycle of an Xray Reality stealth tunnel process
@@ -289,8 +367,9 @@ impl XrayManager {
     /// included.
     #[cfg(test)]
     pub(crate) async fn adopt_for_test(&self, child: Child) {
+        let recorded = RecordedXray::of(&child);
         let mut slot = self.process.lock().await;
-        *lock_pid(&self.recorded_pid) = Some(child.id());
+        *lock_pid(&self.recorded_pid) = Some(recorded);
         *slot = Some(child);
     }
 
@@ -410,10 +489,12 @@ impl XrayManager {
         let stderr_pipe = child.stderr.take();
         let pid = child.id();
         {
-            // MR-849: the PID goes on record with the Child, so `Drop` can
-            // still kill xray when it cannot take the slot.
+            // MR-849: xray goes on record with the Child (its PID, and on
+            // Windows a handle of its own), so `Drop` can still kill it when
+            // it cannot take the slot.
+            let recorded = RecordedXray::of(&child);
             let mut slot = self.process.lock().await;
-            *lock_pid(&self.recorded_pid) = Some(pid);
+            *lock_pid(&self.recorded_pid) = Some(recorded);
             *slot = Some(child);
         }
 
@@ -717,12 +798,22 @@ impl Drop for XrayManager {
                 );
             }
         }
-        // Windows: the kill-on-close job (W1-005) ends xray with this process.
+        // Windows: terminate it through the record's own handle. Should that
+        // fail, the kill-on-close job (W1-005) still ends it with this process.
         #[cfg(target_os = "windows")]
-        tracing::warn!(
-            "XrayManager dropped while process lock is held — xray runs until the app exits \
-             (the kill-on-close job ends it then)"
-        );
+        match kill_recorded_xray(&self.recorded_pid) {
+            Some(Ok(())) => tracing::warn!(
+                "XrayManager dropped while the process lock was held — terminated xray through \
+                 its recorded handle"
+            ),
+            Some(Err(e)) => tracing::warn!(
+                "XrayManager dropped while the process lock was held and xray could not be \
+                 terminated ({}) — it runs until the app exits (the kill-on-close job ends it \
+                 then)",
+                e
+            ),
+            None => {}
+        }
     }
 }
 
@@ -1416,7 +1507,7 @@ mod tests {
     }
 
     fn recorded(record: &PidRecord) -> Option<u32> {
-        *lock_pid(record)
+        lock_pid(record).as_ref().map(|xray| xray.pid)
     }
 
     /// MR-849: the PID is on record exactly while xray is in the slot — a
@@ -1476,7 +1567,7 @@ mod tests {
     /// health check mid-`try_wait` holds), xray used to be left running on
     /// macOS/Linux. It is SIGTERMed by its recorded PID now. Unix-only, so
     /// the Linux and macOS legs of tests.yml run it (`xray::tests` in their
-    /// FILTER); the Windows job compiles it out.
+    /// FILTER); the Windows job compiles it out and runs its twin below.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn dropped_with_the_slot_held_xray_is_killed_by_its_recorded_pid() {
@@ -1504,5 +1595,72 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
+    /// MR-849 on Windows: dropped while the slot is held, xray used to run on
+    /// until the app exited (the kill-on-close job ended it then). It is
+    /// terminated through the record's own handle now, at once, with the exit
+    /// code `Child::kill` gives (1, [`XRAY_KILLED_EXIT_CODE`]). The Windows
+    /// job (`cargo test --lib`) runs it.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn dropped_with_the_slot_held_xray_is_terminated_through_its_recorded_handle() {
+        let xray = XrayManager::new();
+        xray.adopt_for_test(long_running_child()).await;
+        let slot = Arc::clone(&xray.process);
+        let mut held = slot.lock().await;
+
+        let started = std::time::Instant::now();
+        drop(xray);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+        let child = held.as_mut().expect("the child is still in the held slot");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("xray outlived its manager");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(1), "terminated as Child::kill would");
+    }
+
+    /// MR-849, Windows: the record's handle is xray's own process — what lets
+    /// the fallback kill it and nothing else, whatever becomes of the PID — an
+    /// xray that already exited is gone, not a failure, and nothing on record
+    /// is nothing to kill.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn the_recorded_handle_names_xrays_own_process() {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::GetProcessId;
+
+        let xray = XrayManager::new();
+        let mut child = long_running_child();
+        let pid = child.id();
+        child.kill().expect("kill the child");
+        child.wait().expect("reap the child");
+        xray.adopt_for_test(child).await;
+        {
+            let recorded = lock_pid(&xray.recorded_pid);
+            let process = recorded
+                .as_ref()
+                .and_then(|xray| xray.process.as_ref())
+                .expect("a handle is kept");
+            // SAFETY: the record's own handle, open while `recorded` is held.
+            assert_eq!(
+                unsafe { GetProcessId(HANDLE(process.as_raw_handle())) },
+                pid
+            );
+        }
+        assert_eq!(kill_recorded_xray(&xray.recorded_pid), Some(Ok(())));
+
+        xray.stop().await;
+        assert_eq!(kill_recorded_xray(&xray.recorded_pid), None);
     }
 }

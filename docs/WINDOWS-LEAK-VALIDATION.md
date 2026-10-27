@@ -34,7 +34,7 @@ the first tunnel route. A connect whose guard cannot be installed fails.
 | `Birdo: Permit DNS on loopback` | connect v4, v6 | 13 | a local DNS proxy (127/8, ::1) |
 | `Birdo: Block DNS outside the tunnel` | connect v4, v6 | 12 | UDP/TCP 53 and 853 (DNS, DoT, DoQ) to any other resolver, on any interface |
 | `Birdo: Block LLMNR, mDNS and NetBIOS name queries` | connect v4, v6 | 12 | UDP 5355, 5353, 137 — only while **Local Network Sharing is off** |
-| `Birdo: Permit DNS to your own network's resolver (Custom DNS, Local Network Sharing)` | connect v4 | 13 | only when a Custom DNS server is in a private range AND Local Network Sharing is on: that resolver, any interface |
+| `Birdo: Permit DNS to your own network's resolver (Custom DNS, Local Network Sharing)` | connect v4 | 13 | only when a Custom DNS server is in a private range AND Local Network Sharing is on: that resolver, any interface. A Custom DNS server in CGNAT space (100.64/10) or on a public address always goes through the tunnel. Owner decision 2026-10-26 (MR-689), accepting the residual: there is no DNS while connected for a LAN numbered in 100.64/10 or in a public range, or for an overlay network's resolver such as 100.100.100.100 |
 | `Birdo: Permit the relay (WireGuard) on a DNS port` | connect v4 | 13 | only when the WireGuard port is 53: BirdoVPN.exe + relay/32 + UDP 53 |
 
 The block (12) and the loopback permit (13) are also carried by the kill
