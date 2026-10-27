@@ -1919,7 +1919,7 @@ mod tests {
             Ipv4Addr::new(9, 9, 9, 9),
         ] {
             let (resolvers, lan_resolvers) = split_resolvers(&[resolver], true, true);
-            assert_eq!(lan_resolvers, vec![], "{resolver} is never the LAN's");
+            assert!(lan_resolvers.is_empty(), "{resolver} is never the LAN's");
             let dns_guard = DnsGuard {
                 resolvers,
                 lan_resolvers,
