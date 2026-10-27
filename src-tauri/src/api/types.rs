@@ -993,9 +993,8 @@ pub struct VpnConfig {
     pub allowed_ips: Vec<String>,
     pub dns: Vec<String>,
     /// `dns` is the user's Custom DNS, not the server's resolvers. A private
-    /// or CGNAT (MR-689) Custom DNS server with Local Network Sharing on is
-    /// the user's own LAN resolver, reached outside the tunnel
-    /// (`wfp_policy::split_resolvers`).
+    /// Custom DNS server with Local Network Sharing on is the user's own LAN
+    /// resolver, reached outside the tunnel (`wfp_policy::split_resolvers`).
     pub custom_dns: bool,
     pub client_ip: String,
     /// Optional IPv6 tunnel address (e.g. "fd00::2/128"). When present, enables
