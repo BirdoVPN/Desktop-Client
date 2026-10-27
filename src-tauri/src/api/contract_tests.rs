@@ -25,6 +25,10 @@
 //! reply, a body per reason (the quota fields included) decodes into desktop's
 //! model, and every property is either read or listed as deliberately unread.
 //!
+//! And the refused connect (`$defs/ConnectRefusal`, MR-139): every
+//! `refusalReason` has a decided error on both dial paths, and a reason this
+//! build does not know is handled as a refusal without one.
+//!
 //! Fixtures come from the REAL producers wherever one exists
 //! (`utils::get_device_id`, `birdo_pq::generate_keypair`,
 //! `commands::vpn::generate_wireguard_keypair`, `attestation::platform` /
@@ -51,7 +55,7 @@ const SCHEMA_SRC: &str = include_str!("../../contract/vpn-protocol.schema.json")
 /// `sha256sum` of birdo-web `backend/contract/vpn-protocol.schema.json` at the
 /// commit vendored (LF bytes, as git stores them). The test normalises `\r\n`
 /// so an autocrlf checkout hashes the same as CI.
-const SCHEMA_SHA256: &str = "ea19cbe0a94609f4f875fd2a4d9712fe61b243c783787767f58782c1df9a499c";
+const SCHEMA_SHA256: &str = "c3a77432a48d81759193b37f5d0555b2527281bbfd17f741055a87aa6f0208d6";
 
 const CONNECT: &str = "ConnectRequest";
 const MULTI_HOP: &str = "MultiHopConnectRequest";
@@ -93,6 +97,17 @@ fn validator_for(def: &str) -> Validator {
 
 fn def(def: &str) -> Value {
     schema()["$defs"][def].clone()
+}
+
+/// `schema` itself, or the `$defs` entry it names when it is a local `$ref`
+/// (`{"$ref": "#/$defs/RetryableDetails"}`, MR-1637).
+fn resolved(schema: &Value) -> Value {
+    match schema["$ref"].as_str() {
+        Some(target) => def(target
+            .strip_prefix("#/$defs/")
+            .unwrap_or_else(|| panic!("a local $defs reference: {target}"))),
+        None => schema.clone(),
+    }
 }
 
 fn def_properties(name: &str) -> BTreeSet<String> {
@@ -923,7 +938,8 @@ fn each_error_code_body_is_the_contracts_shape_and_maps_as_decided() {
                 "{code}"
             );
             // The key the parser reads is the one the contract requires.
-            let details = &def(code)["properties"]["details"];
+            // MR-1637: `details` is a `$ref` to the one shared definition.
+            let details = resolved(&def(code)["properties"]["details"]);
             assert_eq!(
                 details["properties"]["retryAfterSeconds"]["type"], "integer",
                 "{code}"
@@ -984,6 +1000,173 @@ fn an_unknown_error_code_decodes_to_the_fallback() {
     assert_eq!(err.code, IpcErrorCode::ServerUnavailable);
     assert!(err.retryable);
     assert_eq!(err.server_asked_to_wait(), None);
+}
+
+// ── connect refusal reasons (MR-139) ────────────────────────────────────────
+
+const CONNECT_RESPONSE: &str = "ConnectResponse";
+const CONNECT_REFUSAL: &str = "ConnectRefusal";
+
+/// Every `$defs/ConnectRefusal` value, decided: a refused connect (HTTP 200,
+/// `success:false`) as birdo-web sends it, with its own sentence
+/// (`vpn.service.ts`), and the code desktop answers it with.
+fn connect_refusal_cases() -> Vec<(&'static str, Value, IpcErrorCode)> {
+    let refused = |reason: &str, message: &str| {
+        let mut body = json!({ "success": false, "message": message });
+        body["refusalReason"] = json!(reason);
+        body
+    };
+    let mut quota = refused(
+        "quota_exceeded",
+        "Free-tier data limit reached (50.0 / 50 GB this period). Your allowance resets after \
+         12 Nov. Upgrade to Operative for unlimited data.",
+    );
+    quota["quotaExceeded"] = json!(true);
+    vec![
+        (
+            "device_limit",
+            refused(
+                "device_limit",
+                "Device limit reached (3 devices for OPERATIVE plan)",
+            ),
+            IpcErrorCode::DeviceLimit,
+        ),
+        (
+            "plan",
+            refused(
+                "plan",
+                "Selected server is not included in your RECON plan. Upgrade to access more \
+                 locations.",
+            ),
+            IpcErrorCode::SubscriptionRequired,
+        ),
+        ("quota_exceeded", quota, IpcErrorCode::QuotaExceeded),
+        (
+            "server_capacity",
+            refused(
+                "server_capacity",
+                "Selected server is currently at capacity. Please try another server.",
+            ),
+            IpcErrorCode::ServerUnavailable,
+        ),
+        (
+            "server_unavailable",
+            refused("server_unavailable", "Server not found"),
+            IpcErrorCode::ServerUnavailable,
+        ),
+    ]
+}
+
+fn contract_connect_refusals() -> BTreeSet<String> {
+    def(CONNECT_REFUSAL)["enum"]
+        .as_array()
+        .expect("$defs/ConnectRefusal.enum is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// What desktop answers a refused connect with, through both response types
+/// as the two dial paths decode them (single-hop, and Multi-Hop converted).
+fn connect_refusal_codes(body: &Value) -> [IpcErrorCode; 2] {
+    use super::types::{ConnectResponse, MultiHopConnectResponse};
+    let single: ConnectResponse = serde_json::from_str(&body.to_string())
+        .unwrap_or_else(|e| panic!("desktop's ConnectResponse refused {body}: {e}"));
+    let multi: MultiHopConnectResponse = serde_json::from_str(&body.to_string())
+        .unwrap_or_else(|e| panic!("desktop's MultiHopConnectResponse refused {body}: {e}"));
+    [single, ConnectResponse::from(multi)].map(|response| {
+        assert!(!response.success, "{body}");
+        IpcError::connect_refused(
+            response.message.as_deref().unwrap_or_default(),
+            response.quota_exceeded,
+            response.refusal_reason.as_deref(),
+        )
+        .code
+    })
+}
+
+/// A re-vendored contract with a refusal reason desktop has not decided on
+/// fails HERE, naming it, not in production as whatever its wording reads as.
+#[test]
+fn every_contract_connect_refusal_has_a_decided_handling() {
+    let s = schema();
+    for name in [CONNECT_RESPONSE, CONNECT_REFUSAL] {
+        assert!(
+            s["_status"]["definitions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(name)),
+            "_status.definitions lists {name}"
+        );
+    }
+    let reasons = contract_connect_refusals();
+    // The response's own enum IS $defs/ConnectRefusal.
+    let inline: BTreeSet<String> = def(CONNECT_RESPONSE)["properties"]["refusalReason"]["enum"]
+        .as_array()
+        .expect("$defs/ConnectResponse.refusalReason.enum is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(inline, reasons);
+    let decided: BTreeSet<String> = connect_refusal_cases()
+        .iter()
+        .map(|(reason, ..)| reason.to_string())
+        .collect();
+    assert_eq!(
+        reasons, decided,
+        "$defs/ConnectRefusal changed: decide which error desktop shows for the new reason \
+         (IpcError::connect_refused), then add it to connect_refusal_cases"
+    );
+}
+
+/// Each body IS the contract's shape, decodes on both dial paths, and is
+/// answered with the decided code: by its reason, not by its wording.
+#[test]
+fn each_connect_refusal_body_is_the_contracts_shape_and_maps_as_decided() {
+    for (reason, body, code) in connect_refusal_cases() {
+        assert_valid(CONNECT_RESPONSE, &body);
+        assert!(
+            validator_for(CONNECT_REFUSAL).is_valid(&body["refusalReason"]),
+            "{reason}"
+        );
+        assert_eq!(connect_refusal_codes(&body), [code, code], "{reason}");
+    }
+}
+
+/// A reason newer than this build is refused by the contract (the next one
+/// the server adds, before desktop re-vendors) but still decodes, and, like
+/// a refusal from a server that sends none, is handled as before: by the
+/// `quotaExceeded` flag, then the wording.
+#[test]
+fn an_unknown_or_absent_connect_refusal_is_handled_as_before() {
+    let future = json!({
+        "success": false,
+        "refusalReason": "some_future_reason",
+        "message": "Device limit reached (3 devices for OPERATIVE plan)",
+    });
+    assert!(!contract_connect_refusals().contains("some_future_reason"));
+    assert!(!validator_for(CONNECT_RESPONSE).is_valid(&future));
+    assert_eq!(
+        connect_refusal_codes(&future),
+        [IpcErrorCode::DeviceLimit, IpcErrorCode::DeviceLimit]
+    );
+    for (body, code) in [
+        (
+            json!({ "success": false, "message": "Device limit reached (3 devices for OPERATIVE plan)" }),
+            IpcErrorCode::DeviceLimit,
+        ),
+        (
+            json!({ "success": false, "message": "Selected server is currently at capacity." }),
+            IpcErrorCode::ServerUnavailable,
+        ),
+        (
+            json!({ "success": false, "quotaExceeded": true, "message": "Free-tier data limit reached" }),
+            IpcErrorCode::QuotaExceeded,
+        ),
+    ] {
+        assert_valid(CONNECT_RESPONSE, &body);
+        assert_eq!(connect_refusal_codes(&body), [code, code], "{body}");
+    }
 }
 
 // ── heartbeat replies (MR-1638) ─────────────────────────────────────────────

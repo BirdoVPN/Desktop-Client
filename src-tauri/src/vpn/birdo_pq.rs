@@ -1472,6 +1472,7 @@ mod tests {
             success: true,
             message: None,
             quota_exceeded: false,
+            refusal_reason: None,
             key_id: None,
             public_key: None,
             preshared_key: None,

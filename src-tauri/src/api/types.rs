@@ -1178,6 +1178,14 @@ pub struct ConnectResponse {
     /// says so rides the peer the server has just removed (REVIEW-WIN2-002).
     #[serde(default)]
     pub quota_exceeded: bool,
+    /// With `success:false`: WHY the connect was refused (MR-139, contract
+    /// `$defs/ConnectRefusal`: `device_limit`, `plan`, `quota_exceeded`,
+    /// `server_capacity`, `server_unavailable`). The error is keyed on it,
+    /// never on `message`'s wording (`IpcError::connect_refused`). A string,
+    /// not an enum, so a value newer than this build still decodes, and is
+    /// then handled as absent; older servers never send it.
+    #[serde(default)]
+    pub refusal_reason: Option<String>,
     #[serde(default)]
     pub key_id: Option<String>,
     // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
@@ -1317,6 +1325,10 @@ pub struct MultiHopConnectResponse {
     /// connect gate (MultiHopService returns its refusal as-is).
     #[serde(default)]
     pub quota_exceeded: bool,
+    /// See `ConnectResponse::refusal_reason`: the Multi-Hop door sends the
+    /// same vocabulary (entry or exit full, outside the plan, …).
+    #[serde(default)]
+    pub refusal_reason: Option<String>,
     #[serde(default)]
     pub key_id: Option<String>,
     // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
@@ -1378,6 +1390,7 @@ impl From<MultiHopConnectResponse> for ConnectResponse {
             success: response.success,
             message: response.message,
             quota_exceeded: response.quota_exceeded,
+            refusal_reason: response.refusal_reason,
             key_id: response.key_id,
             public_key: response.public_key,
             preshared_key: response.preshared_key,
