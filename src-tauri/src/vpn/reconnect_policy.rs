@@ -1794,6 +1794,7 @@ mod tests {
         p.on_dial_failed(crate::commands::ipc_error::IpcError::connect_refused(
             "Free-tier data limit reached",
             true,
+            None,
         ));
         match p.decide(&not_connected(now)) {
             Action::GiveUp(err) => {

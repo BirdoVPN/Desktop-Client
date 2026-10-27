@@ -351,22 +351,46 @@ impl IpcError {
     }
 
     /// `/vpn/connect` answered 2xx with `success:false`: the backend refused
-    /// THIS server (full, offline, removed) — or, when it says so, the device
-    /// limit, or (`quotaExceeded`, birdo-web #590) the Free allowance.
+    /// THIS server (full, offline, removed), the device limit, the plan, or
+    /// (`quotaExceeded`, birdo-web #590) the Free allowance.
+    ///
+    /// MR-139: the code is keyed on the refusal's `refusalReason` (contract
+    /// `$defs/ConnectRefusal`), never on the wording, which is what Windows
+    /// used to read the device limit from:
+    ///
+    /// | `refusalReason`                         | code                    |
+    /// |-----------------------------------------|-------------------------|
+    /// | `device_limit`                          | `device_limit`          |
+    /// | `plan`                                  | `subscription_required` |
+    /// | `quota_exceeded`                        | `quota_exceeded`        |
+    /// | `server_capacity`, `server_unavailable` | `server_unavailable`    |
+    ///
+    /// A refusal without one (an older server) or with a value newer than
+    /// this build is handled as before: the `quotaExceeded` flag, then the
+    /// wording. A plan refusal used to read as "server unavailable", which is
+    /// retryable and offers "try another location"; a re-dial asked again
+    /// for a server the plan does not include until its budget ran out.
     ///
     /// The allowance is a hard refusal with the canonical copy, exactly as
     /// when the heartbeat brings it. It used to read as "server unavailable",
     /// which is retryable: the re-dial after an over-cap session was ended
     /// spent its whole budget, then held a lockdown block with the generic
     /// give-up text (REVIEW-WIN2-002).
-    pub fn connect_refused(message: &str, quota_exceeded: bool) -> Self {
-        if quota_exceeded {
+    pub fn connect_refused(
+        message: &str,
+        quota_exceeded: bool,
+        refusal_reason: Option<&str>,
+    ) -> Self {
+        if quota_exceeded || refusal_reason == Some("quota_exceeded") {
             return crate::vpn::reconnect_policy::quota_exceeded_error();
         }
-        let code = if is_device_limit_message(message) {
-            IpcErrorCode::DeviceLimit
-        } else {
-            IpcErrorCode::ServerUnavailable
+        let code = match refusal_reason {
+            Some("device_limit") => IpcErrorCode::DeviceLimit,
+            Some("plan") => IpcErrorCode::SubscriptionRequired,
+            Some("server_capacity" | "server_unavailable") => IpcErrorCode::ServerUnavailable,
+            // Absent, or newer than this build: today's handling.
+            _ if is_device_limit_message(message) => IpcErrorCode::DeviceLimit,
+            _ => IpcErrorCode::ServerUnavailable,
         };
         Self::new(code, message)
     }
@@ -411,9 +435,10 @@ impl IpcError {
     }
 }
 
-/// Whether a backend refusal names the device limit. The backend sends no
-/// machine-readable code for it, so this is the one place its wording is
-/// read; everything else is classified by HTTP status.
+/// Whether a backend refusal names the device limit. Read only where the
+/// server sent no machine-readable code for it: a connect refusal without a
+/// `refusalReason` (a server older than MR-139) and a 403/409 answer;
+/// everything else is classified by HTTP status or by its code.
 fn is_device_limit_message(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     m.contains("device") && (m.contains("limit") || m.contains("maximum"))
@@ -962,15 +987,89 @@ mod tests {
         ));
     }
 
+    /// A refusal without a `refusalReason` (a server older than MR-139) is
+    /// read as before: the device limit by its wording, anything else as an
+    /// unavailable server.
     #[test]
     fn connect_refusals_distinguish_the_device_limit() {
         assert_eq!(
-            IpcError::connect_refused("All VPN servers are currently offline", false).code,
+            IpcError::connect_refused("All VPN servers are currently offline", false, None).code,
             IpcErrorCode::ServerUnavailable
         );
         assert_eq!(
-            IpcError::connect_refused("You have reached your device limit", false).code,
+            IpcError::connect_refused("You have reached your device limit", false, None).code,
             IpcErrorCode::DeviceLimit
+        );
+    }
+
+    /// MR-139: the code comes from `refusalReason`, whatever the wording. On
+    /// main the device limit was found only by its wording (a reworded one
+    /// read as "server unavailable", which is retryable), and a plan refusal
+    /// always read as "server unavailable". The sentences are birdo-web's
+    /// (`vpn.service.ts`, `multi-hop.service.ts`) and reworded ones.
+    #[test]
+    fn connect_refusals_are_keyed_on_their_refusal_reason() {
+        let cases = [
+            (
+                "device_limit",
+                "Device limit reached (3 devices for OPERATIVE plan)",
+                IpcErrorCode::DeviceLimit,
+            ),
+            // Reworded: nothing in it says "device".
+            (
+                "device_limit",
+                "Sign another computer out first.",
+                IpcErrorCode::DeviceLimit,
+            ),
+            (
+                "plan",
+                "Selected server is not included in your RECON plan. Upgrade to access more \
+                 locations.",
+                IpcErrorCode::SubscriptionRequired,
+            ),
+            (
+                "quota_exceeded",
+                "Free-tier data limit reached",
+                IpcErrorCode::QuotaExceeded,
+            ),
+            (
+                "server_capacity",
+                "Selected server is currently at capacity. Please try another server.",
+                IpcErrorCode::ServerUnavailable,
+            ),
+            // The reason wins over a wording that would have read as the
+            // device limit.
+            (
+                "server_unavailable",
+                "Device maximum: server offline",
+                IpcErrorCode::ServerUnavailable,
+            ),
+        ];
+        for (reason, message, code) in cases {
+            let err = IpcError::connect_refused(message, false, Some(reason));
+            assert_eq!(err.code, code, "{reason}: {message}");
+            assert_eq!(err.retryable, code.retryable(), "{reason}");
+        }
+        // A plan or device-limit refusal is hard: a re-dial stops at once
+        // instead of asking again for what the plan does not include.
+        for reason in ["device_limit", "plan", "quota_exceeded"] {
+            assert!(
+                IpcError::connect_refused("x", false, Some(reason))
+                    .code
+                    .is_hard_refusal(),
+                "{reason}"
+            );
+        }
+        // A value newer than this build is a refusal without one: the
+        // wording, as before.
+        assert_eq!(
+            IpcError::connect_refused("Device limit reached", false, Some("some_future_reason"))
+                .code,
+            IpcErrorCode::DeviceLimit
+        );
+        assert_eq!(
+            IpcError::connect_refused("Full", false, Some("some_future_reason")).code,
+            IpcErrorCode::ServerUnavailable
         );
     }
 
@@ -996,6 +1095,7 @@ mod tests {
             let err = IpcError::connect_refused(
                 response.message.as_deref().unwrap_or_default(),
                 response.quota_exceeded,
+                response.refusal_reason.as_deref(),
             );
             assert_eq!(err.code, IpcErrorCode::QuotaExceeded);
             // MR-1979: what the user reads is the canonical sentence, not the
@@ -1024,8 +1124,9 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "success": false, "message": "Full" }))
                 .unwrap();
         assert!(!old.quota_exceeded);
+        assert_eq!(old.refusal_reason, None);
         assert_eq!(
-            IpcError::connect_refused("Full", old.quota_exceeded).code,
+            IpcError::connect_refused("Full", old.quota_exceeded, None).code,
             IpcErrorCode::ServerUnavailable
         );
     }

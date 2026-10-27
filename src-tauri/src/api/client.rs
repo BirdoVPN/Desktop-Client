@@ -2188,6 +2188,71 @@ mod retry_after_tests {
         assert!(api.retry_gate.check(&servers, now).is_ok());
     }
 
+    /// MR-1771: a 429 from `/auth/refresh` keeps the session, through what
+    /// the refresh runs on its answer: `handle_response`, the hold
+    /// `do_request` notes under the refresh's key, and the session gate's
+    /// verdict (`report_refresh_failure` ends a session only on what
+    /// `refresh_rejected` accepts, and the rotated pair is adopted only on
+    /// `Ok`). It is never `session_expired`, the caller is told
+    /// `rate_limited`, and the next refresh is not sent until the wait is
+    /// over: the server's `Retry-After`, or 30 s when it named none (on main
+    /// that one went straight out again). Then it goes out.
+    #[tokio::test]
+    async fn a_refresh_429_keeps_the_session_and_holds_the_next_refresh() {
+        use super::super::retry_gate::{hold_key, REFRESH_DEFAULT_HOLD_SECS};
+        use super::super::session_gate::{self, RefreshOutcome};
+        use crate::commands::ipc_error::{IpcError, IpcErrorCode};
+        let refresh = hold_key(&reqwest::Method::POST, endpoints::auth::REFRESH);
+        for (retry_after, wait) in [
+            (Some("60"), 60),
+            (Some("soon"), REFRESH_DEFAULT_HOLD_SECS),
+            (None, REFRESH_DEFAULT_HOLD_SECS),
+        ] {
+            let api = BirdoApi::new();
+            let t0 = std::time::Instant::now();
+            let answered = api
+                .handle_response::<RefreshResponse>(answer(429, retry_after))
+                .await;
+            api.retry_gate
+                .note(&refresh, answered.as_ref().unwrap_err(), t0);
+            assert_eq!(
+                session_gate::refresh_outcome(&answered),
+                RefreshOutcome::Transient,
+                "{retry_after:?}"
+            );
+            let told = IpcError::from_api(&session_gate::error_after_failed_refresh(
+                answered.unwrap_err(),
+            ));
+            assert_eq!(told.code, IpcErrorCode::RateLimited, "{retry_after:?}");
+
+            // The next refresh, inside the wait: not sent, and still not a
+            // verdict on the session.
+            let held = api.retry_gate.check(&refresh, t0 + Duration::from_secs(1));
+            assert!(
+                matches!(
+                    &held,
+                    Err(ApiError::Held { status: 429, retry_after_secs }) if *retry_after_secs == wait - 1
+                ),
+                "{retry_after:?}: {held:?}"
+            );
+            assert_eq!(
+                session_gate::refresh_outcome(&held),
+                RefreshOutcome::Transient
+            );
+            let told =
+                IpcError::from_api(&session_gate::error_after_failed_refresh(held.unwrap_err()));
+            assert_eq!(told.code, IpcErrorCode::RateLimited);
+            assert_eq!(told.retry_after_secs, Some(wait - 1));
+
+            assert!(
+                api.retry_gate
+                    .check(&refresh, t0 + Duration::from_secs(wait))
+                    .is_ok(),
+                "{retry_after:?}: sent again once the wait is over"
+            );
+        }
+    }
+
     /// The wiring: every control-plane request (the refresh a 401 runs
     /// included — it goes through `do_request` too) asks the gate before it
     /// is sent and tells it what came back.

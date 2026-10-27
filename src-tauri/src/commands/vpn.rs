@@ -1997,6 +1997,7 @@ mod tests {
             success: true,
             message: None,
             quota_exceeded: false,
+            refusal_reason: None,
             key_id: Some("k1".into()),
             public_key: None,
             preshared_key: None,

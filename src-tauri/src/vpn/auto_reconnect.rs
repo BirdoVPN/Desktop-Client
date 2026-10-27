@@ -1759,6 +1759,7 @@ async fn request_fresh_response(
         return Err(IpcError::connect_refused(
             response.message.as_deref().unwrap_or("Connection failed"),
             response.quota_exceeded,
+            response.refusal_reason.as_deref(),
         ));
     }
     Ok(response)

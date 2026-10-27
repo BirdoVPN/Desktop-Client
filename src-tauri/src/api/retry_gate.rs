@@ -7,8 +7,9 @@
 //! `ApiError::Held` — the status the server sent and the wait that is left —
 //! and nothing goes out. That covers
 //! every caller at once: the token refresh every 401 runs (the backend sends
-//! `Retry-After: 60` on its refresh limiter), the 30 s heartbeat, the UI's
-//! polls and a user's repeated clicks.
+//! `Retry-After: 60` on its refresh limiter, and a refresh 429 without a
+//! readable one holds for `REFRESH_DEFAULT_HOLD_SECS`, MR-1771), the 30 s
+//! heartbeat, the UI's polls and a user's repeated clicks.
 //!
 //! Per request, not per client: a rate limit on one route says nothing about
 //! the others, and a gate on everything would hold a sign-out or a heartbeat
@@ -78,6 +79,24 @@ fn is_credential_route(path: &str) -> bool {
     path.starts_with("/auth") || path.contains("/login") || path.contains("/register")
 }
 
+/// MR-1771: how long a 429 from `/auth/refresh` that named no readable wait
+/// holds the refresh. Every other request answered that way holds nothing
+/// (the status decides the error, the user decides when to try again), but
+/// nobody clicks a refresh: every request that meets a 401 sends one, one
+/// after another under the refresh lock, so without a hold a burst of 401s
+/// is a burst of refreshes into the same limit, each refused, and the limit
+/// never rests. birdo-web's own refresh limiters always name their wait
+/// (contract README "Token refresh"), so this covers a 429 from in front of
+/// them. Android holds the same 30 s (Mobile-Client #511); within
+/// `RETRY_AFTER_MAX_SECS` like every hold.
+pub(crate) const REFRESH_DEFAULT_HOLD_SECS: u64 = 30;
+
+/// The token refresh's hold key: method and path, like every route outside
+/// the credential bucket.
+fn is_refresh(key: &str) -> bool {
+    key == hold_key(&reqwest::Method::POST, super::endpoints::auth::REFRESH)
+}
+
 /// Requests held at once. Holds last at most `RETRY_AFTER_MAX_SECS`, so in
 /// practice a handful; past this the hold nearest its end is forgotten first
 /// (the request then goes out and the server answers for itself).
@@ -108,12 +127,17 @@ impl RetryGate {
         })
     }
 
-    /// Hold `key` when `error` named a wait; anything else changes nothing.
+    /// Hold `key` when `error` named a wait, or when it is a refresh 429
+    /// that did not ([`REFRESH_DEFAULT_HOLD_SECS`]); anything else changes
+    /// nothing.
     pub(crate) fn note(&self, key: &str, error: &ApiError, now: Instant) {
         let (status, secs) = match error {
             ApiError::RateLimited {
                 retry_after_secs: Some(secs),
             } => (429, *secs),
+            ApiError::RateLimited {
+                retry_after_secs: None,
+            } if is_refresh(key) => (429, REFRESH_DEFAULT_HOLD_SECS),
             ApiError::ServerBusy {
                 status,
                 retry_after_secs,
@@ -252,6 +276,64 @@ mod tests {
         ] {
             gate.note("GET /x", &error, t0);
             assert!(gate.check("GET /x", t0).is_ok(), "{error:?}");
+        }
+    }
+
+    /// MR-1771: a refresh 429 that names no readable wait (none, or one
+    /// `retry_after_header` could not read) still holds the refresh, for
+    /// `REFRESH_DEFAULT_HOLD_SECS`; one that names its wait holds for that.
+    /// No other request is held without a wait. On main the refresh went
+    /// straight out again on the next 401.
+    #[test]
+    fn a_refresh_429_without_a_wait_holds_the_refresh_for_the_default() {
+        use reqwest::Method;
+        let gate = RetryGate::default();
+        let t0 = Instant::now();
+        let refresh = hold_key(&Method::POST, super::super::endpoints::auth::REFRESH);
+        let no_wait = ApiError::RateLimited {
+            retry_after_secs: None,
+        };
+        gate.note(&refresh, &no_wait, t0);
+        assert!(matches!(
+            gate.check(&refresh, t0 + s(1)),
+            Err(ApiError::Held {
+                status: 429,
+                retry_after_secs: 29
+            })
+        ));
+        assert!(gate
+            .check(&refresh, t0 + s(REFRESH_DEFAULT_HOLD_SECS))
+            .is_ok());
+        assert_eq!(REFRESH_DEFAULT_HOLD_SECS, 30);
+        const _: () =
+            assert!(REFRESH_DEFAULT_HOLD_SECS <= super::super::error::RETRY_AFTER_MAX_SECS);
+
+        // The server's own wait wins.
+        gate.note(
+            &refresh,
+            &ApiError::RateLimited {
+                retry_after_secs: Some(60),
+            },
+            t0,
+        );
+        assert!(matches!(
+            gate.check(&refresh, t0 + s(31)),
+            Err(ApiError::Held {
+                status: 429,
+                retry_after_secs: 29
+            })
+        ));
+
+        // Nothing else is held without a wait: not `/auth/me`, not another
+        // method on the refresh path, not the credential bucket.
+        for key in [
+            hold_key(&Method::GET, "/auth/me"),
+            hold_key(&Method::GET, "/auth/refresh"),
+            hold_key(&Method::POST, "/auth/login/desktop"),
+            hold_key(&Method::GET, "/vpn/servers"),
+        ] {
+            gate.note(&key, &no_wait, t0);
+            assert!(gate.check(&key, t0).is_ok(), "{key}");
         }
     }
 
