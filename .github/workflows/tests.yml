@@ -463,11 +463,30 @@ jobs:
       # Linux: run the real install/remove functions against real ip6tables as
       # root, asserting the chain, the OUTPUT jump, the default-deny, that NDP
       # stays permitted, that repeat installs don't stack, and that teardown
-      # leaves nothing behind (a stuck chain = host with no IPv6).
-      - name: IPv6 leak-block functional test (Linux, root)
+      # leaves nothing behind (a stuck chain = host with no IPv6). MR-2128: a
+      # re-install while the block is hooked is read back from the kernel
+      # after every ip6tables command it runs, and must never let routable
+      # IPv6 out. The module's other tests run the same commands against a
+      # model of the table (the exact order, every failure path), so
+      # --include-ignored runs both kinds here.
+      - name: IPv6 leak-block tests (Linux, root)
         if: matrix.os == 'linux'
         working-directory: src-tauri
-        run: sudo -E "$(command -v cargo)" test --locked --lib ipv6_leak_block_tests -- --ignored --nocapture
+        run: |
+          set -euo pipefail
+          # --test-threads=1: the root tests share the one real OUTPUT chain.
+          out=$(sudo -E "$(command -v cargo)" test --locked --lib ipv6_leak_block_tests -- --include-ignored --nocapture --test-threads=1) || {
+            echo "$out"
+            echo "::error::ipv6_leak_block_tests failed"
+            exit 1
+          }
+          echo "$out"
+          # Seven tests, all required: a filter that matches nothing still
+          # exits 0.
+          if ! grep -qE 'test result: ok\. 7 passed' <<<"$out"; then
+            echo "::error::ipv6_leak_block_tests did not run all seven tests"
+            exit 1
+          fi
 
       # Linux: the kill switch's block-all as the KERNEL holds it. The root
       # test builds one generation of chains for real from a fixed control

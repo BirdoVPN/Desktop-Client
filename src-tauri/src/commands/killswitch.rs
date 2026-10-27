@@ -1167,20 +1167,22 @@ pub(crate) mod iptables_watchdog {
         pub v6: Option<(Vec<String>, Vec<String>)>,
     }
 
-    /// The one rule that may sit above our jump in a built-in chain: the
-    /// IPv6 leak block's (F-001, `tunnel_linux::install_ipv6_leak_block`).
-    /// Every tunnel start inserts it at the top of ip6tables' OUTPUT, while
-    /// our block is held for the whole session, and it lets nothing
-    /// routable out (`iptables_policy` keeps our IPv6 chain from accepting
-    /// anything it refuses, whichever of the two sits first). There alone:
-    /// the same jump in iptables, or in INPUT or FORWARD, is not one
-    /// `tunnel_linux` ever inserted, so it is no exception ([`may_precede`]).
-    const LEAK_BLOCK_JUMP: &str = "-j BIRDO_IPV6_LEAK_BLOCK";
+    /// The rules that may sit above our jump in a built-in chain: the IPv6
+    /// leak block's (F-001, `tunnel_linux::install_ipv6_leak_block`), and
+    /// the cover a re-install hooks in above it while it rebuilds it, with
+    /// the same rules (MR-2128). Every tunnel start inserts them at the top
+    /// of ip6tables' OUTPUT, while our block is held for the whole session,
+    /// and they let nothing routable out (`iptables_policy` keeps our IPv6
+    /// chain from accepting anything they refuse, whichever sits first).
+    /// There alone: the same jumps in iptables, or in INPUT or FORWARD, are
+    /// not ones `tunnel_linux` ever inserted, so they are no exception
+    /// ([`may_precede`]).
+    const LEAK_BLOCK_JUMPS: [&str; 2] = ["-j BIRDO_IPV6_LEAK_BLOCK", "-j BIRDO_IPV6_LEAK_COVER"];
 
     /// Whether `rule` may sit above our jump in `hook` of the family `v6`
-    /// says: the IPv6 leak block's jump, in ip6tables' OUTPUT only.
+    /// says: the IPv6 leak block's jumps, in ip6tables' OUTPUT only.
     fn may_precede(v6: bool, hook: &str, rule: &str) -> bool {
-        v6 && hook == "OUTPUT" && rule == LEAK_BLOCK_JUMP
+        v6 && hook == "OUTPUT" && LEAK_BLOCK_JUMPS.contains(&rule)
     }
 
     /// What an iptables probe (`-L <chain>`, `-C <hook> -j <chain>`) says
@@ -3630,42 +3632,46 @@ mod tests {
         );
     }
 
-    /// MR-2001: the one rule that may sit above our jump is the IPv6 leak
-    /// block's (F-001). Every tunnel start inserts it at the top of
+    /// MR-2001: the rules that may sit above our jump are the IPv6 leak
+    /// block's (F-001), and since MR-2128 the cover a re-install puts above
+    /// it while it rebuilds it. Every tunnel start inserts them at the top of
     /// ip6tables' OUTPUT while our block is held for the whole session, and
-    /// it lets nothing routable out; flagging it would re-arm the block, and
-    /// blame another tool, at every connect. Its name is tunnel_linux.rs's.
-    /// There alone: tunnel_linux inserts it nowhere else, so the same jump
-    /// above our IPv4 OUTPUT jump, or above an INPUT or FORWARD jump, is
-    /// another tool's rule, and noticed.
+    /// they let nothing routable out; flagging them would re-arm the block,
+    /// and blame another tool, at every connect. Their names are
+    /// tunnel_linux.rs's. There alone: tunnel_linux inserts them nowhere
+    /// else, so the same jumps above our IPv4 OUTPUT jump, or above an INPUT
+    /// or FORWARD jump, are another tool's rules, and noticed.
     #[test]
     fn the_ipv6_leak_block_may_sit_above_our_jump() {
-        let (x, live) = armed();
-        x.rules(true, "OUTPUT")
-            .insert(0, "-j BIRDO_IPV6_LEAK_BLOCK".into());
-        assert_eq!(missing(&x, &live), None);
-        assert_eq!(watch(&x, true, true, Some(&live), no_rearm, no_lift), None);
-
-        for (v6, family, hook, chain) in [
-            (false, "iptables", "OUTPUT", "BIRDO_KS_OUT0"),
-            (false, "iptables", "INPUT", "BIRDO_KS_IN0"),
-            (true, "ip6tables", "INPUT", "BIRDO_KS_IN0"),
-            (true, "ip6tables", "FORWARD", "BIRDO_KS_IN0"),
-        ] {
+        for leak_block in ["-j BIRDO_IPV6_LEAK_BLOCK", "-j BIRDO_IPV6_LEAK_COVER"] {
             let (x, live) = armed();
-            x.rules(v6, hook)
-                .insert(0, "-j BIRDO_IPV6_LEAK_BLOCK".into());
-            assert_eq!(
-                missing(&x, &live),
-                Some(format!("{family}: a rule above the {hook} jump to {chain}"))
-            );
+            x.rules(true, "OUTPUT").insert(0, leak_block.into());
+            assert_eq!(missing(&x, &live), None, "{leak_block}");
+            assert_eq!(watch(&x, true, true, Some(&live), no_rearm, no_lift), None);
+
+            for (v6, family, hook, chain) in [
+                (false, "iptables", "OUTPUT", "BIRDO_KS_OUT0"),
+                (false, "iptables", "INPUT", "BIRDO_KS_IN0"),
+                (true, "ip6tables", "INPUT", "BIRDO_KS_IN0"),
+                (true, "ip6tables", "FORWARD", "BIRDO_KS_IN0"),
+            ] {
+                let (x, live) = armed();
+                x.rules(v6, hook).insert(0, leak_block.into());
+                assert_eq!(
+                    missing(&x, &live),
+                    Some(format!("{family}: a rule above the {hook} jump to {chain}")),
+                    "{leak_block}"
+                );
+            }
         }
 
         let tunnel = include_str!("../vpn/tunnel_linux.rs").replace('\r', "");
         assert!(tunnel.contains("const IPV6_BLOCK_CHAIN: &str = \"BIRDO_IPV6_LEAK_BLOCK\";"));
+        assert!(tunnel.contains("const IPV6_BLOCK_COVER: &str = \"BIRDO_IPV6_LEAK_COVER\";"));
         assert!(tunnel.contains("ip6t(&[\"-I\", \"OUTPUT\", \"1\", \"-j\", IPV6_BLOCK_CHAIN])"));
-        // ...and inserts it nowhere else.
-        assert_eq!(tunnel.matches("\"-I\", ").count(), 1, "{tunnel}");
+        assert!(tunnel.contains("ip6t(&[\"-I\", \"OUTPUT\", \"1\", \"-j\", IPV6_BLOCK_COVER])"));
+        // ...and inserts them nowhere else.
+        assert_eq!(tunnel.matches("ip6t(&[\"-I\", ").count(), 2, "{tunnel}");
     }
 
     /// MR-2000: with `-w 5`, a probe (`-L <chain>`, `-C <hook> -j <chain>`)
