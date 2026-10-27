@@ -188,7 +188,8 @@ pub(crate) fn block_all(b: &BlockAll<'_>) -> Chains {
     // ---------------------------------------------------------------- IPv6
     // AUDIT-N5: dual-stack hosts must not leak IPv6 around the tunnel.
     //
-    // This chain and tunnel_linux's BIRDO_IPV6_LEAK_BLOCK both go in at the
+    // This chain and tunnel_linux's BIRDO_IPV6_LEAK_BLOCK (and the cover a
+    // re-install puts above it, with the same rules: MR-2128) all go in at the
     // top of OUTPUT, so either can sit first, and an ACCEPT here is final:
     // whenever this chain is first, whatever it accepts never meets the leak
     // block. So off the tunnel it accepts nothing the leak block refuses —
