@@ -294,7 +294,15 @@ jobs:
       # too_many_arguments in both packet loops and small lints in the tunnel
       # files. Those are fixed; a new one now fails the PR on the platform
       # that has it.
+      #
+      # Every test step below runs once this one has passed, whether or not a
+      # test step before it failed (`success() || failure()`, never after a
+      # cancel): each is its own verdict on code that compiled. MR-782: a red
+      # IPv6 leak-block step skipped the netns step behind it, so the
+      # end-to-end server-switch tests never ran on the commit that was meant
+      # to show them failing.
       - name: cargo clippy (all targets, deny warnings) - also the compile check
+        id: clippy
         working-directory: src-tauri
         run: cargo clippy --locked --all-targets -- -D warnings
 
@@ -311,6 +319,7 @@ jobs:
       # exists to stop, executed in no job at all. A test nothing runs is not
       # coverage, it is a comment that costs a compile.
       - name: DNS journal restore + TUN read tests (Linux + macOS)
+        if: (success() || failure()) && steps.clippy.outcome == 'success'
         working-directory: src-tauri
         env:
           OS: ${{ matrix.os }}
@@ -417,7 +426,7 @@ jobs:
       # own firewall. Both variants are checked, including the fallback that
       # exists precisely for when `load anchor` fails.
       - name: pf ruleset parse-check (macOS)
-        if: matrix.os == 'macos'
+        if: (success() || failure()) && steps.clippy.outcome == 'success' && matrix.os == 'macos'
         working-directory: src-tauri
         run: |
           set -euo pipefail
@@ -467,10 +476,11 @@ jobs:
       # re-install while the block is hooked is read back from the kernel
       # after every ip6tables command it runs, and must never let routable
       # IPv6 out. The module's other tests run the same commands against a
-      # model of the table (the exact order, every failure path), so
+      # model of the table (the exact order, every failure path; MR-782: a
+      # server switch holds the block through the old tunnel's stop()), so
       # --include-ignored runs both kinds here.
       - name: IPv6 leak-block tests (Linux, root)
-        if: matrix.os == 'linux'
+        if: (success() || failure()) && steps.clippy.outcome == 'success' && matrix.os == 'linux'
         working-directory: src-tauri
         run: |
           set -euo pipefail
@@ -481,10 +491,10 @@ jobs:
             exit 1
           }
           echo "$out"
-          # Seven tests, all required: a filter that matches nothing still
+          # Ten tests, all required: a filter that matches nothing still
           # exits 0.
-          if ! grep -qE 'test result: ok\. 7 passed' <<<"$out"; then
-            echo "::error::ipv6_leak_block_tests did not run all seven tests"
+          if ! grep -qE 'test result: ok\. 10 passed' <<<"$out"; then
+            echo "::error::ipv6_leak_block_tests did not run all ten tests"
             exit 1
           fi
 
@@ -497,7 +507,7 @@ jobs:
       # no 443 at all. The chains are NEVER hooked into OUTPUT/INPUT/FORWARD,
       # so the runner's own traffic is untouched (the test asserts that too).
       - name: Kill-switch chain build test (Linux, root)
-        if: matrix.os == 'linux'
+        if: (success() || failure()) && steps.clippy.outcome == 'success' && matrix.os == 'linux'
         working-directory: src-tauri
         run: |
           set -euo pipefail
@@ -527,7 +537,7 @@ jobs:
       # endpoint route it pinned, and a dropped tunnel removes it too. Five
       # tests, all required.
       - name: Endpoint-route + route-ownership tests (macOS, root)
-        if: matrix.os == 'macos'
+        if: (success() || failure()) && steps.clippy.outcome == 'success' && matrix.os == 'macos'
         working-directory: src-tauri
         run: |
           set -euo pipefail
@@ -554,7 +564,7 @@ jobs:
       # IPv6 traffic actually leaves through the tunnel still needs the bench on
       # a dual-stack line; this is the part that does not.
       - name: configure_ipv6 route-shape tests (Linux, root)
-        if: matrix.os == 'linux'
+        if: (success() || failure()) && steps.clippy.outcome == 'success' && matrix.os == 'linux'
         working-directory: src-tauri
         run: |
           set -euo pipefail
@@ -594,10 +604,15 @@ jobs:
       # and a packet the relay sends down the tunnel is decrypted onto birdo0.
       # MR-2115: with resolved active (the stand-ins play it for one test), a
       # failed `resolvectl domain birdo0 ~.` fails the connect and the unwind
-      # leaves nothing behind.
-      # The tests refuse to run outside that namespace.
+      # leaves nothing behind. MR-782: a server switch through the manager,
+      # with a probe sending routable IPv6 and IPv4 out of the uplink the whole
+      # time, lets no IPv6 out between the two tunnels (IPv4-only and
+      # dual-stack sessions), and with the kill switch's block-all up nothing
+      # at all (counted in mangle POSTROUTING); a switch onto a relay that
+      # never answers leaves no IPv6 block behind, nor does the next session's
+      # Disconnect. The tests refuse to run outside that namespace.
       - name: Tunnel teardown tests (Linux, root, private net+mount namespace)
-        if: matrix.os == 'linux'
+        if: (success() || failure()) && steps.clippy.outcome == 'success' && matrix.os == 'linux'
         working-directory: src-tauri
         run: |
           set -euo pipefail
@@ -608,10 +623,10 @@ jobs:
             exit 1
           }
           echo "$out"
-          # Ten tests, all required: an --ignored filter that matches
+          # Fourteen tests, all required: an --ignored filter that matches
           # nothing still exits 0.
-          if ! grep -qE 'test result: ok\. 10 passed' <<<"$out"; then
-            echo "::error::netns_teardown_tests did not run all ten tests"
+          if ! grep -qE 'test result: ok\. 14 passed' <<<"$out"; then
+            echo "::error::netns_teardown_tests did not run all fourteen tests"
             exit 1
           fi
 

@@ -550,6 +550,7 @@ impl UtunTunnel {
 
         // F-001: lift the IPv6 block. Best-effort so it can never fail teardown
         // (a stuck block would leave the host without IPv6 after disconnect).
+        // MR-782: unless a server switch holds it for the incoming tunnel.
         crate::commands::killswitch::ipv6_block_deactivate().await;
 
         // Remove the routes this session added — only those, and each only

@@ -855,6 +855,34 @@ impl VpnManager {
                 }
                 crate::vpn::wfp::hold_ipv6_block(true);
             }
+            // MR-782: the same hold on macOS and Linux. The old tunnel's stop()
+            // used to lift the F-001 leak block, and it was re-engaged only
+            // once the teardown was over, so with the kill switch off routable
+            // IPv6 left the physical NIC in between (the kill switch's
+            // block-all, held for the whole session while armed, covers both
+            // families when it is on). The block goes up now (a dual-stack
+            // session had lifted it) and is held, so the old stop() leaves it
+            // in force and the new start() installs it over itself without a
+            // gap (MR-2128). The hold ends with the teardown below; a failed
+            // switch then lifts the block as before. `ipv6_hold_failed`: the
+            // hold's own install failed, and the block is installed again
+            // once the teardown is over (below).
+            #[cfg(target_os = "linux")]
+            let (ipv6_hold, ipv6_hold_failed) = {
+                let (hold, up) = crate::vpn::tunnel_linux::hold_ipv6_leak_block();
+                if let Err(e) = &up {
+                    tracing::warn!("Could not block IPv6 before server switch: {}", e);
+                }
+                (hold, up.is_err())
+            };
+            #[cfg(target_os = "macos")]
+            let (ipv6_hold, ipv6_hold_failed) = {
+                let (hold, up) = crate::commands::killswitch::hold_ipv6_block().await;
+                if let Err(e) = &up {
+                    tracing::warn!("Could not block IPv6 before server switch: {}", e);
+                }
+                (hold, up.is_err())
+            };
 
             // The tunnel is already out of the Option, so the data plane is
             // disposed here and nothing can reach it again. Its stop() will find
@@ -874,28 +902,43 @@ impl VpnManager {
                 }
             }
 
+            // MR-782 (review N1): the hold's own install failed, so nothing
+            // made sure the block was in force through the teardown (a Linux
+            // dual-stack session had lifted it; macOS installs it in the hold
+            // only when none was recorded). The old re-engage stays as the
+            // fallback:
+            // install it again now, before the new tunnel's multi-second
+            // create and handshake, rather than leave IPv6 open until that
+            // start() installs it.
+            #[cfg(target_os = "linux")]
+            if ipv6_hold_failed {
+                let reengaged = crate::vpn::tunnel_linux::install_ipv6_leak_block();
+                if let Err(e) = reengaged {
+                    tracing::warn!("Could not re-engage IPv6 block during server switch: {}", e);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if ipv6_hold_failed {
+                let reengaged = crate::commands::killswitch::ipv6_block_activate().await;
+                if let Err(e) = reengaged {
+                    tracing::warn!("Could not re-engage IPv6 block during server switch: {}", e);
+                }
+            }
+
             // Release the hold in BOTH outcomes: a held block with no tunnel and no
-            // connect in flight could never be lifted.
+            // connect in flight could never be lifted. The block itself stays in
+            // force for the new tunnel's start() to re-own (and lift only if the
+            // new node is dual-stack); every connect-failure path lifts it via
+            // lift_ipv6_block_after_failed_connect(), so it can never get stuck.
+            // MR-782: released HERE, before the new tunnel is even created, so
+            // that start's unwind (macOS lifts the block there) and every
+            // failure lift below find it unheld. On macOS/Linux the release
+            // only clears the hold; a connect dropped during the teardown
+            // drops the guard, which releases it too.
             #[cfg(target_os = "windows")]
             crate::vpn::wfp::hold_ipv6_block(false);
-
-            // LEAK-2 (macOS/Linux): the old tunnel's stop() just lifted the F-001
-            // IPv6 leak block. Windows holds the block across the teardown above;
-            // Unix has no hold, so on a dual-stack network IPv6 egressed the
-            // physical NIC (real address) for the whole switch window. Re-engage
-            // the block NOW — before the new tunnel's multi-second create+handshake
-            // — so nothing leaks during the gap. The new tunnel's start() re-owns
-            // it idempotently (and lifts it only if the new node is dual-stack),
-            // and every connect-failure path already lifts it via
-            // lift_ipv6_block_after_failed_connect(), so it can never get stuck.
-            #[cfg(target_os = "macos")]
-            if let Err(e) = crate::commands::killswitch::ipv6_block_activate().await {
-                tracing::warn!("Could not re-engage IPv6 block during server switch: {}", e);
-            }
-            #[cfg(target_os = "linux")]
-            if let Err(e) = crate::vpn::tunnel_linux::install_ipv6_leak_block() {
-                tracing::warn!("Could not re-engage IPv6 block during server switch: {}", e);
-            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            drop(ipv6_hold);
         } else if !current_state.can_connect() {
             let err = VpnError::InvalidStateTransition {
                 from: current_state.wire_name().to_string(),
@@ -1707,6 +1750,97 @@ mod tests {
         assert_eq!(OPERATION_LOCK_TIMEOUT, Duration::from_secs(30));
         assert!(docs.contains("`OPERATION_LOCK_TIMEOUT` (30 s)"));
         assert!(docs.contains("no case later than\n//! about 35 s."));
+    }
+
+    /// LEAK-2 / MR-782: on every platform the IPv6 block goes up and is HELD
+    /// before the displaced tunnel's stop(), and the hold ends after it. On
+    /// macOS and Linux the old stop() used to lift the leak block, and the
+    /// manager re-engaged it only once the teardown was over: routable IPv6
+    /// left the physical NIC in between. The behaviour is proven by
+    /// `tunnel_linux`'s netns switch tests and `pf_policy`'s switch tests;
+    /// this pins the manager's half of it.
+    ///
+    /// The hold is released BEFORE the new tunnel's start() and before the
+    /// first failure lift, in every outcome: a failed or cancelled switch
+    /// unwinds that start (macOS lifts the block there) and then lifts the
+    /// block itself (`lift_ipv6_block_after_failed_connect`), and a lift the
+    /// hold still covered would leave IPv6 blocked with no session to lift
+    /// it.
+    #[test]
+    fn a_switch_holds_the_ipv6_block_across_the_old_tunnels_stop() {
+        let source = include_str!("manager.rs").replace('\r', "");
+        let start = source.find("    pub async fn connect(").expect("connect()");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        let stop = body
+            .find("timeout(Duration::from_secs(10), tunnel.stop())")
+            .expect("the displaced tunnel's stop()");
+        let new_start = body
+            .find(".start(private_key)")
+            .expect("the new tunnel's start()");
+        let first_lift = body
+            .find("self.lift_ipv6_block_after_failed_connect()")
+            .expect("a failed connect's lift");
+        for (platform, hold, release) in [
+            (
+                "Windows",
+                "crate::vpn::wfp::hold_ipv6_block(true);",
+                "crate::vpn::wfp::hold_ipv6_block(false);",
+            ),
+            (
+                "Linux",
+                "crate::vpn::tunnel_linux::hold_ipv6_leak_block()",
+                "drop(ipv6_hold);",
+            ),
+            (
+                "macOS",
+                "crate::commands::killswitch::hold_ipv6_block().await",
+                "drop(ipv6_hold);",
+            ),
+        ] {
+            let held = body
+                .find(hold)
+                .unwrap_or_else(|| panic!("{platform}: no hold before the teardown"));
+            let released = body
+                .rfind(release)
+                .unwrap_or_else(|| panic!("{platform}: the hold is never released"));
+            assert!(
+                held < stop && stop < released,
+                "{platform}: the hold must cover the old tunnel's stop()"
+            );
+            assert!(
+                released < new_start && released < first_lift,
+                "{platform}: the hold must be released before the new tunnel's start() and the \
+                 first failure lift"
+            );
+        }
+
+        // Review N1: a hold whose own install failed falls back to the old
+        // re-engage — the block installed again after the teardown, before
+        // the new tunnel's start(). Without it, IPv6 stayed open from the
+        // teardown to that start.
+        for (platform, reengage) in [
+            (
+                "Linux",
+                "crate::vpn::tunnel_linux::install_ipv6_leak_block()",
+            ),
+            (
+                "macOS",
+                "crate::commands::killswitch::ipv6_block_activate().await",
+            ),
+        ] {
+            let at = body
+                .find(reengage)
+                .unwrap_or_else(|| panic!("{platform}: no re-engage after a failed hold"));
+            let failed = body[..at]
+                .rfind("if ipv6_hold_failed {")
+                .unwrap_or_else(|| panic!("{platform}: the re-engage is not the fallback"));
+            assert!(
+                stop < failed && at < new_start,
+                "{platform}: the fallback re-engage must follow the teardown and precede the new \
+                 tunnel's start()"
+            );
+        }
     }
 
     #[tokio::test]

@@ -966,9 +966,35 @@ impl PfState {
         loaded
     }
 
+    /// MR-782: the leak block a server switch holds through the outgoing
+    /// tunnel's teardown (`killswitch::hold_ipv6_block`). A recorded baseline
+    /// is left as it is: macOS never lifts the block during a session, so it
+    /// is pf's ruleset (watched, N6), or the loaded block-all, which denies
+    /// IPv6, falls back to it. Re-loading it was not free (review N1): a
+    /// failed [`ipv6_on`](Self::ipv6_on) puts /etc/pf.conf back and drops our
+    /// reference, which LIFTED the block in force while the old session was
+    /// still up. With no baseline recorded the block goes up as a start puts
+    /// it up.
+    pub(crate) fn ipv6_hold(&mut self, pf: &impl Pf) -> Result<(), String> {
+        if self.ipv6_baseline {
+            return Ok(());
+        }
+        self.ipv6_on(pf)
+    }
+
     /// F-001: the tunnel session is over. Best-effort, never fails a
     /// disconnect — a stuck leak block would leave the host without IPv6.
-    pub(crate) fn ipv6_off(&mut self, pf: &impl Pf) {
+    ///
+    /// MR-782: `held` — a server switch is tearing this tunnel down for the
+    /// next one and holds the block (`killswitch::hold_ipv6_block`). Nothing
+    /// changes then, the baseline included, so a kill-switch lift before the
+    /// next tunnel is up still lands on the leak block. The teardown used to
+    /// load /etc/pf.conf, and IPv6 left the physical NIC until the next
+    /// tunnel's start put the block back.
+    pub(crate) fn ipv6_off(&mut self, pf: &impl Pf, held: bool) {
+        if held {
+            return;
+        }
         if !std::mem::take(&mut self.ipv6_baseline) {
             return;
         }
@@ -2015,7 +2041,7 @@ mod tests {
         assert!(pf.rules().unwrap().contains("inet6"), "baseline retained");
         assert!(pf.running());
         assert_eq!(pf.take_ref_calls.get(), 1);
-        state.ipv6_off(&pf);
+        state.ipv6_off(&pf, false);
         assert!(!pf.rules().unwrap().contains("inet6"));
         assert!(!pf.running(), "our reference was the only one");
     }
@@ -2043,9 +2069,152 @@ mod tests {
         let (pf, mut state) = engaged();
         assert_eq!(state.ipv6_on(&pf), Ok(()));
         assert!(block_all_loaded(&pf.rules().unwrap()));
-        state.ipv6_off(&pf);
+        state.ipv6_off(&pf, false);
         assert!(block_all_loaded(&pf.rules().unwrap()));
         assert!(state.loaded && state.token.is_some());
+    }
+
+    // ── MR-782: the leak block held across a server switch ─────────────
+
+    /// pf keeps IPv6 contained: running, with the block-all or our IPv6 leak
+    /// block as its ruleset.
+    fn ipv6_contained(pf: &FakePf) -> bool {
+        let rules = pf.rules().unwrap();
+        pf.running()
+            && (block_all_loaded(&rules) || (marker_loaded(&rules) && rules.contains("inet6")))
+    }
+
+    /// MR-782, kill switch OFF: a server switch as the manager runs it — the
+    /// hold (an `ipv6_on`) before the old tunnel's teardown, whose
+    /// `ipv6_off` it holds, then the new tunnel's `ipv6_on` — keeps IPv6
+    /// contained after every step, on the one pf reference. The old teardown
+    /// loaded /etc/pf.conf before the new tunnel put the block back.
+    #[test]
+    fn a_switch_holds_the_ipv6_block_through_the_old_tunnels_teardown() {
+        let (pf, mut state) = ipv6_only();
+        assert_eq!(state.ipv6_hold(&pf), Ok(()), "the hold");
+        assert!(ipv6_contained(&pf));
+        state.ipv6_off(&pf, true);
+        assert!(
+            ipv6_contained(&pf),
+            "the old tunnel's teardown lifted the held block: {}",
+            pf.rules().unwrap()
+        );
+        assert_eq!(state.ipv6_on(&pf), Ok(()), "the new tunnel's start");
+        assert!(ipv6_contained(&pf));
+        assert_eq!(pf.take_ref_calls.get(), 1, "one reference, kept throughout");
+
+        // The new session ends as any other: unheld, its teardown lifts it.
+        state.ipv6_off(&pf, false);
+        assert!(!pf.rules().unwrap().contains("inet6"));
+        assert!(!pf.running());
+    }
+
+    /// MR-782, kill switch ON: the block-all is loaded for the whole session
+    /// and stays through the switch (the old utun's permit leaves with the old
+    /// tunnel), and the held leak block stays recorded as the baseline, so a
+    /// kill-switch lift during the switch lands on it, not on /etc/pf.conf.
+    #[test]
+    fn with_the_kill_switch_on_a_switch_keeps_the_block_all_and_the_ipv6_baseline() {
+        let (pf, mut state) = engaged();
+        assert_eq!(state.ipv6_on(&pf), Ok(()), "session A's leak block");
+        assert_eq!(state.ipv6_hold(&pf), Ok(()), "the hold");
+        assert_eq!(state.tunnel_down(&pf, &inputs(), "utun4"), Ok(()));
+        state.ipv6_off(&pf, true);
+        assert!(state.enforcing && block_all_loaded(&pf.rules().unwrap()));
+        assert!(
+            state.ipv6_baseline,
+            "the old tunnel's teardown dropped the held baseline"
+        );
+
+        // The kill switch turned off before the new tunnel is up: IPv6 stays
+        // contained by the leak block it falls back to.
+        assert_eq!(state.disengage(&pf), Ok(()));
+        let rules = pf.rules().unwrap();
+        assert!(marker_loaded(&rules) && rules.contains("inet6"), "{rules}");
+        assert!(ipv6_contained(&pf));
+    }
+
+    /// A plain Disconnect is what the user asked for: unheld, the tunnel's
+    /// teardown lifts the leak block, as it always did.
+    #[test]
+    fn an_unheld_teardown_still_lifts_the_ipv6_block() {
+        let (pf, mut state) = ipv6_only();
+        state.ipv6_off(&pf, false);
+        assert!(!state.ipv6_baseline);
+        assert!(!pf.rules().unwrap().contains("inet6"));
+        assert!(!pf.running());
+    }
+
+    /// MR-782, a switch that FAILS, kill switch OFF: the hold, the old
+    /// tunnel's held teardown, then — the hold released before the new
+    /// tunnel's start — that start's unwind, or the manager's failure lift,
+    /// as an unheld `ipv6_off`. It lands where a Disconnect lands:
+    /// /etc/pf.conf loaded and our pf reference released. A lift the hold
+    /// still covered would leave IPv6 blocked with no session to lift it.
+    #[test]
+    fn a_failed_switch_lifts_the_held_ipv6_block_once_the_hold_is_released() {
+        let (pf, mut state) = ipv6_only();
+        assert_eq!(state.ipv6_hold(&pf), Ok(()), "the hold");
+        state.ipv6_off(&pf, true);
+        assert!(ipv6_contained(&pf), "the old tunnel's teardown is held");
+
+        state.ipv6_off(&pf, false);
+        assert!(!state.ipv6_baseline);
+        assert_eq!(pf.rules().unwrap(), pf_prints(STOCK_PF_CONF));
+        assert!(
+            state.token.is_none() && !pf.running(),
+            "our reference is released"
+        );
+        assert_eq!(pf.take_ref_calls.get(), 1);
+    }
+
+    /// MR-782, review N1: the hold leaves a recorded leak block exactly as it
+    /// is — no re-load — so a pfctl that would fail now cannot lift it. The
+    /// hold used to re-load it through `ipv6_on`, whose failure puts
+    /// /etc/pf.conf back and drops our reference: IPv6 was open while the
+    /// old session was still up, and through its teardown.
+    #[test]
+    fn the_hold_never_reloads_a_recorded_ipv6_block() {
+        let (mut pf, mut state) = ipv6_only();
+        let (loads, rules) = (pf.loads.get(), pf.rules().unwrap());
+        pf.load_fails = true;
+
+        assert_eq!(state.ipv6_hold(&pf), Ok(()), "the hold");
+        assert_eq!(pf.loads.get(), loads, "re-loaded");
+        assert_eq!(pf.rules().unwrap(), rules);
+        assert!(state.ipv6_baseline && state.token.is_some());
+        assert!(ipv6_contained(&pf));
+
+        // The old tunnel's held teardown changes nothing either.
+        state.ipv6_off(&pf, true);
+        assert!(ipv6_contained(&pf));
+        assert_eq!(pf.take_ref_calls.get(), 1);
+    }
+
+    /// With the block-all loaded and no baseline recorded yet, the hold
+    /// records it, as a start does: the block-all already denies IPv6, and a
+    /// kill-switch lift during the switch lands on the leak block.
+    #[test]
+    fn under_the_block_all_the_hold_records_the_ipv6_baseline() {
+        let (pf, mut state) = engaged();
+        let loads = pf.loads.get();
+        assert_eq!(state.ipv6_hold(&pf), Ok(()), "the hold");
+        assert!(state.ipv6_baseline);
+        assert_eq!(pf.loads.get(), loads);
+        assert!(ipv6_contained(&pf));
+    }
+
+    /// With nothing recorded (no session had put the block up), the hold
+    /// installs it as a start would, on one pf reference.
+    #[test]
+    fn with_no_ipv6_baseline_the_hold_installs_the_block() {
+        let pf = FakePf::default();
+        let mut state = PfState::new();
+        assert_eq!(state.ipv6_hold(&pf), Ok(()), "the hold");
+        assert!(state.ipv6_baseline);
+        assert!(ipv6_contained(&pf));
+        assert_eq!(pf.take_ref_calls.get(), 1);
     }
 
     // ── P2-1 / MR-1125: the tunnel's own utun, confirmed ──────────────
