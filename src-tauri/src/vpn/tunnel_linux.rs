@@ -5296,26 +5296,6 @@ mod netns_teardown_tests {
         }
     }
 
-    /// The kill switch's block-all, as an armed Linux session holds it for
-    /// the whole session. Lifted at the end of the test; on drop as well, so
-    /// a failing test leaves no chain behind for the next one.
-    struct KillSwitchBlock;
-
-    impl KillSwitchBlock {
-        async fn up() -> Self {
-            crate::vpn::firewall_linux::activate_blocking()
-                .await
-                .expect("the kill switch's block-all");
-            Self
-        }
-    }
-
-    impl Drop for KillSwitchBlock {
-        fn drop(&mut self) {
-            crate::vpn::firewall_linux::emergency_cleanup();
-        }
-    }
-
     fn label(name: &str) -> crate::vpn::manager::SessionLabel {
         crate::vpn::manager::SessionLabel {
             server_name: name.into(),
@@ -5324,11 +5304,57 @@ mod netns_teardown_tests {
         }
     }
 
-    /// A relay, and the config and key a manager connect to it takes.
-    async fn session() -> (VpnConfig, WgPrivateKey, Relay) {
+    /// A relay, and the config and key a manager connect to it takes. A
+    /// `dual_stack` session is issued an IPv6 address too, so its start()
+    /// routes IPv6 through the tunnel and lifts the leak block.
+    async fn session(dual_stack: bool) -> (VpnConfig, WgPrivateKey, Relay) {
         let key = WgPrivateKey::generate();
         let relay = relay(key.public_key()).await;
-        (config(&relay), key, relay)
+        let mut config = config(&relay);
+        if dual_stack {
+            config.client_ipv6 = Some("fd99:66::2".into());
+            config.allowed_ips_v6 = vec!["::/0".into()];
+        }
+        (config, key, relay)
+    }
+
+    /// A relay that never answers: its socket is bound on RELAY and never
+    /// read. A start() against it creates birdo0, then fails at the
+    /// handshake, before it adds a route or installs the leak block.
+    async fn silent_relay() -> Relay {
+        use base64::Engine as _;
+        let server_secret = crate::utils::os_rng::x25519_static_secret();
+        let server_public = boringtun::x25519::PublicKey::from(&server_secret);
+        let socket = tokio::net::UdpSocket::bind(format!("{RELAY}:0"))
+            .await
+            .expect("bind the silent relay on RELAY");
+        let endpoint = socket.local_addr().expect("the relay's port").to_string();
+        let task = tokio::spawn(async move {
+            let _bound = socket;
+            std::future::pending::<()>().await;
+        });
+        Relay {
+            endpoint,
+            server_public_b64: base64::engine::general_purpose::STANDARD
+                .encode(server_public.as_bytes()),
+            task,
+        }
+    }
+
+    /// What `ip6tables -S` lists of the leak block (`BIRDO_IPV6_LEAK_*`: the
+    /// chain, its cover, their jumps from OUTPUT). Empty once IPv6 is the
+    /// host's again.
+    fn ipv6_leak_block_rules() -> Vec<String> {
+        let out = cmd("ip6tables")
+            .args(["-w", "-S"])
+            .output()
+            .expect("ip6tables -S");
+        assert!(out.status.success(), "ip6tables -S: {out:?}");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains(IPV6_BLOCK_CHAIN) || l.contains(IPV6_BLOCK_COVER))
+            .map(str::to_string)
+            .collect()
     }
 
     /// The probe running with its counters in place, and the CONTROL that
@@ -5351,15 +5377,25 @@ mod netns_teardown_tests {
     /// switch, exactly as the manager runs it — the old tunnel torn down, the
     /// new one started. The counters are zeroed once A is up, so what they
     /// hold afterwards left the uplink from A's session to B's:
-    /// `(IPv6, IPv4)` packets. Ends disconnected.
-    async fn switch_while_probing() -> (u64, u64) {
+    /// `(IPv6, IPv4)` packets. Both sessions are `dual_stack`, or neither.
+    /// Ends disconnected, with no leak block left.
+    async fn switch_while_probing(dual_stack: bool) -> (u64, u64) {
         let vm = crate::vpn::manager::VpnManager::new();
-        let (a, key_a, _relay_a) = session().await;
+        let (a, key_a, _relay_a) = session(dual_stack).await;
         vm.connect(a, key_a, label("netns-a"), false, vm.begin_attempt())
             .await
             .expect("session A");
+        if dual_stack {
+            // Otherwise the dual-stack test is the IPv4-only one again.
+            let rules = ipv6_leak_block_rules();
+            assert!(
+                rules.is_empty(),
+                "precondition: the dual-stack session routes IPv6 through the tunnel, its leak \
+                 block lifted: {rules:?}"
+            );
+        }
         UplinkCounters::zero();
-        let (b, key_b, _relay_b) = session().await;
+        let (b, key_b, _relay_b) = session(dual_stack).await;
         vm.connect(b, key_b, label("netns-b"), false, vm.begin_attempt())
             .await
             .expect("the switch onto B");
@@ -5368,6 +5404,11 @@ mod netns_teardown_tests {
             UplinkCounters::escaped(PROBE_V4),
         );
         vm.disconnect().await.expect("disconnect");
+        let rules = ipv6_leak_block_rules();
+        assert!(
+            rules.is_empty(),
+            "the Disconnect left IPv6 blocked: {rules:?}"
+        );
         escaped
     }
 
@@ -5384,7 +5425,7 @@ mod netns_teardown_tests {
         let before = resolv_conf();
         let (counters, probe) = probing().await;
 
-        let (v6, _) = switch_while_probing().await;
+        let (v6, _) = switch_while_probing(false).await;
         drop(probe);
         drop(counters);
 
@@ -5397,11 +5438,40 @@ mod netns_teardown_tests {
         assert_eq!(resolv_conf(), before);
     }
 
+    /// MR-782, the same switch between DUAL-STACK sessions, kill switch OFF.
+    /// Session A's start() lifted the leak block once IPv6 was routed through
+    /// the tunnel, so leaving the block alone in the old stop() is not
+    /// enough: the hold must put it up BEFORE the teardown takes the
+    /// tunnel's IPv6 routes away with birdo0. Session B lifts it again once
+    /// its own routes are in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_dual_stack_switch_lets_no_routable_ipv6_out_between_the_two_tunnels() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+        let (counters, probe) = probing().await;
+
+        let (v6, _) = switch_while_probing(true).await;
+        drop(probe);
+        drop(counters);
+
+        assert_eq!(
+            v6, 0,
+            "{v6} routable IPv6 packets left the uplink during the dual-stack switch"
+        );
+        let after = net();
+        assert!(after.nothing_of_ours(), "{after:?}");
+        assert_eq!(resolv_conf(), before);
+    }
+
     /// MR-782, kill switch ON (an armed Linux session holds its block-all
     /// for the whole session): the same switch lets nothing out of the
     /// uplink, IPv4 or IPv6, from A's session to B's — the old tunnel's
     /// stop() leaves the block-all in force across the gap. This half held
-    /// before the hold too; the test keeps it held.
+    /// before the hold too; the test keeps it held. The kill switch is armed
+    /// as a dial arms it, through its intent, and lifted as a Disconnect
+    /// lifts it (`killswitch::netns_kill_switch`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
     async fn with_the_kill_switch_on_a_switch_lets_nothing_out_between_the_two_tunnels() {
@@ -5410,19 +5480,81 @@ mod netns_teardown_tests {
         let before = resolv_conf();
         let (counters, probe) = probing().await;
 
-        let block = KillSwitchBlock::up().await;
-        let escaped = switch_while_probing().await;
+        let armed = crate::commands::killswitch::netns_kill_switch::arm().await;
+        let escaped = switch_while_probing(false).await;
         drop(probe);
-        crate::vpn::firewall_linux::deactivate_blocking()
+        crate::commands::killswitch::disarm()
             .await
-            .expect("lift the block-all");
-        drop(block);
+            .expect("lift the block-all, as a Disconnect does");
+        drop(armed);
         drop(counters);
 
         assert_eq!(
             escaped,
             (0, 0),
             "(IPv6, IPv4) packets left the uplink during the switch with the kill switch on"
+        );
+        let after = net();
+        assert!(after.nothing_of_ours(), "{after:?}");
+        assert_eq!(resolv_conf(), before);
+    }
+
+    /// MR-782, a switch that FAILS, kill switch OFF: the next relay never
+    /// answers, so the new tunnel's start() fails at its handshake and the
+    /// connect with it. The hold covers the old tunnel's stop() only and is
+    /// released before the new start(), so that start's unwind and the
+    /// manager's failure lift take the leak block down: IPv6 is not left
+    /// blocked with no session to lift it. A hold that outlived the switch
+    /// would also keep the next session's stop() from lifting it, so that
+    /// session's Disconnect must leave nothing either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_failed_switch_leaves_no_ipv6_block_behind() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+        let vm = crate::vpn::manager::VpnManager::new();
+        let (a, key_a, _relay_a) = session(false).await;
+        vm.connect(a, key_a, label("netns-a"), false, vm.begin_attempt())
+            .await
+            .expect("session A");
+        assert!(
+            !ipv6_leak_block_rules().is_empty(),
+            "precondition: session A blocks IPv6"
+        );
+
+        let silent = silent_relay().await;
+        let switched = vm
+            .connect(
+                config(&silent),
+                WgPrivateKey::generate(),
+                label("netns-silent"),
+                false,
+                vm.begin_attempt(),
+            )
+            .await;
+        assert!(
+            switched.is_err(),
+            "a switch onto a relay that never answers succeeded"
+        );
+        let rules = ipv6_leak_block_rules();
+        assert!(
+            rules.is_empty(),
+            "the failed switch left IPv6 blocked: {rules:?}"
+        );
+        let after = net();
+        assert!(after.nothing_of_ours(), "{after:?}");
+        assert_eq!(resolv_conf(), before);
+
+        let (c, key_c, _relay_c) = session(false).await;
+        vm.connect(c, key_c, label("netns-c"), false, vm.begin_attempt())
+            .await
+            .expect("the session after the failed switch");
+        vm.disconnect().await.expect("disconnect");
+        let rules = ipv6_leak_block_rules();
+        assert!(
+            rules.is_empty(),
+            "the Disconnect after a failed switch left IPv6 blocked: {rules:?}"
         );
         let after = net();
         assert!(after.nothing_of_ours(), "{after:?}");

@@ -1716,6 +1716,13 @@ mod tests {
     /// left the physical NIC in between. The behaviour is proven by
     /// `tunnel_linux`'s netns switch tests and `pf_policy`'s switch tests;
     /// this pins the manager's half of it.
+    ///
+    /// The hold is released BEFORE the new tunnel's start() and before the
+    /// first failure lift, in every outcome: a failed or cancelled switch
+    /// unwinds that start (macOS lifts the block there) and then lifts the
+    /// block itself (`lift_ipv6_block_after_failed_connect`), and a lift the
+    /// hold still covered would leave IPv6 blocked with no session to lift
+    /// it.
     #[test]
     fn a_switch_holds_the_ipv6_block_across_the_old_tunnels_stop() {
         let source = include_str!("manager.rs").replace('\r', "");
@@ -1725,6 +1732,12 @@ mod tests {
         let stop = body
             .find("timeout(Duration::from_secs(10), tunnel.stop())")
             .expect("the displaced tunnel's stop()");
+        let new_start = body
+            .find(".start(private_key)")
+            .expect("the new tunnel's start()");
+        let first_lift = body
+            .find("self.lift_ipv6_block_after_failed_connect()")
+            .expect("a failed connect's lift");
         for (platform, hold, release) in [
             (
                 "Windows",
@@ -1751,6 +1764,11 @@ mod tests {
             assert!(
                 held < stop && stop < released,
                 "{platform}: the hold must cover the old tunnel's stop()"
+            );
+            assert!(
+                released < new_start && released < first_lift,
+                "{platform}: the hold must be released before the new tunnel's start() and the \
+                 first failure lift"
             );
         }
     }

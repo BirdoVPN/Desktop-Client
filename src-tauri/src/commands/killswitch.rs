@@ -836,6 +836,38 @@ async fn arm_with_preference(enabled: bool, seen: u64) -> Result<bool, String> {
     }
 }
 
+/// The kill switch as `tunnel_linux`'s netns tests arm it (MR-782): as a dial
+/// arms it with the preference ON ([`arm_with_preference`]), so its block-all
+/// goes up through the intent path like every other
+/// (`tests::no_block_all_is_engaged_around_the_intent`) and the iptables
+/// watchdog reads it as wanted. The test lifts it with [`disarm`], as a
+/// Disconnect does. Dropping the guard clears the intent and removes the
+/// chains as well, so a test that fails half way leaves neither to the next
+/// test in the process.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod netns_kill_switch {
+    pub(crate) struct Armed(());
+
+    pub(crate) async fn arm() -> Armed {
+        // Taken first: a failed arm below still drops it.
+        let armed = Armed(());
+        let seen = super::intent_seq();
+        assert_eq!(
+            super::arm_with_preference(true, seen).await,
+            Ok(true),
+            "the kill switch's steady-state block-all"
+        );
+        armed
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            super::intent_off();
+            crate::vpn::firewall_linux::emergency_cleanup();
+        }
+    }
+}
+
 /// [`arm_with_preference`]'s step that opens the kill switch's firewall engine
 /// (`open`: `wfp::initialize()`), with the preference ON and `seen` the
 /// intent's sequence from before the preference was read. Split out so the

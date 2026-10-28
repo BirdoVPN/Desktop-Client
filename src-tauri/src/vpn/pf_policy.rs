@@ -2123,6 +2123,29 @@ mod tests {
         assert!(!pf.running());
     }
 
+    /// MR-782, a switch that FAILS, kill switch OFF: the hold, the old
+    /// tunnel's held teardown, then — the hold released before the new
+    /// tunnel's start — that start's unwind, or the manager's failure lift,
+    /// as an unheld `ipv6_off`. It lands where a Disconnect lands:
+    /// /etc/pf.conf loaded and our pf reference released. A lift the hold
+    /// still covered would leave IPv6 blocked with no session to lift it.
+    #[test]
+    fn a_failed_switch_lifts_the_held_ipv6_block_once_the_hold_is_released() {
+        let (pf, mut state) = ipv6_only();
+        assert_eq!(state.ipv6_on(&pf), Ok(()), "the hold");
+        state.ipv6_off(&pf, true);
+        assert!(ipv6_contained(&pf), "the old tunnel's teardown is held");
+
+        state.ipv6_off(&pf, false);
+        assert!(!state.ipv6_baseline);
+        assert_eq!(pf.rules().unwrap(), pf_prints(STOCK_PF_CONF));
+        assert!(
+            state.token.is_none() && !pf.running(),
+            "our reference is released"
+        );
+        assert_eq!(pf.take_ref_calls.get(), 1);
+    }
+
     // ── P2-1 / MR-1125: the tunnel's own utun, confirmed ──────────────
 
     #[test]

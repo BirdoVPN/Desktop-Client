@@ -12,9 +12,12 @@
 # nor wakes in a loop, and a packet from the relay is decrypted onto birdo0;
 # MR-2115: a failed `resolvectl domain birdo0 ~.` fails the connect, and the
 # unwind leaves nothing behind; MR-782: a server switch through the manager
-# lets no routable IPv6 out of the uplink between the two tunnels, and with
-# the kill switch's block-all up nothing at all - those tests give uplink0 an
-# IPv6 address and default route of their own, and take them away again).
+# lets no routable IPv6 out of the uplink between the two tunnels, from an
+# IPv4-only session and from a dual-stack one, and with the kill switch's
+# block-all up nothing at all - those tests give uplink0 an IPv6 address and
+# default route of their own, and take them away again; and a switch onto a
+# relay that never answers - a socket on 10.99.0.7 that reads nothing - leaves
+# no IPv6 block behind).
 #
 # Those tests create birdo0, add and delete routes and rewrite
 # /etc/resolv.conf, so they run only in the private namespace built here, and
