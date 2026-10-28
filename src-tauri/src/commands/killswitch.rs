@@ -1966,17 +1966,23 @@ impl Drop for Ipv6BlockHold {
 /// outgoing tunnel's stop() used to load /etc/pf.conf, and IPv6 left the
 /// physical NIC until the incoming tunnel's start put the block back.
 ///
-/// The block is pf's whole ruleset, re-loaded atomically over the one in
-/// force, or recorded under a loaded block-all, which already denies IPv6
-/// (`PfState::ipv6_on`). A re-load that fails puts /etc/pf.conf back, as
-/// every failed install does, and the failure is returned with the hold
-/// taken: the caller warns and goes on, as Windows does, and the incoming
-/// tunnel's start() installs the block again.
+/// macOS never lifts the block during a session, so a recorded one is left
+/// exactly as it is and the hold only sets the flag (`PfState::ipv6_hold`,
+/// review N1): re-loading it could only fail, and a failed load puts
+/// /etc/pf.conf back, lifting the block while the old session is still up.
+/// With none recorded it goes up as a start puts it up. If that fails, the
+/// failure is returned with the hold taken: the caller warns, goes on as
+/// Windows does, and installs the block again after the teardown.
 #[cfg(target_os = "macos")]
 pub(crate) async fn hold_ipv6_block() -> (Ipv6BlockHold, Result<(), String>) {
     IPV6_BLOCK_HELD.store(true, Ordering::SeqCst);
     let hold = Ipv6BlockHold(());
-    (hold, ipv6_block_activate().await)
+    // N6: the leak block is watched, kill switch on or off.
+    ensure_pf_watchdog();
+    let mut pf = PF.lock().await;
+    let result = pf.ipv6_hold(&Pfctl);
+    mirror(&pf);
+    (hold, result)
 }
 
 /// F-001: lift the steady-state IPv6 leak block at teardown.
@@ -4060,6 +4066,18 @@ mod tests {
         let run = fn_body(code, "fn xtables(");
         assert!(run.contains(".args([\"-w\", XTABLES_WAIT_SECS])"), "{run}");
         assert!(!code.contains(".arg(\"-w\")"));
+
+        // MR-782 review N4: the IPv6 leak block's ip6tables runs wait as
+        // long, and no longer: a server switch installs it from connect().
+        let tunnel = include_str!("../vpn/tunnel_linux.rs").replace('\r', "");
+        let tunnel = non_test(&tunnel);
+        assert!(tunnel.contains("const XTABLES_WAIT_SECS: &str = \"5\";"));
+        let ip6t = fn_body(tunnel, "fn ip6t(");
+        assert!(
+            ip6t.contains(".args([\"-w\", XTABLES_WAIT_SECS])"),
+            "{ip6t}"
+        );
+        assert!(!ip6t.contains(".arg(\"-w\")"), "{ip6t}");
 
         assert!(
             !code.contains("CHAINS.lock("),

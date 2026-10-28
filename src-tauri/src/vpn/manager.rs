@@ -864,22 +864,24 @@ impl VpnManager {
             // session had lifted it) and is held, so the old stop() leaves it
             // in force and the new start() installs it over itself without a
             // gap (MR-2128). The hold ends with the teardown below; a failed
-            // switch then lifts the block as before.
+            // switch then lifts the block as before. `ipv6_hold_failed`: the
+            // hold's own install failed, and the block is installed again
+            // once the teardown is over (below).
             #[cfg(target_os = "linux")]
-            let ipv6_hold = {
+            let (ipv6_hold, ipv6_hold_failed) = {
                 let (hold, up) = crate::vpn::tunnel_linux::hold_ipv6_leak_block();
-                if let Err(e) = up {
+                if let Err(e) = &up {
                     tracing::warn!("Could not block IPv6 before server switch: {}", e);
                 }
-                hold
+                (hold, up.is_err())
             };
             #[cfg(target_os = "macos")]
-            let ipv6_hold = {
+            let (ipv6_hold, ipv6_hold_failed) = {
                 let (hold, up) = crate::commands::killswitch::hold_ipv6_block().await;
-                if let Err(e) = up {
+                if let Err(e) = &up {
                     tracing::warn!("Could not block IPv6 before server switch: {}", e);
                 }
-                hold
+                (hold, up.is_err())
             };
 
             // The tunnel is already out of the Option, so the data plane is
@@ -897,6 +899,29 @@ impl VpnManager {
                             "Old tunnel teardown timed out (continuing): Tunnel stop timed out"
                         );
                     }
+                }
+            }
+
+            // MR-782 (review N1): the hold's own install failed, so nothing
+            // made sure the block was in force through the teardown (a Linux
+            // dual-stack session had lifted it; macOS installs it in the hold
+            // only when none was recorded). The old re-engage stays as the
+            // fallback:
+            // install it again now, before the new tunnel's multi-second
+            // create and handshake, rather than leave IPv6 open until that
+            // start() installs it.
+            #[cfg(target_os = "linux")]
+            if ipv6_hold_failed {
+                let reengaged = crate::vpn::tunnel_linux::install_ipv6_leak_block();
+                if let Err(e) = reengaged {
+                    tracing::warn!("Could not re-engage IPv6 block during server switch: {}", e);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if ipv6_hold_failed {
+                let reengaged = crate::commands::killswitch::ipv6_block_activate().await;
+                if let Err(e) = reengaged {
+                    tracing::warn!("Could not re-engage IPv6 block during server switch: {}", e);
                 }
             }
 
@@ -1787,6 +1812,33 @@ mod tests {
                 released < new_start && released < first_lift,
                 "{platform}: the hold must be released before the new tunnel's start() and the \
                  first failure lift"
+            );
+        }
+
+        // Review N1: a hold whose own install failed falls back to the old
+        // re-engage — the block installed again after the teardown, before
+        // the new tunnel's start(). Without it, IPv6 stayed open from the
+        // teardown to that start.
+        for (platform, reengage) in [
+            (
+                "Linux",
+                "crate::vpn::tunnel_linux::install_ipv6_leak_block()",
+            ),
+            (
+                "macOS",
+                "crate::commands::killswitch::ipv6_block_activate().await",
+            ),
+        ] {
+            let at = body
+                .find(reengage)
+                .unwrap_or_else(|| panic!("{platform}: no re-engage after a failed hold"));
+            let failed = body[..at]
+                .rfind("if ipv6_hold_failed {")
+                .unwrap_or_else(|| panic!("{platform}: the re-engage is not the fallback"));
+            assert!(
+                stop < failed && at < new_start,
+                "{platform}: the fallback re-engage must follow the teardown and precede the new \
+                 tunnel's start()"
             );
         }
     }
