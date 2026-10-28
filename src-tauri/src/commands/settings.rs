@@ -2029,9 +2029,11 @@ pub async fn set_crash_reports_enabled(app: AppHandle, enabled: bool) -> Result<
 /// that said OFF. And a save the settings file refuses (it cannot be
 /// verified) would leave them on for the whole session.
 ///
-/// An opt-IN is applied only once it is saved: a choice that did not stick is
-/// shown as OFF (`saveConsentCrashChoice`, the Settings switch), so nothing
-/// may be sent for it.
+/// An opt-IN is applied only once it is saved. ANY save that fails leaves
+/// reports OFF: a choice that did not stick is shown as OFF
+/// (`saveConsentCrashChoice`, the Settings switch), so nothing may be sent
+/// for it, not even for the opt-in an earlier consent stored, which `setup()`
+/// applied and which the consent the accept records next would reopen.
 fn write_crash_choice(
     enabled: bool,
     mut apply: impl FnMut(bool),
@@ -2040,7 +2042,10 @@ fn write_crash_choice(
     if !enabled {
         apply(false);
     }
-    save()?;
+    if let Err(refused) = save() {
+        apply(false);
+        return Err(refused);
+    }
     if enabled {
         apply(true);
     }
@@ -3743,10 +3748,12 @@ mod tests {
     /// MR-1516 (review of #364): an opt-OUT is applied before the save, so
     /// the consent the accept records next cannot reopen reports for the
     /// opt-in stored earlier, and a save the file refuses still stops them;
-    /// an opt-IN only after the save, so a choice that did not stick sends
-    /// nothing. Until the review the command saved first and applied after,
-    /// in both directions: `off, save` below read `save, off`, and a refused
-    /// opt-out applied nothing at all.
+    /// an opt-IN only after the save; and any save that fails ends OFF, so a
+    /// choice that did not stick (shown OFF) sends nothing, not even for the
+    /// opt-in stored earlier. Until the review the command saved first and
+    /// applied after, in both directions: `off, save` below read `save, off`,
+    /// and a refused save applied nothing at all (fd362215 still left a
+    /// refused opt-in at the stored opt-in: `save` alone).
     #[test]
     fn a_crash_report_opt_out_applies_before_the_save_and_an_opt_in_after() {
         let run = |enabled: bool, saved: bool| {
@@ -3768,14 +3775,14 @@ mod tests {
         assert_eq!(run(false, true), (true, vec!["off", "save"]));
         assert_eq!(
             run(false, false),
-            (false, vec!["off", "save"]),
+            (false, vec!["off", "save", "off"]),
             "a refused save still opts out"
         );
         assert_eq!(run(true, true), (true, vec!["save", "on"]));
         assert_eq!(
             run(true, false),
-            (false, vec!["save"]),
-            "a refused opt-in is never applied"
+            (false, vec!["save", "off"]),
+            "a refused opt-in is never applied, and leaves reports OFF"
         );
 
         // And the command is that function over the real gate and save.
