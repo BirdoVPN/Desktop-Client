@@ -147,11 +147,22 @@ fn record_at(path: &Path, asked: u32) -> Result<u32, String> {
     Ok(accepted)
 }
 
+/// Whether the record at start holds the current text: what `setup()` gives
+/// the crash-report gate before the webview has said anything (MR-1516).
+pub fn current_on_record(app: &AppHandle) -> bool {
+    record_path(app).is_ok_and(|p| has_current_consent(read_at(&p)))
+}
+
 /// Record the consent text `version` the webview holds (the consent screen's
 /// accept, and every start: the migration, and MR-2016's lowering). Answers
 /// the version now on record.
+///
+/// MR-1516 (owner decision 2026-10-28): crash reports follow what the
+/// webview holds, written or not: off while its consent screen is up, on
+/// again (for a user who opted in) the moment the current text is accepted.
 #[tauri::command]
 pub async fn record_consent(app: AppHandle, version: u32) -> Result<u32, IpcError> {
+    crate::utils::crash_report::set_consent_current(has_current_consent(held(version)));
     tokio::task::spawn_blocking(move || {
         let path = record_path(&app).map_err(IpcError::unknown)?;
         record_at(&path, version).map_err(IpcError::unknown)
@@ -314,5 +325,36 @@ mod tests {
             tray.contains("e.code != commands::ipc_error::IpcErrorCode::Cancelled"),
             "a refusal (consent_required included) brings the window up"
         );
+    }
+
+    /// MR-1516 (owner decision 2026-10-28): crash reports are off while a
+    /// consent screen is up, a re-consent included. The gate is fed from the
+    /// record at start, before the stored opt-in is applied, and from every
+    /// write the webview makes — the accept (on) and MR-2016's lowering (off).
+    /// A source pin: both need an `AppHandle` (the rule itself is
+    /// `crash_report::reporting`, tested there).
+    #[test]
+    fn crash_reports_follow_the_consent_the_webview_holds() {
+        let src = include_str!("consent.rs").replace('\r', "");
+        let command = &src[src
+            .find("pub async fn record_consent(")
+            .expect("record_consent")..];
+        let command = &command[..command.find("\n}").unwrap()];
+        assert!(
+            command
+                .contains("crash_report::set_consent_current(has_current_consent(held(version)));"),
+            "record_consent feeds the crash-report gate"
+        );
+
+        let main = include_str!("../main.rs").replace('\r', "");
+        let setup = &main[main.find(".setup(|app| {").expect("setup")..];
+        let gate = setup
+            .find("crash_report::set_consent_current(")
+            .expect("setup() feeds the crash-report gate");
+        let opt_in = setup
+            .find("crash_report::set_opted_in(")
+            .expect("setup() applies the stored opt-in");
+        assert!(gate < opt_in, "the gate is set before the stored opt-in");
+        assert!(setup[gate..opt_in].contains("commands::consent::current_on_record("));
     }
 }

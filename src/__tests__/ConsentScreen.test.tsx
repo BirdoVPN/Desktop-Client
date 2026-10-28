@@ -9,7 +9,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { openUrl as openExternal } from '@tauri-apps/plugin-opener';
-import { ConsentScreen, CONSENT_COPY, TERMS_URL, PRIVACY_URL } from '@/components/ConsentScreen';
+import {
+  ConsentScreen,
+  CONSENT_COPY,
+  CRASH_TOGGLE_SUBTITLE,
+  CRASH_TOGGLE_WAS_ON_SUBTITLE,
+  TERMS_URL,
+  PRIVACY_URL,
+} from '@/components/ConsentScreen';
 import { createHash } from 'node:crypto';
 import { CONSENT_VERSION } from '@/lib/consent';
 
@@ -117,16 +124,32 @@ describe('ConsentScreen controls', () => {
     render(<ConsentScreen onAccept={onAccept} onDecline={onDecline} />);
     const toggle = screen.getByRole('switch', { name: /send crash reports/i });
     expect(toggle).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByText(CRASH_TOGGLE_SUBTITLE)).toBeInTheDocument();
+    expect(screen.queryByText(CRASH_TOGGLE_WAS_ON_SUBTITLE)).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: /i agree & continue/i }));
     expect(onAccept).toHaveBeenCalledWith(false);
   });
 
-  // MR-1516: on a re-consent App passes the stored choice in.
-  it('starts from the choice it is given, and accepting passes it through', async () => {
-    render(<ConsentScreen onAccept={onAccept} onDecline={onDecline} initialCrashReports />);
-    expect(screen.getByRole('switch', { name: /send crash reports/i })).toHaveAttribute('aria-checked', 'true');
+  // MR-1516 (owner decision 2026-10-28): OFF on a re-consent too. A user who
+  // had reports on is told so, and keeps them only by turning it on again.
+  it('a re-consent for a user who had reports on still starts OFF, and says they had it on', async () => {
+    render(<ConsentScreen onAccept={onAccept} onDecline={onDecline} hadCrashReportsOn />);
+    expect(screen.getByRole('switch', { name: /send crash reports/i })).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByText(CRASH_TOGGLE_WAS_ON_SUBTITLE)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /i agree & continue/i }));
+    expect(onAccept).toHaveBeenCalledWith(false);
+  });
+
+  it('a re-consent passes a renewed opt-in through', async () => {
+    render(<ConsentScreen onAccept={onAccept} onDecline={onDecline} hadCrashReportsOn />);
+    await userEvent.click(screen.getByRole('switch', { name: /send crash reports/i }));
     await userEvent.click(screen.getByRole('button', { name: /i agree & continue/i }));
     expect(onAccept).toHaveBeenCalledWith(true);
+  });
+
+  it('the re-consent subtitle still says the toggle is off unless turned on', () => {
+    expect(CRASH_TOGGLE_WAS_ON_SUBTITLE).toMatch(/^Off unless you turn it on\./);
+    expect(CRASH_TOGGLE_SUBTITLE).toMatch(/Off unless you turn it on\./);
   });
 
   it('passes an explicit opt-in through', async () => {

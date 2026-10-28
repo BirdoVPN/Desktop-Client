@@ -48,16 +48,24 @@ export const CONSENT_COPY = {
   noAds: "No advertising or analytics SDKs. We don't sell your data or share it with advertisers.",
 } as const;
 
+/** The crash-report toggle's subtitle. */
+export const CRASH_TOGGLE_SUBTITLE = 'Optional. Off unless you turn it on.';
+/**
+ * The subtitle on a re-consent for a user who had crash reports on: the
+ * toggle still starts OFF (MR-1516), and this says so (WIN2-026).
+ */
+export const CRASH_TOGGLE_WAS_ON_SUBTITLE = 'Off unless you turn it on. You had it on before.';
+
 interface ConsentScreenProps {
   /** Called with the user's crash-report choice. */
   onAccept: (crashReportsEnabled: boolean) => void;
   onDecline: () => void;
   /**
-   * Where the crash-report toggle starts: OFF on a first consent, the stored
-   * choice when an existing user re-consents to a newer text (owner decision
-   * 2026-10-07, MR-1516). Read once, when the screen mounts.
+   * The user had crash reports on before this re-consent. The toggle starts
+   * OFF all the same (owner decision 2026-10-28, MR-1516); this only changes
+   * its subtitle, so the change is not made unannounced (WIN2-026).
    */
-  initialCrashReports?: boolean;
+  hadCrashReportsOn?: boolean;
 }
 
 /**
@@ -69,13 +77,15 @@ interface ConsentScreenProps {
  * where the Terms are accepted on desktop (audit B-13).
  *
  * Crash reporting is a separate, optional choice made here with a toggle that
- * starts OFF on a first consent; nothing is sent to Sentry unless it is
- * switched on (C-3). On a re-consent it starts from the user's stored choice
- * (`initialCrashReports`), so accepting a new text does not quietly turn
- * reports off for someone who had turned them on.
+ * starts OFF on every consent, a re-consent to a newer text included (owner
+ * decision 2026-10-28, MR-1516); nothing is sent to Sentry unless it is
+ * switched on (C-3). Accepting saves what the toggle shows. A user who had
+ * turned reports on is told so on the toggle (`hadCrashReportsOn`) and keeps
+ * them by turning it on again; declining quits and leaves the stored choice
+ * as it was.
  */
-export function ConsentScreen({ onAccept, onDecline, initialCrashReports = false }: ConsentScreenProps) {
-  const [crashReports, setCrashReports] = useState(initialCrashReports);
+export function ConsentScreen({ onAccept, onDecline, hadCrashReportsOn = false }: ConsentScreenProps) {
+  const [crashReports, setCrashReports] = useState(false);
 
   return (
     <div className="flex h-full flex-col">
@@ -149,8 +159,8 @@ export function ConsentScreen({ onAccept, onDecline, initialCrashReports = false
             </BirdoCard>
           </motion.div>
 
-          {/* The crash-report choice: a real control, starting OFF unless a
-              re-consent carries the stored choice in. */}
+          {/* The crash-report choice: a real control, starting OFF on every
+              consent, a re-consent included (MR-1516). */}
           <motion.div
             className="mb-5 w-full"
             initial={{ opacity: 0, y: 10 }}
@@ -160,7 +170,7 @@ export function ConsentScreen({ onAccept, onDecline, initialCrashReports = false
             <BirdoCard padding="0.25rem" cornerRadius={20}>
               <BirdoToggleRow
                 title="Send crash reports"
-                subtitle="Optional. Off unless you turn it on."
+                subtitle={hadCrashReportsOn ? CRASH_TOGGLE_WAS_ON_SUBTITLE : CRASH_TOGGLE_SUBTITLE}
                 leadingIcon={ChartColumn}
                 checked={crashReports}
                 onCheckedChange={setCrashReports}

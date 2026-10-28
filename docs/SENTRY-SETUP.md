@@ -21,6 +21,15 @@
 > - The user turns it on with the toggle on the consent screen (starts OFF) or
 >   in Settings › Privacy › Crash reports, via the `set_crash_reports_enabled`
 >   command. Both directions take effect immediately; no restart.
+> - **2026-10-28 (MR-1516, owner decision "Off by default"):** the consent
+>   screen's toggle starts OFF on a **re-consent** to a newer text too (from
+>   #274 until then it started from the stored choice). A user who had reports
+>   on is told so on the toggle and keeps them by turning it on again; accepting
+>   saves what the toggle shows, declining quits and changes nothing. While any
+>   consent screen is up nothing is sent, whatever the stored choice says:
+>   `crash_report::set_consent_current`, fed from Rust's consent record at start
+>   and from every `record_consent`. A user on the current text is never asked
+>   again and keeps the stored choice.
 > - With it off, no Sentry client exists (no panic hook, no transport), and
 >   `report_security_event` returns before touching the SDK. After a runtime
 >   opt-out the client stays bound, but `before_send` (`gate_and_scrub`) drops
@@ -31,8 +40,8 @@
 >   that is sent.
 >
 > The code is `src-tauri/src/utils/crash_report.rs` (`set_opted_in`,
-> `client_options`, `gate_and_scrub`); `main.rs` `setup()` applies the stored
-> choice. The DSN requirement in `build.rs` is unchanged: it guarantees the
+> `set_consent_current`, `client_options`, `gate_and_scrub`); `main.rs`
+> `setup()` applies the stored choice and the consent record. The DSN requirement in `build.rs` is unchanged: it guarantees the
 > opt-in can work, not that anything is sent.
 >
 > The project's Sentry **region** has not been verified from the repo (the

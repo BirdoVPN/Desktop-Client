@@ -549,6 +549,13 @@ fn main() {
                 startup_settings.as_ref(),
                 startup_verified,
             ));
+            // MR-1516 (owner decision 2026-10-28): no crash reports while a
+            // consent screen is up, a re-consent included. The record on disk
+            // decides until the webview's start-up `record_consent` says what
+            // it holds (an install with no record yet waits for that write).
+            crate::utils::crash_report::set_consent_current(commands::consent::current_on_record(
+                app.handle(),
+            ));
             crate::utils::crash_report::set_opted_in(
                 startup_settings
                     .as_ref()

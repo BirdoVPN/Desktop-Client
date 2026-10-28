@@ -70,6 +70,18 @@
 //!   outgoing envelope, so a dropped event sends nothing either.
 //! - No release-health sessions: the SDK's `release-health` feature is not
 //!   compiled (Cargo.toml), so no session envelope exists in this binary.
+//!
+//! # And OFF while a consent screen is up (MR-1516, owner decision 2026-10-28)
+//!
+//! The consent screen's crash-report toggle starts OFF on every consent, a
+//! re-consent to a newer text included. So while that screen is up nothing is
+//! sent either, whatever the stored choice says: reports go out only while
+//! the user has opted in ([`set_opted_in`]) AND the current consent text is
+//! accepted ([`set_consent_current`], fed from `commands::consent`'s record at
+//! start and from every `record_consent`). The stored choice itself is not
+//! touched by this gate: only the screen's accept (which saves what its toggle
+//! shows) or the Settings switch changes it. Before this, a user re-consenting
+//! with reports on had Sentry live behind a screen asking the question again.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -82,15 +94,44 @@ use super::redact::sanitize_always;
 /// [`set_opted_in`] says otherwise.
 static OPTED_IN: AtomicBool = AtomicBool::new(false);
 
+/// Whether the current consent text is accepted (MR-1516). OFF until
+/// [`set_consent_current`] says otherwise.
+static CONSENT_CURRENT: AtomicBool = AtomicBool::new(false);
+
 /// The one Sentry client this process ever builds (the panic integration
 /// installs its hook once per process, so it is built at most once).
 static CLIENT: OnceLock<Arc<sentry::Client>> = OnceLock::new();
 
-/// Apply the user's choice. `true` builds and binds the client on first use;
-/// `false` makes [`gate_and_scrub`] drop everything from now on.
+/// Apply the user's choice. `true` builds and binds the client on first use,
+/// once the current consent is accepted too; `false` makes [`gate_and_scrub`]
+/// drop everything from now on.
 pub fn set_opted_in(enabled: bool) {
     OPTED_IN.store(enabled, Ordering::SeqCst);
-    if enabled {
+    apply();
+    tracing::info!(
+        "Crash reporting {}",
+        if enabled {
+            "enabled by the user"
+        } else {
+            "off"
+        }
+    );
+}
+
+/// Apply whether the current consent text is accepted (MR-1516). `false` —
+/// a consent screen is up — makes [`gate_and_scrub`] drop everything until it
+/// is accepted; the user's stored choice is left as it is.
+pub fn set_consent_current(current: bool) {
+    let was = CONSENT_CURRENT.swap(current, Ordering::SeqCst);
+    apply();
+    if was != current && !current && OPTED_IN.load(Ordering::SeqCst) {
+        tracing::info!("Crash reporting paused until the current consent is accepted");
+    }
+}
+
+/// Build and bind the client the first time reports are on.
+fn apply() {
+    if is_reporting() {
         CLIENT.get_or_init(|| {
             let client = Arc::new(sentry::Client::from(sentry::apply_defaults(
                 client_options(),
@@ -113,19 +154,20 @@ pub fn set_opted_in(enabled: bool) {
             client
         });
     }
-    tracing::info!(
-        "Crash reporting {}",
-        if enabled {
-            "enabled by the user"
-        } else {
-            "off"
-        }
-    );
 }
 
-/// Whether the user has opted in to crash reports.
-pub fn is_opted_in() -> bool {
-    OPTED_IN.load(Ordering::SeqCst)
+/// Whether crash reports go out now: the user opted in and the current
+/// consent is accepted ([`reporting`]).
+pub fn is_reporting() -> bool {
+    reporting(
+        OPTED_IN.load(Ordering::SeqCst),
+        CONSENT_CURRENT.load(Ordering::SeqCst),
+    )
+}
+
+/// The pure half of [`is_reporting`]: on only when both say so (MR-1516).
+fn reporting(opted_in: bool, consent_current: bool) -> bool {
+    opted_in && consent_current
 }
 
 /// How long an exit waits for queued reports to go out.
@@ -147,10 +189,11 @@ pub fn flush_on_exit() {
     }
 }
 
-/// `before_send`: drop everything while the user is opted out, otherwise
-/// rebuild the event from the allowlist ([`scrub_event`]).
+/// `before_send`: drop everything while the user is opted out or a consent
+/// screen is up (MR-1516), otherwise rebuild the event from the allowlist
+/// ([`scrub_event`]).
 pub fn gate_and_scrub(event: Event<'static>) -> Option<Event<'static>> {
-    gate(is_opted_in(), event)
+    gate(is_reporting(), event)
 }
 
 /// The pure half of [`gate_and_scrub`], so both branches are testable without
@@ -348,7 +391,7 @@ pub fn never_sample_a_transaction(_ctx: &sentry::TransactionContext) -> f32 {
 /// Like every other report it is sent ONLY if the user opted in to crash
 /// reports; otherwise it returns before touching the SDK at all.
 pub fn report_security_event(message: &str) {
-    if !is_opted_in() {
+    if !is_reporting() {
         return;
     }
     sentry::capture_message(message, sentry::Level::Error);
@@ -578,8 +621,40 @@ mod tests {
     /// the test binary ever opts in, so the global must read false here.
     #[test]
     fn the_process_starts_opted_out() {
-        assert!(!is_opted_in());
+        assert!(!is_reporting());
         assert!(gate_and_scrub(Event::new()).is_none());
+    }
+
+    /// MR-1516 (owner decision 2026-10-28): reports go out only while the user
+    /// has opted in AND the current consent text is accepted.
+    #[test]
+    fn reports_need_the_opt_in_and_the_current_consent() {
+        assert!(reporting(true, true));
+        assert!(!reporting(true, false), "a consent screen is up");
+        assert!(!reporting(false, true), "opted out");
+        assert!(!reporting(false, false));
+    }
+
+    /// MR-1516: a stored opt-in behind a consent screen (a re-consent) sends
+    /// nothing and builds no client. Until 2026-10-28 `set_opted_in(true)`
+    /// alone built the client and let every event through, so Sentry was live
+    /// behind a screen whose toggle starts OFF. This test never marks the
+    /// consent current, so it cannot build a client under the other tests.
+    #[test]
+    fn a_stored_opt_in_behind_a_consent_screen_sends_nothing() {
+        set_consent_current(false);
+        set_opted_in(true);
+        let reporting_now = is_reporting();
+        let passed = gate_and_scrub(Event::new()).is_some();
+        report_security_event("MR-1516 test: must not be sent");
+        let built = CLIENT.get().is_some();
+        set_opted_in(false);
+        assert!(
+            !reporting_now,
+            "reports are off until the consent is accepted"
+        );
+        assert!(!passed, "before_send drops the event");
+        assert!(!built, "no Sentry client is built behind a consent screen");
     }
 
     /// Second-pass #17: the exit flush never builds a client, and so never

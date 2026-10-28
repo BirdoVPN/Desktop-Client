@@ -18,6 +18,7 @@ import App from '@/App';
 import { defaultSettings, useAppStore } from '@/store/app-store';
 import { CONSENT_VERSION } from '@/lib/consent';
 import { CONSENT_NOT_SAVED_COPY, CONSENT_RESAVED_COPY } from '@/session/consent-sync';
+import { CRASH_TOGGLE_SUBTITLE, CRASH_TOGGLE_WAS_ON_SUBTITLE } from '@/components/ConsentScreen';
 
 // Start Minimized keeps the window hidden at launch (REVIEW-WIN2-010).
 const appWindow = vi.hoisted(() => ({ visible: true }));
@@ -231,29 +232,64 @@ describe("Rust's consent record (MR-1607)", () => {
   });
 });
 
-// MR-1516 (owner decision 2026-10-07): a re-consent's crash-report toggle
-// starts from the stored choice. It used to start OFF every time, so accepting
-// a newer text quietly turned reports off for a user who had turned them on.
+// MR-1516 (owner decision 2026-10-28, "Off by default"): the crash-report
+// toggle starts OFF on a re-consent too. From 2026-10-08 (#274) it started
+// from the stored choice, so the re-consent screen pre-selected reports for a
+// user who had turned them on. Such a user is now told they had it on
+// (WIN2-026: the change is not made unannounced) and keeps reports by turning
+// the toggle on again. A user on the current text sees no screen and keeps
+// the stored choice untouched.
 describe('the crash-report toggle on a re-consent (MR-1516)', () => {
   const crashToggle = () => screen.findByRole('switch', { name: /send crash reports/i });
 
-  it('starts from the stored choice, and accepting keeps it', async () => {
+  it('starts OFF even when the stored choice is ON, says so, and accepting saves OFF', async () => {
     useAppStore.setState({ acceptedConsentVersion: 1, settings: { ...defaultSettings, crashReportsEnabled: true } });
     render(<App />);
-    expect(await crashToggle()).toHaveAttribute('aria-checked', 'true');
+    expect(await crashToggle()).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByText(CRASH_TOGGLE_WAS_ON_SUBTITLE)).toBeInTheDocument();
     await userEvent.click(await agree());
-    await waitFor(() => expect(callsTo('set_crash_reports_enabled')).toEqual([['set_crash_reports_enabled', { enabled: true }]]));
+    await waitFor(() => expect(callsTo('set_crash_reports_enabled')).toEqual([['set_crash_reports_enabled', { enabled: false }]]));
+    expect(useAppStore.getState().settings.crashReportsEnabled).toBe(false);
   });
 
-  it('a first consent still starts OFF, whatever the store holds', async () => {
+  it('turning it on again keeps reports on', async () => {
+    useAppStore.setState({ acceptedConsentVersion: 1, settings: { ...defaultSettings, crashReportsEnabled: true } });
+    render(<App />);
+    await userEvent.click(await crashToggle());
+    await userEvent.click(await agree());
+    await waitFor(() => expect(callsTo('set_crash_reports_enabled')).toEqual([['set_crash_reports_enabled', { enabled: true }]]));
+    expect(useAppStore.getState().settings.crashReportsEnabled).toBe(true);
+  });
+
+  it('declining leaves the stored choice as it was', async () => {
+    useAppStore.setState({ acceptedConsentVersion: 1, settings: { ...defaultSettings, crashReportsEnabled: true } });
+    render(<App />);
+    await userEvent.click(await screen.findByRole('button', { name: /^decline$/i }));
+    await waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+    expect(callsTo('set_crash_reports_enabled')).toHaveLength(0);
+    expect(useAppStore.getState().settings.crashReportsEnabled).toBe(true);
+  });
+
+  it('a first consent starts OFF with the plain subtitle, whatever the store holds', async () => {
     useAppStore.setState({ acceptedConsentVersion: 0, settings: { ...defaultSettings, crashReportsEnabled: true } });
     render(<App />);
     expect(await crashToggle()).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByText(CRASH_TOGGLE_SUBTITLE)).toBeInTheDocument();
   });
 
-  it('a stored OFF stays OFF', async () => {
+  it('a stored OFF stays OFF, with the plain subtitle', async () => {
     useAppStore.setState({ acceptedConsentVersion: 1, settings: { ...defaultSettings, crashReportsEnabled: false } });
     render(<App />);
     expect(await crashToggle()).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByText(CRASH_TOGGLE_SUBTITLE)).toBeInTheDocument();
+  });
+
+  it('a user on the current text keeps the stored choice: no screen, nothing writes it', async () => {
+    useAppStore.setState({ acceptedConsentVersion: CONSENT_VERSION, settings: { ...defaultSettings, crashReportsEnabled: true } });
+    render(<App />);
+    await waitFor(() => expect(callsTo('get_auth_state')).toHaveLength(1));
+    expect(screen.queryByRole('switch', { name: /send crash reports/i })).not.toBeInTheDocument();
+    expect(callsTo('set_crash_reports_enabled')).toHaveLength(0);
+    expect(useAppStore.getState().settings.crashReportsEnabled).toBe(true);
   });
 });
