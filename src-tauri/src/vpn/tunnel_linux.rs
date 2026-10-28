@@ -5360,7 +5360,15 @@ mod netns_teardown_tests {
     /// The probe running with its counters in place, and the CONTROL that
     /// makes a zero mean something: with nothing blocking yet, its packets
     /// of both families are counted on the uplink.
+    ///
+    /// "Nothing blocking" is made so first: the tests share the namespace,
+    /// and a start an earlier one dropped half way (MR-764's
+    /// `a_start_dropped_after_routes_and_dns_leaves_nothing_behind`) leaves
+    /// the leak block in force — a dropped LinuxTunnel never lifts it; the
+    /// manager's failure path does, and that test has no manager. Left there,
+    /// it refused the probe's IPv6 and failed the CONTROL.
     async fn probing() -> (UplinkCounters, Probe) {
+        remove_ipv6_leak_block();
         let counters = UplinkCounters::add();
         let probe = Probe::start();
         assert!(
