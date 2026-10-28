@@ -261,6 +261,13 @@ fn remove_ipv6_leak_block_with(ip6t: Ip6tables<'_>) {
     remove_ipv6_chain(ip6t, IPV6_BLOCK_COVER);
 }
 
+/// WIP (MR-782 old-code proof): the leak block's part of `stop()`, through
+/// `ip6t`. `held` is not honoured yet: the fix that follows does.
+fn lift_ipv6_leak_block_at_stop(ip6t: Ip6tables<'_>, _held: bool) {
+    remove_ipv6_leak_block_with(ip6t);
+    tracing::info!("F-001: IPv6 egress block removed");
+}
+
 /// Unhook `chain` from OUTPUT, then flush and delete it. Best-effort.
 ///
 /// A chain still hooked after the unhook is left whole, never flushed: an
@@ -662,7 +669,7 @@ impl LinuxTunnel {
 
         // F-001: lift the IPv6 block. Best-effort so it can never fail teardown
         // (a stuck block would leave the host without IPv6 after disconnect).
-        remove_ipv6_leak_block();
+        lift_ipv6_leak_block_at_stop(&mut ip6t, false);
 
         // Remove the routes this session added — only those, each qualified
         // exactly as it was added, so a route that merely shares a prefix with
@@ -3319,6 +3326,59 @@ mod ipv6_leak_block_tests {
         assert_removed(&table);
     }
 
+    /// The outgoing tunnel's `stop()` in a server switch, with the block held
+    /// for it by the manager (MR-782).
+    fn held_stop(ip6t: Ip6tables<'_>) {
+        lift_ipv6_leak_block_at_stop(ip6t, true);
+    }
+
+    /// MR-782: a server switch as the manager runs it — the hold puts the
+    /// block up before the old tunnel's stop(), which leaves it in force,
+    /// and the new tunnel's start() installs it again. Routable IPv6 never
+    /// gets out from A's session to B's. The old stop() lifted the block, and
+    /// the manager put it back only once the teardown was over.
+    #[test]
+    fn a_switch_holds_the_block_through_the_old_tunnels_stop() {
+        let mut table = installed();
+        let (held, _) = watched(&mut table, false, &no_failure, install_ipv6_leak_block_with);
+        held.expect("the hold's install");
+        let ((), _) = watched(&mut table, false, &no_failure, held_stop);
+        let (started, _) = watched(&mut table, false, &no_failure, install_ipv6_leak_block_with);
+        started.expect("the new tunnel's install");
+        assert_installed(&table);
+    }
+
+    /// MR-782, a dual-stack session: its start lifted the block (IPv6 went
+    /// through the tunnel), so the hold puts it up BEFORE the teardown, and
+    /// from there to the new session it never goes.
+    #[test]
+    fn a_dual_stack_sessions_switch_blocks_before_the_teardown() {
+        let mut table = installed();
+        let ((), _) = watched(&mut table, true, &no_failure, remove_ipv6_leak_block_with);
+        assert!(
+            !blocks(&table),
+            "precondition: the dual-stack session lifted it"
+        );
+        let (held, _) = watched(&mut table, false, &no_failure, install_ipv6_leak_block_with);
+        held.expect("the hold's install");
+        assert!(blocks(&table), "the hold is in force before the teardown");
+        let ((), _) = watched(&mut table, false, &no_failure, held_stop);
+        let (started, _) = watched(&mut table, false, &no_failure, install_ipv6_leak_block_with);
+        started.expect("the new tunnel's install");
+        assert_installed(&table);
+    }
+
+    /// A plain Disconnect is what the user asked for: with no hold, the
+    /// tunnel's stop() lifts the block, as it always did.
+    #[test]
+    fn an_unheld_stop_still_lifts_the_block() {
+        let mut table = installed();
+        let ((), _) = watched(&mut table, true, &no_failure, |ip6t| {
+            lift_ipv6_leak_block_at_stop(ip6t, false)
+        });
+        assert_removed(&table);
+    }
+
     fn ip6tables_available() -> bool {
         cmd("ip6tables")
             .arg("-L")
@@ -5095,6 +5155,274 @@ mod netns_teardown_tests {
         assert!(
             stats.1 >= received + 1028 && stats.3 > packets,
             "the tunnel did not count the packet it wrote to birdo0: {stats:?}"
+        );
+        let after = net();
+        assert!(after.nothing_of_ours(), "{after:?}");
+        assert_eq!(resolv_conf(), before);
+    }
+
+    // ── MR-782: a server switch through the manager, probed on the uplink ──
+
+    /// Where the probe sends: a routable IPv6 host and a routable IPv4 host
+    /// (documentation prefixes), reached through the uplink whenever no
+    /// tunnel route covers them.
+    const PROBE_V6: &str = "2001:db8::1";
+    const PROBE_V4: &str = "198.51.100.1";
+
+    /// IPv6 on the uplink (an address and a default route: the namespace has
+    /// none of its own), and for each family a counter in mangle POSTROUTING,
+    /// which a packet reaches only past OUTPUT's filter verdict, of the
+    /// probe's packets that leave through the uplink. Removed on drop: every
+    /// test here shares the namespace.
+    struct UplinkCounters;
+
+    impl UplinkCounters {
+        const RULES: [(&'static str, &'static str); 2] =
+            [("ip6tables", PROBE_V6), ("iptables", PROBE_V4)];
+
+        fn add() -> Self {
+            for args in [
+                &[
+                    "-6",
+                    "addr",
+                    "add",
+                    "2001:db8:99::2/64",
+                    "dev",
+                    "uplink0",
+                    "nodad",
+                ][..],
+                &[
+                    "-6",
+                    "route",
+                    "add",
+                    "default",
+                    "via",
+                    "2001:db8:99::1",
+                    "dev",
+                    "uplink0",
+                ],
+            ] {
+                let (ok, out) = ip(args);
+                assert!(ok, "ip {args:?}: {out}");
+            }
+            for (tool, dst) in Self::RULES {
+                let added = cmd(tool)
+                    .args(["-w", "-t", "mangle", "-A", "POSTROUTING", "-o", "uplink0"])
+                    .args(["-d", dst, "-j", "ACCEPT"])
+                    .status()
+                    .is_ok_and(|s| s.success());
+                assert!(added, "{tool}: the probe's counter");
+            }
+            Self
+        }
+
+        /// The probe's packets to `dst` that left through the uplink since
+        /// the last [`zero`](Self::zero).
+        fn escaped(dst: &str) -> u64 {
+            let tool = if dst.contains(':') {
+                "ip6tables"
+            } else {
+                "iptables"
+            };
+            let out = cmd(tool)
+                .args(["-w", "-t", "mangle", "-L", "POSTROUTING", "-n", "-v", "-x"])
+                .output()
+                .expect("read the probe's counter");
+            let listing = String::from_utf8_lossy(&out.stdout).into_owned();
+            listing
+                .lines()
+                .find(|l| l.contains(dst) && l.contains("uplink0"))
+                .and_then(|l| l.split_whitespace().next()?.parse().ok())
+                .unwrap_or_else(|| panic!("no counter for {dst} in:\n{listing}"))
+        }
+
+        fn zero() {
+            for (tool, _) in Self::RULES {
+                let zeroed = cmd(tool)
+                    .args(["-w", "-t", "mangle", "-Z", "POSTROUTING"])
+                    .status()
+                    .is_ok_and(|s| s.success());
+                assert!(zeroed, "{tool}: zero the probe's counter");
+            }
+        }
+    }
+
+    impl Drop for UplinkCounters {
+        fn drop(&mut self) {
+            for (tool, dst) in Self::RULES {
+                let _ = cmd(tool)
+                    .args(["-w", "-t", "mangle", "-D", "POSTROUTING", "-o", "uplink0"])
+                    .args(["-d", dst, "-j", "ACCEPT"])
+                    .status();
+            }
+            let _ = ip(&["-6", "route", "del", "default", "via", "2001:db8:99::1"]);
+            let _ = ip(&["-6", "addr", "del", "2001:db8:99::2/64", "dev", "uplink0"]);
+        }
+    }
+
+    /// A datagram to each probe address every half millisecond until dropped.
+    /// A send a block refuses fails, and the probe sends on.
+    struct Probe {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Probe {
+        fn start() -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                let v6 = std::net::UdpSocket::bind("[::]:0").expect("an IPv6 probe socket");
+                let v4 = std::net::UdpSocket::bind("0.0.0.0:0").expect("an IPv4 probe socket");
+                while !stopping.load(Ordering::SeqCst) {
+                    let _ = v6.send_to(b"birdo-probe", (PROBE_V6, 9));
+                    let _ = v4.send_to(b"birdo-probe", (PROBE_V4, 9));
+                    std::thread::sleep(Duration::from_micros(500));
+                }
+            });
+            Self {
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// The kill switch's block-all, as an armed Linux session holds it for
+    /// the whole session. Lifted at the end of the test; on drop as well, so
+    /// a failing test leaves no chain behind for the next one.
+    struct KillSwitchBlock;
+
+    impl KillSwitchBlock {
+        async fn up() -> Self {
+            crate::vpn::firewall_linux::activate_blocking()
+                .await
+                .expect("the kill switch's block-all");
+            Self
+        }
+    }
+
+    impl Drop for KillSwitchBlock {
+        fn drop(&mut self) {
+            crate::vpn::firewall_linux::emergency_cleanup();
+        }
+    }
+
+    fn label(name: &str) -> crate::vpn::manager::SessionLabel {
+        crate::vpn::manager::SessionLabel {
+            server_name: name.into(),
+            server_id: name.into(),
+            multi_hop: None,
+        }
+    }
+
+    /// A relay, and the config and key a manager connect to it takes.
+    async fn session() -> (VpnConfig, WgPrivateKey, Relay) {
+        let key = WgPrivateKey::generate();
+        let relay = relay(key.public_key()).await;
+        (config(&relay), key, relay)
+    }
+
+    /// The probe running with its counters in place, and the CONTROL that
+    /// makes a zero mean something: with nothing blocking yet, its packets
+    /// of both families are counted on the uplink.
+    async fn probing() -> (UplinkCounters, Probe) {
+        let counters = UplinkCounters::add();
+        let probe = Probe::start();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                UplinkCounters::escaped(PROBE_V6) > 0 && UplinkCounters::escaped(PROBE_V4) > 0
+            })
+            .await,
+            "CONTROL: the probe's packets never reached the uplink"
+        );
+        (counters, probe)
+    }
+
+    /// Session A up through a manager, then a connect onto B: the server
+    /// switch, exactly as the manager runs it — the old tunnel torn down, the
+    /// new one started. The counters are zeroed once A is up, so what they
+    /// hold afterwards left the uplink from A's session to B's:
+    /// `(IPv6, IPv4)` packets. Ends disconnected.
+    async fn switch_while_probing() -> (u64, u64) {
+        let vm = crate::vpn::manager::VpnManager::new();
+        let (a, key_a, _relay_a) = session().await;
+        vm.connect(a, key_a, label("netns-a"), false, vm.begin_attempt())
+            .await
+            .expect("session A");
+        UplinkCounters::zero();
+        let (b, key_b, _relay_b) = session().await;
+        vm.connect(b, key_b, label("netns-b"), false, vm.begin_attempt())
+            .await
+            .expect("the switch onto B");
+        let escaped = (
+            UplinkCounters::escaped(PROBE_V6),
+            UplinkCounters::escaped(PROBE_V4),
+        );
+        vm.disconnect().await.expect("disconnect");
+        escaped
+    }
+
+    /// MR-782, kill switch OFF: no routable IPv6 leaves the uplink while a
+    /// server switch replaces the tunnel. The old tunnel's stop() lifted the
+    /// F-001 leak block and the manager put it back only after the teardown
+    /// (the #360 review's note), so the probe's IPv6 got out in between. IPv4
+    /// may go here: with the kill switch off, that is what the user chose.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_switch_lets_no_routable_ipv6_out_between_the_two_tunnels() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+        let (counters, probe) = probing().await;
+
+        let (v6, _) = switch_while_probing().await;
+        drop(probe);
+        drop(counters);
+
+        assert_eq!(
+            v6, 0,
+            "{v6} routable IPv6 packets left the uplink during the switch"
+        );
+        let after = net();
+        assert!(after.nothing_of_ours(), "{after:?}");
+        assert_eq!(resolv_conf(), before);
+    }
+
+    /// MR-782, kill switch ON (an armed Linux session holds its block-all
+    /// for the whole session): the same switch lets nothing out of the
+    /// uplink, IPv4 or IPv6, from A's session to B's — the old tunnel's
+    /// stop() leaves the block-all in force across the gap. This half held
+    /// before the hold too; the test keeps it held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn with_the_kill_switch_on_a_switch_lets_nothing_out_between_the_two_tunnels() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+        let (counters, probe) = probing().await;
+
+        let block = KillSwitchBlock::up().await;
+        let escaped = switch_while_probing().await;
+        drop(probe);
+        crate::vpn::firewall_linux::deactivate_blocking()
+            .await
+            .expect("lift the block-all");
+        drop(block);
+        drop(counters);
+
+        assert_eq!(
+            escaped,
+            (0, 0),
+            "(IPv6, IPv4) packets left the uplink during the switch with the kill switch on"
         );
         let after = net();
         assert!(after.nothing_of_ours(), "{after:?}");

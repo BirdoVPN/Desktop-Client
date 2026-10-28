@@ -1912,7 +1912,7 @@ pub async fn ipv6_block_activate() -> Result<(), String> {
 pub async fn ipv6_block_deactivate() {
     let mut pf = PF.lock().await;
     let (wanted, kill_switch_owns) = (pf.ipv6_baseline, pf.loaded);
-    pf.ipv6_off(&Pfctl);
+    pf.ipv6_off(&Pfctl, false);
     mirror(&pf);
     if wanted {
         if kill_switch_owns {

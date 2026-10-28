@@ -467,7 +467,8 @@ jobs:
       # re-install while the block is hooked is read back from the kernel
       # after every ip6tables command it runs, and must never let routable
       # IPv6 out. The module's other tests run the same commands against a
-      # model of the table (the exact order, every failure path), so
+      # model of the table (the exact order, every failure path; MR-782: a
+      # server switch holds the block through the old tunnel's stop()), so
       # --include-ignored runs both kinds here.
       - name: IPv6 leak-block tests (Linux, root)
         if: matrix.os == 'linux'
@@ -481,10 +482,10 @@ jobs:
             exit 1
           }
           echo "$out"
-          # Seven tests, all required: a filter that matches nothing still
+          # Ten tests, all required: a filter that matches nothing still
           # exits 0.
-          if ! grep -qE 'test result: ok\. 7 passed' <<<"$out"; then
-            echo "::error::ipv6_leak_block_tests did not run all seven tests"
+          if ! grep -qE 'test result: ok\. 10 passed' <<<"$out"; then
+            echo "::error::ipv6_leak_block_tests did not run all ten tests"
             exit 1
           fi
 
@@ -594,7 +595,10 @@ jobs:
       # and a packet the relay sends down the tunnel is decrypted onto birdo0.
       # MR-2115: with resolved active (the stand-ins play it for one test), a
       # failed `resolvectl domain birdo0 ~.` fails the connect and the unwind
-      # leaves nothing behind.
+      # leaves nothing behind. MR-782: a server switch through the manager,
+      # with a probe sending routable IPv6 and IPv4 out of the uplink the whole
+      # time, lets no IPv6 out between the two tunnels, and with the kill
+      # switch's block-all up nothing at all (counted in mangle POSTROUTING).
       # The tests refuse to run outside that namespace.
       - name: Tunnel teardown tests (Linux, root, private net+mount namespace)
         if: matrix.os == 'linux'
@@ -608,10 +612,10 @@ jobs:
             exit 1
           }
           echo "$out"
-          # Ten tests, all required: an --ignored filter that matches
+          # Twelve tests, all required: an --ignored filter that matches
           # nothing still exits 0.
-          if ! grep -qE 'test result: ok\. 10 passed' <<<"$out"; then
-            echo "::error::netns_teardown_tests did not run all ten tests"
+          if ! grep -qE 'test result: ok\. 12 passed' <<<"$out"; then
+            echo "::error::netns_teardown_tests did not run all twelve tests"
             exit 1
           fi
 

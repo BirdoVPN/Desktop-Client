@@ -1709,6 +1709,52 @@ mod tests {
         assert!(docs.contains("no case later than\n//! about 35 s."));
     }
 
+    /// LEAK-2 / MR-782: on every platform the IPv6 block goes up and is HELD
+    /// before the displaced tunnel's stop(), and the hold ends after it. On
+    /// macOS and Linux the old stop() used to lift the leak block, and the
+    /// manager re-engaged it only once the teardown was over: routable IPv6
+    /// left the physical NIC in between. The behaviour is proven by
+    /// `tunnel_linux`'s netns switch tests and `pf_policy`'s switch tests;
+    /// this pins the manager's half of it.
+    #[test]
+    fn a_switch_holds_the_ipv6_block_across_the_old_tunnels_stop() {
+        let source = include_str!("manager.rs").replace('\r', "");
+        let start = source.find("    pub async fn connect(").expect("connect()");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        let stop = body
+            .find("timeout(Duration::from_secs(10), tunnel.stop())")
+            .expect("the displaced tunnel's stop()");
+        for (platform, hold, release) in [
+            (
+                "Windows",
+                "crate::vpn::wfp::hold_ipv6_block(true);",
+                "crate::vpn::wfp::hold_ipv6_block(false);",
+            ),
+            (
+                "Linux",
+                "crate::vpn::tunnel_linux::hold_ipv6_leak_block()",
+                "drop(ipv6_hold);",
+            ),
+            (
+                "macOS",
+                "crate::commands::killswitch::hold_ipv6_block().await",
+                "drop(ipv6_hold);",
+            ),
+        ] {
+            let held = body
+                .find(hold)
+                .unwrap_or_else(|| panic!("{platform}: no hold before the teardown"));
+            let released = body
+                .rfind(release)
+                .unwrap_or_else(|| panic!("{platform}: the hold is never released"));
+            assert!(
+                held < stop && stop < released,
+                "{platform}: the hold must cover the old tunnel's stop()"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_superseded_epoch_is_cancelled() {
         let mgr = VpnManager::with_block_probe(not_blocking);
