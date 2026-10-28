@@ -156,6 +156,30 @@ describe('Crash reports toggle', () => {
       expect(updateSettings).toHaveBeenLastCalledWith({ crashReportsEnabled: false });
     });
   });
+
+  // MR-1516 (review of #364): a save that fails leaves reports OFF in Rust in
+  // both directions (`write_crash_choice`), so a failed opt-OUT shows OFF too.
+  // It used to put the switch back ON, a state Rust no longer had.
+  it('a failed opt-out shows OFF, the state Rust has', async () => {
+    mockStoreState.settings.crashReportsEnabled = true;
+    mockedInvoke.mockImplementation((cmd: string) =>
+      cmd === 'set_crash_reports_enabled'
+        ? Promise.reject(new Error('disk full'))
+        : cmd === 'check_biometric_available'
+          ? Promise.resolve({ available: false, enabled: false, method: 'none' })
+          : Promise.resolve(undefined),
+    );
+    render(<Settings />);
+    await userEvent.click(await screen.findByRole('switch', { name: /crash reports/i }));
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith('set_crash_reports_enabled', { enabled: false });
+    });
+    const crashWrites = () =>
+      updateSettings.mock.calls.filter(([partial]) => 'crashReportsEnabled' in (partial as object));
+    // The optimistic OFF, then OFF again once the save has failed.
+    await waitFor(() => expect(crashWrites()).toHaveLength(2));
+    expect(crashWrites()).toEqual([[{ crashReportsEnabled: false }], [{ crashReportsEnabled: false }]]);
+  });
 });
 
 describe('a settings file that cannot be verified (review of #222, round 3)', () => {

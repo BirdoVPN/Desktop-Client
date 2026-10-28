@@ -44,15 +44,16 @@ async function windowIsVisible(): Promise<boolean> {
 }
 
 function App() {
-  const { isAuthenticated, hasAcceptedConsent, storedCrashChoice, setAuthenticated, setLoading, setUserEmail, setAccount, acceptConsent, windowCorner, pushed, onConnectTab } =
+  const { isAuthenticated, hasAcceptedConsent, hadCrashReportsOn, setAuthenticated, setLoading, setUserEmail, setAccount, acceptConsent, windowCorner, pushed, onConnectTab } =
     useAppStore(
       useShallow((s) => ({
         isAuthenticated: s.isAuthenticated,
         // The CURRENT text (D7): an older acceptance shows the screen again.
         hasAcceptedConsent: hasCurrentConsent(s.acceptedConsentVersion),
-        // A re-consent's crash-report toggle starts from the stored choice
-        // (owner decision 2026-10-07, MR-1516); a first consent starts OFF.
-        storedCrashChoice: s.acceptedConsentVersion > 0 && s.settings.crashReportsEnabled,
+        // The crash-report toggle starts OFF on every consent, a re-consent
+        // included (owner decision 2026-10-28, MR-1516). A re-consenting user
+        // who had reports on is told so on the toggle (WIN2-026).
+        hadCrashReportsOn: s.acceptedConsentVersion > 0 && s.settings.crashReportsEnabled,
         setAuthenticated: s.setAuthenticated,
         setLoading: s.setLoading,
         setUserEmail: s.setUserEmail,
@@ -346,10 +347,14 @@ function App() {
   // ── Consent handlers ──────────────────────────────────────────
   // The crash-report choice goes straight to Rust through the dedicated
   // command, and a refusal is reported like any other settings write
-  // (`saveConsentCrashChoice`).
+  // (`saveConsentCrashChoice`, which never throws). The consent is accepted
+  // only once that command has answered (MR-1516, review of #364): accepting
+  // records it in Rust (the effect above), which opens the crash-report
+  // gate, and until the choice is applied the opt-in an earlier consent
+  // stored still holds there. An opt-out is applied even when its save is
+  // refused (`settings::write_crash_choice`).
   const handleAcceptConsent = (crashReportsEnabled: boolean) => {
-    acceptConsent();
-    void saveConsentCrashChoice(crashReportsEnabled);
+    void saveConsentCrashChoice(crashReportsEnabled).then(() => acceptConsent());
   };
 
   const handleDeclineConsent = async () => {
@@ -417,7 +422,7 @@ function App() {
       <ConsentScreen
         onAccept={handleAcceptConsent}
         onDecline={handleDeclineConsent}
-        initialCrashReports={storedCrashChoice}
+        hadCrashReportsOn={hadCrashReportsOn}
       />
     );
   } else if (isAuthenticated) {

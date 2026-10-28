@@ -258,8 +258,10 @@ export function Settings() {
     try {
       await invoke('set_crash_reports_enabled', { enabled: value });
     } catch (e) {
-      // Not persisted: show the state Rust actually has, and say why.
-      updateSettings({ crashReportsEnabled: !value });
+      // Not persisted: show the state Rust actually has, and say why. That is
+      // OFF in both directions: a save that fails leaves reports off
+      // (`write_crash_choice`, MR-1516), an opt-out's included.
+      updateSettings({ crashReportsEnabled: false });
       showSaveFailure(e, "Couldn't change crash reporting. Please try again.");
     }
   }, []);
