@@ -4067,18 +4067,6 @@ mod tests {
         assert!(run.contains(".args([\"-w\", XTABLES_WAIT_SECS])"), "{run}");
         assert!(!code.contains(".arg(\"-w\")"));
 
-        // MR-782 review N4: the IPv6 leak block's ip6tables runs wait as
-        // long, and no longer: a server switch installs it from connect().
-        let tunnel = include_str!("../vpn/tunnel_linux.rs").replace('\r', "");
-        let tunnel = non_test(&tunnel);
-        assert!(tunnel.contains("const XTABLES_WAIT_SECS: &str = \"5\";"));
-        let ip6t = fn_body(tunnel, "fn ip6t(");
-        assert!(
-            ip6t.contains(".args([\"-w\", XTABLES_WAIT_SECS])"),
-            "{ip6t}"
-        );
-        assert!(!ip6t.contains(".arg(\"-w\")"), "{ip6t}");
-
         assert!(
             !code.contains("CHAINS.lock("),
             "CHAINS is taken in with_chains alone"

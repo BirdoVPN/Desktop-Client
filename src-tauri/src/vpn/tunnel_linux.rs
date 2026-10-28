@@ -119,25 +119,13 @@ const IPV6_BLOCK_CHAIN: &str = "BIRDO_IPV6_LEAK_BLOCK";
 /// is in force it is complete. Gone again once the chain is back on top.
 const IPV6_BLOCK_COVER: &str = "BIRDO_IPV6_LEAK_COVER";
 
-/// How long one ip6tables run of the leak block waits for the xtables lock:
-/// firewall_linux.rs's bound (MR-2000). A run that gives up exits 4 and
-/// fails like any other, closed: an install that fails leaves a block that
-/// was in force as it was (MR-2128).
-const XTABLES_WAIT_SECS: &str = "5";
-
 /// Run an ip6tables command, tolerating ip6tables being absent (IPv4-only host).
 /// Mirrors firewall_linux.rs's ip6tables() so behaviour is identical.
 fn ip6t(args: &[&str]) -> Result<(), String> {
     // `-w`: wait for the xtables lock instead of failing instantly under
-    // contention (firewalld, docker) — same as firewall_linux.rs's helpers,
-    // and like theirs for at most XTABLES_WAIT_SECS (MR-2000; MR-782 review
-    // N4): a bare `-w` waited for as long as a wedged holder kept the lock,
-    // and the server switch's hold now installs the block from connect().
-    match cmd("ip6tables")
-        .args(["-w", XTABLES_WAIT_SECS])
-        .args(args)
-        .output()
-    {
+    // contention (firewalld, docker) — same as firewall_linux.rs's helpers.
+    // Unbounded, unlike MR-2000's `-w 5`: here a lock timeout (exit 4) would read as "absent".
+    match cmd("ip6tables").arg("-w").args(args).output() {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => Err(format!(
             "ip6tables {} failed: {}",
