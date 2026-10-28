@@ -27,9 +27,15 @@
 >   on is told so on the toggle and keeps them by turning it on again; accepting
 >   saves what the toggle shows, declining quits and changes nothing. While any
 >   consent screen is up nothing is sent, whatever the stored choice says:
->   `crash_report::set_consent_current`, fed from Rust's consent record at start
->   and from every `record_consent`. A user on the current text is never asked
->   again and keeps the stored choice.
+>   `crash_report::set_consent_current`, fed only by `record_consent` (what the
+>   webview holds, at every start and on the accept), so the gate is closed from
+>   the start of the process until the webview confirms the current text. The
+>   accept records the consent only after `set_crash_reports_enabled` has
+>   answered, and that command applies an opt-OUT before its save (even a
+>   refused save opts out) and an opt-IN only after it
+>   (`settings::write_crash_choice`). A user on the current text is never asked
+>   again and keeps the stored choice. Trade-off: a panic in the first moments
+>   of a start, before the webview has answered, is not sent to Sentry.
 > - With it off, no Sentry client exists (no panic hook, no transport), and
 >   `report_security_event` returns before touching the SDK. After a runtime
 >   opt-out the client stays bound, but `before_send` (`gate_and_scrub`) drops
@@ -41,7 +47,8 @@
 >
 > The code is `src-tauri/src/utils/crash_report.rs` (`set_opted_in`,
 > `set_consent_current`, `client_options`, `gate_and_scrub`); `main.rs`
-> `setup()` applies the stored choice and the consent record. The DSN requirement in `build.rs` is unchanged: it guarantees the
+> `setup()` applies the stored choice; `commands::consent::record_consent` the
+> consent. The DSN requirement in `build.rs` is unchanged: it guarantees the
 > opt-in can work, not that anything is sent.
 >
 > The project's Sentry **region** has not been verified from the repo (the

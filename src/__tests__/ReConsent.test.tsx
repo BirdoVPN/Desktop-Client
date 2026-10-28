@@ -19,6 +19,7 @@ import { defaultSettings, useAppStore } from '@/store/app-store';
 import { CONSENT_VERSION } from '@/lib/consent';
 import { CONSENT_NOT_SAVED_COPY, CONSENT_RESAVED_COPY } from '@/session/consent-sync';
 import { CRASH_TOGGLE_SUBTITLE, CRASH_TOGGLE_WAS_ON_SUBTITLE } from '@/components/ConsentScreen';
+import { CONSENT_CRASH_CHOICE_FAILED_COPY } from '@/session/settings-persist';
 
 // Start Minimized keeps the window hidden at launch (REVIEW-WIN2-010).
 const appWindow = vi.hoisted(() => ({ visible: true }));
@@ -291,5 +292,52 @@ describe('the crash-report toggle on a re-consent (MR-1516)', () => {
     expect(screen.queryByRole('switch', { name: /send crash reports/i })).not.toBeInTheDocument();
     expect(callsTo('set_crash_reports_enabled')).toHaveLength(0);
     expect(useAppStore.getState().settings.crashReportsEnabled).toBe(true);
+  });
+
+  // Review of #364: accepting records the consent in Rust, which opens its
+  // crash-report gate, so the consent is accepted only once the crash-report
+  // choice has answered. On b1ab4efb the consent was accepted first, and the
+  // record went out while the opt-out was still being saved: in that window
+  // the opt-in stored by the earlier consent sent reports.
+  it('records the consent only after the crash-report choice has answered', async () => {
+    let answer: () => void = () => {};
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) =>
+      cmd === 'set_crash_reports_enabled'
+        ? new Promise((resolve) => {
+            answer = () => resolve(false);
+          })
+        : scripted?.(cmd, args, options),
+    );
+    const currentRecords = () =>
+      callsTo('record_consent').filter(([, a]) => (a as { version: number }).version === CONSENT_VERSION);
+    useAppStore.setState({ acceptedConsentVersion: 1, settings: { ...defaultSettings, crashReportsEnabled: true } });
+    render(<App />);
+    await userEvent.click(await agree());
+    await waitFor(() =>
+      expect(callsTo('set_crash_reports_enabled')).toEqual([['set_crash_reports_enabled', { enabled: false }]]),
+    );
+    expect(currentRecords()).toHaveLength(0);
+    expect(useAppStore.getState().acceptedConsentVersion).toBe(1);
+
+    answer();
+    await waitFor(() => expect(currentRecords()).toHaveLength(1));
+    expect(useAppStore.getState().acceptedConsentVersion).toBe(CONSENT_VERSION);
+  });
+
+  it('a crash-report choice that could not be saved still accepts the consent, and says so', async () => {
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'set_crash_reports_enabled') throw 'disk full (fixture)';
+      return scripted?.(cmd, args, options);
+    });
+    useAppStore.setState({ acceptedConsentVersion: 1, settings: { ...defaultSettings, crashReportsEnabled: true } });
+    render(<App />);
+    await userEvent.click(await agree());
+    await waitFor(() => expect(useAppStore.getState().acceptedConsentVersion).toBe(CONSENT_VERSION));
+    expect(useAppStore.getState().settings.crashReportsEnabled).toBe(false);
+    expect(useAppStore.getState().notice?.text).toBe(CONSENT_CRASH_CHOICE_FAILED_COPY);
+    quiet.mockRestore();
   });
 });

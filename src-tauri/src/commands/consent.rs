@@ -147,19 +147,15 @@ fn record_at(path: &Path, asked: u32) -> Result<u32, String> {
     Ok(accepted)
 }
 
-/// Whether the record at start holds the current text: what `setup()` gives
-/// the crash-report gate before the webview has said anything (MR-1516).
-pub fn current_on_record(app: &AppHandle) -> bool {
-    record_path(app).is_ok_and(|p| has_current_consent(read_at(&p)))
-}
-
 /// Record the consent text `version` the webview holds (the consent screen's
 /// accept, and every start: the migration, and MR-2016's lowering). Answers
 /// the version now on record.
 ///
 /// MR-1516 (owner decision 2026-10-28): crash reports follow what the
-/// webview holds, written or not: off while its consent screen is up, on
-/// again (for a user who opted in) the moment the current text is accepted.
+/// webview holds, written or not, and nothing else opens their gate: closed
+/// from the start of the process (not opened from this record, which a
+/// webview that lost its storage contradicts) until the webview says it holds
+/// the current text, closed again while its consent screen is up.
 #[tauri::command]
 pub async fn record_consent(app: AppHandle, version: u32) -> Result<u32, IpcError> {
     crate::utils::crash_report::set_consent_current(has_current_consent(held(version)));
@@ -328,11 +324,15 @@ mod tests {
     }
 
     /// MR-1516 (owner decision 2026-10-28): crash reports are off while a
-    /// consent screen is up, a re-consent included. The gate is fed from the
-    /// record at start, before the stored opt-in is applied, and from every
-    /// write the webview makes — the accept (on) and MR-2016's lowering (off).
-    /// A source pin: both need an `AppHandle` (the rule itself is
-    /// `crash_report::reporting`, tested there).
+    /// consent screen is up, a re-consent included. Only what the webview
+    /// says opens or closes the gate: every `record_consent` — the accept and
+    /// each start (on), MR-2016's lowering (off). `setup()` applies the stored
+    /// opt-in alone. Until the review of #364 it also opened the gate from
+    /// consent.json, so a webview that had lost its storage (the consent
+    /// screen up, the file still "accepted") sent reports from the start
+    /// until its own write closed the gate again. A source pin: both need an
+    /// `AppHandle` (the rule itself is `crash_report::reporting`, tested
+    /// there).
     #[test]
     fn crash_reports_follow_the_consent_the_webview_holds() {
         let src = include_str!("consent.rs").replace('\r', "");
@@ -348,13 +348,40 @@ mod tests {
 
         let main = include_str!("../main.rs").replace('\r', "");
         let setup = &main[main.find(".setup(|app| {").expect("setup")..];
-        let gate = setup
-            .find("crash_report::set_consent_current(")
-            .expect("setup() feeds the crash-report gate");
-        let opt_in = setup
-            .find("crash_report::set_opted_in(")
-            .expect("setup() applies the stored opt-in");
-        assert!(gate < opt_in, "the gate is set before the stored opt-in");
-        assert!(setup[gate..opt_in].contains("commands::consent::current_on_record("));
+        assert!(
+            setup.contains("crash_report::set_opted_in("),
+            "setup() applies the stored opt-in"
+        );
+
+        // Nothing but record_consent opens the gate: no other caller in src/.
+        let gate_call = ["set_consent_current", "("].concat();
+        let mut callers = Vec::new();
+        let mut dirs = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src/") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("source");
+                    let calls = text.matches(gate_call.as_str()).count();
+                    if calls > 0 {
+                        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                        callers.push((name, calls));
+                    }
+                }
+            }
+        }
+        callers.sort();
+        // crash_report.rs: its definition and a test that keeps it closed;
+        // consent.rs: record_consent's call and the line above, which pins it.
+        assert_eq!(
+            callers,
+            [
+                ("consent.rs".to_string(), 2),
+                ("crash_report.rs".to_string(), 2)
+            ],
+            "set_consent_current is called from more than record_consent"
+        );
     }
 }

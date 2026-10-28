@@ -77,11 +77,15 @@
 //! re-consent to a newer text included. So while that screen is up nothing is
 //! sent either, whatever the stored choice says: reports go out only while
 //! the user has opted in ([`set_opted_in`]) AND the current consent text is
-//! accepted ([`set_consent_current`], fed from `commands::consent`'s record at
-//! start and from every `record_consent`). The stored choice itself is not
-//! touched by this gate: only the screen's accept (which saves what its toggle
-//! shows) or the Settings switch changes it. Before this, a user re-consenting
-//! with reports on had Sentry live behind a screen asking the question again.
+//! accepted ([`set_consent_current`], fed by `commands::consent::record_consent`
+//! alone: what the webview holds, at every start and on the accept). The gate
+//! is closed from the start of the process until the webview says so, so a
+//! stored opt-in builds no client in `setup()`. The stored choice itself is
+//! not touched by this gate: only the screen's accept (which saves what its
+//! toggle shows, and records the consent only once that is applied:
+//! `settings::write_crash_choice`) or the Settings switch changes it. Before
+//! this, a user re-consenting with reports on had Sentry live behind a screen
+//! asking the question again.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};

@@ -549,13 +549,12 @@ fn main() {
                 startup_settings.as_ref(),
                 startup_verified,
             ));
-            // MR-1516 (owner decision 2026-10-28): no crash reports while a
-            // consent screen is up, a re-consent included. The record on disk
-            // decides until the webview's start-up `record_consent` says what
-            // it holds (an install with no record yet waits for that write).
-            crate::utils::crash_report::set_consent_current(commands::consent::current_on_record(
-                app.handle(),
-            ));
+            // The stored choice only: the client is built once the webview's
+            // start-up `record_consent` says it holds the current consent too
+            // (MR-1516, owner decision 2026-10-28: no crash reports while a
+            // consent screen is up, a re-consent included). Not consent.json
+            // here: a webview that lost its storage shows the consent screen
+            // while that file still says "accepted" (MR-2016).
             crate::utils::crash_report::set_opted_in(
                 startup_settings
                     .as_ref()

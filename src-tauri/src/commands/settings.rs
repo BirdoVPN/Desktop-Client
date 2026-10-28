@@ -2001,20 +2001,50 @@ fn with_tunnel_settings_of(
 /// Rust: saving the store's view there could overwrite a settings.json the
 /// store has never read. This reads the file, changes the one field and
 /// writes it back. Takes effect immediately in both directions (see
-/// `utils::crash_report`), so no restart is needed.
+/// `utils::crash_report`), so no restart is needed; in which order:
+/// `write_crash_choice`.
 #[tauri::command]
 pub async fn set_crash_reports_enabled(app: AppHandle, enabled: bool) -> Result<bool, IpcError> {
     off_the_runtime(move || {
-        // MR-692: one field over what is saved — never over the defaults a
-        // load serves while it cannot verify the file.
-        let _write = SETTINGS_WRITE.lock();
-        let mut settings = verified(load_settings(&app)?)?;
-        settings.crash_reports_enabled = enabled;
-        save_settings_inner(&app, &settings).map_err(IpcError::unknown)?;
-        crate::utils::crash_report::set_opted_in(enabled);
-        Ok(enabled)
+        write_crash_choice(enabled, crate::utils::crash_report::set_opted_in, || {
+            // MR-692: one field over what is saved — never over the defaults a
+            // load serves while it cannot verify the file.
+            let _write = SETTINGS_WRITE.lock();
+            let mut settings = verified(load_settings(&app)?)?;
+            settings.crash_reports_enabled = enabled;
+            save_settings_inner(&app, &settings).map_err(IpcError::unknown)
+        })
     })
     .await
+}
+
+/// Write the crash-report choice with `save` and apply it with `apply`
+/// (MR-1516, review of #364).
+///
+/// An opt-OUT is applied FIRST, before anything that can wait or fail. The
+/// consent screen's accept records the consent (which opens the crash-report
+/// gate) only once this command has answered (`App.tsx`), and until the
+/// opt-out is applied the opt-in stored by an earlier consent still holds: a
+/// save after it would leave a window in which reports go out behind a screen
+/// that said OFF. And a save the settings file refuses (it cannot be
+/// verified) would leave them on for the whole session.
+///
+/// An opt-IN is applied only once it is saved: a choice that did not stick is
+/// shown as OFF (`saveConsentCrashChoice`, the Settings switch), so nothing
+/// may be sent for it.
+fn write_crash_choice(
+    enabled: bool,
+    mut apply: impl FnMut(bool),
+    save: impl FnOnce() -> Result<(), IpcError>,
+) -> Result<bool, IpcError> {
+    if !enabled {
+        apply(false);
+    }
+    save()?;
+    if enabled {
+        apply(true);
+    }
+    Ok(enabled)
 }
 
 /// Put the settings back to their defaults: the way out of a file that cannot
@@ -3708,6 +3738,56 @@ mod tests {
                 "{command} does its work on the async runtime"
             );
         }
+    }
+
+    /// MR-1516 (review of #364): an opt-OUT is applied before the save, so
+    /// the consent the accept records next cannot reopen reports for the
+    /// opt-in stored earlier, and a save the file refuses still stops them;
+    /// an opt-IN only after the save, so a choice that did not stick sends
+    /// nothing. Until the review the command saved first and applied after,
+    /// in both directions: `off, save` below read `save, off`, and a refused
+    /// opt-out applied nothing at all.
+    #[test]
+    fn a_crash_report_opt_out_applies_before_the_save_and_an_opt_in_after() {
+        let run = |enabled: bool, saved: bool| {
+            let events = std::cell::RefCell::new(Vec::new());
+            let result = write_crash_choice(
+                enabled,
+                |on| events.borrow_mut().push(if on { "on" } else { "off" }),
+                || {
+                    events.borrow_mut().push("save");
+                    if saved {
+                        Ok(())
+                    } else {
+                        Err(IpcError::unknown("refused (fixture)"))
+                    }
+                },
+            );
+            (result.is_ok(), events.into_inner())
+        };
+        assert_eq!(run(false, true), (true, vec!["off", "save"]));
+        assert_eq!(
+            run(false, false),
+            (false, vec!["off", "save"]),
+            "a refused save still opts out"
+        );
+        assert_eq!(run(true, true), (true, vec!["save", "on"]));
+        assert_eq!(
+            run(true, false),
+            (false, vec!["save"]),
+            "a refused opt-in is never applied"
+        );
+
+        // And the command is that function over the real gate and save.
+        let source = include_str!("settings.rs").replace('\r', "");
+        let command = &source[source
+            .find("pub async fn set_crash_reports_enabled(")
+            .expect("the command")..];
+        let command = &command[..command.find("\n}\n").expect("end of fn")];
+        assert!(command.contains(
+            "write_crash_choice(enabled, crate::utils::crash_report::set_opted_in, || {"
+        ));
+        assert_eq!(command.matches("set_opted_in").count(), 1, "{command}");
     }
 
     /// For a quarantine that writes nothing: there is nothing to sign.

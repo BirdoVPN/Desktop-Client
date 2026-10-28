@@ -347,10 +347,14 @@ function App() {
   // ── Consent handlers ──────────────────────────────────────────
   // The crash-report choice goes straight to Rust through the dedicated
   // command, and a refusal is reported like any other settings write
-  // (`saveConsentCrashChoice`).
+  // (`saveConsentCrashChoice`, which never throws). The consent is accepted
+  // only once that command has answered (MR-1516, review of #364): accepting
+  // records it in Rust (the effect above), which opens the crash-report
+  // gate, and until the choice is applied the opt-in an earlier consent
+  // stored still holds there. An opt-out is applied even when its save is
+  // refused (`settings::write_crash_choice`).
   const handleAcceptConsent = (crashReportsEnabled: boolean) => {
-    acceptConsent();
-    void saveConsentCrashChoice(crashReportsEnabled);
+    void saveConsentCrashChoice(crashReportsEnabled).then(() => acceptConsent());
   };
 
   const handleDeclineConsent = async () => {
