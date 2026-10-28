@@ -261,11 +261,54 @@ fn remove_ipv6_leak_block_with(ip6t: Ip6tables<'_>) {
     remove_ipv6_chain(ip6t, IPV6_BLOCK_COVER);
 }
 
-/// WIP (MR-782 old-code proof): the leak block's part of `stop()`, through
-/// `ip6t`. `held` is not honoured yet: the fix that follows does.
-fn lift_ipv6_leak_block_at_stop(ip6t: Ip6tables<'_>, _held: bool) {
+/// The leak block's part of `stop()`, through `ip6t`: lifted, unless a
+/// server switch holds it for the incoming tunnel (`held`, MR-782,
+/// [`hold_ipv6_leak_block`]).
+fn lift_ipv6_leak_block_at_stop(ip6t: Ip6tables<'_>, held: bool) {
+    if held {
+        tracing::info!("F-001: IPv6 egress block kept in force for the server switch");
+        return;
+    }
     remove_ipv6_leak_block_with(ip6t);
     tracing::info!("F-001: IPv6 egress block removed");
+}
+
+/// MR-782: set while a server switch tears the outgoing tunnel down
+/// ([`hold_ipv6_leak_block`]). That tunnel's stop() then leaves the leak
+/// block in force for the incoming one. [`remove_ipv6_leak_block`] never
+/// reads it: the failure lift, the exit cleanup and the startup reconcile
+/// take everything down whatever it says.
+static IPV6_BLOCK_HELD: AtomicBool = AtomicBool::new(false);
+
+/// MR-782: the F-001 leak block, held in force across a server switch's
+/// teardown of the outgoing tunnel. Dropping it ends the hold, in every
+/// outcome of the teardown (an error, a timeout, a connect dropped half way
+/// through it), and does nothing else: the block stays for the incoming
+/// tunnel's start() to re-own, and a switch that fails lifts it afterwards,
+/// unheld (the new start's unwind, then
+/// `VpnManager::lift_ipv6_block_after_failed_connect`). A hold that outlived
+/// the switch would keep every later stop() from lifting it.
+pub(crate) struct Ipv6BlockHold(());
+
+impl Drop for Ipv6BlockHold {
+    fn drop(&mut self) {
+        IPV6_BLOCK_HELD.store(false, Ordering::SeqCst);
+    }
+}
+
+/// MR-782, the twin of Windows' `wfp::block_ipv6` + `hold_ipv6_block(true)`:
+/// put the leak block up and hold it until the returned guard drops. The
+/// outgoing tunnel's stop() used to lift it, and the manager put it back only
+/// after the teardown, so routable IPv6 left the physical NIC in between.
+/// INSTALLED here, not only kept: a dual-stack session's start() lifted it
+/// once IPv6 was routed through the tunnel, and the teardown takes those
+/// routes away with the device. The install is gapless over a block already
+/// in force (MR-2128). If it fails, the failure is returned with the hold
+/// taken (the caller warns and goes on, as Windows does); a block that was
+/// up stays up (MR-2128 again).
+pub(crate) fn hold_ipv6_leak_block() -> (Ipv6BlockHold, Result<(), String>) {
+    IPV6_BLOCK_HELD.store(true, Ordering::SeqCst);
+    (Ipv6BlockHold(()), install_ipv6_leak_block())
 }
 
 /// Unhook `chain` from OUTPUT, then flush and delete it. Best-effort.
@@ -669,7 +712,8 @@ impl LinuxTunnel {
 
         // F-001: lift the IPv6 block. Best-effort so it can never fail teardown
         // (a stuck block would leave the host without IPv6 after disconnect).
-        lift_ipv6_leak_block_at_stop(&mut ip6t, false);
+        // MR-782: unless a server switch holds it for the incoming tunnel.
+        lift_ipv6_leak_block_at_stop(&mut ip6t, IPV6_BLOCK_HELD.load(Ordering::SeqCst));
 
         // Remove the routes this session added — only those, each qualified
         // exactly as it was added, so a route that merely shares a prefix with

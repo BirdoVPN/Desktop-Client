@@ -1936,18 +1936,67 @@ pub async fn ipv6_block_activate() -> Result<(), String> {
     result
 }
 
+/// MR-782: set while a server switch tears the outgoing tunnel down
+/// ([`hold_ipv6_block`]). That tunnel's teardown ([`ipv6_block_deactivate`])
+/// then leaves the leak block in force for the incoming one. An atomic, not
+/// part of the state under `PF`: the hold's Drop clears it at once, with no
+/// lock to wait for or to fail to take.
+#[cfg(target_os = "macos")]
+static IPV6_BLOCK_HELD: AtomicBool = AtomicBool::new(false);
+
+/// MR-782: the F-001 leak block, held in force across a server switch's
+/// teardown of the outgoing tunnel. Dropping it ends the hold, in every
+/// outcome of the teardown (an error, a timeout, a connect dropped half way
+/// through it), and does nothing else: the block stays for the incoming
+/// tunnel's start() to re-own, and a switch that fails lifts it afterwards,
+/// unheld (`VpnManager::lift_ipv6_block_after_failed_connect`). A hold that
+/// outlived the switch would keep every later teardown from lifting it.
+#[cfg(target_os = "macos")]
+pub(crate) struct Ipv6BlockHold(());
+
+#[cfg(target_os = "macos")]
+impl Drop for Ipv6BlockHold {
+    fn drop(&mut self) {
+        IPV6_BLOCK_HELD.store(false, Ordering::SeqCst);
+    }
+}
+
+/// MR-782, the twin of Windows' `wfp::block_ipv6` + `hold_ipv6_block(true)`:
+/// put the leak block up and hold it until the returned guard drops. The
+/// outgoing tunnel's stop() used to load /etc/pf.conf, and IPv6 left the
+/// physical NIC until the incoming tunnel's start put the block back.
+///
+/// The block is pf's whole ruleset, re-loaded atomically over the one in
+/// force, or recorded under a loaded block-all, which already denies IPv6
+/// (`PfState::ipv6_on`). A re-load that fails puts /etc/pf.conf back, as
+/// every failed install does, and the failure is returned with the hold
+/// taken: the caller warns and goes on, as Windows does, and the incoming
+/// tunnel's start() installs the block again.
+#[cfg(target_os = "macos")]
+pub(crate) async fn hold_ipv6_block() -> (Ipv6BlockHold, Result<(), String>) {
+    IPV6_BLOCK_HELD.store(true, Ordering::SeqCst);
+    let hold = Ipv6BlockHold(());
+    (hold, ipv6_block_activate().await)
+}
+
 /// F-001: lift the steady-state IPv6 leak block at teardown.
 ///
 /// Best-effort and always safe to call (no-op if never engaged), so it can never
 /// fail a disconnect — a stuck block would leave the host without IPv6.
+/// MR-782: a no-op while a server switch holds the block ([`hold_ipv6_block`]).
 #[cfg(target_os = "macos")]
 pub async fn ipv6_block_deactivate() {
     let mut pf = PF.lock().await;
+    // Read once the lock is ours: a hold released while this waited for it
+    // is released.
+    let held = IPV6_BLOCK_HELD.load(Ordering::SeqCst);
     let (wanted, kill_switch_owns) = (pf.ipv6_baseline, pf.loaded);
-    pf.ipv6_off(&Pfctl, false);
+    pf.ipv6_off(&Pfctl, held);
     mirror(&pf);
     if wanted {
-        if kill_switch_owns {
+        if held {
+            tracing::info!("F-001: IPv6 egress block kept in force for the server switch");
+        } else if kill_switch_owns {
             tracing::info!("F-001: leak block released; kill switch still owns the pf ruleset");
         } else {
             tracing::info!("F-001: IPv6 egress block removed");

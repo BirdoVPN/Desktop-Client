@@ -969,9 +969,16 @@ impl PfState {
     /// F-001: the tunnel session is over. Best-effort, never fails a
     /// disconnect — a stuck leak block would leave the host without IPv6.
     ///
-    /// WIP (MR-782 old-code proof): `held` is not honoured yet; the fix that
-    /// follows does.
-    pub(crate) fn ipv6_off(&mut self, pf: &impl Pf, _held: bool) {
+    /// MR-782: `held` — a server switch is tearing this tunnel down for the
+    /// next one and holds the block (`killswitch::hold_ipv6_block`). Nothing
+    /// changes then, the baseline included, so a kill-switch lift before the
+    /// next tunnel is up still lands on the leak block. The teardown used to
+    /// load /etc/pf.conf, and IPv6 left the physical NIC until the next
+    /// tunnel's start put the block back.
+    pub(crate) fn ipv6_off(&mut self, pf: &impl Pf, held: bool) {
+        if held {
+            return;
+        }
         if !std::mem::take(&mut self.ipv6_baseline) {
             return;
         }

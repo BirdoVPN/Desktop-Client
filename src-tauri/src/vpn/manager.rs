@@ -855,6 +855,32 @@ impl VpnManager {
                 }
                 crate::vpn::wfp::hold_ipv6_block(true);
             }
+            // MR-782: the same hold on macOS and Linux. The old tunnel's stop()
+            // used to lift the F-001 leak block, and it was re-engaged only
+            // once the teardown was over, so with the kill switch off routable
+            // IPv6 left the physical NIC in between (the kill switch's
+            // block-all, held for the whole session while armed, covers both
+            // families when it is on). The block goes up now (a dual-stack
+            // session had lifted it) and is held, so the old stop() leaves it
+            // in force and the new start() installs it over itself without a
+            // gap (MR-2128). The hold ends with the teardown below; a failed
+            // switch then lifts the block as before.
+            #[cfg(target_os = "linux")]
+            let ipv6_hold = {
+                let (hold, up) = crate::vpn::tunnel_linux::hold_ipv6_leak_block();
+                if let Err(e) = up {
+                    tracing::warn!("Could not block IPv6 before server switch: {}", e);
+                }
+                hold
+            };
+            #[cfg(target_os = "macos")]
+            let ipv6_hold = {
+                let (hold, up) = crate::commands::killswitch::hold_ipv6_block().await;
+                if let Err(e) = up {
+                    tracing::warn!("Could not block IPv6 before server switch: {}", e);
+                }
+                hold
+            };
 
             // The tunnel is already out of the Option, so the data plane is
             // disposed here and nothing can reach it again. Its stop() will find
@@ -875,27 +901,19 @@ impl VpnManager {
             }
 
             // Release the hold in BOTH outcomes: a held block with no tunnel and no
-            // connect in flight could never be lifted.
+            // connect in flight could never be lifted. The block itself stays in
+            // force for the new tunnel's start() to re-own (and lift only if the
+            // new node is dual-stack); every connect-failure path lifts it via
+            // lift_ipv6_block_after_failed_connect(), so it can never get stuck.
+            // MR-782: released HERE, before the new tunnel is even created, so
+            // that start's unwind (macOS lifts the block there) and every
+            // failure lift below find it unheld. On macOS/Linux the release
+            // only clears the hold; a connect dropped during the teardown
+            // drops the guard, which releases it too.
             #[cfg(target_os = "windows")]
             crate::vpn::wfp::hold_ipv6_block(false);
-
-            // LEAK-2 (macOS/Linux): the old tunnel's stop() just lifted the F-001
-            // IPv6 leak block. Windows holds the block across the teardown above;
-            // Unix has no hold, so on a dual-stack network IPv6 egressed the
-            // physical NIC (real address) for the whole switch window. Re-engage
-            // the block NOW — before the new tunnel's multi-second create+handshake
-            // — so nothing leaks during the gap. The new tunnel's start() re-owns
-            // it idempotently (and lifts it only if the new node is dual-stack),
-            // and every connect-failure path already lifts it via
-            // lift_ipv6_block_after_failed_connect(), so it can never get stuck.
-            #[cfg(target_os = "macos")]
-            if let Err(e) = crate::commands::killswitch::ipv6_block_activate().await {
-                tracing::warn!("Could not re-engage IPv6 block during server switch: {}", e);
-            }
-            #[cfg(target_os = "linux")]
-            if let Err(e) = crate::vpn::tunnel_linux::install_ipv6_leak_block() {
-                tracing::warn!("Could not re-engage IPv6 block during server switch: {}", e);
-            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            drop(ipv6_hold);
         } else if !current_state.can_connect() {
             let err = VpnError::InvalidStateTransition {
                 from: current_state.wire_name().to_string(),
