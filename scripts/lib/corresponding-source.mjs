@@ -1,7 +1,9 @@
 // What each release publishes as the corresponding source of the third-party
 // programs it bundles, and the module check every reader of xray's Go build
-// information shares (owner decisions 2026-10-14, L1: mirror the source per
-// release; L2: the AppImage's own components).
+// information shares (owner decision 2026-10-14, L1: mirror the source per
+// release). The AppImage runtime's sources left the asset with the AppImage
+// (owner decision 2026-10-28, MR-2020/MR-2041/MR-2042: Linux ships the .deb
+// only); the assets of the releases that shipped one keep them.
 //
 // Each Desktop release carries one asset, BirdoVPN-<version>-corresponding-
 // source.tar.gz (scripts/build-corresponding-source.mjs builds it, release.yml
@@ -12,11 +14,9 @@
 //                                          xray binaries link, at that version
 //   xray/go/go<version>.src.tar.gz         the Go toolchain that built them
 //                                          (standard library and runtime)
-//   appimage-runtime/...                   the AppImage runtime's source, and
-//                                          libfuse's and squashfuse's
 //   README.txt
-// THIRD-PARTY-NOTICES.txt (scripts/generate-third-party-notices.mjs and
-// scripts/generate-appimage-notices.mjs) names that asset as the primary
+// THIRD-PARTY-NOTICES.txt (scripts/generate-third-party-notices.mjs) names
+// that asset as the primary
 // source location, so its name, URL and member paths are defined here, once.
 
 /** Licences whose terms require the source to be offered: GPL, LGPL, AGPL, MPL. */
@@ -43,12 +43,6 @@ export const xrayTagArchiveMember = (xrayVersion) => `xray/Xray-core-${xrayVersi
 
 /** Where, inside the asset's top-level directory, the Go toolchain's official source archive is. */
 export const goSourceMember = (srcArchive) => `xray/go/${srcArchive}`;
-
-/** Where, inside the asset's top-level directory, the AppImage runtime's sources are. */
-export const runtimeMember = (file) => `appimage-runtime/${file}`;
-
-/** The type2-runtime source archive's file name. */
-export const runtimeSourceFile = (commit) => `type2-runtime-${commit}.tar`;
 
 /**
  * The mismatch gate between xray's Go build information and

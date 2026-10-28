@@ -1076,8 +1076,8 @@ fn find_xray_binary(_app_data_dir: &std::path::Path) -> Result<PathBuf, String> 
                 }
             }
 
-            // Linux .deb / AppImage: the exe is installed to /usr/bin (or
-            // usr/bin inside the AppImage mount) while resources land under
+            // Linux .deb (and an AppImage up to 1.4.50, inside its mount):
+            // the exe is installed to /usr/bin while resources land under
             // /usr/lib/<app>/. Same failure mode as macOS — `exe_dir/resources`
             // would be /usr/bin/resources.
             #[cfg(target_os = "linux")]

@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 // ============================================================================
 // Builds the corresponding-source asset every Desktop release publishes
-// (owner decisions 2026-10-14: L1, mirror the source per release; L2, the
-// AppImage's own components; review round 1 of #298).
+// (owner decision 2026-10-14: L1, mirror the source per release; review
+// round 1 of #298). The AppImage runtime's sources (type2-runtime, libfuse,
+// squashfuse) left it with the AppImage: owner decision 2026-10-28
+// (MR-2020/MR-2041/MR-2042), Linux ships the .deb only. The assets of the
+// releases that shipped an AppImage (1.4.46-1.4.50) keep them.
 //
 //   node scripts/build-corresponding-source.mjs --out-dir <dir> [--download-dir <dir>]
 //
@@ -19,10 +22,6 @@
 //                                          Go toolchain that built them (the
 //                                          standard library and runtime are
 //                                          linked into every binary)
-//   appimage-runtime/type2-runtime-<commit>.tar  the AppImage runtime's source
-//   appimage-runtime/fuse-<v>.tar.xz, squashfuse-<v>.tar.gz  the two libraries
-//                                          it links statically that the
-//                                          runtime's build compiles from source
 //   README.txt                             versions, hashes, how they map to
 //                                          the binaries, how to rebuild/relink
 //
@@ -39,11 +38,7 @@
 //    tarballs cannot change it); each binary must carry the commit's
 //    abbreviation (Xray-core's release build stamps it in);
 //  * each module zip must hash to its zipSha256 pin, and its Go checksum
-//    (dirhash h1:) must equal its line in that source's own go.sum;
-//  * the type2-runtime source is fetched with git at the pinned commit and
-//    tree (third_party/licenses/appimage-runtime.json), the libfuse and
-//    squashfuse tarballs must hash to their pins, and the runtime's own
-//    build script must pin those same two hashes.
+//    (dirhash h1:) must equal its line in that source's own go.sum.
 //
 // Deterministic for a given git and node: fixed tar headers, sorted members,
 // gzip with no timestamp, `git archive` with a fixed umask and no line-ending
@@ -64,8 +59,6 @@ import { readGoBuildInfo } from './lib/go-buildinfo.mjs';
 import {
   goSourceMember,
   moduleZipMember,
-  runtimeMember,
-  runtimeSourceFile,
   sourceAssetName,
   sourceAssetRoot,
   sourceAssetUrl,
@@ -112,7 +105,7 @@ const PLATFORMS = [
   { zip: 'Xray-windows-64.zip', pin: 'XRAY_WINDOWS_SHA256', binary: 'xray.exe',
     ships: "the Windows installer, as resources\\xray.exe (release builds add BirdoVPN's Authenticode signature to it)" },
   { zip: 'Xray-linux-64.zip', pin: 'XRAY_LINUX_SHA256', binary: 'xray',
-    ships: 'the .deb and the AppImage, as usr/lib/BirdoVPN/resources/xray' },
+    ships: 'the .deb, as usr/lib/BirdoVPN/resources/xray' },
   { zip: 'Xray-macos-arm64-v8a.zip', pin: 'XRAY_MACOS_ARM64_SHA256', binary: 'xray',
     ships: 'the Apple silicon .dmg and .app, as Contents/Resources/resources/xray' },
   { zip: 'Xray-macos-64.zip', pin: 'XRAY_MACOS_AMD64_SHA256', binary: 'xray',
@@ -123,14 +116,13 @@ for (const p of PLATFORMS) p.sha = releasePin(p.pin, HEX64);
 const licences = path.join(repo, 'third_party', 'licenses');
 const appVersion = JSON.parse(fs.readFileSync(path.join(repo, 'src-tauri', 'tauri.conf.json'), 'utf8')).version;
 const table = JSON.parse(fs.readFileSync(path.join(licences, 'xray-go-modules.json'), 'utf8'));
-const runtimePins = JSON.parse(fs.readFileSync(path.join(licences, 'appimage-runtime.json'), 'utf8'));
 
 // ── Downloads ───────────────────────────────────────────────────────────────
 // The URLs are built from release.yml, the pin files and the binaries' build
 // information: only these upstreams, and only well-formed paths, are fetched.
 const ALLOWED_URL =
-  /^https:\/\/(github\.com\/XTLS\/Xray-core\/releases\/download\/v[0-9.]+\/Xray-[a-z0-9-]+\.zip|proxy\.golang\.org\/[a-z0-9._~!/-]+\/@v\/[A-Za-z0-9._~!+-]+\.zip|github\.com\/libfuse\/libfuse\/releases\/download\/fuse-[0-9.]+\/fuse-[0-9.]+\.tar\.xz|github\.com\/vasi\/squashfuse\/archive\/[0-9.]+\.tar\.gz|go\.dev\/dl\/go[0-9.]+\.src\.tar\.gz)$/;
-const GIT_REPOS = new Set(['https://github.com/XTLS/Xray-core', 'https://github.com/AppImage/type2-runtime']);
+  /^https:\/\/(github\.com\/XTLS\/Xray-core\/releases\/download\/v[0-9.]+\/Xray-[a-z0-9-]+\.zip|proxy\.golang\.org\/[a-z0-9._~!/-]+\/@v\/[A-Za-z0-9._~!+-]+\.zip|go\.dev\/dl\/go[0-9.]+\.src\.tar\.gz)$/;
+const GIT_REPOS = new Set(['https://github.com/XTLS/Xray-core']);
 
 /** A download that must hash to its pin. */
 async function pinned(url, expected, what) {
@@ -347,25 +339,6 @@ if (toolchain.srcArchive !== `${goVersion}.src.tar.gz` || !/^[0-9a-f]{64}$/.test
 const goSourceUrl = `https://go.dev/dl/${toolchain.srcArchive}`;
 const goSource = await pinned(goSourceUrl, toolchain.srcSha256, `${toolchain.srcArchive} (srcSha256 in xray-go-modules.json)`);
 
-// ── The AppImage runtime's sources ──────────────────────────────────────────
-const rt = runtimePins.runtime;
-const runtimeTar = gitSource(rt.repository, rt.commit, rt.tree, `type2-runtime-${rt.commit}`);
-const runtimeFiles = [{ file: runtimeSourceFile(rt.commit), data: runtimeTar }];
-{
-  const script = readTar(runtimeTar).members.get(`type2-runtime-${rt.commit}/scripts/common/install-dependencies.sh`);
-  if (!script) fail(`type2-runtime ${rt.commit} has no scripts/common/install-dependencies.sh - its build changed; review the pins`);
-  for (const lib of runtimePins.linked.filter((l) => l.mirror)) {
-    const { file, url, sha256: want } = lib.mirror;
-    // The build script downloads the same URL and checks its hash under the URL's file name.
-    const fetched = url.slice(url.lastIndexOf('/') + 1);
-    const text = script.data.toString('utf8');
-    if (!text.includes(url) || !text.includes(`${want}  ${fetched}`)) {
-      fail(`type2-runtime ${rt.commit}'s build does not fetch ${url} pinned at ${want} - the mirrored ${lib.name} would not be what the runtime links`);
-    }
-    runtimeFiles.push({ file, data: await pinned(url, want, `${lib.name} ${lib.version} source (appimage-runtime.json)`) });
-  }
-}
-
 // ── README ──────────────────────────────────────────────────────────────────
 const assetUrl = sourceAssetUrl(appVersion);
 const wrap = (text, indent = '') => {
@@ -391,9 +364,9 @@ const readme = [
   `  ${assetUrl}`,
   '',
   ...wrap(
-    'It holds the complete corresponding source of two programs BirdoVPN ships but did not write: Xray-core, ' +
-      'which every package bundles and runs as a separate process, and the AppImage runtime, which starts the ' +
-      'Linux AppImage. THIRD-PARTY-NOTICES.txt in each package lists them with their licences.',
+    'It holds the complete corresponding source of the program BirdoVPN ships but did not write: Xray-core, ' +
+      'which every package bundles and runs as a separate process. THIRD-PARTY-NOTICES.txt in each package ' +
+      'lists it with its licences.',
   ),
   '',
   ...heading(`1. Xray-core ${xrayVersion}`),
@@ -467,48 +440,6 @@ readme.push(
   ),
   '',
 );
-const linkedLibs = runtimePins.linked.map((l) => `${l.name} ${l.version} (${l.license})`).join(', ');
-readme.push(
-  ...heading(`2. The AppImage runtime (type2-runtime ${rt.commit.slice(0, 7)})`),
-  ...wrap(
-    "The Linux AppImage starts with the AppImage project's type2-runtime: the program that mounts the rest of " +
-      'the file and starts BirdoVPN. It is the unmodified runtime-x86_64 that type2-runtime\'s CI built from ' +
-      `commit ${rt.commit} (SHA-256 ${rt.sha256}; published as ${rt.url} on ${rt.published.slice(0, 10)}), ` +
-      'the same runtime BirdoVPN 1.4.46 shipped. The runtime is under the MIT licence ' +
-      `and links statically: ${linkedLibs}. libfuse's library is under the LGPL-2.1, so this part holds the ` +
-      "runtime's source with its build scripts, and libfuse's and squashfuse's, which that build compiles from " +
-      'source. zstd, zlib, mimalloc and musl come from Alpine Linux 3.21\'s packages, under permissive licences.',
-  ),
-  '',
-  runtimeMember(runtimeSourceFile(rt.commit)),
-  `  The type2-runtime source at commit ${rt.commit} (tree ${rt.tree}), made with \`git archive\`.`,
-  '  Its patches/libfuse/mount.c.diff is applied to libfuse; its BUILD.md and scripts/ build the runtime.',
-);
-for (const lib of runtimePins.linked.filter((l) => l.mirror)) {
-  readme.push(
-    runtimeMember(lib.mirror.file),
-    `  ${lib.name} ${lib.version} (${lib.license}), as ${lib.mirror.url}`,
-    `  SHA-256 ${lib.mirror.sha256}, the hash the runtime's build script checks.`,
-  );
-}
-readme.push(
-  '',
-  'Relinking with a modified libfuse (LGPL-2.1 section 6):',
-  ...wrap(
-    "1. Build the runtime as its CI does (BUILD.md; scripts/docker/build-with-docker.sh or scripts/chroot/" +
-      'build.sh): scripts/common/install-dependencies.sh unpacks fuse-3.15.0.tar.xz, applies the patch and installs ' +
-      'it as a static library, then builds squashfuse 0.5.2; scripts/build-runtime.sh compiles src/runtime/runtime.c ' +
-      'against them. To use your own libfuse, change it before that step.',
-    '  ',
-  ),
-  ...wrap(
-    '2. Put the new runtime in front of BirdoVPN\'s AppImage contents: run `<BirdoVPN AppImage> --appimage-extract`, ' +
-      'then `appimagetool --runtime-file <your runtime> squashfs-root BirdoVPN.AppImage` ' +
-      '(https://github.com/AppImage/appimagetool).',
-    '  ',
-  ),
-  '',
-);
 const readmeText = `${readme.join('\n')}\n`;
 
 // ── The archive ─────────────────────────────────────────────────────────────
@@ -551,7 +482,6 @@ const files = [
   [xrayTagArchiveMember(xrayVersion), xrayTar],
   ...modules.map((m) => [moduleZipMember(m.path, m.version), m.zip]),
   [goSourceMember(toolchain.srcArchive), goSource],
-  ...runtimeFiles.map((f) => [runtimeMember(f.file), f.data]),
 ].sort(([a], [b]) => byKey(a, b));
 const parts = [];
 for (const [name, data] of files) parts.push(...tarMember(`${root}/${name}`, data, xrayDir.mtime));
@@ -564,7 +494,6 @@ const out = path.join(args.outDir, sourceAssetName(appVersion));
 fs.writeFileSync(out, gz);
 console.log(
   `Wrote ${out}: ${gz.length} bytes, SHA-256 ${sha256(gz)}\n` +
-    `  Xray-core ${xrayVersion} (${xrayCommit}), ${modules.length} Go module zips, ` +
-    `type2-runtime ${rt.commit} with ${runtimeFiles.length - 1} library source(s)\n` +
+    `  Xray-core ${xrayVersion} (${xrayCommit}), ${modules.length} Go module zips, ${goVersion} source\n` +
     `  notices URL: ${assetUrl}`,
 );

@@ -25,7 +25,7 @@ pub fn elevation_required_message() -> &'static str {
     #[cfg(target_os = "linux")]
     {
         "Root privileges required to manage the tunnel. Launch BirdoVPN \
-         with pkexec or sudo (e.g. `sudo ./BirdoVPN.AppImage`)."
+         with pkexec or sudo (e.g. `sudo -E birdo-vpn-desktop`)."
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
