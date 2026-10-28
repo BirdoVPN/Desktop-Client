@@ -68,7 +68,7 @@ Get-Content SHA256SUMS.txt | ForEach-Object {
 
 | Layer | Covers | Checked by |
 |---|---|---|
-| Sigstore bundle over `SHA256SUMS.txt` | every installer and package in the release, and `BirdoVPN-<version>-corresponding-source.tar.gz` (the source of the bundled Xray-core, every Go module it links and the Go toolchain that built it, and of the AppImage runtime with libfuse and squashfuse) | you, with the commands above |
+| Sigstore bundle over `SHA256SUMS.txt` | every installer and package in the release, and `BirdoVPN-<version>-corresponding-source.tar.gz` (the source of the bundled Xray-core, every Go module it links and the Go toolchain that built it; up to 1.4.50 also the AppImage runtime with libfuse and squashfuse) | you, with the commands above |
 | Authenticode (Azure Trusted Signing) | the Windows installer, the app `.exe` inside it, and the bundled `xray.exe` | Windows, automatically |
 | Tauri updater signature (`*.sig`, minisign) | each auto-update bundle | the in-app updater, against the public key built into the app |
 

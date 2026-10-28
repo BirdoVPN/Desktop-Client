@@ -711,8 +711,10 @@ jobs:
 
   # ══════════════════════════════════════════════════════════════════════
   # LINUX — began as a faithful copy of the retired build-linux.yml `build-linux` job.
-  # AppImage + .deb + the minisign updater .sig. Checksums + Sigstore are
-  # produced once, in the release job, over the final asset names.
+  # The .deb only: owner decision 2026-10-28 (MR-2020/MR-2041/MR-2042) dropped
+  # the AppImage, so Linux ships no in-app updater bundle (the .deb is
+  # installed and upgraded with apt/dpkg). Checksums + Sigstore are produced
+  # once, in the release job, over the final asset names.
   # ══════════════════════════════════════════════════════════════════════
   build-linux:
     needs: test  # never build/publish on a red test suite
@@ -794,8 +796,7 @@ jobs:
           echo "Xray ready: src-tauri/resources/xray ($BINARY_SHA)"
 
       # MR-1685, as build-windows (no Wintun here). Checked in the .deb by the
-      # post-bundle gate (NOTICES_FILE); the AppImage gets this file plus the
-      # list of the libraries it bundles (L2, after the build below).
+      # post-bundle gate (NOTICES_FILE).
       - name: Generate the third-party notices (resources/THIRD-PARTY-NOTICES.txt)
         env:
           ARCH: ${{ matrix.arch }}
@@ -819,16 +820,6 @@ jobs:
           fi
           echo "Attestation key present (kid: ${BIRDO_DESKTOP_ATTEST_KID})"
 
-      # L2 (review round 1 of #298): the AppImage starts with the AppImage
-      # runtime, which links libfuse (LGPL-2.1) statically. Left alone, the
-      # bundler fetches type2-runtime's moving `continuous` build; this pins it
-      # (LDAI_RUNTIME_FILE, read by linuxdeploy-plugin-appimage) and the AppRun
-      # Tauri copies in, to the bytes third_party/licenses/appimage-runtime.json
-      # names - the ones the notices list and the corresponding-source asset
-      # mirrors the source of. The notices step checks the AppImage has them.
-      - name: Pin the AppImage runtime and AppRun (third_party/licenses/appimage-runtime.json)
-        run: bash scripts/ci/fetch-appimage-tooling.sh "$RUNNER_TEMP/appimage-tooling"
-
       - name: Build Tauri application
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -842,54 +833,35 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: npx tauri build --target "$ARCH" -- --locked
 
-      # Owner decision 2026-10-14 (L2): the AppImage carries system libraries
-      # from this ubuntu-22.04 image (WebKitGTK, GTK, GLib, libsoup and what
-      # they link) that the .deb leaves to the user's system, so its own
-      # THIRD-PARTY-NOTICES.txt also lists EVERY file in it: libraries,
-      # typelibs, schemas and copyright files by their Ubuntu package (dpkg -S
-      # on this runner, after resolving symlinks), source package at the exact
-      # version, copyright file and the licence texts that cites; the runtime
-      # (checked to be the pinned one) and the libraries it links; AppRun and
-      # what linuxdeploy writes. Which files linuxdeploy bundled is only known
-      # now, so the script maps them, writes the AppImage's notices and
-      # re-bundles ONLY the AppImage with them (`tauri bundle`: nothing
-      # recompiles; the updater .sig is made again). The .deb keeps the
-      # generic file. Fails on a file it cannot account for. Self-test (fake
-      # dpkg): scripts/ci/appimage-notices.tests.sh, in tests.yml; the real
-      # path runs on PRs in linux-packages.yml, with a throwaway signing key.
-      - name: AppImage — list everything it carries in its own notices, then re-bundle it
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          ARCH: ${{ matrix.arch }}
-        run: bash scripts/ci/appimage-notices.sh "$ARCH" "$RUNNER_TEMP/appimage-notices/THIRD-PARTY-NOTICES.txt"
-
       # MR-720 / MR-736: the Linux twin of build-windows' xray gate. Unpacks the
-      # .deb and the AppImage exactly as shipped and requires
-      # usr/lib/BirdoVPN/resources/xray to be executable and to hash to the
-      # XRAY_BINARY_SHA256 this build compiled in (and that the app binary
-      # really carries that value). Script + self-test: scripts/ci/; passes on
-      # the published v1.4.45 packages.
-      # MR-1685: and each must carry this build's THIRD-PARTY-NOTICES.txt -
-      # the .deb the generic file, the AppImage its own (L2: APPIMAGE_NOTICES_
-      # FILE), which must begin with the generic one, list every file the
-      # AppImage carries, and name the runtime it starts with.
-      - name: Gate — bundled xray (.deb, .AppImage) must hash to the compiled-in XRAY_BINARY_SHA256; THIRD-PARTY-NOTICES.txt must be this build's
+      # .deb exactly as shipped and requires usr/lib/BirdoVPN/resources/xray
+      # to be executable and to hash to the XRAY_BINARY_SHA256 this build
+      # compiled in (and that the app binary really carries that value).
+      # Script + self-test: scripts/ci/; passes on the published v1.4.45
+      # packages. MR-1685: and it must carry this build's
+      # THIRD-PARTY-NOTICES.txt.
+      # Owner decision 2026-10-28 (MR-2020/MR-2041/MR-2042): Linux ships the
+      # .deb only. An AppImage under bundle/ means bundle.targets builds one
+      # again: refuse it rather than ship it unlisted.
+      - name: Gate — the .deb alone; its bundled xray must hash to the compiled-in XRAY_BINARY_SHA256; THIRD-PARTY-NOTICES.txt must be this build's
         env:
           ARCH: ${{ matrix.arch }}
           NOTICES_FILE: src-tauri/resources/THIRD-PARTY-NOTICES.txt
         run: |
           set -euo pipefail
-          export APPIMAGE_NOTICES_FILE="$RUNNER_TEMP/appimage-notices/THIRD-PARTY-NOTICES.txt"
           bundle="src-tauri/target/$ARCH/release/bundle"
           shopt -s nullglob
           debs=("$bundle"/deb/*.deb)
           appimages=("$bundle"/appimage/*.AppImage)
-          if [ "${#debs[@]}" -ne 1 ] || [ "${#appimages[@]}" -ne 1 ]; then
-            echo "::error::expected exactly one .deb and one .AppImage under $bundle (found ${#debs[@]} and ${#appimages[@]})"
+          if [ "${#appimages[@]}" -ne 0 ]; then
+            echo "::error::found ${#appimages[@]} .AppImage under $bundle - Linux ships the .deb only (owner decision 2026-10-28); take \"appimage\" out of bundle.targets in tauri.conf.json"
             exit 1
           fi
-          bash scripts/ci/verify-bundled-xray.sh "${XRAY_BINARY_SHA256:-}" "${debs[0]}" "${appimages[0]}"
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one .deb under $bundle (found ${#debs[@]})"
+            exit 1
+          fi
+          bash scripts/ci/verify-bundled-xray.sh "${XRAY_BINARY_SHA256:-}" "${debs[0]}"
 
       # Integrity/provenance is handled ONCE in the release job (unified
       # SHA256SUMS.txt + one Sigstore bundle). The per-artifact .sigstore and
@@ -902,11 +874,9 @@ jobs:
           name: birdo-vpn-linux-${{ matrix.label }}
           path: |
             src-tauri/target/${{ matrix.arch }}/release/bundle/deb/*.deb
-            src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage
-            src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage.sig
           retention-days: 30
           if-no-files-found: error
-          compression-level: 0 # .deb / AppImage are already compressed
+          compression-level: 0 # a .deb is already compressed
 
   # ══════════════════════════════════════════════════════════════════════
   # Is the signed Mac App Store app live yet? (owner decision 2026-10-01)
@@ -1253,24 +1223,23 @@ jobs:
           compression-level: 0 # .dmg / .app.tar.gz are already compressed
 
   # ══════════════════════════════════════════════════════════════════════
-  # CORRESPONDING SOURCE — owner decisions 2026-10-14 (L1: mirror the source
-  # per release; L2), review round 1 of #298. The bundled xray links
+  # CORRESPONDING SOURCE — owner decision 2026-10-14 (L1: mirror the source
+  # per release), review round 1 of #298. The bundled xray links
   # GPL-3.0-or-later and LGPL-3.0 Go modules, so as a whole it is under the
-  # GPL-3.0, whose corresponding source covers EVERY module linked in; and
-  # the AppImage's runtime links libfuse (LGPL-2.1) statically. So every
-  # release publishes, next to its installers,
+  # GPL-3.0, whose corresponding source covers EVERY module linked in. So
+  # every release publishes, next to its installers,
   # BirdoVPN-<version>-corresponding-source.tar.gz (the URL every package's
   # THIRD-PARTY-NOTICES.txt names first): the Xray-core source at
   # XRAY_SOURCE_COMMIT (`git archive`, tree XRAY_SOURCE_TREE), the module zip
-  # of every module the four bundled binaries link, the official source of
-  # the Go toolchain that built them (go.dev's published SHA-256), and the AppImage
-  # runtime's source with libfuse's and squashfuse's. The script checks every
-  # input before writing anything (the binary zips against XRAY_*_SHA256 and
-  # their Go modules against xray-go-modules.json, the tag against the
-  # pinned commit and tree and the commit the binaries carry, each module zip
-  # against its zipSha256 pin and Xray's own go.sum, the runtime's source and
-  # library tarballs against appimage-runtime.json) and fails on any
-  # mismatch. tests.yml runs the same script on every PR. Nothing secret,
+  # of every module the four bundled binaries link, and the official source
+  # of the Go toolchain that built them (go.dev's published SHA-256). (The
+  # AppImage runtime's source, with libfuse's and squashfuse's, left the
+  # asset with the AppImage: owner decision 2026-10-28, MR-2020/2041/2042.)
+  # The script checks every input before writing anything (the binary zips
+  # against XRAY_*_SHA256 and their Go modules against xray-go-modules.json,
+  # the tag against the pinned commit and tree and the commit the binaries
+  # carry, each module zip against its zipSha256 pin and Xray's own go.sum)
+  # and fails on any mismatch. tests.yml runs the same script on every PR. Nothing secret,
   # read-only; the release job publishes it, puts it in SHA256SUMS.txt and so
   # under the Sigstore signature. About 155 MB.
   # ══════════════════════════════════════════════════════════════════════
@@ -1459,7 +1428,7 @@ jobs:
       #
       # Two jobs in one pass:
       #  * The bundlers emit `BirdoVPN_<ver>_<arch>.<ext>` with no OS token, so
-      #    `_x64-setup.exe` vs `_amd64.AppImage` vs `_x64.dmg` were only
+      #    `_x64-setup.exe` vs `_amd64.deb` vs `_x64.dmg` were only
       #    distinguishable if you already knew which bundler produced which
       #    extension. Insert an OS token: `BirdoVPN_<ver>_<OS>_<arch>.<ext>`.
       #  * Both macOS builds emit a generic `BirdoVPN.app.tar.gz` (+ its .sig) —
@@ -1473,7 +1442,9 @@ jobs:
       # !! DO NOT rename in a way that breaks the updater !!
       # `backend/src/updates/updates.controller.ts` resolves the bundle to serve
       # by matching, on the asset FILENAME:
-      #   1. an installer suffix — /-setup\.exe$/, /\.AppImage$/, /\.app\.tar\.gz$/
+      #   1. an installer suffix — /-setup\.exe$/, /\.app\.tar\.gz$/ (and
+      #      /\.AppImage$/ for Linux, which no release carries since the
+      #      AppImage was dropped: owner decision 2026-10-28)
       #   2. an arch token anywhere in the name — x86_64|x64|amd64 / aarch64|arm64
       #   3. the detached signature by EXACT `<installer-name>.sig`
       # So the OS token may only be INSERTED (never replacing the arch token or
@@ -1539,9 +1510,21 @@ jobs:
             done <<< "$hit"
           }
           check release-files/windows     "Windows NSIS" '\-setup\.exe$'   '(x86[_-]?64|x64|amd64)'
-          check release-files/linux       "Linux AppImage" '\.AppImage$'   '(x86[_-]?64|x64|amd64)'
           check release-files/macos-arm64 "macOS arm64"  '\.app\.tar\.gz$' '(aarch64|arm64)'
           check release-files/macos-x64   "macOS x64"    '\.app\.tar\.gz$' '(x86[_-]?64|x64|amd64)'
+          # Owner decision 2026-10-28 (MR-2020/MR-2041/MR-2042): Linux ships
+          # the .deb only, which apt/dpkg installs and upgrades, so a Linux
+          # release carries no updater bundle. Exactly one .deb; an AppImage
+          # here would ship unlisted in any notices.
+          linux_debs="$({ find release-files/linux -type f -name '*.deb' 2>/dev/null || true; } | wc -l)"
+          if [ "$linux_debs" -ne 1 ]; then
+            echo "::error::expected exactly one Linux .deb in release-files/linux, found $linux_debs"
+            fail=1
+          fi
+          if [ -n "$(find release-files/linux -type f -name '*.AppImage*' 2>/dev/null)" ]; then
+            echo "::error::release-files/linux carries an AppImage - Linux ships the .deb only (owner decision 2026-10-28)"
+            fail=1
+          fi
           [ "$fail" -eq 0 ] || { echo "Updater asset contract violated — refusing to publish"; exit 1; }
 
       # MR-2072 (AUD-DESK-21): the step above only checks that each .sig

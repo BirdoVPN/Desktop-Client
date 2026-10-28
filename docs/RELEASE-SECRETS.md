@@ -119,7 +119,7 @@ Optional:
 
 | Secret | Description |
 | ------ | ----------- |
-| `LINUX_GPG_PRIVATE_KEY` | (future) detached `.asc` signing key for AppImage |
+| `LINUX_GPG_PRIVATE_KEY` | (future) detached `.asc` signing key for the Linux `.deb` |
 | `LINUX_GPG_KEY_ID` | (future) long-form GPG key ID |
 
 ---

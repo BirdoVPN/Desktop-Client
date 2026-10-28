@@ -488,7 +488,7 @@ fn main() {
     }
 
     // Linux: TUN device creation requires root (or CAP_NET_ADMIN).
-    // In production, the .deb/.AppImage should be launched via pkexec or
+    // In production, the .deb should be launched via pkexec or
     // the binary should have CAP_NET_ADMIN capability set.
     #[cfg(target_os = "linux")]
     {

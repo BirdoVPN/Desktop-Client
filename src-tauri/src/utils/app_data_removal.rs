@@ -17,7 +17,8 @@
 //!   (`<identifier>` under the data, local data and cache folders, and
 //!   `~/Library/WebKit/<identifier>` on macOS).
 //!
-//! WHO RUNS IT. The user, before deleting the app (macOS, the AppImage), the
+//! WHO RUNS IT. The user, before deleting the app (macOS, an AppImage up to
+//! 1.4.50), the
 //! same way they run the app (as root), so the folders and the keystore are
 //! the ones the app itself used: docs/UNINSTALL.md. A .deb's `apt purge`
 //! removes root's folders itself (src-tauri/linux/postrm.sh): dpkg has

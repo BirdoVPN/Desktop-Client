@@ -9,8 +9,9 @@
 #   verify-release-updater-signatures.sh <release-files-dir> <tauri.conf.json>
 #
 # Two checks, each over the whole directory tree:
-#   1. every bundle the update server serves (-setup.exe, .AppImage,
-#      .app.tar.gz: the suffixes birdo-web's updates.controller.ts matches)
+#   1. every bundle the update server serves (-setup.exe, .app.tar.gz: the
+#      suffixes birdo-web's updates.controller.ts matches; Linux ships the
+#      .deb only since the owner decision of 2026-10-28, so no Linux bundle)
 #      has its <bundle>.sig;
 #   2. every .sig has its bundle next to it and verifies it against
 #      plugins.updater.pubkey in tauri.conf.json - the key compiled into the
@@ -55,7 +56,7 @@ while IFS= read -r f; do
     echo "::error::$(basename "$f") has no updater signature $(basename "$f").sig"
     fail=1
   fi
-done < <(find "$dir" -type f \( -name '*-setup.exe' -o -name '*.AppImage' -o -name '*.app.tar.gz' \) | sort)
+done < <(find "$dir" -type f \( -name '*-setup.exe' -o -name '*.app.tar.gz' \) | sort)
 
 sigs=0
 while IFS= read -r s; do

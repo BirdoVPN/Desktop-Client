@@ -3,7 +3,7 @@
 Cross-platform desktop VPN client for [Birdo.app](https://birdo.app), built with
 [Tauri](https://tauri.app) — a TypeScript/React frontend wrapped in a Rust core.
 
-- **Product:** `BirdoVPN`  •  **Bundle ID:** `uk.birdo.vpn.desktop`  •  **Targets:** Windows (NSIS), macOS (DMG/app — **unsigned and un-notarised**, see below), Linux (deb/AppImage)
+- **Product:** `BirdoVPN`  •  **Bundle ID:** `uk.birdo.vpn.desktop`  •  **Targets:** Windows (NSIS), macOS (DMG/app — **unsigned and un-notarised**, see below), Linux (.deb)
 - **Licence:** source-available under CC BY-NC 4.0 (see `LICENSE`) — not an OSI open-source licence. © Birdo Networks Ltd.
 - **Version** is the single source of truth in `src-tauri/tauri.conf.json` **and** `package.json` — they **must match** (CI enforces this; a mismatch fails the release build).
 
@@ -30,11 +30,34 @@ npm run test:run       # vitest
 npm run tauri:build    # produces installers under src-tauri/target/release/bundle/
 ```
 
+## Install
+Download from the [latest release](https://github.com/BirdoVPN/Desktop-Client/releases/latest)
+([verify the download](docs/VERIFICATION.md) first):
+
+- **Windows:** `BirdoVPN_<version>_Windows_x64-setup.exe`. It updates itself in the app.
+- **macOS:** `BirdoVPN_<version>_macOS_aarch64.dmg` (Apple silicon) or `..._macOS_x64.dmg` (Intel).
+- **Linux (Debian, Ubuntu and derivatives, x86_64):** the `.deb` only.
+  ```bash
+  sudo apt install ./BirdoVPN_<version>_Linux_amd64.deb
+  ```
+  Upgrade by installing the next release's `.deb` the same way. The tunnel needs
+  root: start BirdoVPN as root, for example `sudo -E birdo-vpn-desktop`.
+
+**No AppImage any more.** Owner decision 2026-10-28: the AppImage carried its own
+copies of about 100 Ubuntu libraries, with the licence duties that brings, so Linux
+ships as a `.deb` only. 1.4.50 was the last AppImage, and the in-app updater does not
+move an AppImage to the `.deb`. To switch: quit the AppImage, install the `.deb` as
+above, then delete the AppImage file. The `.deb` is the same app (same identifier and
+folders), so settings and sign-in normally carry over when you start it the same way
+you started the AppImage; if not, sign in again. To remove the AppImage's data
+instead, see [`docs/UNINSTALL.md`](docs/UNINSTALL.md#linux-an-appimage-from-1450-or-earlier).
+Other distributions (Fedora, Arch, ...) have no package for now.
+
 ## Uninstall
 Removing the app keeps its data (keys, tokens, logs, crash reports) unless you
 ask for it to go: the Windows uninstaller's **Delete the application data**
-box, `apt purge` for the .deb, and on macOS and the AppImage the app's own
-cleanup flag. See [`docs/UNINSTALL.md`](docs/UNINSTALL.md).
+box, `apt purge` for the .deb, and on macOS (and an AppImage from 1.4.50 or
+earlier) the app's own cleanup flag. See [`docs/UNINSTALL.md`](docs/UNINSTALL.md).
 
 ## Release
 Pushing a `v*` tag triggers the unified Windows/macOS/Linux release build that is

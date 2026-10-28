@@ -880,8 +880,8 @@ jobs:
         run: ./scripts/ci/verify-bundled-xray-hash.tests.ps1
 
   # The macOS + Linux twin of the job above (register MR-720/MR-736):
-  # release.yml now gates the .app, the updater .app.tar.gz, the .dmg, the
-  # .deb and the AppImage with scripts/ci/verify-bundled-xray.sh. The Linux
+  # release.yml now gates the .app, the updater .app.tar.gz, the .dmg and the
+  # .deb with scripts/ci/verify-bundled-xray.sh. The Linux
   # leg runs the .deb scenarios (dpkg-deb), the macOS leg the .dmg ones
   # (hdiutil); both run the rest. The real-package path was verified against
   # the published v1.4.45 artifacts when the gate was written.
@@ -909,37 +909,6 @@ jobs:
 
       - name: Run the gate against fake packages (pass + must-fail scenarios)
         run: bash scripts/ci/verify-bundled-xray.tests.sh
-
-  # Owner decision 2026-10-14 (L2): the AppImage's own notices list every
-  # system library it bundles (scripts/generate-appimage-notices.mjs, run by
-  # release.yml's build-linux through scripts/ci/appimage-notices.sh). Only a
-  # release and linux-packages.yml (path-filtered) build an AppImage, so this
-  # proves the mapping on every PR with a fake dpkg/dpkg-query, a fake
-  # /usr/share/doc and a fake unpacked AppImage: each kind of bundled file
-  # maps to its package, source package and licence texts, each failure path
-  # fails, and the gate's check 8 accepts exactly what the generator lists.
-  appimage-notices-selftest:
-    name: AppImage library notices self-test (fake dpkg)
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # The generator uses node built-ins only: nothing to install.
-      - name: Setup Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "22"
-          package-manager-cache: false
-
-      - name: Run the generator and the gate against fixtures (pass + must-fail scenarios)
-        run: bash scripts/ci/appimage-notices.tests.sh
 
   # MR-2072 (AUD-DESK-21): release.yml's release job verifies every updater
   # .sig against tauri.conf.json's updater pubkey before it publishes
@@ -1076,17 +1045,17 @@ jobs:
             esac
           done
 
-      # L1/L2 (owner decisions 2026-10-14; review round 1 of #298): the asset
-      # the notices above point at, built as release.yml's corresponding-source
+      # L1 (owner decision 2026-10-14; review round 1 of #298): the asset the
+      # notices above point at, built as release.yml's corresponding-source
       # job builds it, from every pin it has: the four Xray release zips
       # (XRAY_*_SHA256) and the Go modules their binaries link
       # (xray-go-modules.json), the Xray-core source by commit and tree
       # (XRAY_SOURCE_COMMIT/TREE, `git archive`) and the commit the binaries
-      # carry, every module zip (zipSha256, and its line in Xray's go.sum), the
-      # Go toolchain's source archive (srcSha256, as go.dev publishes it), and
-      # the AppImage runtime's sources (appimage-runtime.json). Built twice, from
-      # two downloads (it must be byte-identical), and every module each
-      # target's notices list must be in it under the path they give.
+      # carry, every module zip (zipSha256, and its line in Xray's go.sum) and
+      # the Go toolchain's source archive (srcSha256, as go.dev publishes it).
+      # Built twice, from two downloads (it must be byte-identical), and every
+      # module each target's notices list must be in it under the path they
+      # give.
       - name: Build the corresponding-source asset, as the release does (pins, determinism, agreement with the notices)
         run: |
           set -euo pipefail
@@ -1239,7 +1208,6 @@ jobs:
       - release-cli-contract
       - xray-gate-selftest
       - xray-gate-selftest-unix
-      - appimage-notices-selftest
       - updater-signature-gate-selftest
       - third-party-notices
       - version-consistency

@@ -14,7 +14,6 @@
 #
 # Usage:
 #   NOTICES_FILE=src-tauri/resources/THIRD-PARTY-NOTICES.txt \
-#   APPIMAGE_NOTICES_FILE=<the AppImage's own notices, needed with an .AppImage> \
 #     scripts/ci/verify-bundled-xray.sh <expected-sha256> <artifact> [<artifact>...]
 #
 # Artifact kinds, chosen by name:
@@ -22,8 +21,9 @@
 #   *.app.tar.gz  macOS updater tar -> one *.app inside, as above
 #   *.dmg         macOS disk image  -> one *.app at the volume root (hdiutil)
 #   *.deb         Debian package    -> usr/lib/<product>/resources/xray (dpkg-deb)
-#   *.AppImage    AppImage          -> same layout (the runtime's --appimage-extract)
 # These are the paths src-tauri/src/vpn/xray.rs find_xray_binary() probes.
+# An .AppImage is no longer a kind: Linux ships the .deb only (owner decision
+# 2026-10-28, MR-2020/MR-2041/MR-2042), so one handed in fails as unknown.
 #
 # For EVERY artifact all of these must hold, or the script exits 1 with a
 # ::error:: line per failure (all artifacts are checked before exiting):
@@ -47,21 +47,6 @@
 #      Xray source pointer and every crate's and npm package's licence, and
 #      Settings › About › Licences reads this file. NOTICES_FILE is required:
 #      unset, empty or missing fails before any artifact is opened.
-#      An AppImage's file is instead byte-identical to APPIMAGE_NOTICES_FILE:
-#      the same notices plus the sections listing the system libraries that
-#      only the AppImage bundles (scripts/ci/appimage-notices.sh; owner
-#      decision 2026-10-14, L2). Unset, empty or missing fails that AppImage.
-#   8. (AppImage only) EVERY regular file in it - libraries, modules,
-#      WebKitGTK's helpers, typelibs, schemas, AppRun, AppRun.wrapped, the
-#      hooks, BirdoVPN's own - is listed, as a line "    <path>", in those
-#      notices: a file the bundler added after the notices were generated
-#      fails the release instead of shipping unlisted (review round 1 of #298).
-#   9. (AppImage only) its runtime is the one those notices name: the commit
-#      in their "AppImage type2-runtime ... - commit <sha> -" line is the one
-#      the runtime reports (--appimage-version).
-#  10. (AppImage only) those notices begin with the generic notices
-#      (NOTICES_FILE), byte for byte: the AppImage adds sections, it does not
-#      ship different ones.
 #
 # Self-test: scripts/ci/verify-bundled-xray.tests.sh (tests.yml runs it on
 # Linux and macOS on every PR), with fixtures for each failure path.
@@ -87,7 +72,6 @@ if ! printf '%s' "$expected" | grep -qE '^[0-9a-fA-F]{64}$'; then
 fi
 expected_lc="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
 notices="${NOTICES_FILE:-}"
-appimage_notices="${APPIMAGE_NOTICES_FILE:-}"
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -212,43 +196,6 @@ check_tree() {
   fi
 }
 
-# check_appimage_contents <label> <AppImage> <root> <notices file>
-# Checks 8-10 on an AppImage unpacked at <root>.
-check_appimage_contents() {
-  local label="$1" appimage="$2" root="$3" list="$4"
-  local f rel total=0 missing=0
-  # Check 8: every regular file, wherever it is.
-  collect "$root" -type f
-  for f in "${found[@]+"${found[@]}"}"; do
-    total=$((total + 1))
-    rel="${f#"$root"/}"
-    if ! grep -qxF -- "    $rel" "$list"; then
-      missing=$((missing + 1))
-      err "$label: $rel is in the AppImage but not listed in its notices ($list) - every file the AppImage carries must be listed with its source and licence (owner decision 2026-10-14, L2)"
-    fi
-  done
-  if [ "$missing" -eq 0 ]; then
-    echo "  files    : all $total files in it are listed in its notices"
-  fi
-  # Check 9: the runtime.
-  local commit reported
-  commit="$(sed -nE 's/^  AppImage type2-runtime .* - commit ([0-9a-f]{40}) - .*$/\1/p' "$list")"
-  if [ "$(printf '%s\n' "$commit" | grep -c .)" -ne 1 ]; then
-    err "$label: its notices name no AppImage runtime (one '  AppImage type2-runtime ... - commit <sha> -' line) - the runtime at the start of the file would ship unlisted"
-  else
-    reported="$("$appimage" --appimage-version 2>&1 || true)"
-    if printf '%s' "$reported" | grep -qF "/commit/${commit:0:7}"; then
-      echo "  runtime  : type2-runtime ${commit:0:7}, as its notices say"
-    else
-      err "$label: its runtime reports '$reported', its notices name type2-runtime $commit - the bundler used another runtime (LDAI_RUNTIME_FILE, scripts/ci/fetch-appimage-tooling.sh)"
-    fi
-  fi
-  # Check 10: the generic notices first, then the AppImage's sections.
-  if ! head -c "$(wc -c <"$notices" | tr -d ' ')" "$list" | cmp -s - "$notices"; then
-    err "$label: its notices ($list) do not begin with the generic notices ($notices) byte for byte"
-  fi
-}
-
 n=0
 for artifact in "$@"; do
   n=$((n + 1))
@@ -300,27 +247,8 @@ for artifact in "$@"; do
       if ! dpkg-deb -x "$artifact" "$dest"; then err "$label: dpkg-deb could not extract it"; continue; fi
       check_tree "$label" "$dest" linux "$notices"
       ;;
-    *.AppImage)
-      if [ ! -f "$artifact" ]; then err "$label: not found"; continue; fi
-      if [ -z "$appimage_notices" ] || [ ! -s "$appimage_notices" ]; then
-        err "$label: APPIMAGE_NOTICES_FILE must name the AppImage's own generated notices, with its bundled libraries (scripts/ci/appimage-notices.sh) - got '$appimage_notices'"
-        continue
-      fi
-      abs="$(cd "$(dirname "$artifact")" && pwd)/$(basename "$artifact")"
-      if [ ! -x "$abs" ]; then
-        # Never change the mode of the file we ship; run a copy instead.
-        cp "$abs" "$dest/runtime.AppImage"
-        chmod +x "$dest/runtime.AppImage"
-        abs="$dest/runtime.AppImage"
-      fi
-      # The AppImage runtime (static, no FUSE needed for extraction) unpacks
-      # its own squashfs into ./squashfs-root.
-      if ! (cd "$dest" && "$abs" --appimage-extract >/dev/null); then err "$label: --appimage-extract failed"; continue; fi
-      check_tree "$label" "$dest/squashfs-root" linux "$appimage_notices"
-      check_appimage_contents "$label" "$abs" "$dest/squashfs-root" "$appimage_notices"
-      ;;
     *)
-      err "$label: unknown artifact kind (expected .app, .app.tar.gz, .dmg, .deb or .AppImage)"
+      err "$label: unknown artifact kind (expected .app, .app.tar.gz, .dmg or .deb; Linux ships no AppImage since the owner decision of 2026-10-28)"
       ;;
   esac
 done
@@ -329,4 +257,4 @@ if [ "$fail_count" -gt 0 ]; then
   echo "verify-bundled-xray: $fail_count failure(s) across $n artifact(s)"
   exit 1
 fi
-echo "OK: every artifact ($n) ships an executable resources/xray matching the compiled-in XRAY_BINARY_SHA256 ($expected_lc), this build's resources/THIRD-PARTY-NOTICES.txt (an AppImage: its own, listing every library it bundles), and no dotfile under resources/"
+echo "OK: every artifact ($n) ships an executable resources/xray matching the compiled-in XRAY_BINARY_SHA256 ($expected_lc), this build's resources/THIRD-PARTY-NOTICES.txt, and no dotfile under resources/"

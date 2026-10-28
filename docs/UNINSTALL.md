@@ -58,10 +58,12 @@ BirdoVPN:
 sudo -E birdo-vpn-desktop --remove-leftovers-and-exit --with-app-data
 ```
 
-## Linux (AppImage)
+## Linux (an AppImage from 1.4.50 or earlier)
 
-An AppImage has no uninstaller. Run it once with the cleanup flags, the same
-way you start it, then delete the file:
+BirdoVPN no longer ships an AppImage (owner decision 2026-10-28; 1.4.50 was the
+last): Linux ships the .deb only. An AppImage you still have has no
+uninstaller. Run it once with the cleanup flags, the same way you start it,
+then delete the file:
 
 ```sh
 sudo ./BirdoVPN_*.AppImage --remove-leftovers-and-exit --with-app-data

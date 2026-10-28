@@ -2,10 +2,10 @@
 // ============================================================================
 // Verifies a Tauri updater signature (<bundle>.sig) against a public key, as
 // the in-app updater does, with node's own Ed25519 and BLAKE2b (no minisign
-// tool). linux-packages.yml signs its PR build with a throwaway key made by
-// `tauri signer generate` (never the real one) and runs this on the FINAL
-// AppImage: proof that scripts/ci/appimage-notices.sh's re-bundle signed the
-// bytes that ship, not the first bundle it replaced (review round 1 of #298).
+// tool). release.yml's release job runs it, through
+// verify-release-updater-signatures.sh, on every updater bundle it publishes
+// (MR-2072). (linux-packages.yml ran it on the re-bundled AppImage until the
+// AppImage was dropped: owner decision 2026-10-28.)
 //
 //   node scripts/ci/verify-updater-signature.mjs <bundle> <bundle.sig> <key.pub>
 //

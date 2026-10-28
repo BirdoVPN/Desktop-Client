@@ -113,17 +113,17 @@ bundle() { # bundle <tauri name> <path under release-files>
   mv "$src.sig" "$dest.sig"
 }
 bundle BirdoVPN_9.9.9_x64-setup.exe windows/BirdoVPN_9.9.9_Windows_x64-setup.exe
-bundle BirdoVPN_9.9.9_amd64.AppImage linux/BirdoVPN_9.9.9_Linux_amd64.AppImage
 bundle arm64/BirdoVPN.app.tar.gz macos-arm64/BirdoVPN-macos-arm64.app.tar.gz
 bundle x64/BirdoVPN.app.tar.gz macos-x64/BirdoVPN-macos-x64.app.tar.gz
-# Assets the release ships with no updater signature.
+# Assets the release ships with no updater signature. Linux: the .deb only
+# (owner decision 2026-10-28), which apt/dpkg upgrades; no updater bundle.
+mkdir -p "$pristine/linux"
 printf 'not a real package\n' >"$pristine/linux/BirdoVPN_9.9.9_Linux_amd64.deb"
 printf 'not a real disk image\n' >"$pristine/macos-arm64/BirdoVPN_9.9.9_macOS_aarch64.dmg"
 mkdir -p "$pristine/source"
 printf 'not a real archive\n' >"$pristine/source/BirdoVPN-9.9.9-corresponding-source.tar.gz"
 
 win=windows/BirdoVPN_9.9.9_Windows_x64-setup.exe
-lin=linux/BirdoVPN_9.9.9_Linux_amd64.AppImage
 arm=macos-arm64/BirdoVPN-macos-arm64.app.tar.gz
 x64=macos-x64/BirdoVPN-macos-x64.app.tar.gz
 
@@ -161,7 +161,7 @@ printf 'x' >>"$d/$win"
 expect_fail "a bundle changed after signing (one byte appended)" "$d" "$work/conf-a.json" 'the signature is not over these bytes'
 
 d=$(scenario flipped)
-flip "$d/$lin"
+flip "$d/$x64"
 expect_fail "a bundle changed after signing (one bit flipped, same size)" "$d" "$work/conf-a.json" 'the signature is not over these bytes'
 
 d=$(scenario signed-with-b)
@@ -181,7 +181,7 @@ sig_edit comment "$d/$win.sig"
 expect_fail "a .sig whose trusted comment was edited" "$d" "$work/conf-a.json" "the trusted comment's signature does not verify"
 
 d=$(scenario swapped)
-cp "$d/$lin.sig" "$d/$win.sig"
+cp "$d/$arm.sig" "$d/$win.sig"
 expect_fail "another bundle's .sig (same key, other bytes)" "$d" "$work/conf-a.json" 'the signature is not over these bytes'
 
 d=$(scenario missing-sig)
@@ -189,8 +189,8 @@ rm "$d/$arm.sig"
 expect_fail "a bundle with no .sig" "$d" "$work/conf-a.json" 'has no updater signature BirdoVPN-macos-arm64.app.tar.gz.sig'
 
 d=$(scenario orphan-sig)
-rm "$d/$lin"
-expect_fail "a .sig with no bundle" "$d" "$work/conf-a.json" 'has no bundle BirdoVPN_9.9.9_Linux_amd64.AppImage'
+rm "$d/$win"
+expect_fail "a .sig with no bundle" "$d" "$work/conf-a.json" 'has no bundle BirdoVPN_9.9.9_Windows_x64-setup.exe'
 
 d=$(scenario no-sigs)
 find "$d" -name '*.sig' -delete

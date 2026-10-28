@@ -24,7 +24,7 @@
 //!   Not on macOS, where a plain Quit takes the same path (Cmd+Q, the Dock's
 //!   Quit and logout reach `RunEvent::Exit` through applicationWillTerminate,
 //!   with no `ExitRequested`): a user who quits has chosen to end the session.
-//!   So a manual DMG or AppImage upgrade does not resume; only the in-app one
+//!   So a manual DMG or .deb upgrade does not resume; only the in-app one
 //!   does.
 //! - Every other end of a session — Disconnect, Quit, sign-out, an expired
 //!   sign-in — and an install that failed throw the record away ([`discard`],

@@ -25,7 +25,7 @@ and none of them stands in for another:
 | Signature | Over | Checked by |
 |---|---|---|
 | **Authenticode** (Azure Trusted Signing) | the Windows installer and the binaries it installs (`BirdoVPN.exe`, `xray.exe`) | Windows itself, at download and at the UAC prompt |
-| **Tauri updater signature** (`.sig`, minisign) | each updater bundle: the Windows setup `.exe`, the AppImage, the macOS `.app.tar.gz` | the installed app, against `plugins.updater.pubkey`, before it installs an update |
+| **Tauri updater signature** (`.sig`, minisign) | each updater bundle: the Windows setup `.exe`, the macOS `.app.tar.gz` (Linux ships the `.deb` only, which apt/dpkg upgrades: no updater bundle) | the installed app, against `plugins.updater.pubkey`, before it installs an update |
 | **Sigstore** (cosign keyless) | **one** file, `SHA256SUMS.txt`, which lists every release asset except the `.sig` files | anyone, by hand: [VERIFICATION.md](./VERIFICATION.md) |
 
 Sigstore signs no installer directly. The release job writes `SHA256SUMS.txt`
@@ -48,7 +48,8 @@ licence), anyone can tie a download to the workflow run that built it.
 Push tag v* → release.yml (test gate first)
   → Windows: xray.exe signed (Authenticode) → Tauri build signs BirdoVPN.exe
              and the NSIS installer (Authenticode) → updater .sig (minisign)
-  → Linux:   Tauri build → AppImage + .deb → updater .sig for the AppImage
+  → Linux:   Tauri build → .deb (no AppImage since the owner decision of 2026-10-28;
+             no updater bundle)
   → macOS:   Tauri build, unsigned and un-notarised → DMGs + .app.tar.gz → updater .sig
   → release job: every updater .sig verified against plugins.updater.pubkey
                  (tauri.conf.json); any mismatch and nothing is published
@@ -176,7 +177,7 @@ Each release includes:
 | File | Purpose |
 |------|---------|
 | `BirdoVPN_X.Y.Z_Windows_x64-setup.exe` (+ `.sig`) | NSIS installer, Authenticode-signed (+ updater signature) |
-| `BirdoVPN_X.Y.Z_Linux_amd64.AppImage` (+ `.sig`), `..._Linux_amd64.deb` | Linux packages (+ updater signature) |
+| `BirdoVPN_X.Y.Z_Linux_amd64.deb` | Linux package (Debian/Ubuntu); no AppImage since the owner decision of 2026-10-28 (1.4.50 was the last) |
 | `BirdoVPN_X.Y.Z_macOS_{aarch64,x64}.dmg` | DMG installers (macOS, unsigned and un-notarised) |
 | `BirdoVPN-macos-{arm64,x64}.app.tar.gz` (+ `.sig`) | macOS updater bundles (+ updater signature) |
 | `SHA256SUMS.txt` | Checksums for every asset above except the `.sig` files |

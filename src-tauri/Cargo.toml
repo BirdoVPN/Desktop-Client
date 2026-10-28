@@ -53,7 +53,8 @@ tauri-plugin-autostart = "2.0"
 # Default features minus `zip`. That feature only extracts .zip / .tar.gz update
 # bundles (Windows .nsis.zip / .msi.zip, Linux .AppImage.tar.gz), which
 # `createUpdaterArtifacts: true` never produces: we sign and serve the NSIS
-# setup .exe (installed through extract_exe) and the raw .AppImage. macOS
+# setup .exe (installed through extract_exe); Linux ships the .deb only and no
+# updater bundle (the raw .AppImage was served up to 1.4.50). macOS
 # .app.tar.gz extraction does not depend on it. Dropping it removes zip 4.6.1
 # (RUSTSEC-2026-0367/0368/0369) from the build.
 tauri-plugin-updater = { version = "2.0", default-features = false, features = ["rustls-tls", "system-proxy"] }
