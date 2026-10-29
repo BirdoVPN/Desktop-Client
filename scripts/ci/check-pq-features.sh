@@ -34,7 +34,7 @@ err() { printf '::error::%s\n' "$*" >&2; fail=1; }
 ok() { printf '  OK   %s\n' "$*"; }
 
 # ── 1. The pin is exact, and it is the version we reviewed ────────────────────
-WANT_VERSION="0.3.2"
+WANT_VERSION="0.3.3"
 if ! grep -qE '^ml-kem = \{ version = "='"${WANT_VERSION}"'"' Cargo.toml; then
   err "Cargo.toml no longer pins ml-kem exactly to =${WANT_VERSION}. Moving the KEM needs the KAT re-run (cargo test --lib birdo_pq) and a read of ml-kem/CHANGELOG.md, then this line updated deliberately."
 else
