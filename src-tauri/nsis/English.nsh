@@ -1,8 +1,9 @@
 ; English strings for the NSIS installer and uninstaller, wired via
 ; tauri.conf.json bundle.windows.nsis.customLanguageFiles. A custom file
 ; REPLACES the bundler's built-in English.nsh, so this is that file from
-; tauri-bundler 2.10.0 (@tauri-apps/cli 2.12.0), line for line, with ONE
-; change: deleteAppData.
+; tauri-bundler 2.10.4 (@tauri-apps/cli 2.12.4), line for line, with ONE
+; change: deleteAppData. (2.10.4 renamed the template's misspelt
+; choowHowToInstall to chooseHowToInstall; the wording is unchanged.)
 ;
 ; MR-1606 / REVIEW-WIN2-018: "Delete the application data" does not delete
 ; the DNS-restore journal (%APPDATA%\BirdoVPN\dns-restore.json*) while it
@@ -19,7 +20,7 @@ LangString alreadyInstalledLong ${LANG_ENGLISH} "${PRODUCTNAME} ${VERSION} is al
 LangString appRunning ${LANG_ENGLISH} "{{product_name}} is running! Please close it first then try again."
 LangString appRunningOkKill ${LANG_ENGLISH} "{{product_name}} is running!$\nClick OK to kill it"
 LangString chooseMaintenanceOption ${LANG_ENGLISH} "Choose the maintenance option to perform."
-LangString choowHowToInstall ${LANG_ENGLISH} "Choose how you want to install ${PRODUCTNAME}."
+LangString chooseHowToInstall ${LANG_ENGLISH} "Choose how you want to install ${PRODUCTNAME}."
 LangString createDesktop ${LANG_ENGLISH} "Create desktop shortcut"
 LangString dontUninstall ${LANG_ENGLISH} "Do not uninstall"
 LangString dontUninstallDowngrade ${LANG_ENGLISH} "Do not uninstall (Downgrading without uninstall is disabled for this installer)"
