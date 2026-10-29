@@ -208,7 +208,7 @@ zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
 # `encapsulate_deterministic` out of production is a CODE-REVIEW invariant:
 # the only caller is the `#[cfg(test)]` KAT helper in src/vpn/birdo_pq.rs,
 # and it must stay that way.
-ml-kem = { version = "=0.3.2", default-features = false, features = ["alloc", "zeroize"] }
+ml-kem = { version = "=0.3.3", default-features = false, features = ["alloc", "zeroize"] }
 hkdf = "0.13"
 
 # Fast mutex for async-safe crypto operations (replaces std::sync::Mutex)
