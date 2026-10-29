@@ -356,7 +356,7 @@ tokio = { version = "1.41", features = ["test-util"] }
 # know the production dependency set changed here, not just the test set.
 # 0.56.0 -> 0.58.3 (#241): the same zmij and fraction requirements as 0.56.0,
 # so that bump moved no crate in the shipped binary.
-jsonschema ={ version = "=0.58.6", default-features = false }
+jsonschema ={ version = "=0.60.0", default-features = false }
 # MR-713: src/commands/capability_scope_tests.rs matches the opener URL scope
 # with the matcher tauri-plugin-opener itself uses (`glob::Pattern`). "0.3"
 # unifies with the plugin's own `glob = "^0.3"`, so the test and the app share
