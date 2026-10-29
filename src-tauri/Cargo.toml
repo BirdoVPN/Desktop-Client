@@ -212,7 +212,7 @@ ml-kem = { version = "=0.3.2", default-features = false, features = ["alloc", "z
 hkdf = "0.13"
 
 # Fast mutex for async-safe crypto operations (replaces std::sync::Mutex)
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # WireGuard userspace implementation
 # 0.7.1: drops the RUSTSEC-2024-0344 curve25519-dalek 4.0.0-rc.3 pin and
