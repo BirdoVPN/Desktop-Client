@@ -203,7 +203,7 @@ function buildTiers(prices: Record<PlanId, PlanPrice>, gates: Partial<Record<Pla
       // locations" already describes. The Recon plan can use a fast node too.
       features: [
         ...(operativeClaims ? ['Everything in Recon'] : []),
-        '5 device connections',
+        '3 device connections',
         'All server locations',
         bandwidthFeature(prices.OPERATIVE),
         ...gatedLines('OPERATIVE', operativeClaims, gates),
@@ -225,7 +225,7 @@ function buildTiers(prices: Record<PlanId, PlanPrice>, gates: Partial<Record<Pla
       // Operative's line, whatever the server priced).
       features: [
         ...(sovereignClaims ? ['Everything in Operative'] : []),
-        '10 device connections',
+        '5 device connections',
         ...(!sovereignClaims || capOf(prices.SOVEREIGN) !== capOf(prices.OPERATIVE)
           ? [bandwidthFeature(prices.SOVEREIGN)]
           : []),
