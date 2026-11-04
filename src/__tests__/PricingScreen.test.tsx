@@ -6,6 +6,7 @@
  * - Savings per plan (Operative 20%, Sovereign 17%) or "up to 20%", never a
  *   flat figure that overstates Sovereign.
  * - Prices unchanged: £3.99 / £38 and £9.99 / £99. No location counts.
+ * - Connection limits on the cards: Recon 1, Operative 3, Sovereign 5.
  * - MR-132 / MR-630 / MR-1767 / MR-1979: prices, savings and caps render from
  *   the server's `plans` (birdo-web #708); without it, or for a plan it left
  *   out, the fallback (the prices above, the free cap at 50 GB, not 10).
@@ -76,6 +77,17 @@ describe('Pricing', () => {
     const text = container.textContent ?? '';
     expect(text).toContain('Prices include VAT for customers in the UK, EU and most other countries');
     expect(text).not.toMatch(/\d+\s+(server\s+)?locations/i);
+  });
+
+  // Paid limits change on 5 December 2026: Operative 5 to 3, Sovereign 10 to 5
+  // (birdo-web lib/plans.ts). A card states what a new buyer gets. A subscriber's
+  // own limit is the server's (`devicesLimit`) and can be the old one until then.
+  it('sells the connection limit a new buyer gets, per plan', () => {
+    const { container } = render(<Pricing />);
+    const limits = [...container.querySelectorAll('li')]
+      .map((li) => li.textContent ?? '')
+      .filter((line) => /device connection/.test(line));
+    expect(limits).toEqual(['1 device connection', '3 device connections', '5 device connections']);
   });
 
   it('uses the mobile wording and sells no server tier that does not exist', () => {
