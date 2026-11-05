@@ -593,7 +593,7 @@ mod tests {
         assert_eq!(made_in, target.canonicalize().unwrap());
     }
 
-    /// MR-1722 depends on how tauri-plugin-updater 2.14.0 places the
+    /// MR-1722 depends on how tauri-plugin-updater 2.14.1 places the
     /// installer (see `AdminOnlyTemp`). A different version must be checked
     /// again before it ships: confirm its Windows `install` still writes the
     /// installer under `std::env::temp_dir()` (or now offers a directory, or
@@ -606,7 +606,7 @@ mod tests {
             .expect("tauri-plugin-updater in Cargo.lock")..];
         let version = entry.lines().nth(1).unwrap();
         assert_eq!(
-            version, "version = \"2.14.0\"",
+            version, "version = \"2.14.1\"",
             "tauri-plugin-updater moved: re-verify MR-1722 (AdminOnlyTemp) against its Windows install"
         );
     }
