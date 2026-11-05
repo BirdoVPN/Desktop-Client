@@ -47,6 +47,18 @@ export type PendingAction = 'connecting' | 'disconnecting' | 'switching';
 
 export type LoadStatus = 'idle' | 'loading' | 'ready' | 'error';
 
+/**
+ * One entry of `/auth/me` `termsNotices` (MR-2199, birdo-web #808): a terms
+ * change that has not reached this account yet. `path` is a path on the
+ * website, `null` when Rust could not read the server's.
+ */
+export interface TermsNotice {
+  version: string;
+  text: string;
+  effectiveAt: string;
+  path: string | null;
+}
+
 export interface AccountInfo {
   email: string | null;
   /**
@@ -82,6 +94,8 @@ export interface AccountInfo {
   isAnonymous: boolean | null;
   /** Item 86: the anonymous account number. A credential: never logged. */
   accountNumber: string | null;
+  /** MR-2199: what `TermsNoticeBanners` shows. Like all of `account`, in memory only. */
+  termsNotices: TermsNotice[];
 }
 
 export type Protocol = 'wireguard';
@@ -438,6 +452,7 @@ const defaultAccount: AccountInfo = {
   hasPassword: true,
   isAnonymous: null,
   accountNumber: null,
+  termsNotices: [],
 };
 
 /**

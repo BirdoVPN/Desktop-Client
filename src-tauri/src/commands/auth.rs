@@ -4,7 +4,7 @@
 
 use crate::api::error::ApiError;
 use crate::api::session_gate::{self, RefreshOutcome, StoredSession};
-use crate::api::types::{AccountNumber, LoginResult, UserProfile};
+use crate::api::types::{AccountNumber, LoginResult, TermsNotice, UserProfile};
 use crate::api::BirdoApi;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use crate::commands::session::{end_session, EndReason};
@@ -49,6 +49,10 @@ pub struct AuthState {
     /// Item 86: the anonymous account number, for the Profile card. A
     /// credential: redacted in `Debug`, never logged.
     pub account_number: Option<AccountNumber>,
+    /// MR-2199: the terms notices `/auth/me` named. `None` when no profile
+    /// answered this cycle, so the UI keeps what it holds; a list, empty
+    /// included, replaces it.
+    pub terms_notices: Option<Vec<TermsNotice>>,
 }
 
 /// Manual: phase 1's anonymous email carries the account number (see
@@ -63,6 +67,7 @@ impl std::fmt::Debug for AuthState {
             .field("has_password", &self.has_password)
             .field("is_anonymous", &self.is_anonymous)
             .field("account_number", &self.account_number)
+            .field("terms_notices", &self.terms_notices)
             .finish()
     }
 }
@@ -80,6 +85,7 @@ impl AuthState {
             has_password: true,
             is_anonymous: None,
             account_number: None,
+            terms_notices: None,
         }
     }
 
@@ -93,6 +99,7 @@ impl AuthState {
             account_id: Some(profile.id),
             plan: None,
             account_number: profile.account_number,
+            terms_notices: Some(profile.terms_notices),
         }
     }
 }
@@ -1294,6 +1301,40 @@ mod account_boundary_tests {
             serde_json::to_value(&state).unwrap()["account_number"],
             serde_json::Value::Null
         );
+    }
+
+    /// MR-2199: what `/auth/me` named reaches the UI in order and in the shape
+    /// the shell reads. A cycle with no profile says nothing rather than
+    /// "none", so a passing failure cannot take a notice off the screen.
+    #[test]
+    fn the_auth_state_carries_terms_notices_to_the_ui() {
+        use crate::api::types::UserProfile;
+        let notice = |version: &str| {
+            serde_json::json!({
+                "version": version,
+                "text": "We have changed our Terms.",
+                "effectiveAt": "2026-12-05T00:00:00.000Z",
+                "path": "/legal/changes"
+            })
+        };
+        let profile: UserProfile = serde_json::from_value(serde_json::json!({
+            "id": "u1",
+            "termsNotices": [notice("2026-11-20"), notice("2026-10-30")]
+        }))
+        .unwrap();
+        let json = serde_json::to_value(super::AuthState::of(profile)).unwrap();
+        assert_eq!(
+            json["terms_notices"],
+            serde_json::json!([notice("2026-11-20"), notice("2026-10-30")])
+        );
+
+        // The profile answered and named none: the UI must drop what it holds.
+        let none: UserProfile = serde_json::from_value(serde_json::json!({ "id": "u2" })).unwrap();
+        let json = serde_json::to_value(super::AuthState::of(none)).unwrap();
+        assert_eq!(json["terms_notices"], serde_json::json!([]));
+
+        let unknown = serde_json::to_value(super::AuthState::unknown_identity(true)).unwrap();
+        assert_eq!(unknown["terms_notices"], serde_json::Value::Null);
     }
 
     /// REVIEW-WIN2-009: phase 2 of the contract really sends `email: null`

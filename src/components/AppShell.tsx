@@ -25,6 +25,7 @@ import { motion as motionTokens } from '@/lib/birdo-theme';
 import { BottomNav } from '@/components/BottomNav';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { PixelCanvas } from '@/components/PixelCanvas';
+import { TermsNoticeBanners } from '@/components/TermsNoticeBanners';
 import { Dashboard } from '@/components/Dashboard';
 import { DeepLinkDialog } from '@/components/home/DeepLinkDialog';
 import { Profile } from '@/screens/Profile';
@@ -77,6 +78,9 @@ export function AppShell() {
 
   return (
     <div className="relative z-10 mx-auto flex h-full w-full min-w-phone-min max-w-phone flex-col overflow-hidden">
+      {/* Above every tab and sub-screen: the notice is about the account, not a tab. */}
+      <TermsNoticeBanners />
+
       {/* Tab root. Inert while a sub-screen covers it: it stays mounted, and
           keyboard users used to tab into the invisible screen behind (W2-017). */}
       <div className="relative flex-1 overflow-hidden">

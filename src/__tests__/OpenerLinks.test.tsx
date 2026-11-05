@@ -37,6 +37,7 @@ import { relative, resolve } from 'node:path';
 import { ConsentScreen } from '@/components/ConsentScreen';
 import { Login } from '@/components/Login';
 import { Settings } from '@/components/Settings';
+import { TermsNoticeBanners } from '@/components/TermsNoticeBanners';
 import { UpdateRequired } from '@/components/UpdateRequired';
 import { Pricing } from '@/screens/Pricing';
 import { Profile } from '@/screens/Profile';
@@ -189,6 +190,18 @@ describe('every external link goes through openUrl with its URL', () => {
     expect(openedUrls()).toEqual(['https://birdo.app/dashboard/devices']);
   });
 
+  it('a terms notice: See every change opens the path /auth/me named on birdo.app (MR-2199)', async () => {
+    useAppStore.getState().setAccount({
+      termsNotices: [
+        { version: 'v', text: 'We have changed our Terms.', effectiveAt: '2099-12-05T00:00:00.000Z', path: '/legal/changes' },
+      ],
+    });
+    render(<TermsNoticeBanners />);
+    await userEvent.click(screen.getByRole('button', { name: 'See every change' }));
+    expect(openedUrls()).toEqual(['https://birdo.app/legal/changes']);
+    useAppStore.getState().setAccount({ termsNotices: [] });
+  });
+
   // Declared last, so it runs after every call site above (a file's tests run
   // in order): the links the UI has are exactly the list the Rust scope test
   // checks. Running this test alone, it fails - nothing has been observed.
@@ -207,7 +220,7 @@ const DRIVEN_CALL_SITES: Record<string, number> = {
   'components/Login.tsx': 1, // Forgot password
   'components/Settings.tsx': 3, // Privacy, Terms, Manage on web
   'components/UpdateRequired.tsx': 1, // Download manually (the 426 updateUrl)
-  'lib/links.ts': 1, // review page (account_restricted), Devices page (deviceNotice)
+  'lib/links.ts': 1, // review page (account_restricted), Devices page (deviceNotice), terms notice
   'screens/Pricing.tsx': 1, // Upgrade
   'screens/Profile.tsx': 1, // Manage Subscription
 };

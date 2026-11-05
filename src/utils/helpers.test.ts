@@ -290,6 +290,14 @@ describe('identityPatch', () => {
     expect(identityPatch(signedIn).hasPassword).toBe(true);
   });
 
+  it('MR-2199: a list replaces the notices, an empty one too; a cycle with no profile says nothing', () => {
+    const notice = { version: 'v', text: 't', effectiveAt: '2099-12-05T00:00:00.000Z', path: '/legal/changes' };
+    expect(identityPatch({ ...signedIn, terms_notices: [notice] }).termsNotices).toEqual([notice]);
+    expect(identityPatch({ ...signedIn, terms_notices: [] }).termsNotices).toEqual([]);
+    expect(identityPatch({ ...signedIn, terms_notices: null })).not.toHaveProperty('termsNotices');
+    expect(identityPatch(signedIn)).not.toHaveProperty('termsNotices');
+  });
+
   it('writes only what was received', () => {
     expect(identityPatch(signedIn)).toEqual({ status: 'active', hasPassword: true });
     expect(

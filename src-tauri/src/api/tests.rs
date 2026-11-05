@@ -590,6 +590,88 @@ mod types_serialization_tests {
         }
     }
 
+    const TERMS_NOTICE: &str = r#"{"version":"2026-10-30","text":"We have changed our Terms.",
+        "effectiveAt":"2026-12-05T00:00:00.000Z","path":"/legal/changes"}"#;
+
+    fn profile_with_terms_notices(value: &str) -> UserProfile {
+        serde_json::from_str(&format!(
+            r#"{{"id":"u1","email":"a@b.com","termsNotices":{value}}}"#
+        ))
+        .unwrap_or_else(|e| panic!("termsNotices {value} failed the profile: {e}"))
+    }
+
+    /// MR-2199: the field as birdo-web #808 sends it, every key, in order.
+    #[test]
+    fn auth_me_reads_terms_notices() {
+        let user = profile_with_terms_notices(&format!(
+            r#"[{TERMS_NOTICE},{{"version":"older","text":"Second.","effectiveAt":"2026-12-06T00:00:00.000Z","path":"/legal/changes"}}]"#
+        ));
+        assert_eq!(user.terms_notices.len(), 2);
+        let first = &user.terms_notices[0];
+        assert_eq!(first.version, "2026-10-30");
+        assert_eq!(first.text, "We have changed our Terms.");
+        assert_eq!(first.effective_at, "2026-12-05T00:00:00.000Z");
+        assert_eq!(first.path.as_deref(), Some("/legal/changes"));
+        assert_eq!(user.terms_notices[1].version, "older");
+    }
+
+    /// The key is absent whenever no notice applies, and on every backend
+    /// before #808 deploys.
+    #[test]
+    fn auth_me_without_terms_notices_shows_nothing() {
+        let user: UserProfile = serde_json::from_str(r#"{"id":"u1","email":"a@b.com"}"#).unwrap();
+        assert!(user.terms_notices.is_empty());
+        assert_eq!(user.email.as_deref(), Some("a@b.com"));
+    }
+
+    /// A shape this build does not know is no notice, never a failed profile:
+    /// that would blank the identity for the sake of an optional line.
+    #[test]
+    fn a_bad_terms_notices_shape_shows_nothing_and_keeps_the_profile() {
+        for bad in [
+            "null",
+            "42",
+            "true",
+            r#""soon""#,
+            "{}",
+            TERMS_NOTICE, // one object, not a list
+            "[42]",
+            r#"["soon"]"#,
+            "[null]",
+            "[[]]",
+            "[{}]",
+            r#"[{"version":"v"}]"#,
+            r#"[{"version":1,"text":"t","effectiveAt":"2026-12-05T00:00:00.000Z"}]"#,
+            r#"[{"version":"v","text":null,"effectiveAt":"2026-12-05T00:00:00.000Z"}]"#,
+            r#"[{"version":"v","text":"t","effectiveAt":1796428800000}]"#,
+        ] {
+            let user = profile_with_terms_notices(bad);
+            assert!(user.terms_notices.is_empty(), "{bad}");
+            assert_eq!(user.email.as_deref(), Some("a@b.com"), "{bad}");
+        }
+    }
+
+    /// Two notices can be in force together: a broken one must not hide the other.
+    #[test]
+    fn a_bad_terms_notice_does_not_hide_a_good_one() {
+        let user = profile_with_terms_notices(&format!(r#"[{{}},"soon",{TERMS_NOTICE},42]"#));
+        assert_eq!(user.terms_notices.len(), 1);
+        assert_eq!(user.terms_notices[0].version, "2026-10-30");
+    }
+
+    /// A path that cannot be read loses the link, not the notice.
+    #[test]
+    fn a_bad_terms_notice_path_keeps_the_text() {
+        for path in [r#","path":42"#, r#","path":null"#, r#","path":{}"#, ""] {
+            let user = profile_with_terms_notices(&format!(
+                r#"[{{"version":"v","text":"t","effectiveAt":"2026-12-05T00:00:00.000Z"{path}}}]"#
+            ));
+            assert_eq!(user.terms_notices.len(), 1, "{path}");
+            assert_eq!(user.terms_notices[0].text, "t");
+            assert_eq!(user.terms_notices[0].path, None, "{path}");
+        }
+    }
+
     #[test]
     fn user_profile_uses_camel_case() {
         let json = r#"{
