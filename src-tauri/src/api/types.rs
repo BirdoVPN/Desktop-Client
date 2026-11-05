@@ -1165,6 +1165,41 @@ pub struct AttestationNonceResponse {
     pub nonce: String,
 }
 
+/// Decode `T` or fall back to `None`: an optional informational object whose
+/// shape drifted must not turn a connect answer into a parse error.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// `accountRestriction` (contract `$defs/ConnectResponse`): with
+/// `refusalReason: "account_restricted"`. `until` is ISO-8601 server time;
+/// `appealPath` is a path on the website.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRestriction {
+    #[serde(default)]
+    pub until: Option<String>,
+    #[serde(default)]
+    pub appeal_path: Option<String>,
+}
+
+/// `deviceNotice` (contract `$defs/ConnectResponse`): on a successful connect.
+/// The contract's `code` is not read: there is one value and the client keys
+/// on the presence of the object.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceNotice {
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub manage_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectResponse {
@@ -1186,6 +1221,16 @@ pub struct ConnectResponse {
     /// then handled as absent; older servers never send it.
     #[serde(default)]
     pub refusal_reason: Option<String>,
+    /// With `refusalReason: "account_restricted"`: when new free-plan
+    /// connections are allowed again, and where to ask for a review. Read
+    /// leniently: a shape this build does not know is absent, never a failed
+    /// decode of the whole answer.
+    #[serde(default, deserialize_with = "lenient")]
+    pub account_restriction: Option<AccountRestriction>,
+    /// On a SUCCESSFUL connect: other devices on a free account kept taking its
+    /// one connection. The connect went ahead; the client says so once.
+    #[serde(default, deserialize_with = "lenient")]
+    pub device_notice: Option<DeviceNotice>,
     #[serde(default)]
     pub key_id: Option<String>,
     // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
@@ -1329,6 +1374,16 @@ pub struct MultiHopConnectResponse {
     /// same vocabulary (entry or exit full, outside the plan, …).
     #[serde(default)]
     pub refusal_reason: Option<String>,
+    /// With `refusalReason: "account_restricted"`: when new free-plan
+    /// connections are allowed again, and where to ask for a review. Read
+    /// leniently: a shape this build does not know is absent, never a failed
+    /// decode of the whole answer.
+    #[serde(default, deserialize_with = "lenient")]
+    pub account_restriction: Option<AccountRestriction>,
+    /// On a SUCCESSFUL connect: other devices on a free account kept taking its
+    /// one connection. The connect went ahead; the client says so once.
+    #[serde(default, deserialize_with = "lenient")]
+    pub device_notice: Option<DeviceNotice>,
     #[serde(default)]
     pub key_id: Option<String>,
     // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
@@ -1391,6 +1446,8 @@ impl From<MultiHopConnectResponse> for ConnectResponse {
             message: response.message,
             quota_exceeded: response.quota_exceeded,
             refusal_reason: response.refusal_reason,
+            account_restriction: response.account_restriction,
+            device_notice: response.device_notice,
             key_id: response.key_id,
             public_key: response.public_key,
             preshared_key: response.preshared_key,

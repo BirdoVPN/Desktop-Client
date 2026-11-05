@@ -174,6 +174,21 @@ describe('every external link goes through openUrl with its URL', () => {
     expect(openedUrls()).toEqual(['https://dashboard.birdo.app/billing']);
   });
 
+  it('account_restricted review page and the device notice open a site path on birdo.app', async () => {
+    const { appealUrl } = await import('@/lib/errors');
+    const { openWebsite } = await import('@/lib/links');
+    const url = appealUrl({
+      code: 'account_restricted',
+      message: 'm',
+      retryable: false,
+      retry_after_secs: null,
+      restriction: { until: null, appeal_path: '/dashboard/devices' },
+    });
+    expect(url).toBe('https://birdo.app/dashboard/devices');
+    openWebsite(url!);
+    expect(openedUrls()).toEqual(['https://birdo.app/dashboard/devices']);
+  });
+
   // Declared last, so it runs after every call site above (a file's tests run
   // in order): the links the UI has are exactly the list the Rust scope test
   // checks. Running this test alone, it fails - nothing has been observed.
@@ -192,6 +207,7 @@ const DRIVEN_CALL_SITES: Record<string, number> = {
   'components/Login.tsx': 1, // Forgot password
   'components/Settings.tsx': 3, // Privacy, Terms, Manage on web
   'components/UpdateRequired.tsx': 1, // Download manually (the 426 updateUrl)
+  'lib/links.ts': 1, // review page (account_restricted), Devices page (deviceNotice)
   'screens/Pricing.tsx': 1, // Upgrade
   'screens/Profile.tsx': 1, // Manage Subscription
 };

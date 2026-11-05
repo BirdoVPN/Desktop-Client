@@ -1473,6 +1473,8 @@ mod tests {
             message: None,
             quota_exceeded: false,
             refusal_reason: None,
+            account_restriction: None,
+            device_notice: None,
             key_id: None,
             public_key: None,
             preshared_key: None,

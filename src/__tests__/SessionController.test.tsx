@@ -807,6 +807,33 @@ describe('App: the controller runs under the biometric cover (W2-001, W2-026)', 
   });
 });
 
+/** MR-2229: `deviceNotice` on a successful connect is a notice, never a stop. */
+describe('the device notice', () => {
+  it('shows the server sentence with a Devices link, and leaves the tunnel alone', async () => {
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().statusSeq).toBe(1));
+    emit('vpn-status-changed', { state: 'connected', seq: 2, kill_switch_blocking: false, error: null });
+    emit('device-notice', { message: 'Another device took this connection.', managePath: '/dashboard/devices' });
+    const notice = useAppStore.getState().notice;
+    expect(notice?.text).toBe('Another device took this connection.');
+    expect(notice?.tone).toBe('info');
+    expect(notice?.actionLabel).toBe('Manage devices');
+    expect(useAppStore.getState().connectionState).toBe('connected');
+    expect(callsTo('disconnect_vpn')).toHaveLength(0);
+  });
+
+  it('offers no link for a path that is not a plain site path, and ignores an empty notice', async () => {
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().statusSeq).toBe(1));
+    emit('device-notice', { message: 'Hello.', managePath: 'https://evil.example/' });
+    expect(useAppStore.getState().notice?.actionLabel).toBeUndefined();
+    useAppStore.getState().showNotice({ text: 'previous', tone: 'info' });
+    emit('device-notice', { message: '  ' });
+    emit('device-notice', null);
+    expect(useAppStore.getState().notice?.text).toBe('previous');
+  });
+});
+
 /** birdo-web #590: the Free allowance, inside and after its grace window. */
 describe('the Free data allowance', () => {
   it('a grace warning is a notice with View plans and a system notification; the tunnel is untouched', async () => {

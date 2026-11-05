@@ -48,7 +48,10 @@ function signInError(e: unknown, context: ErrorContext = 'sign_in'): string {
   return errorCopy(toIpcError(e), context).message;
 }
 function refusedCopy(result: LoginResponse, context: ErrorContext, fallback: string): string {
-  return result.code ? signInError({ code: result.code, message: '' }, context) : fallback;
+  // `registration_not_allowed` is worded by the server's own sentence, the
+  // one place a refusal's `message` is shown (there is nothing else to say).
+  const message = result.code === 'registration_not_allowed' ? (result.message ?? '') : '';
+  return result.code ? signInError({ code: result.code, message }, context) : fallback;
 }
 
 // Module scope, not inside Login(): a component TYPE created inside the render

@@ -303,10 +303,16 @@ pub fn needs_rebind<R: PartialEq>(pinned: Option<&R>, now: Option<&R>) -> bool {
 }
 
 /// Whether the SERVER ended the session: a revocation (owner default, iOS
-/// parity, P1-parity-021) or a used-up Free allowance (birdo-web #590). No
-/// reconnect can bring either back.
+/// parity, P1-parity-021), a used-up Free allowance (birdo-web #590) or an
+/// account restriction (`account_restricted`, which pauses new free-plan
+/// connections for up to 24 hours). No reconnect can bring any of them back,
+/// and holding the lockdown block over one would keep the machine offline
+/// behind its own firewall until the pause ends.
 pub fn server_ended(code: IpcErrorCode) -> bool {
-    matches!(code, IpcErrorCode::Revoked | IpcErrorCode::QuotaExceeded)
+    matches!(
+        code,
+        IpcErrorCode::Revoked | IpcErrorCode::QuotaExceeded | IpcErrorCode::AccountRestricted
+    )
 }
 
 /// Whether a give-up keeps the block-all engaged. Always-on (lockdown) keeps
@@ -1807,9 +1813,52 @@ mod tests {
         }
     }
 
+    /// MR-2229: under always-on lockdown an `account_restricted` refusal on the
+    /// re-dial ends the recovery on the FIRST attempt and RELEASES the block;
+    /// before, it read as `server_unavailable` (retryable), spent the budget
+    /// and then kept the machine offline behind its own firewall.
+    #[test]
+    fn an_account_restriction_on_the_re_dial_ends_it_at_once_and_releases_lockdown() {
+        assert!(server_ended(IpcErrorCode::AccountRestricted));
+        assert!(!give_up_keeps_block(IpcErrorCode::AccountRestricted, true));
+        let mut p = ReconnectPolicy::new(Budget {
+            max_attempts: 10,
+            ..budget()
+        });
+        let now = Instant::now();
+        let mut t = tick(now, Observed::Connected);
+        t.liveness = Liveness::Dead(DropCause::HandshakeStale);
+        assert!(matches!(p.decide(&t), Action::TearDown { .. }));
+        assert!(matches!(
+            p.decide(&not_connected(now)),
+            Action::Dial { attempt: 1, .. }
+        ));
+        p.on_dial_failed(crate::commands::ipc_error::IpcError::connect_refused(
+            "New free-plan connections on this account are paused.",
+            false,
+            Some("account_restricted"),
+        ));
+        match p.decide(&not_connected(now)) {
+            Action::GiveUp(err) => {
+                assert_eq!(err.code, IpcErrorCode::AccountRestricted);
+                assert_eq!(p.attempts(), 1, "no second dial");
+                assert!(!give_up_keeps_block(err.code, true));
+                assert!(
+                    !marks_give_up(err.code),
+                    "its own banner, not 'keeps dropping'"
+                );
+            }
+            other => panic!("expected the session to end, got {other:?}"),
+        }
+    }
+
     #[test]
     fn only_a_recovery_that_failed_is_marked_as_a_give_up() {
-        for ended in [IpcErrorCode::QuotaExceeded, IpcErrorCode::Revoked] {
+        for ended in [
+            IpcErrorCode::QuotaExceeded,
+            IpcErrorCode::Revoked,
+            IpcErrorCode::AccountRestricted,
+        ] {
             assert!(!marks_give_up(ended), "{ended:?}");
         }
         for failed in [

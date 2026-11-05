@@ -63,6 +63,15 @@ pub enum IpcErrorCode {
     /// `commands::consent`). Accepting it is the way out, so asking again
     /// unchanged cannot succeed.
     ConsentRequired,
+    /// `/vpn/connect` refused with `refusalReason: "account_restricted"`: new
+    /// free-plan connections on this account are paused until a time the
+    /// server names (a device-limit conflict continued past its notice). A
+    /// retry is refused the same way until then, so it is a hard refusal.
+    AccountRestricted,
+    /// Creating an account is refused for the country this request came from
+    /// (403 `details.code: "registration_country_not_allowed"`). The UI shows
+    /// the server's sentence; "upgrade your plan" and "try again" cannot help.
+    RegistrationNotAllowed,
     Unknown,
 }
 
@@ -84,6 +93,8 @@ impl IpcErrorCode {
                 | IpcErrorCode::NotElevated
                 | IpcErrorCode::Cancelled
                 | IpcErrorCode::ConsentRequired
+                | IpcErrorCode::AccountRestricted
+                | IpcErrorCode::RegistrationNotAllowed
         )
     }
 
@@ -101,6 +112,7 @@ impl IpcErrorCode {
                 | IpcErrorCode::UpgradeRequired
                 | IpcErrorCode::ClientAttestationRequired
                 | IpcErrorCode::NotElevated
+                | IpcErrorCode::AccountRestricted
         )
     }
 }
@@ -132,6 +144,53 @@ pub struct IpcError {
     pub settings_restored: bool,
     #[serde(skip)]
     pub transport: Option<TransportFailure>,
+    /// `account_restricted` only: when it ends and where to ask for a review,
+    /// both already checked (`Restriction::from_wire`). Absent from the wire
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restriction: Option<Restriction>,
+}
+
+/// What the UI is shown beside an `account_restricted` refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Restriction {
+    /// ISO-8601 server time at which the pause ends (shown, never parsed here).
+    pub until: Option<String>,
+    /// A path on the website (`/...`), never a full URL: the UI builds the link.
+    pub appeal_path: Option<String>,
+}
+
+impl Restriction {
+    /// The server's values, kept only if they have the shape the UI relies on:
+    /// a short timestamp-like string, and a same-site absolute path. Anything
+    /// else is dropped, so a value that cannot be shown or opened safely is
+    /// simply absent and the refusal still reads from `message`.
+    pub fn from_wire(wire: &crate::api::types::AccountRestriction) -> Self {
+        let until = wire
+            .until
+            .as_deref()
+            .filter(|u| {
+                (10..=40).contains(&u.len())
+                    && u.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ':' | '.' | '+'))
+            })
+            .map(str::to_string);
+        let appeal_path = wire.appeal_path.as_deref().and_then(site_path);
+        Self { until, appeal_path }
+    }
+}
+
+/// A path on the website the server named (`/dashboard/devices`), or `None`:
+/// the UI builds the link, so only a plain same-site path may pass, never
+/// `//host`, a scheme, a backslash, whitespace or something long.
+pub fn site_path(path: &str) -> Option<String> {
+    (path.len() <= 200
+        && path.starts_with('/')
+        && !path.starts_with("//")
+        && path
+            .chars()
+            .all(|c| c.is_ascii_graphic() && c as u32 != 0x5c))
+    .then(|| path.to_string())
 }
 
 impl std::fmt::Display for IpcError {
@@ -151,6 +210,7 @@ impl IpcError {
             retry_after_secs: None,
             settings_restored: false,
             transport: None,
+            restriction: None,
         }
     }
 
@@ -254,6 +314,15 @@ impl IpcError {
                 IpcErrorCode::ClientAttestationRequired,
                 "BirdoVPN couldn't verify this copy of the app. Install the latest version from \
                  birdo.app, then try again.",
+            ),
+            // The server's own words: nothing else says why this account
+            // cannot be created. Empty only if the server sent no sentence.
+            ApiError::RegistrationNotAllowed(message) if !message.is_empty() => {
+                Self::new(IpcErrorCode::RegistrationNotAllowed, message)
+            }
+            ApiError::RegistrationNotAllowed(_) => Self::new(
+                IpcErrorCode::RegistrationNotAllowed,
+                "BirdoVPN cannot create new accounts from your country right now.",
             ),
             ApiError::CertificatePinningFailed(_) => {
                 Self::new(IpcErrorCode::CertPinFailed, error.to_string())
@@ -364,6 +433,7 @@ impl IpcError {
     /// | `plan`                                  | `subscription_required` |
     /// | `quota_exceeded`                        | `quota_exceeded`        |
     /// | `server_capacity`, `server_unavailable` | `server_unavailable`    |
+    /// | `account_restricted`                    | `account_restricted`    |
     ///
     /// A refusal without one (an older server) or with a value newer than
     /// this build is handled as before: the `quotaExceeded` flag, then the
@@ -376,10 +446,25 @@ impl IpcError {
     /// which is retryable: the re-dial after an over-cap session was ended
     /// spent its whole budget, then held a lockdown block with the generic
     /// give-up text (REVIEW-WIN2-002).
+    #[cfg(test)]
     pub fn connect_refused(
         message: &str,
         quota_exceeded: bool,
         refusal_reason: Option<&str>,
+    ) -> Self {
+        Self::connect_refused_with(message, quota_exceeded, refusal_reason, None)
+    }
+
+    /// [`Self::connect_refused`] with the refusal's `accountRestriction`, which
+    /// `account_restricted` carries to the UI. `account_restricted` is keyed on
+    /// `refusalReason` alone (the object only adds the time and the link), and
+    /// it never overrides the allowance flag: a `quotaExceeded` answer is the
+    /// allowance whatever else it says.
+    pub fn connect_refused_with(
+        message: &str,
+        quota_exceeded: bool,
+        refusal_reason: Option<&str>,
+        restriction: Option<&crate::api::types::AccountRestriction>,
     ) -> Self {
         if quota_exceeded || refusal_reason == Some("quota_exceeded") {
             return crate::vpn::reconnect_policy::quota_exceeded_error();
@@ -388,11 +473,16 @@ impl IpcError {
             Some("device_limit") => IpcErrorCode::DeviceLimit,
             Some("plan") => IpcErrorCode::SubscriptionRequired,
             Some("server_capacity" | "server_unavailable") => IpcErrorCode::ServerUnavailable,
+            Some("account_restricted") => IpcErrorCode::AccountRestricted,
             // Absent, or newer than this build: today's handling.
             _ if is_device_limit_message(message) => IpcErrorCode::DeviceLimit,
             _ => IpcErrorCode::ServerUnavailable,
         };
-        Self::new(code, message)
+        let mut error = Self::new(code, message);
+        if code == IpcErrorCode::AccountRestricted {
+            error.restriction = restriction.map(Restriction::from_wire);
+        }
+        error
     }
 
     /// The tunnel stage failed (`VpnManager::connect`). The only distinction
@@ -511,6 +601,11 @@ mod tests {
                 "client_attestation_required",
             ),
             (IpcErrorCode::ConsentRequired, "consent_required"),
+            (IpcErrorCode::AccountRestricted, "account_restricted"),
+            (
+                IpcErrorCode::RegistrationNotAllowed,
+                "registration_not_allowed",
+            ),
             (IpcErrorCode::Unknown, "unknown"),
         ];
         for (code, wire) in pairs {

@@ -1756,10 +1756,11 @@ async fn request_fresh_response(
     // re-dial is refused with `quotaExceeded` — a hard refusal that ends the
     // recovery at once, releasing the block (`give_up_keeps_block`).
     if !response.success {
-        return Err(IpcError::connect_refused(
+        return Err(IpcError::connect_refused_with(
             response.message.as_deref().unwrap_or("Connection failed"),
             response.quota_exceeded,
             response.refusal_reason.as_deref(),
+            response.account_restriction.as_ref(),
         ));
     }
     Ok(response)

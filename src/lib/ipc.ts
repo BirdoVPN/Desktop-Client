@@ -44,6 +44,8 @@ export type IpcErrorCode =
   | 'settings_unverified'
   | 'client_attestation_required'
   | 'consent_required'
+  | 'account_restricted'
+  | 'registration_not_allowed'
   | 'unknown';
 
 const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
@@ -71,6 +73,8 @@ const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
   'settings_unverified',
   'client_attestation_required',
   'consent_required',
+  'account_restricted',
+  'registration_not_allowed',
   'unknown',
 ]);
 
@@ -81,6 +85,8 @@ export interface IpcError {
   message: string;
   retryable: boolean;
   retry_after_secs: number | null;
+  /** `account_restricted` only: when the pause ends and the review page's path. */
+  restriction?: { until: string | null; appeal_path: string | null };
 }
 
 type Obj = Record<string, unknown>;
@@ -108,12 +114,19 @@ const bool = (v: unknown, fallback = false): boolean => (typeof v === 'boolean' 
 export function toIpcError(e: unknown): IpcError {
   if (isObj(e) && typeof e.code === 'string') {
     const code = ERROR_CODES.has(e.code) ? (e.code as IpcErrorCode) : 'unknown';
-    return {
+    const error: IpcError = {
       code,
       message: str(e.message) ?? '',
       retryable: bool(e.retryable, true),
       retry_after_secs: num(pick(e, 'retryAfterSecs', 'retry_after_secs')),
     };
+    if (code === 'account_restricted' && isObj(e.restriction)) {
+      error.restriction = {
+        until: str(e.restriction.until),
+        appeal_path: str(pick(e.restriction, 'appealPath', 'appeal_path')),
+      };
+    }
+    return error;
   }
   const message =
     typeof e === 'string' ? e : e instanceof Error ? e.message : isObj(e) ? str(e.message) ?? '' : '';

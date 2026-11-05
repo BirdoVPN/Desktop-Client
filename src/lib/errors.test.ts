@@ -5,6 +5,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  ACCOUNT_RESTRICTED_COPY,
+  appealUrl,
   CLIENT_ATTESTATION_COPY,
   CONSENT_REQUIRED_COPY,
   errorCopy,
@@ -15,6 +17,7 @@ import {
   KILLSWITCH_HOLDING_COPY,
   PQ_FAILED_COPY,
   QUOTA_EXCEEDED_COPY,
+  REGISTRATION_NOT_ALLOWED_COPY,
   quotaGraceMessage,
   REVOKED_COPY,
   SESSION_EXPIRED_COPY,
@@ -22,7 +25,7 @@ import {
   UPDATE_REQUIRED_COPY,
   vpnErrorCopy,
 } from './errors';
-import type { IpcError, IpcErrorCode } from './ipc';
+import { toIpcError, type IpcError, type IpcErrorCode } from './ipc';
 
 const err = (code: IpcErrorCode, extra: Partial<IpcError> = {}): IpcError => ({
   code,
@@ -59,6 +62,56 @@ const ALL: IpcErrorCode[] = [
   'consent_required',
   'unknown',
 ];
+
+/** MR-2229: the two refusals whose own sentence is the explanation. */
+describe('account_restricted and registration_not_allowed', () => {
+  const restricted = (extra: Partial<IpcError> = {}) =>
+    err('account_restricted', {
+      message: 'New free-plan connections on this account are paused.',
+      retryable: false,
+      restriction: { until: '2026-10-31T14:00:00.000Z', appeal_path: '/dashboard/devices' },
+      ...extra,
+    });
+
+  it('shows the server sentence, the end time and a review link, and never offers Try again', () => {
+    const copy = errorCopy(restricted(), 'vpn');
+    expect(copy.message).toContain('New free-plan connections on this account are paused.');
+    expect(copy.message).toMatch(/Connections resume .+/);
+    expect(copy.action).toBe('appeal');
+    expect(appealUrl(restricted())).toBe('https://birdo.app/dashboard/devices');
+  });
+
+  it('falls back to its own copy without a sentence or a time, and has no link without a path', () => {
+    const copy = errorCopy(restricted({ message: '', restriction: undefined }), 'vpn');
+    expect(copy).toEqual({ message: ACCOUNT_RESTRICTED_COPY, action: null });
+  });
+
+  it.each(['https://evil.example/x', '//evil.example/x', 'dashboard', '/a b', '/a\b', '/a\\b'])(
+    'never opens %s',
+    (appeal_path) => {
+      const e = restricted({ restriction: { until: null, appeal_path } });
+      expect(appealUrl(e)).toBeNull();
+      expect(errorCopy(e, 'vpn').action).toBeNull();
+    },
+  );
+
+  it('toIpcError reads the restriction (snake or camel) and ignores it on other codes', () => {
+    const wire = { code: 'account_restricted', message: 'm', retryable: false, restriction: { until: 'u', appealPath: '/p' } };
+    expect(toIpcError(wire).restriction).toEqual({ until: 'u', appeal_path: '/p' });
+    expect(toIpcError({ ...wire, code: 'server_error' }).restriction).toBeUndefined();
+    expect(toIpcError({ code: 'some_future_code', message: 'm' }).code).toBe('unknown');
+  });
+
+  it('a refused sign-up shows the server sentence instead of "Upgrade to unlock"', () => {
+    const sentence = 'BirdoVPN cannot create new accounts in your country right now.';
+    const copy = errorCopy(err('registration_not_allowed', { message: sentence, retryable: false }), 'general');
+    expect(copy).toEqual({ message: sentence, action: null });
+    expect(copy.message).not.toMatch(/upgrade/i);
+    expect(errorCopy(err('registration_not_allowed', { message: '' })).message).toBe(REGISTRATION_NOT_ALLOWED_COPY);
+    // Other 403s are unchanged.
+    expect(errorCopy(err('subscription_required'), 'general').message).toMatch(/Upgrade to unlock/);
+  });
+});
 
 describe('errorCopy', () => {
   it.each(ALL.filter((c) => c !== 'cancelled'))('%s has canonical copy and never echoes Rust\'s message', (code) => {

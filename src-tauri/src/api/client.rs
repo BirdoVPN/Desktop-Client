@@ -1481,6 +1481,20 @@ impl BirdoApi {
             super::error::retry_after_secs(body.as_ref().and_then(|b| b.details.as_ref()))
                 .or(retry_after)
         };
+        // The sign-up gate's refusals carry their reason in `details.code`
+        // (`refusal()` in birdo-web's registration-gate.service.ts), not in
+        // `error`. A bare 403 reads as "your plan does not include this",
+        // wrong advice for a country the account cannot be created from.
+        if status == StatusCode::FORBIDDEN
+            && body
+                .as_ref()
+                .and_then(|b| b.details.as_ref())
+                .and_then(|d| d.get("code"))
+                .and_then(|c| c.as_str())
+                == Some("registration_country_not_allowed")
+        {
+            return ApiError::RegistrationNotAllowed(message().trim().to_string());
+        }
         match body.as_ref().and_then(|b| b.error.as_deref()) {
             Some("two_factor_required") => return ApiError::TwoFactorRequired(message()),
             Some("two_factor_invalid") => return ApiError::TwoFactorInvalid(message()),

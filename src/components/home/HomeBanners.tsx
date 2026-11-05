@@ -16,6 +16,7 @@ import { status } from '@/lib/birdo-theme';
 import { useAppStore } from '@/store/app-store';
 
 const ACTION_LABEL: Record<Exclude<ErrorAction, null | 'update' | 'sign_in'>, string> = {
+  appeal: 'Ask for a review',
   view_plans: 'View plans',
   open_settings: 'Open Settings',
   choose_server: 'Choose server',

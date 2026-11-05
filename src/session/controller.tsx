@@ -21,6 +21,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { parseQuotaWarning, parseSessionExpired, parseVpnStats, parseVpnStatus } from '@/lib/ipc';
 import { giveUpMessage, quotaGraceMessage, vpnErrorCopy } from '@/lib/errors';
+import { openWebsite, websiteUrl } from '@/lib/links';
 import { useAppStore, type Server } from '@/store/app-store';
 import { selectTunnelActive } from '@/store/selectors';
 import { endSession } from '@/session/session';
@@ -496,6 +497,27 @@ function useQuotaWarning(): void {
 }
 
 /**
+ * Rust says other devices on a free account kept taking its one connection
+ * (`deviceNotice` on a successful connect). The connection is up and stays up:
+ * a notice in the window, with a way to the Devices page. Never red.
+ */
+export function showDeviceNotice(payload: unknown): void {
+  const p = typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {};
+  const text = typeof p.message === 'string' ? p.message.trim() : '';
+  if (!text) return;
+  const manage = websiteUrl(typeof p.managePath === 'string' ? p.managePath : null);
+  useAppStore.getState().showNotice({
+    text,
+    tone: 'info',
+    ...(manage ? { actionLabel: 'Manage devices', onAction: () => openWebsite(manage) } : {}),
+  });
+}
+
+function useDeviceNotice(): void {
+  useEffect(() => unlistenLater(listen('device-notice', (e) => showDeviceNotice(e.payload))), []);
+}
+
+/**
  * The kill switch toggle across dials (round 5 of the review of #222;
  * `watchKillSwitchAcrossDials`).
  */
@@ -518,6 +540,7 @@ export function VpnSessionController(): null {
   useMultiHopPrune();
   useStealthFallbackNotice();
   useQuotaWarning();
+  useDeviceNotice();
   useKillSwitchAcrossDials();
   return null;
 }

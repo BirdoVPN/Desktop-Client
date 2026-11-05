@@ -8,6 +8,7 @@
  * from iOS where iOS has a sentence for the case.
  */
 import { toIpcError, type IpcError, type IpcErrorCode } from '@/lib/ipc';
+import { websiteUrl } from '@/lib/links';
 
 /** What the banner's button does, if it has one. */
 export type ErrorAction =
@@ -18,6 +19,7 @@ export type ErrorAction =
   | 'connect'
   | 'retry'
   | 'update'
+  | 'appeal'
   | 'disconnect'
   | null;
 
@@ -63,6 +65,27 @@ export const CONSENT_REQUIRED_COPY = "Your privacy consent wasn't saved, so Bird
 export const SETTINGS_UNVERIFIED_COPY =
   "Your saved settings couldn't be verified right now, so this change wasn't saved. " +
   'Try again in a moment, or reset your settings to their defaults.';
+
+export const ACCOUNT_RESTRICTED_COPY =
+  'New connections on this account are paused for now. If this is a mistake, ask for a review.';
+export const REGISTRATION_NOT_ALLOWED_COPY =
+  "BirdoVPN can't create new accounts from your country right now.";
+
+/**
+ * The link for an `account_restricted` refusal's review page, only if the path
+ * the server named is a plain same-site path. `birdo.app/dashboard/...` is the
+ * website's own redirect to the dashboard host.
+ */
+export function appealUrl(error: IpcError): string | null {
+  return error.code === 'account_restricted' ? websiteUrl(error.restriction?.appeal_path) : null;
+}
+
+/** `until` in the viewer's time zone, or null if it is not a date. */
+function untilText(until: string | null | undefined): string | null {
+  if (!until) return null;
+  const date = new Date(until);
+  return Number.isNaN(date.getTime()) ? null : date.toLocaleString();
+}
 
 const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   network_offline: {
@@ -135,6 +158,10 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   // and it is no accusation.
   client_attestation_required: { message: CLIENT_ATTESTATION_COPY, action: null },
   consent_required: { message: CONSENT_REQUIRED_COPY, action: null },
+  // Both show the server's own sentence when it sent one (see `errorCopy`):
+  // these are the fallbacks for an answer that carried none.
+  account_restricted: { message: ACCOUNT_RESTRICTED_COPY, action: null },
+  registration_not_allowed: { message: REGISTRATION_NOT_ALLOWED_COPY, action: null },
   unknown: { message: 'Something went wrong. Please try again.', action: 'retry' },
 };
 
@@ -168,6 +195,19 @@ export function errorCopy(error: IpcError, context: ErrorContext = 'general'): E
     return {
       message: `Too many attempts. Please wait ${secs} second${secs === 1 ? '' : 's'}.`,
       action: null,
+    };
+  }
+  // The server's own sentence says why, and for these two nothing else does.
+  // Keyed on the code, never on the wording; the sentence is shown, not read.
+  if (error.code === 'registration_not_allowed') {
+    return { message: error.message.trim() || REGISTRATION_NOT_ALLOWED_COPY, action: null };
+  }
+  if (error.code === 'account_restricted') {
+    const until = untilText(error.restriction?.until);
+    const base = error.message.trim() || ACCOUNT_RESTRICTED_COPY;
+    return {
+      message: until ? `${base} Connections resume ${until}.` : base,
+      action: appealUrl(error) ? 'appeal' : null,
     };
   }
   return COPY[error.code];

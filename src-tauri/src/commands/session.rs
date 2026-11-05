@@ -502,12 +502,16 @@ async fn attempt(
             .clone()
             .unwrap_or_else(|| "Connection failed".to_string());
         tracing::error!("Server rejected connection: {}", message);
-        return Err(IpcError::connect_refused(
+        return Err(IpcError::connect_refused_with(
             &message,
             response.quota_exceeded,
             response.refusal_reason.as_deref(),
+            response.account_restriction.as_ref(),
         ));
     }
+    // `deviceNotice` rides a SUCCESSFUL connect; it is shown once the tunnel
+    // is up, and never changes what the connect does.
+    let device_notice = response.device_notice.clone();
 
     let prepared = prepare_tunnel(
         app,
@@ -642,7 +646,29 @@ async fn attempt(
     // release log (info reaches birdo.log); the id is still visible at debug.
     tracing::info!("VPN connected successfully");
     tracing::debug!("VPN connected to server id {}", dialled_id);
+    if let Some(payload) = device_notice.as_ref().and_then(device_notice_payload) {
+        let _ = app.emit("device-notice", payload);
+    }
     Ok(())
+}
+
+/// The `device-notice` event's payload for a connect's `deviceNotice`: the
+/// server's sentence (redacted, bounded) and the website path of its Devices
+/// page when that is a plain same-site path. `None` without a sentence: there
+/// is nothing to show, and ignoring the notice loses nothing (contract).
+fn device_notice_payload(notice: &crate::api::types::DeviceNotice) -> Option<serde_json::Value> {
+    let message: String = crate::utils::redact::sanitize_always(notice.message.as_deref()?.trim())
+        .chars()
+        .take(400)
+        .collect();
+    if message.is_empty() {
+        return None;
+    }
+    let manage_path = notice
+        .manage_path
+        .as_deref()
+        .and_then(crate::commands::ipc_error::site_path);
+    Some(serde_json::json!({ "message": message, "managePath": manage_path }))
 }
 
 /// How a failed user connect ends (W1-010). Pure, so every branch is tested.
@@ -811,13 +837,14 @@ pub(crate) fn verified_multi_hop_response(
     exit_id: &str,
 ) -> Result<(ConnectResponse, MultiHopStatus), IpcError> {
     if !response.success {
-        return Err(IpcError::connect_refused(
+        return Err(IpcError::connect_refused_with(
             response
                 .message
                 .as_deref()
                 .unwrap_or("Multi-hop connection failed"),
             response.quota_exceeded,
             response.refusal_reason.as_deref(),
+            response.account_restriction.as_ref(),
         ));
     }
     let Some(route) = response.multi_hop.as_ref() else {
