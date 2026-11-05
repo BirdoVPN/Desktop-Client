@@ -55,7 +55,7 @@ const SCHEMA_SRC: &str = include_str!("../../contract/vpn-protocol.schema.json")
 /// `sha256sum` of birdo-web `backend/contract/vpn-protocol.schema.json` at the
 /// commit vendored (LF bytes, as git stores them). The test normalises `\r\n`
 /// so an autocrlf checkout hashes the same as CI.
-const SCHEMA_SHA256: &str = "c3a77432a48d81759193b37f5d0555b2527281bbfd17f741055a87aa6f0208d6";
+const SCHEMA_SHA256: &str = "068ab0f30144119b9a1135bfb830ff633cd73f03f73365f7026bfabf9334a2dc";
 
 const CONNECT: &str = "ConnectRequest";
 const MULTI_HOP: &str = "MultiHopConnectRequest";
@@ -1016,6 +1016,12 @@ fn connect_refusal_cases() -> Vec<(&'static str, Value, IpcErrorCode)> {
         body["refusalReason"] = json!(reason);
         body
     };
+    let mut restricted = refused(
+        "account_restricted",
+        "New free-plan connections on this account are paused until 31 Oct 2026, 14:00 UTC.",
+    );
+    restricted["accountRestriction"] =
+        json!({ "until": "2026-10-31T14:00:00.000Z", "appealPath": "/dashboard/devices" });
     let mut quota = refused(
         "quota_exceeded",
         "Free-tier data limit reached (50.0 / 50 GB this period). Your allowance resets after \
@@ -1041,6 +1047,11 @@ fn connect_refusal_cases() -> Vec<(&'static str, Value, IpcErrorCode)> {
             IpcErrorCode::SubscriptionRequired,
         ),
         ("quota_exceeded", quota, IpcErrorCode::QuotaExceeded),
+        (
+            "account_restricted",
+            restricted,
+            IpcErrorCode::AccountRestricted,
+        ),
         (
             "server_capacity",
             refused(
@@ -1076,10 +1087,11 @@ fn connect_refusal_codes(body: &Value) -> [IpcErrorCode; 2] {
         .unwrap_or_else(|e| panic!("desktop's MultiHopConnectResponse refused {body}: {e}"));
     [single, ConnectResponse::from(multi)].map(|response| {
         assert!(!response.success, "{body}");
-        IpcError::connect_refused(
+        IpcError::connect_refused_with(
             response.message.as_deref().unwrap_or_default(),
             response.quota_exceeded,
             response.refusal_reason.as_deref(),
+            response.account_restriction.as_ref(),
         )
         .code
     })
@@ -1130,6 +1142,135 @@ fn each_connect_refusal_body_is_the_contracts_shape_and_maps_as_decided() {
             "{reason}"
         );
         assert_eq!(connect_refusal_codes(&body), [code, code], "{reason}");
+    }
+}
+
+/// MR-2229: `account_restricted` is a hard refusal that carries the server's
+/// sentence, the end time and the review path to the UI, keyed on the reason.
+#[test]
+fn an_account_restriction_is_a_hard_refusal_with_its_time_and_link() {
+    use super::types::ConnectResponse;
+    let (_, body, _) = connect_refusal_cases()
+        .into_iter()
+        .find(|(reason, ..)| *reason == "account_restricted")
+        .unwrap();
+    let response: ConnectResponse = serde_json::from_value(body).unwrap();
+    let err = IpcError::connect_refused_with(
+        response.message.as_deref().unwrap(),
+        response.quota_exceeded,
+        response.refusal_reason.as_deref(),
+        response.account_restriction.as_ref(),
+    );
+    assert_eq!(err.code, IpcErrorCode::AccountRestricted);
+    assert!(!err.retryable, "a re-dial is refused the same way until `until`");
+    assert!(err.code.is_hard_refusal());
+    assert!(err.message.contains("paused until"), "the server's sentence is kept");
+    let wire = serde_json::to_value(&err).unwrap();
+    assert_eq!(wire["restriction"]["until"], "2026-10-31T14:00:00.000Z");
+    assert_eq!(wire["restriction"]["appeal_path"], "/dashboard/devices");
+}
+
+/// The time and the link are shown and opened by the UI, so a value that
+/// cannot be shown or opened safely is dropped; the refusal still stands.
+#[test]
+fn a_restriction_keeps_only_a_plain_time_and_a_same_site_path() {
+    use super::types::AccountRestriction;
+    let backslash_path = format!("/a{}b", char::from(92u8));
+    for appeal in [
+        "https://evil.example/x",
+        "//evil.example/x",
+        "dashboard",
+        "/a b",
+        backslash_path.as_str(),
+    ] {
+        let err = IpcError::connect_refused_with(
+            "paused",
+            false,
+            Some("account_restricted"),
+            Some(&AccountRestriction {
+                until: Some("tomorrow, probably <b>".into()),
+                appeal_path: Some(appeal.into()),
+            }),
+        );
+        assert_eq!(err.code, IpcErrorCode::AccountRestricted);
+        let r = err.restriction.expect("the refusal carries a (now empty) restriction");
+        assert_eq!((r.until, r.appeal_path), (None, None), "{appeal}");
+    }
+    // Absent or malformed `accountRestriction` never fails the decode.
+    for restriction in [json!(null), json!("later"), json!([1]), json!({ "until": 5 })] {
+        let body = json!({
+            "success": false, "refusalReason": "account_restricted",
+            "message": "paused", "accountRestriction": restriction,
+        });
+        assert_eq!(
+            connect_refusal_codes(&body),
+            [IpcErrorCode::AccountRestricted; 2],
+            "{body}"
+        );
+    }
+}
+
+/// `deviceNotice` on a success decodes on both dial paths and a malformed one
+/// is simply absent.
+#[test]
+fn a_device_notice_on_a_success_is_read_and_a_malformed_one_is_ignored() {
+    use super::types::{ConnectResponse, MultiHopConnectResponse};
+    let ok = json!({
+        "success": true,
+        "deviceNotice": {
+            "code": "device_limit_conflict",
+            "message": "Another device took this connection.",
+            "managePath": "/dashboard/devices",
+        },
+    });
+    assert_valid(CONNECT_RESPONSE, &ok);
+    let single: ConnectResponse = serde_json::from_value(ok.clone()).unwrap();
+    let multi: MultiHopConnectResponse = serde_json::from_value(ok).unwrap();
+    let notice = single.device_notice.expect("single-hop reads it");
+    assert_eq!(notice.manage_path.as_deref(), Some("/dashboard/devices"));
+    assert_eq!(
+        ConnectResponse::from(multi).device_notice,
+        Some(notice),
+        "multi-hop converts it"
+    );
+    let bad: ConnectResponse =
+        serde_json::from_value(json!({ "success": true, "deviceNotice": "oops" })).unwrap();
+    assert!(bad.device_notice.is_none());
+}
+
+/// MR-2229: a 403 sign-up refusal that names its reason in `details.code` is
+/// the server's sentence, not "your plan does not include this"; every other
+/// 403 is unchanged.
+#[test]
+fn a_country_refusal_at_sign_up_shows_the_servers_sentence_and_other_403s_do_not() {
+    use crate::api::client::BirdoApi;
+    use reqwest::StatusCode;
+    let sentence = "BirdoVPN cannot create new accounts in your country right now.";
+    let body = json!({
+        "statusCode": 403, "message": sentence, "error": "FORBIDDEN",
+        "details": { "code": "registration_country_not_allowed" },
+    })
+    .to_string();
+    let err = IpcError::from_api(&BirdoApi::classify_error_response(StatusCode::FORBIDDEN, &body));
+    assert_eq!(err.code, IpcErrorCode::RegistrationNotAllowed);
+    assert_eq!(err.message, sentence);
+    assert!(!err.retryable);
+    for other in [
+        json!({ "message": "Stealth mode requires an Operative subscription", "details": { "code": "attestation_required" } }),
+        json!({ "message": sentence, "details": { "code": "registration_country_not_allowed" } }),
+        json!({ "message": "Forbidden" }),
+    ] {
+        // The same body is a plan refusal on any status but 403 as well.
+        let status = if other["details"]["code"] == "registration_country_not_allowed" {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        let err = IpcError::from_api(&BirdoApi::classify_error_response(status, &other.to_string()));
+        assert_ne!(err.code, IpcErrorCode::RegistrationNotAllowed, "{other}");
+        if status == StatusCode::FORBIDDEN {
+            assert_eq!(err.code, IpcErrorCode::SubscriptionRequired, "{other}");
+        }
     }
 }
 

@@ -47,6 +47,10 @@ pub enum ApiError {
     /// actionable one ("Stealth mode requires an Operative or Sovereign
     /// subscription") rather than a generic "Access denied".
     Rejected { status: u16, message: String },
+    /// 403 with `details.code: "registration_country_not_allowed"`: the server
+    /// does not create new accounts from this country. Carries the backend's
+    /// own sentence, which is the only explanation there is.
+    RegistrationNotAllowed(String),
     /// The action needs the account's two-factor code (`error:
     /// "two_factor_required"`, Account API contract item 85). Carries the
     /// backend's sentence.
@@ -195,6 +199,7 @@ impl fmt::Display for ApiError {
             ApiError::Rejected { message, .. }
             | ApiError::TwoFactorRequired(message)
             | ApiError::TwoFactorInvalid(message)
+            | ApiError::RegistrationNotAllowed(message)
             | ApiError::ClientAttestationRequired(message) => write!(f, "{}", message),
             ApiError::QuotaCheckUnavailable { .. } => {
                 write!(f, "The data allowance check is unavailable right now")
