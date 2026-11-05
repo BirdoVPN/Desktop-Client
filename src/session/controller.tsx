@@ -20,9 +20,8 @@ import { useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { parseQuotaWarning, parseSessionExpired, parseVpnStats, parseVpnStatus } from '@/lib/ipc';
-import { openUrl } from '@tauri-apps/plugin-opener';
 import { giveUpMessage, quotaGraceMessage, vpnErrorCopy } from '@/lib/errors';
-import { websiteUrl } from '@/lib/links';
+import { openWebsite, websiteUrl } from '@/lib/links';
 import { useAppStore, type Server } from '@/store/app-store';
 import { selectTunnelActive } from '@/store/selectors';
 import { endSession } from '@/session/session';
@@ -510,7 +509,7 @@ export function showDeviceNotice(payload: unknown): void {
   useAppStore.getState().showNotice({
     text,
     tone: 'info',
-    ...(manage ? { actionLabel: 'Manage devices', onAction: () => void openUrl(manage).catch(() => {}) } : {}),
+    ...(manage ? { actionLabel: 'Manage devices', onAction: () => openWebsite(manage) } : {}),
   });
 }
 

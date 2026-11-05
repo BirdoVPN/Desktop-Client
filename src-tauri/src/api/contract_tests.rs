@@ -1162,9 +1162,15 @@ fn an_account_restriction_is_a_hard_refusal_with_its_time_and_link() {
         response.account_restriction.as_ref(),
     );
     assert_eq!(err.code, IpcErrorCode::AccountRestricted);
-    assert!(!err.retryable, "a re-dial is refused the same way until `until`");
+    assert!(
+        !err.retryable,
+        "a re-dial is refused the same way until `until`"
+    );
     assert!(err.code.is_hard_refusal());
-    assert!(err.message.contains("paused until"), "the server's sentence is kept");
+    assert!(
+        err.message.contains("paused until"),
+        "the server's sentence is kept"
+    );
     let wire = serde_json::to_value(&err).unwrap();
     assert_eq!(wire["restriction"]["until"], "2026-10-31T14:00:00.000Z");
     assert_eq!(wire["restriction"]["appeal_path"], "/dashboard/devices");
@@ -1193,11 +1199,18 @@ fn a_restriction_keeps_only_a_plain_time_and_a_same_site_path() {
             }),
         );
         assert_eq!(err.code, IpcErrorCode::AccountRestricted);
-        let r = err.restriction.expect("the refusal carries a (now empty) restriction");
+        let r = err
+            .restriction
+            .expect("the refusal carries a (now empty) restriction");
         assert_eq!((r.until, r.appeal_path), (None, None), "{appeal}");
     }
     // Absent or malformed `accountRestriction` never fails the decode.
-    for restriction in [json!(null), json!("later"), json!([1]), json!({ "until": 5 })] {
+    for restriction in [
+        json!(null),
+        json!("later"),
+        json!([1]),
+        json!({ "until": 5 }),
+    ] {
         let body = json!({
             "success": false, "refusalReason": "account_restricted",
             "message": "paused", "accountRestriction": restriction,
@@ -1251,7 +1264,10 @@ fn a_country_refusal_at_sign_up_shows_the_servers_sentence_and_other_403s_do_not
         "details": { "code": "registration_country_not_allowed" },
     })
     .to_string();
-    let err = IpcError::from_api(&BirdoApi::classify_error_response(StatusCode::FORBIDDEN, &body));
+    let err = IpcError::from_api(&BirdoApi::classify_error_response(
+        StatusCode::FORBIDDEN,
+        &body,
+    ));
     assert_eq!(err.code, IpcErrorCode::RegistrationNotAllowed);
     assert_eq!(err.message, sentence);
     assert!(!err.retryable);
@@ -1266,7 +1282,10 @@ fn a_country_refusal_at_sign_up_shows_the_servers_sentence_and_other_403s_do_not
         } else {
             StatusCode::FORBIDDEN
         };
-        let err = IpcError::from_api(&BirdoApi::classify_error_response(status, &other.to_string()));
+        let err = IpcError::from_api(&BirdoApi::classify_error_response(
+            status,
+            &other.to_string(),
+        ));
         assert_ne!(err.code, IpcErrorCode::RegistrationNotAllowed, "{other}");
         if status == StatusCode::FORBIDDEN {
             assert_eq!(err.code, IpcErrorCode::SubscriptionRequired, "{other}");

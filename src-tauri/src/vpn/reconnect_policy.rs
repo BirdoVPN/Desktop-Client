@@ -1843,7 +1843,10 @@ mod tests {
                 assert_eq!(err.code, IpcErrorCode::AccountRestricted);
                 assert_eq!(p.attempts(), 1, "no second dial");
                 assert!(!give_up_keeps_block(err.code, true));
-                assert!(!marks_give_up(err.code), "its own banner, not 'keeps dropping'");
+                assert!(
+                    !marks_give_up(err.code),
+                    "its own banner, not 'keeps dropping'"
+                );
             }
             other => panic!("expected the session to end, got {other:?}"),
         }

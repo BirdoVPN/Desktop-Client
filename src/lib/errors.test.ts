@@ -86,7 +86,7 @@ describe('account_restricted and registration_not_allowed', () => {
     expect(copy).toEqual({ message: ACCOUNT_RESTRICTED_COPY, action: null });
   });
 
-  it.each(['https://evil.example/x', '//evil.example/x', 'dashboard', '/a b', '/a\b'])(
+  it.each(['https://evil.example/x', '//evil.example/x', 'dashboard', '/a b', '/a\b', '/a\\b'])(
     'never opens %s',
     (appeal_path) => {
       const e = restricted({ restriction: { until: null, appeal_path } });

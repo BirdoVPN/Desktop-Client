@@ -187,7 +187,9 @@ pub fn site_path(path: &str) -> Option<String> {
     (path.len() <= 200
         && path.starts_with('/')
         && !path.starts_with("//")
-        && path.chars().all(|c| c.is_ascii_graphic() && c as u32 != 0x5c))
+        && path
+            .chars()
+            .all(|c| c.is_ascii_graphic() && c as u32 != 0x5c))
     .then(|| path.to_string())
 }
 
@@ -444,6 +446,7 @@ impl IpcError {
     /// which is retryable: the re-dial after an over-cap session was ended
     /// spent its whole budget, then held a lockdown block with the generic
     /// give-up text (REVIEW-WIN2-002).
+    #[cfg(test)]
     pub fn connect_refused(
         message: &str,
         quota_exceeded: bool,

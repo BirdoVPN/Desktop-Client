@@ -16,7 +16,6 @@
  * it owned them, none of them ran off the Connect tab.
  */
 import { useState } from 'react';
-import { openUrl } from '@tauri-apps/plugin-opener';
 import { useShallow } from 'zustand/react/shallow';
 import { Globe } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
@@ -31,6 +30,7 @@ import { hairline, motion as motionTokens, white } from '@/lib/birdo-theme';
 import { connectCta } from '@/lib/vpn-display';
 import { lowestPlanWith, planHasFeature, planName, titleCasePlan } from '@/lib/plan';
 import { appealUrl, type ErrorAction } from '@/lib/errors';
+import { openWebsite } from '@/lib/links';
 import { useAppStore, type Server } from '@/store/app-store';
 import { selectDisplayState, selectTunnelActive } from '@/store/selectors';
 import {
@@ -192,7 +192,7 @@ export function Dashboard() {
         // The review page `account_restricted` named, if it is a plain path.
         const error = s.vpnError ?? s.commandError;
         const url = error ? appealUrl(error) : null;
-        if (url) openUrl(url).catch(() => {});
+        if (url) openWebsite(url);
         break;
       }
       case 'choose_server':
