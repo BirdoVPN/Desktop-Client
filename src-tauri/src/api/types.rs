@@ -645,6 +645,10 @@ pub struct UserProfile {
     /// standard account. A credential — see [`AccountNumber`].
     #[serde(default, deserialize_with = "account_number_or_none")]
     pub account_number: Option<AccountNumber>,
+    /// MR-2199 (birdo-web #808): the terms changes this account has not
+    /// reached yet. The key is absent when none applies; see [`TermsNotice`].
+    #[serde(default, deserialize_with = "terms_notices_or_empty")]
+    pub terms_notices: Vec<TermsNotice>,
 }
 
 /// Manual, like `VpnConfig`'s: in phase 1 an anonymous account's email is
@@ -723,6 +727,38 @@ where
         .as_ref()
         .and_then(|v| v.as_str())
         .and_then(AccountNumber::parse))
+}
+
+/// One entry of `/auth/me` `termsNotices`, for the signed-in shell: an account
+/// with no address on file gets no e-mail about a terms change, so the app says
+/// it instead. `text` is shown as sent, and the UI drops the entry at
+/// `effective_at` (ISO-8601), or at once if it cannot read that. A `path` that
+/// is not a string costs the entry its link, never the notice.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TermsNotice {
+    pub version: String,
+    pub text: String,
+    pub effective_at: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub path: Option<String>,
+}
+
+/// `termsNotices` as sent, less any entry of another shape; nothing for null,
+/// absence or anything but a list. Never a parse failure, which would blank the
+/// whole identity, and never one entry hiding another: two can be in force.
+fn terms_notices_or_empty<'de, D>(deserializer: D) -> Result<Vec<TermsNotice>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(serde_json::Value::Array(entries)) = raw else {
+        return Ok(Vec::new());
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect())
 }
 
 /// `GET /api/client-config` — only the fields this client acts on.
