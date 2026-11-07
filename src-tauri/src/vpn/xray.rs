@@ -401,6 +401,25 @@ impl XrayManager {
 
         // Parse server endpoint
         let (server_host, server_port) = parse_endpoint(&config.endpoint)?;
+        // MR-2135: the address xray dials, never a name it would look up
+        // itself. xray resolves an outbound address lazily, at its first dial,
+        // which comes from WireGuard's handshake inside the manager's connect.
+        // During a server switch that is inside Linux's DNS hold, and xray's
+        // lookup goes through the system resolver on port 53. The backend
+        // sends `<node ip>:8443`, but nothing here guaranteed it. DoH first;
+        // `resolve_via_doh` fails CLOSED when every provider is refused, so on a
+        // network that blocks DoH (Stealth's own use case) the system resolver
+        // is the fallback, as xray's own lookup used to be. This runs in
+        // prepare_tunnel, before the manager's connect, so before any hold.
+        let server_host = relay_address(&server_host, |host| async move {
+            doh_then_system(
+                &host,
+                |h| async move { super::doh::resolve_via_doh(&h).await },
+                |h| async move { system_ipv4(&h).await },
+            )
+            .await
+        })
+        .await?;
 
         // Generate Xray config JSON
         let xray_config = build_xray_config(
@@ -923,6 +942,71 @@ fn xray_stderr_line(line: &str) -> (bool, String) {
 }
 
 /// Parse "host:port" endpoint string
+/// MR-2135: `host` as an address. An IP literal (IPv6 in brackets included)
+/// is returned as it is; a name is resolved through `resolve`, which is DoH
+/// in production, as `wireguard_new` resolves a hostname endpoint (L-7). It
+/// runs before the manager's connect, so before any DNS hold.
+async fn relay_address<F, Fut>(host: &str, resolve: F) -> Result<String, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<std::net::Ipv4Addr, String>>,
+{
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(host.to_string());
+    }
+    // P6-CLI-D-03: this Err string reaches release-level loggers verbatim.
+    let ip = resolve(host.to_string()).await.map_err(|e| {
+        format!(
+            "Could not resolve the Stealth relay {} over DoH: {}",
+            crate::utils::redact::redact_hostname(host),
+            e
+        )
+    })?;
+    Ok(ip.to_string())
+}
+
+/// MR-2135: `host` through `doh`, and through `system` only when DoH fails.
+/// Both errors are kept, so a relay that resolves nowhere says why.
+async fn doh_then_system<D, DFut, S, SFut>(
+    host: &str,
+    doh: D,
+    system: S,
+) -> Result<std::net::Ipv4Addr, String>
+where
+    D: FnOnce(String) -> DFut,
+    DFut: std::future::Future<Output = Result<std::net::Ipv4Addr, String>>,
+    S: FnOnce(String) -> SFut,
+    SFut: std::future::Future<Output = Result<std::net::Ipv4Addr, String>>,
+{
+    match doh(host.to_string()).await {
+        Ok(ip) => Ok(ip),
+        Err(doh_err) => {
+            tracing::warn!(
+                "Stealth relay {}: DoH failed ({}); using the system resolver",
+                crate::utils::redact::redact_hostname(host),
+                doh_err
+            );
+            system(host.to_string())
+                .await
+                .map_err(|sys_err| format!("DoH: {doh_err}; system resolver: {sys_err}"))
+        }
+    }
+}
+
+/// The first IPv4 address the system resolver gives for `host` (the relays
+/// are IPv4-only).
+async fn system_ipv4(host: &str) -> Result<std::net::Ipv4Addr, String> {
+    tokio::net::lookup_host((host, 0))
+        .await
+        .map_err(|e| e.to_string())?
+        .find_map(|a| match a.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .ok_or_else(|| "no IPv4 address".to_string())
+}
+
 fn parse_endpoint(endpoint: &str) -> Result<(String, u16), String> {
     // P6-CLI-D-03: these Err strings reach release-level catch-all loggers verbatim.
     let parts: Vec<&str> = endpoint.rsplitn(2, ':').collect();
@@ -1164,6 +1248,109 @@ mod stderr_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn never_resolved(host: String) -> Result<std::net::Ipv4Addr, String> {
+        panic!("{host} was resolved")
+    }
+
+    /// MR-2135: an address passes through untouched, and nothing is resolved.
+    #[tokio::test]
+    async fn an_ip_relay_is_used_as_it_is() {
+        for host in ["203.0.113.9", "[2001:db8::9]", "2001:db8::9"] {
+            let got = relay_address(host, |h| async move { never_resolved(h) })
+                .await
+                .expect("an address");
+            assert_eq!(got, host);
+        }
+    }
+
+    /// MR-2135: a name is resolved through the given resolver (DoH in
+    /// production), and xray gets the address, so it never looks the name
+    /// up itself through the system resolver, which a switch's DNS hold
+    /// drops on Linux.
+    #[tokio::test]
+    async fn a_hostname_relay_is_resolved_before_xray_sees_it() {
+        let got = relay_address("relay.example.net", |host| async move {
+            assert_eq!(host, "relay.example.net");
+            Ok(std::net::Ipv4Addr::new(203, 0, 113, 9))
+        })
+        .await
+        .expect("resolved");
+        assert_eq!(got, "203.0.113.9");
+
+        let config = build_xray_config(10808, &got, 8443, 51820, "u", "k", "s", "sni", "");
+        let json = config.to_string();
+        assert!(
+            !json.contains("relay.example.net"),
+            "a name reached xray: {json}"
+        );
+        assert_eq!(
+            config["outbounds"][0]["settings"]["vnext"][0]["address"],
+            "203.0.113.9"
+        );
+        assert_eq!(config["inbounds"][0]["settings"]["address"], "203.0.113.9");
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_does_not_resolve_fails_the_start() {
+        let err = relay_address("relay.example.net", |_| async {
+            Err("no answer".to_string())
+        })
+        .await
+        .expect_err("an unresolvable relay");
+        assert!(err.contains("no answer"), "{err}");
+    }
+
+    /// MR-2135: DoH is used when it answers; the system resolver only when
+    /// it does not (a network blocking DoH, Stealth's own use case), as
+    /// xray's own lookup used to resolve; both failing keeps both reasons.
+    #[tokio::test]
+    async fn the_system_resolver_is_the_fallback_only_when_doh_fails() {
+        let doh_ok = doh_then_system(
+            "relay.example.net",
+            |_| async { Ok(std::net::Ipv4Addr::new(203, 0, 113, 9)) },
+            |h| async move { never_resolved(h) },
+        )
+        .await;
+        assert_eq!(doh_ok, Ok(std::net::Ipv4Addr::new(203, 0, 113, 9)));
+
+        let fell_back = doh_then_system(
+            "relay.example.net",
+            |_| async { Err("every provider refused".to_string()) },
+            |_| async { Ok(std::net::Ipv4Addr::new(198, 51, 100, 9)) },
+        )
+        .await;
+        assert_eq!(fell_back, Ok(std::net::Ipv4Addr::new(198, 51, 100, 9)));
+
+        let neither = doh_then_system(
+            "relay.example.net",
+            |_| async { Err("doh down".to_string()) },
+            |_| async { Err("nxdomain".to_string()) },
+        )
+        .await
+        .expect_err("nothing resolved");
+        assert!(
+            neither.contains("doh down") && neither.contains("nxdomain"),
+            "{neither}"
+        );
+    }
+
+    /// MR-2135: start() resolves before it builds the config xray reads.
+    #[test]
+    fn start_resolves_the_relay_before_building_the_config() {
+        let source = include_str!("xray.rs").replace('\r', "");
+        let start = source.find("    pub async fn start(").expect("start()");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        let resolved = body
+            .find("relay_address(&server_host")
+            .expect("the resolve");
+        let built = body.find("build_xray_config(").expect("the config");
+        assert!(
+            resolved < built,
+            "xray's config is built before the relay is resolved"
+        );
+    }
 
     /// MR-1724: the lookup never consults PATH. It used to fall back to
     /// `which::which("xray")`, which runs whatever a user's own PATH entry
