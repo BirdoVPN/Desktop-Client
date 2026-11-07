@@ -623,10 +623,10 @@ jobs:
             exit 1
           }
           echo "$out"
-          # Fourteen tests, all required: an --ignored filter that matches
+          # Sixteen tests, all required: an --ignored filter that matches
           # nothing still exits 0.
-          if ! grep -qE 'test result: ok\. 14 passed' <<<"$out"; then
-            echo "::error::netns_teardown_tests did not run all fourteen tests"
+          if ! grep -qE 'test result: ok\. 16 passed' <<<"$out"; then
+            echo "::error::netns_teardown_tests did not run all sixteen tests"
             exit 1
           fi
 

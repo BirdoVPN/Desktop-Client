@@ -829,6 +829,13 @@ impl VpnManager {
         #[cfg(target_os = "windows")]
         let transition_gen = crate::vpn::win_machine_state::begin_transition();
 
+        // MR-2135: Linux's twin of the DNS guard held above, for a switch only.
+        // Taken in the teardown below, before the old stop() restores the
+        // physical resolvers, and dropped once the new tunnel's build is over
+        // (its start() has configured its own), or by any early return.
+        #[cfg(target_os = "linux")]
+        let mut dns_hold: Option<crate::vpn::tunnel_linux::DnsHold> = None;
+
         if displaced.is_some()
             || matches!(
                 current_state,
@@ -883,6 +890,24 @@ impl VpnManager {
                 }
                 (hold, up.is_err())
             };
+            // MR-2135: with the kill switch off, DNS used to leave on the
+            // physical link from the old stop() (which restores the original
+            // resolvers) until the new start() configured its own. Held now,
+            // as Windows holds its DNS guard; a failed install warns and goes
+            // on, as the IPv6 hold does.
+            #[cfg(target_os = "linux")]
+            {
+                let exempt = crate::vpn::tunnel_linux::dns_hold_exempt(
+                    &config.endpoint,
+                    &config.dns,
+                    local_network_sharing,
+                );
+                let (hold, up) = crate::vpn::tunnel_linux::hold_dns(&exempt);
+                if let Err(e) = &up {
+                    tracing::warn!("Could not hold DNS for the server switch: {}", e);
+                }
+                dns_hold = Some(hold);
+            }
 
             // The tunnel is already out of the Option, so the data plane is
             // disposed here and nothing can reach it again. Its stop() will find
@@ -1009,6 +1034,13 @@ impl VpnManager {
         if !matches!(tunnel_result, Some(Ok(Ok(_)))) && !self.emergency_teardowns.settled().await {
             tracing::warn!("Continuing with a dropped tunnel's cleanup still running");
         }
+
+        // MR-2135: the build is over. A started tunnel has configured its own
+        // resolvers; a failed one's unwind has put the physical ones back (the
+        // wait above covers a dropped one's handed-off cleanup). Either way the
+        // hold has done its job.
+        #[cfg(target_os = "linux")]
+        drop(dns_hold);
 
         match tunnel_result {
             Some(Ok(Ok(tunnel))) => {
@@ -1841,6 +1873,42 @@ mod tests {
                  tunnel's start()"
             );
         }
+    }
+
+    /// MR-2135: on Linux the switch holds DNS from BEFORE the old tunnel's
+    /// stop() (which puts the physical resolvers back) until the new
+    /// tunnel's build is over (its start() configures its own), unlike the
+    /// IPv6 hold, which ends before that start. Dropped before the first
+    /// failure arm, so a failed or cancelled switch never leaves it up;
+    /// `tunnel_linux`'s netns switch tests pin the behaviour.
+    #[test]
+    fn a_linux_switch_holds_dns_from_before_the_old_stop_until_the_build_is_over() {
+        let source = include_str!("manager.rs").replace('\r', "");
+        let start = source.find("    pub async fn connect(").expect("connect()");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("connect() has no {needle}"))
+        };
+        let held = at("crate::vpn::tunnel_linux::hold_dns(&exempt)");
+        let stop = at("timeout(Duration::from_secs(10), tunnel.stop())");
+        let new_start = at(".start(private_key)");
+        let released = at("drop(dns_hold);");
+        let first_arm = at("match tunnel_result {");
+        assert!(
+            held < stop,
+            "the hold must be up before the old tunnel's stop()"
+        );
+        assert!(
+            new_start < released && released < first_arm,
+            "the hold must last through the new start() and end before the outcome is handled"
+        );
+        assert_eq!(
+            body.matches("drop(dns_hold);").count(),
+            1,
+            "one explicit release; every early return drops the Option"
+        );
     }
 
     #[tokio::test]
