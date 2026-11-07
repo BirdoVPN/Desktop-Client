@@ -2061,7 +2061,7 @@ impl Drop for DnsHold {
             mirror(pf);
         };
         match PF.try_lock() {
-            Ok(mut pf) => lift(&mut *pf),
+            Ok(mut pf) => lift(&mut pf),
             Err(_) => {
                 tauri::async_runtime::spawn(async move {
                     lift(&mut *PF.lock().await);
