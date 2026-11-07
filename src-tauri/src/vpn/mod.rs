@@ -105,6 +105,11 @@ pub(crate) mod iptables_policy;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod pf_policy;
 
+// MR-2135: what a server switch's DNS hold holds and lets through, shared by
+// the Linux hold and the macOS one. Compiled into every test build too.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+pub(crate) mod dns_hold;
+
 // MR-740: the crash-recovery record of the routes a Linux/macOS session puts
 // via the physical gateway, which outlive the tunnel device. Root-only; the
 // next start removes what a killed session left. Compiled into every test

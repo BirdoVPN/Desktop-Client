@@ -2010,6 +2010,91 @@ pub async fn ipv6_block_deactivate() {
     }
 }
 
+/// MR-2135: the generation the next DNS hold gets (`PfState::dns_hold_gen`).
+#[cfg(target_os = "macos")]
+static DNS_HOLD_NEXT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// MR-2135: DNS held across a server switch, the twin of Linux's
+/// `tunnel_linux::DnsHold` and Windows' DNS guard held by
+/// `win_machine_state::begin_transition`. pf's lock is async, so the switch
+/// lifts it with an awaited [`DnsHold::release`] once the new tunnel's build
+/// is over, before connect() reports anything. Dropping it unreleased (a
+/// connect dropped half way) lifts it too: in place when the lock is free,
+/// else on the runtime, and only if no newer hold has replaced it. A process
+/// that dies holding it leaves it in the leak block's ruleset, which carries
+/// our marker: `reconcile_stale_pf_state` and the panic hook remove it.
+#[cfg(target_os = "macos")]
+pub(crate) struct DnsHold {
+    generation: u64,
+    released: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl DnsHold {
+    /// Lift the hold and wait for pf's read-back. `Err`: it may still be in
+    /// force, and the watchdog retries the lift.
+    pub(crate) async fn release(mut self) -> Result<(), String> {
+        let mut pf = PF.lock().await;
+        let result = pf.dns_hold_off(&Pfctl, self.generation);
+        // Only now: a release dropped while it waited for the lock is still
+        // owed, and Drop does it.
+        self.released = true;
+        mirror(&pf);
+        if result.is_ok() {
+            tracing::info!("MR-2135: DNS hold lifted");
+        }
+        result
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for DnsHold {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let generation = self.generation;
+        let lift = move |pf: &mut PfState| {
+            if let Err(e) = pf.dns_hold_off(&Pfctl, generation) {
+                tracing::warn!("MR-2135: lifting the DNS hold: {}", e);
+            }
+            mirror(pf);
+        };
+        match PF.try_lock() {
+            Ok(mut pf) => lift(&mut *pf),
+            Err(_) => {
+                tauri::async_runtime::spawn(async move {
+                    lift(&mut *PF.lock().await);
+                });
+            }
+        }
+    }
+}
+
+/// MR-2135: hold DNS for a server switch onto the session `exempt`
+/// describes, until the returned guard is released or dropped. Taken after
+/// [`hold_ipv6_block`]: the hold is carried by the IPv6 leak block
+/// (`PfState::dns_hold_on`). The guard comes back even when the hold could
+/// not be put in force; the caller warns and goes on, as with the IPv6 hold.
+#[cfg(target_os = "macos")]
+pub(crate) async fn hold_dns(
+    exempt: crate::vpn::dns_hold::DnsHoldExempt,
+) -> (DnsHold, Result<(), String>) {
+    let generation = DNS_HOLD_NEXT_GEN.fetch_add(1, Ordering::SeqCst);
+    let hold = DnsHold {
+        generation,
+        released: false,
+    };
+    ensure_pf_watchdog();
+    let mut pf = PF.lock().await;
+    let result = pf.dns_hold_on(&Pfctl, exempt, generation);
+    mirror(&pf);
+    if result.is_ok() {
+        tracing::info!("MR-2135: DNS held for the server switch");
+    }
+    (hold, result)
+}
+
 /// F-001: remove a leak-block / kill-switch ruleset left behind by a crash.
 ///
 /// pf rules loaded with `pfctl -f` live in the kernel and survive process exit —
