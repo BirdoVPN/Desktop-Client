@@ -312,6 +312,216 @@ pub(crate) fn hold_ipv6_leak_block() -> (Ipv6BlockHold, Result<(), String>) {
     (Ipv6BlockHold(()), install_ipv6_leak_block())
 }
 
+// ── MR-2135: DNS held across a server switch ────────────────────────────────
+//
+// With the kill switch off, a switch used to let DNS out on the physical link
+// for the whole gap: the outgoing tunnel's stop() puts the original resolvers
+// back, and the incoming tunnel's start() configures its own only after it has
+// created the device and finished the handshake. Windows holds its DNS guard
+// across that gap (win_machine_state::begin_transition). This is the Unix
+// twin: a firewall hold, not resolver configuration, because keeping the
+// tunnel's resolvers configured across the gap cannot work here. The incoming
+// start() would capture them as the "original" to restore (and refuses a
+// resolv.conf carrying our marker, leaving nothing to restore), and
+// systemd-resolved's per-link settings die with birdo0 anyway, after which
+// resolved asks the physical link's servers. So stop() restores exactly as
+// before, start() captures exactly as before, and a query in between is
+// dropped instead of leaving.
+//
+// DNS only, by owner decision (2026-11-07): other IPv4 keeps going out
+// directly in the gap with the kill switch off, a known difference from
+// Windows.
+
+/// The hold's chain, in the MANGLE table of both families. mangle OUTPUT is
+/// traversed before filter OUTPUT, so no ACCEPT there (the IPv6 leak block
+/// accepts link-local destinations, where an IPv6 router's resolver often
+/// sits) can let a held query past it.
+const DNS_HOLD_CHAIN: &str = "BIRDO_DNS_HOLD";
+
+/// Its stand-in while a re-install rebuilds it, as [`IPV6_BLOCK_COVER`].
+const DNS_HOLD_COVER: &str = "BIRDO_DNS_HOLD_COVER";
+
+/// Plain DNS (53), DNS-over-TLS (TCP 853) and DNS-over-QUIC (UDP 853), each
+/// over TCP and UDP: what Windows' DNS guard blocks (wfp_policy.rs DNS_PORTS).
+/// DNS-over-HTTPS on 443 cannot be told apart from any other HTTPS, here or
+/// on Windows, and the app's own DoH must keep working.
+const DNS_HOLD_PORTS: [&str; 2] = ["53", "853"];
+
+/// NetBIOS name service (137), mDNS (5353) and LLMNR (5355): held as well
+/// unless Local Network Sharing is on, as Windows does (LAN_NAME_PORTS).
+const DNS_HOLD_LAN_NAME_PORTS: [&str; 3] = ["137", "5353", "5355"];
+
+/// What the hold lets through, from the incoming session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DnsHoldExempt {
+    /// The incoming relay: a relay on a DNS port must still get its handshake
+    /// (Windows permits the tunnel's own flow on a DNS port the same way).
+    /// `None` for a hostname endpoint, which is resolved later, over DoH.
+    relay: Option<std::net::IpAddr>,
+    /// The user's own resolvers on the local network (a Pi-hole), with Local
+    /// Network Sharing on only, as Windows' `split_resolvers`.
+    lan_resolvers: Vec<std::net::IpAddr>,
+    local_network_sharing: bool,
+}
+
+/// An address on the local network: private, link-local or unique-local.
+fn is_lan_address(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// What the hold for a switch onto a session at `endpoint`, with resolvers
+/// `dns`, lets through (the incoming `VpnConfig`'s two fields).
+pub(crate) fn dns_hold_exempt(
+    endpoint: &str,
+    dns: &[String],
+    local_network_sharing: bool,
+) -> DnsHoldExempt {
+    let relay = endpoint
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|a| a.ip());
+    let lan_resolvers = if local_network_sharing {
+        dns.iter()
+            .filter_map(|d| d.parse::<std::net::IpAddr>().ok())
+            .filter(is_lan_address)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    DnsHoldExempt {
+        relay,
+        lan_resolvers,
+        local_network_sharing,
+    }
+}
+
+/// The hold's rules, appended to `chain`, for one family (`v6`).
+///
+/// Loopback stays open: a local stub (systemd-resolved's 127.0.0.53) still
+/// answers, while its own upstream query out of the physical link is
+/// dropped. The same holds for any local DNS proxy (dnsmasq, unbound): only
+/// the hop to it is exempt, and its forward upstream leaves through OUTPUT
+/// on the physical link, where it is held. So does birdo0, which the incoming tunnel's resolvers are reached
+/// through once its start() is up. DROP, not REJECT, as Windows' WFP block: a
+/// resolver waits and retries rather than failing at once, and its retry
+/// lands after the gap.
+fn fill_dns_hold(
+    t: Ip6tables<'_>,
+    chain: &str,
+    exempt: &DnsHoldExempt,
+    v6: bool,
+) -> Result<(), String> {
+    t(&["-A", chain, "-o", "lo", "-j", "RETURN"])?;
+    t(&["-A", chain, "-o", TUN_DEVICE_NAME, "-j", "RETURN"])?;
+    for ip in exempt
+        .relay
+        .iter()
+        .chain(&exempt.lan_resolvers)
+        .filter(|ip| ip.is_ipv6() == v6)
+    {
+        let ip = ip.to_string();
+        t(&["-A", chain, "-d", &ip, "-j", "RETURN"])?;
+    }
+    let lan_name_ports: &[&str] = if exempt.local_network_sharing {
+        &[]
+    } else {
+        &DNS_HOLD_LAN_NAME_PORTS
+    };
+    for port in DNS_HOLD_PORTS.iter().chain(lan_name_ports) {
+        for proto in ["udp", "tcp"] {
+            t(&["-A", chain, "-p", proto, "--dport", port, "-j", "DROP"])?;
+        }
+    }
+    Ok(())
+}
+
+/// Put the hold up through `t` (one family), never lifting one already in
+/// force, by the same cover-first sequence as [`install_ipv6_leak_block_with`].
+fn install_dns_hold_with(t: Ip6tables<'_>, exempt: &DnsHoldExempt, v6: bool) -> Result<(), String> {
+    if t(&["-C", "OUTPUT", "-j", DNS_HOLD_COVER]).is_err() {
+        let _ = t(&["-N", DNS_HOLD_COVER]);
+        let _ = t(&["-F", DNS_HOLD_COVER]);
+        let hooked = fill_dns_hold(t, DNS_HOLD_COVER, exempt, v6)
+            .and_then(|()| t(&["-I", "OUTPUT", "1", "-j", DNS_HOLD_COVER]));
+        if let Err(e) = hooked {
+            let _ = t(&["-F", DNS_HOLD_COVER]);
+            let _ = t(&["-X", DNS_HOLD_COVER]);
+            return Err(e);
+        }
+    }
+    unhook_ipv6_chain(t, DNS_HOLD_CHAIN);
+    let _ = t(&["-N", DNS_HOLD_CHAIN]);
+    let _ = t(&["-F", DNS_HOLD_CHAIN]);
+    fill_dns_hold(t, DNS_HOLD_CHAIN, exempt, v6)?;
+    t(&["-I", "OUTPUT", "1", "-j", DNS_HOLD_CHAIN])?;
+    remove_ipv6_chain(t, DNS_HOLD_COVER);
+    Ok(())
+}
+
+/// Lift the hold through `t` (one family): the chain and any cover.
+fn remove_dns_hold_with(t: Ip6tables<'_>) {
+    remove_ipv6_chain(t, DNS_HOLD_CHAIN);
+    remove_ipv6_chain(t, DNS_HOLD_COVER);
+}
+
+/// `<tool> -w -t mangle <args>`. ip6tables absent is an IPv4-only host,
+/// with no IPv6 to hold: a no-op, as [`ip6t`] treats it. iptables absent
+/// is an error: there is nothing to hold DNS with.
+fn mangle(tool: &str, args: &[&str]) -> Result<(), String> {
+    match cmd(tool).args(["-w", "-t", "mangle"]).args(args).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "{} -t mangle {} failed: {}",
+            tool,
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && tool == "ip6tables" => Ok(()),
+        Err(e) => Err(format!("{} unavailable: {}", tool, e)),
+    }
+}
+
+/// MR-2135: DNS held across a server switch until the guard drops. Dropping
+/// it lifts the hold, in every outcome: the switch done, failed, or a
+/// connect dropped half way. A process that dies holding it leaves the
+/// chain in the kernel; the startup reconcile and the exit cleanup lift it
+/// ([`remove_dns_hold`]).
+pub(crate) struct DnsHold(());
+
+impl Drop for DnsHold {
+    fn drop(&mut self) {
+        remove_dns_hold();
+    }
+}
+
+/// MR-2135: hold DNS for a switch whose incoming session is `exempt`'s. The
+/// guard is returned even when the install failed (the caller warns and
+/// goes on, as with the IPv6 hold); dropping it lifts whatever went in.
+pub(crate) fn hold_dns(exempt: &DnsHoldExempt) -> (DnsHold, Result<(), String>) {
+    let hold = DnsHold(());
+    let v4 = install_dns_hold_with(&mut |a: &[&str]| mangle("iptables", a), exempt, false);
+    let v6 = install_dns_hold_with(&mut |a: &[&str]| mangle("ip6tables", a), exempt, true);
+    let result = v4.and(v6);
+    if result.is_ok() {
+        tracing::info!("MR-2135: DNS held for the server switch");
+    }
+    (hold, result)
+}
+
+/// MR-2135: lift the hold, both families. Best-effort and idempotent: the
+/// chain names are ours alone, so the startup reconcile and the exit cleanup
+/// call it unconditionally.
+pub(crate) fn remove_dns_hold() {
+    remove_dns_hold_with(&mut |a: &[&str]| mangle("iptables", a));
+    remove_dns_hold_with(&mut |a: &[&str]| mangle("ip6tables", a));
+}
+
 /// Unhook `chain` from OUTPUT, then flush and delete it. Best-effort.
 ///
 /// A chain still hooked after the unhook is left whole, never flushed: an
@@ -4376,6 +4586,339 @@ mod configure_ipv6_tests {
 //     bash scripts/ci/linux-netns-tests.sh "$(command -v cargo)"
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
+mod dns_hold_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::net::IpAddr;
+
+    /// The mangle table as far as the hold reaches: OUTPUT's jumps in order,
+    /// and each user chain's rules. It refuses what iptables refuses, as
+    /// `ipv6_leak_block_tests::Table` does, and a refused command changes
+    /// nothing.
+    #[derive(Debug, Default, Clone)]
+    struct Table {
+        output: Vec<String>,
+        chains: BTreeMap<String, Vec<Vec<String>>>,
+    }
+
+    impl Table {
+        fn run(&mut self, args: &[&str]) -> Result<(), String> {
+            let missing = |chain: &str| format!("No chain/target/match by that name: {chain}");
+            match args {
+                ["-N", chain] => {
+                    if self.chains.contains_key(*chain) {
+                        return Err("Chain already exists.".into());
+                    }
+                    self.chains.insert(chain.to_string(), Vec::new());
+                }
+                ["-F", chain] => self
+                    .chains
+                    .get_mut(*chain)
+                    .ok_or_else(|| missing(chain))?
+                    .clear(),
+                ["-X", chain] => {
+                    if self.output.iter().any(|jump| jump == chain) {
+                        return Err("Too many links.".into());
+                    }
+                    let rules = self.chains.get(*chain).ok_or_else(|| missing(chain))?;
+                    if !rules.is_empty() {
+                        return Err("Directory not empty.".into());
+                    }
+                    self.chains.remove(*chain);
+                }
+                ["-A", chain, rule @ ..] => self
+                    .chains
+                    .get_mut(*chain)
+                    .ok_or_else(|| missing(chain))?
+                    .push(rule.iter().map(|a| a.to_string()).collect()),
+                ["-I", "OUTPUT", "1", "-j", chain] => {
+                    if !self.chains.contains_key(*chain) {
+                        return Err(missing(chain));
+                    }
+                    self.output.insert(0, chain.to_string());
+                }
+                ["-D", "OUTPUT", "-j", chain] => {
+                    let at = self
+                        .output
+                        .iter()
+                        .position(|jump| jump == chain)
+                        .ok_or("Bad rule (does a matching rule exist in that chain?).")?;
+                    self.output.remove(at);
+                }
+                ["-C", "OUTPUT", "-j", chain] => {
+                    if !self.output.iter().any(|jump| jump == chain) {
+                        return Err("Bad rule (does a matching rule exist in that chain?).".into());
+                    }
+                }
+                other => panic!("the DNS hold ran an unexpected command {other:?}"),
+            }
+            Ok(())
+        }
+
+        /// What OUTPUT does with a packet: DROP at the first matching DROP,
+        /// chain by chain in jump order, where a matching RETURN ends that
+        /// chain. ACCEPT (the policy) when nothing drops it.
+        fn verdict(&self, dst: &str, oif: &str, proto: &str, dport: u16) -> &'static str {
+            let dst: IpAddr = dst.parse().expect("an address");
+            for chain in &self.output {
+                for rule in &self.chains[chain] {
+                    match target_if_matches(rule, dst, oif, proto, dport) {
+                        Some("DROP") => return "DROP",
+                        Some("RETURN") => break,
+                        Some(other) => panic!("the model does not know target {other}"),
+                        None => {}
+                    }
+                }
+            }
+            "ACCEPT"
+        }
+    }
+
+    /// The target of `rule` for the packet, if the rule matches it. Knows the
+    /// options the hold writes and panics on any other.
+    fn target_if_matches<'a>(
+        rule: &'a [String],
+        dst: IpAddr,
+        oif: &str,
+        proto: &str,
+        dport: u16,
+    ) -> Option<&'a str> {
+        let mut target = None;
+        let mut words = rule.iter().map(String::as_str);
+        while let Some(opt) = words.next() {
+            let value = words
+                .next()
+                .unwrap_or_else(|| panic!("{opt} without a value in {rule:?}"));
+            match opt {
+                "-o" if value != oif => return None,
+                "-d" if value.parse::<IpAddr>().ok() != Some(dst) => return None,
+                "-p" if value != proto => return None,
+                "--dport" if value.parse::<u16>().ok() != Some(dport) => return None,
+                "-o" | "-d" | "-p" | "--dport" => {}
+                "-j" => target = Some(value),
+                other => panic!("the model does not know {other} (in {rule:?})"),
+            }
+        }
+        Some(target.unwrap_or_else(|| panic!("a rule with no target: {rule:?}")))
+    }
+
+    fn installed(exempt: &DnsHoldExempt, v6: bool) -> Table {
+        let mut table = Table::default();
+        install_dns_hold_with(&mut |a: &[&str]| table.run(a), exempt, v6).expect("installs");
+        table
+    }
+
+    fn sharing(on: bool) -> DnsHoldExempt {
+        DnsHoldExempt {
+            local_network_sharing: on,
+            ..DnsHoldExempt::default()
+        }
+    }
+
+    /// The physical link, and a resolver out on the internet.
+    const ETH: &str = "eth0";
+    const RESOLVER: &str = "8.8.8.8";
+
+    #[test]
+    fn plain_dns_dot_and_doq_out_of_the_physical_link_are_dropped() {
+        let table = installed(&sharing(false), false);
+        for proto in ["udp", "tcp"] {
+            for port in [53, 853] {
+                assert_eq!(
+                    table.verdict(RESOLVER, ETH, proto, port),
+                    "DROP",
+                    "{proto}/{port}"
+                );
+            }
+        }
+    }
+
+    /// Loopback stays open, so a local stub (systemd-resolved's 127.0.0.53)
+    /// still answers; its own upstream query out of the physical link is
+    /// what the hold drops. birdo0 stays open for the incoming tunnel's
+    /// resolvers.
+    #[test]
+    fn loopback_and_the_tunnel_stay_open() {
+        let table = installed(&sharing(false), false);
+        assert_eq!(table.verdict("127.0.0.53", "lo", "udp", 53), "ACCEPT");
+        assert_eq!(
+            table.verdict("10.8.0.1", TUN_DEVICE_NAME, "udp", 53),
+            "ACCEPT"
+        );
+        assert_eq!(
+            table.verdict(RESOLVER, TUN_DEVICE_NAME, "tcp", 853),
+            "ACCEPT"
+        );
+    }
+
+    /// DNS only, by owner decision: everything else keeps going out in the
+    /// gap with the kill switch off. DoH on 443 cannot be told apart from
+    /// other HTTPS, and the app's own DoH must keep working.
+    #[test]
+    fn other_traffic_is_not_held() {
+        let table = installed(&sharing(false), false);
+        assert_eq!(table.verdict(RESOLVER, ETH, "tcp", 443), "ACCEPT");
+        assert_eq!(table.verdict("198.51.100.1", ETH, "udp", 9), "ACCEPT");
+        assert_eq!(table.verdict("198.51.100.1", ETH, "udp", 51820), "ACCEPT");
+    }
+
+    /// As Windows: LLMNR, mDNS and NetBIOS name queries are held only with
+    /// Local Network Sharing off. DNS proper is held either way.
+    #[test]
+    fn lan_name_resolution_is_held_unless_local_network_sharing_is_on() {
+        let off = installed(&sharing(false), false);
+        let on = installed(&sharing(true), false);
+        for port in [137, 5353, 5355] {
+            assert_eq!(
+                off.verdict("224.0.0.251", ETH, "udp", port),
+                "DROP",
+                "off, {port}"
+            );
+            assert_eq!(
+                on.verdict("224.0.0.251", ETH, "udp", port),
+                "ACCEPT",
+                "on, {port}"
+            );
+        }
+        assert_eq!(on.verdict(RESOLVER, ETH, "udp", 53), "DROP");
+    }
+
+    /// The incoming relay passes, so a relay on a DNS port still gets its
+    /// handshake; and, with Local Network Sharing on, the user's own LAN
+    /// resolver. Each family's chain carries only its own addresses.
+    #[test]
+    fn the_relay_and_a_lan_resolver_are_exempt_in_their_own_family() {
+        let dns = vec![
+            "192.168.1.2".to_string(),
+            "9.9.9.9".to_string(),
+            "fd00::53".to_string(),
+        ];
+        let exempt = dns_hold_exempt("203.0.113.9:53", &dns, true);
+        let v4 = installed(&exempt, false);
+        assert_eq!(
+            v4.verdict("203.0.113.9", ETH, "udp", 53),
+            "ACCEPT",
+            "the relay"
+        );
+        assert_eq!(
+            v4.verdict("192.168.1.2", ETH, "udp", 53),
+            "ACCEPT",
+            "the LAN resolver"
+        );
+        assert_eq!(
+            v4.verdict("9.9.9.9", ETH, "udp", 53),
+            "DROP",
+            "not on the LAN"
+        );
+        assert!(
+            !format!("{v4:?}").contains("fd00::53"),
+            "an IPv6 address in the IPv4 chain"
+        );
+        let v6 = installed(&exempt, true);
+        assert_eq!(v6.verdict("fd00::53", ETH, "udp", 53), "ACCEPT");
+        assert!(
+            !format!("{v6:?}").contains("203.0.113.9"),
+            "an IPv4 address in the IPv6 chain"
+        );
+    }
+
+    #[test]
+    fn the_exemptions_come_from_the_incoming_session() {
+        let dns = vec![
+            "192.168.1.2".to_string(),
+            "fe80::1".to_string(),
+            "1.1.1.1".to_string(),
+        ];
+        let on = dns_hold_exempt("203.0.113.9:51820", &dns, true);
+        assert_eq!(on.relay, Some("203.0.113.9".parse().unwrap()));
+        assert_eq!(
+            on.lan_resolvers,
+            vec![
+                "192.168.1.2".parse::<IpAddr>().unwrap(),
+                "fe80::1".parse().unwrap()
+            ]
+        );
+        let off = dns_hold_exempt("203.0.113.9:51820", &dns, false);
+        assert!(
+            off.lan_resolvers.is_empty(),
+            "LAN resolvers with sharing off"
+        );
+        let hostname = dns_hold_exempt("relay.example.net:51820", &dns, false);
+        assert_eq!(
+            hostname.relay, None,
+            "a hostname is resolved later, over DoH"
+        );
+    }
+
+    #[test]
+    fn an_install_hooks_one_chain_on_top_and_leaves_no_cover() {
+        let table = installed(&sharing(false), false);
+        assert_eq!(table.output, vec![DNS_HOLD_CHAIN.to_string()]);
+        assert!(!table.chains.contains_key(DNS_HOLD_COVER));
+    }
+
+    /// A re-install over a hold in force never lets DNS out, not for one
+    /// command: the cover goes on top first, as the IPv6 leak block's does.
+    #[test]
+    fn a_reinstall_never_lets_dns_out() {
+        let mut table = installed(&sharing(false), false);
+        let mut leaked = Vec::new();
+        install_dns_hold_with(
+            &mut |a: &[&str]| {
+                let r = table.run(a);
+                if table.verdict(RESOLVER, ETH, "udp", 53) != "DROP" {
+                    leaked.push(a.join(" "));
+                }
+                r
+            },
+            &sharing(false),
+            false,
+        )
+        .expect("re-installs");
+        assert!(leaked.is_empty(), "DNS got out after: {leaked:?}");
+        assert_eq!(table.output, vec![DNS_HOLD_CHAIN.to_string()]);
+    }
+
+    /// An install that fails part way leaves DNS held (the cover stays in
+    /// force), and the removal the guard's Drop runs takes all of it down.
+    #[test]
+    fn a_failed_install_stays_held_and_the_removal_lifts_everything() {
+        let mut table = Table::default();
+        let hook = format!("-I OUTPUT 1 -j {DNS_HOLD_CHAIN}");
+        let failed = install_dns_hold_with(
+            &mut |a: &[&str]| {
+                if a.join(" ") == hook {
+                    return Err("injected".into());
+                }
+                table.run(a)
+            },
+            &sharing(false),
+            false,
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            table.verdict(RESOLVER, ETH, "udp", 53),
+            "DROP",
+            "a failed install let DNS out"
+        );
+
+        remove_dns_hold_with(&mut |a: &[&str]| table.run(a));
+        assert!(table.output.is_empty(), "still hooked: {:?}", table.output);
+        assert!(table.chains.is_empty(), "chains left: {:?}", table.chains);
+        assert_eq!(table.verdict(RESOLVER, ETH, "udp", 53), "ACCEPT");
+    }
+
+    /// The startup reconcile and the exit cleanup call the removal on a host
+    /// with no hold at all: it must change nothing and not fail.
+    #[test]
+    fn removing_no_hold_is_a_no_op() {
+        let mut table = Table::default();
+        remove_dns_hold_with(&mut |a: &[&str]| table.run(a));
+        assert!(table.output.is_empty() && table.chains.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod netns_teardown_tests {
     use super::*;
     use std::path::{Path, PathBuf};
@@ -5213,6 +5756,9 @@ mod netns_teardown_tests {
     /// tunnel route covers them.
     const PROBE_V6: &str = "2001:db8::1";
     const PROBE_V4: &str = "198.51.100.1";
+    /// MR-2135: where the probe's plain DNS goes (UDP 53), a host of its own
+    /// so its counter is separate from [`PROBE_V4`]'s.
+    const PROBE_DNS_V4: &str = "198.51.100.53";
 
     /// IPv6 on the uplink (an address and a default route: the namespace has
     /// none of its own), and for each family a counter in mangle POSTROUTING,
@@ -5222,8 +5768,11 @@ mod netns_teardown_tests {
     struct UplinkCounters;
 
     impl UplinkCounters {
-        const RULES: [(&'static str, &'static str); 2] =
-            [("ip6tables", PROBE_V6), ("iptables", PROBE_V4)];
+        const RULES: [(&'static str, &'static str); 3] = [
+            ("ip6tables", PROBE_V6),
+            ("iptables", PROBE_V4),
+            ("iptables", PROBE_DNS_V4),
+        ];
 
         fn add() -> Self {
             for args in [
@@ -5322,6 +5871,7 @@ mod netns_teardown_tests {
                 while !stopping.load(Ordering::SeqCst) {
                     let _ = v6.send_to(b"birdo-probe", (PROBE_V6, 9));
                     let _ = v4.send_to(b"birdo-probe", (PROBE_V4, 9));
+                    let _ = v4.send_to(b"birdo-probe", (PROBE_DNS_V4, 53));
                     std::thread::sleep(Duration::from_micros(500));
                 }
             });
@@ -5414,11 +5964,14 @@ mod netns_teardown_tests {
     /// it refused the probe's IPv6 and failed the CONTROL.
     async fn probing() -> (UplinkCounters, Probe) {
         remove_ipv6_leak_block();
+        remove_dns_hold();
         let counters = UplinkCounters::add();
         let probe = Probe::start();
         assert!(
             wait_until(Duration::from_secs(5), || {
-                UplinkCounters::escaped(PROBE_V6) > 0 && UplinkCounters::escaped(PROBE_V4) > 0
+                UplinkCounters::escaped(PROBE_V6) > 0
+                    && UplinkCounters::escaped(PROBE_V4) > 0
+                    && UplinkCounters::escaped(PROBE_DNS_V4) > 0
             })
             .await,
             "CONTROL: the probe's packets never reached the uplink"
@@ -5426,13 +5979,34 @@ mod netns_teardown_tests {
         (counters, probe)
     }
 
+    /// MR-2135: what `iptables -t mangle -S` and `ip6tables -t mangle -S`
+    /// list of the DNS hold (its chain, its cover, their jumps). Empty once
+    /// DNS is the host's again.
+    fn dns_hold_rules() -> Vec<String> {
+        let mut rules = Vec::new();
+        for tool in ["iptables", "ip6tables"] {
+            let out = cmd(tool)
+                .args(["-w", "-t", "mangle", "-S"])
+                .output()
+                .unwrap_or_else(|e| panic!("{tool} -t mangle -S: {e}"));
+            assert!(out.status.success(), "{tool} -t mangle -S: {out:?}");
+            rules.extend(
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter(|l| l.contains(DNS_HOLD_CHAIN) || l.contains(DNS_HOLD_COVER))
+                    .map(|l| format!("{tool}: {l}")),
+            );
+        }
+        rules
+    }
+
     /// Session A up through a manager, then a connect onto B: the server
     /// switch, exactly as the manager runs it — the old tunnel torn down, the
     /// new one started. The counters are zeroed once A is up, so what they
     /// hold afterwards left the uplink from A's session to B's:
-    /// `(IPv6, IPv4)` packets. Both sessions are `dual_stack`, or neither.
-    /// Ends disconnected, with no leak block left.
-    async fn switch_while_probing(dual_stack: bool) -> (u64, u64) {
+    /// `(IPv6, IPv4, plain DNS)` packets. Both sessions are `dual_stack`, or
+    /// neither. Ends disconnected, with no leak block and no DNS hold left.
+    async fn switch_while_probing(dual_stack: bool) -> (u64, u64, u64) {
         let vm = crate::vpn::manager::VpnManager::new();
         let (a, key_a, _relay_a) = session(dual_stack).await;
         vm.connect(a, key_a, label("netns-a"), false, vm.begin_attempt())
@@ -5455,6 +6029,12 @@ mod netns_teardown_tests {
         let escaped = (
             UplinkCounters::escaped(PROBE_V6),
             UplinkCounters::escaped(PROBE_V4),
+            UplinkCounters::escaped(PROBE_DNS_V4),
+        );
+        let held = dns_hold_rules();
+        assert!(
+            held.is_empty(),
+            "the switch left its DNS hold in force once B was up: {held:?}"
         );
         vm.disconnect().await.expect("disconnect");
         let rules = ipv6_leak_block_rules();
@@ -5478,7 +6058,7 @@ mod netns_teardown_tests {
         let before = resolv_conf();
         let (counters, probe) = probing().await;
 
-        let (v6, _) = switch_while_probing(false).await;
+        let (v6, _, _) = switch_while_probing(false).await;
         drop(probe);
         drop(counters);
 
@@ -5505,7 +6085,7 @@ mod netns_teardown_tests {
         let before = resolv_conf();
         let (counters, probe) = probing().await;
 
-        let (v6, _) = switch_while_probing(true).await;
+        let (v6, _, _) = switch_while_probing(true).await;
         drop(probe);
         drop(counters);
 
@@ -5544,8 +6124,8 @@ mod netns_teardown_tests {
 
         assert_eq!(
             escaped,
-            (0, 0),
-            "(IPv6, IPv4) packets left the uplink during the switch with the kill switch on"
+            (0, 0, 0),
+            "(IPv6, IPv4, DNS) packets left the uplink during the switch with the kill switch on"
         );
         let after = net();
         assert!(after.nothing_of_ours(), "{after:?}");
@@ -5595,6 +6175,11 @@ mod netns_teardown_tests {
             rules.is_empty(),
             "the failed switch left IPv6 blocked: {rules:?}"
         );
+        let held = dns_hold_rules();
+        assert!(
+            held.is_empty(),
+            "MR-2135: the failed switch left DNS held: {held:?}"
+        );
         let after = net();
         assert!(after.nothing_of_ours(), "{after:?}");
         assert_eq!(resolv_conf(), before);
@@ -5612,5 +6197,93 @@ mod netns_teardown_tests {
         let after = net();
         assert!(after.nothing_of_ours(), "{after:?}");
         assert_eq!(resolv_conf(), before);
+    }
+
+    /// MR-2135, kill switch OFF: no plain DNS leaves the uplink while a server
+    /// switch replaces the tunnel. The old stop() put the physical resolvers
+    /// back and the new start() configured its own only after its handshake,
+    /// so a query in between went to the network's resolver. It is held now,
+    /// as Windows holds its DNS guard, through a real hold, start and lift
+    /// run by the manager. The CONTROL is the same window's other IPv4: with
+    /// the kill switch off it still gets out (DNS only, by owner decision), so
+    /// the gap was real and the zero is the hold's. After the Disconnect DNS
+    /// gets out again: the hold did not outlive the switch.
+    ///
+    /// Loopback stays open under the hold, so systemd-resolved's stub still
+    /// answers locally while its own upstream query out of the uplink is
+    /// dropped. That is the behaviour wanted; this probe, a plain query
+    /// straight out of the uplink, is the upstream half.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_switch_lets_no_plain_dns_out_between_the_two_tunnels() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+        let (counters, probe) = probing().await;
+
+        let (_, v4, dns) = switch_while_probing(false).await;
+        assert!(
+            v4 > 0,
+            "CONTROL: no IPv4 left the uplink during the switch, so its gap was never seen"
+        );
+        assert_eq!(
+            dns, 0,
+            "{dns} plain DNS packets left the uplink during the switch"
+        );
+
+        UplinkCounters::zero();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                UplinkCounters::escaped(PROBE_DNS_V4) > 0
+            })
+            .await,
+            "DNS stayed blocked after the Disconnect"
+        );
+        drop(probe);
+        drop(counters);
+        let after = net();
+        assert!(after.nothing_of_ours(), "{after:?}");
+        assert_eq!(resolv_conf(), before);
+    }
+
+    /// MR-2135: a run killed mid-switch leaves the hold in the kernel, since
+    /// a SIGKILL never runs the guard's Drop. main.rs's startup reconcile
+    /// calls [`remove_dns_hold`], which must lift it. The hold below is left
+    /// exactly as a crash leaves it: hooked, with no guard to drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_dns_hold_left_by_a_killed_run_is_lifted_by_the_startup_sweep() {
+        assert_isolated();
+        let (counters, probe) = probing().await;
+
+        let (hold, up) = hold_dns(&DnsHoldExempt::default());
+        up.expect("hold DNS");
+        std::mem::forget(hold);
+        let held = dns_hold_rules();
+        assert!(!held.is_empty(), "precondition: the hold is in force");
+        UplinkCounters::zero();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                UplinkCounters::escaped(PROBE_V4) > 20
+            })
+            .await,
+            "CONTROL: the probe's other IPv4 stopped reaching the uplink"
+        );
+        let dns = UplinkCounters::escaped(PROBE_DNS_V4);
+        assert_eq!(dns, 0, "{dns} plain DNS packets got past the hold");
+
+        remove_dns_hold();
+        let left = dns_hold_rules();
+        assert!(left.is_empty(), "the startup sweep left the hold: {left:?}");
+        UplinkCounters::zero();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                UplinkCounters::escaped(PROBE_DNS_V4) > 0
+            })
+            .await,
+            "DNS stayed blocked after the startup sweep"
+        );
+        drop(probe);
+        drop(counters);
     }
 }

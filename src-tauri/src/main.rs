@@ -629,6 +629,10 @@ fn main() {
             #[cfg(target_os = "linux")]
             {
                 crate::vpn::tunnel_linux::remove_ipv6_leak_block();
+                // MR-2135: and a DNS hold a run killed mid-switch left behind.
+                // With the kill switch off it would leave the host unable to
+                // resolve anything, with nothing to say why.
+                crate::vpn::tunnel_linux::remove_dns_hold();
                 // The v6 chain was reconciled here but BIRDO_KILLSWITCH was not —
                 // and that is the one that blocks EVERYTHING. A SIGKILL or power
                 // loss with the kill switch armed left the host with a
@@ -1190,6 +1194,9 @@ fn cleanup_on_crash() {
         // survive process exit, so without this a crash leaves the host with no
         // IPv6 until the next successful connect/disconnect cycle.
         vpn::tunnel_linux::remove_ipv6_leak_block();
+
+        // MR-2135: and a DNS hold, should the app exit mid-switch.
+        vpn::tunnel_linux::remove_dns_hold();
 
         // Restore DNS. `resolvectl revert` is only half of it, despite the old
         // comment's "or": configure_dns OVERWRITES /etc/resolv.conf on every
