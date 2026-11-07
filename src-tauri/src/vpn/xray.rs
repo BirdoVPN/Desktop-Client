@@ -406,9 +406,18 @@ impl XrayManager {
         // which comes from WireGuard's handshake inside the manager's connect.
         // During a server switch that is inside Linux's DNS hold, and xray's
         // lookup goes through the system resolver on port 53. The backend
-        // sends `<node ip>:8443`, but nothing here guaranteed it.
+        // sends `<node ip>:8443`, but nothing here guaranteed it. DoH first;
+        // `resolve_via_doh` fails CLOSED when every provider is refused, so on a
+        // network that blocks DoH (Stealth's own use case) the system resolver
+        // is the fallback, as xray's own lookup used to be. This runs in
+        // prepare_tunnel, before the manager's connect, so before any hold.
         let server_host = relay_address(&server_host, |host| async move {
-            super::doh::resolve_via_doh(&host).await
+            doh_then_system(
+                &host,
+                |h| async move { super::doh::resolve_via_doh(&h).await },
+                |h| async move { system_ipv4(&h).await },
+            )
+            .await
         })
         .await?;
 
@@ -957,6 +966,47 @@ where
     Ok(ip.to_string())
 }
 
+/// MR-2135: `host` through `doh`, and through `system` only when DoH fails.
+/// Both errors are kept, so a relay that resolves nowhere says why.
+async fn doh_then_system<D, DFut, S, SFut>(
+    host: &str,
+    doh: D,
+    system: S,
+) -> Result<std::net::Ipv4Addr, String>
+where
+    D: FnOnce(String) -> DFut,
+    DFut: std::future::Future<Output = Result<std::net::Ipv4Addr, String>>,
+    S: FnOnce(String) -> SFut,
+    SFut: std::future::Future<Output = Result<std::net::Ipv4Addr, String>>,
+{
+    match doh(host.to_string()).await {
+        Ok(ip) => Ok(ip),
+        Err(doh_err) => {
+            tracing::warn!(
+                "Stealth relay {}: DoH failed ({}); using the system resolver",
+                crate::utils::redact::redact_hostname(host),
+                doh_err
+            );
+            system(host.to_string())
+                .await
+                .map_err(|sys_err| format!("DoH: {doh_err}; system resolver: {sys_err}"))
+        }
+    }
+}
+
+/// The first IPv4 address the system resolver gives for `host` (the relays
+/// are IPv4-only).
+async fn system_ipv4(host: &str) -> Result<std::net::Ipv4Addr, String> {
+    tokio::net::lookup_host((host, 0))
+        .await
+        .map_err(|e| e.to_string())?
+        .find_map(|a| match a.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .ok_or_else(|| "no IPv4 address".to_string())
+}
+
 fn parse_endpoint(endpoint: &str) -> Result<(String, u16), String> {
     // P6-CLI-D-03: these Err strings reach release-level catch-all loggers verbatim.
     let parts: Vec<&str> = endpoint.rsplitn(2, ':').collect();
@@ -1249,6 +1299,40 @@ mod tests {
         .await
         .expect_err("an unresolvable relay");
         assert!(err.contains("no answer"), "{err}");
+    }
+
+    /// MR-2135: DoH is used when it answers; the system resolver only when
+    /// it does not (a network blocking DoH, Stealth's own use case), as
+    /// xray's own lookup used to resolve; both failing keeps both reasons.
+    #[tokio::test]
+    async fn the_system_resolver_is_the_fallback_only_when_doh_fails() {
+        let doh_ok = doh_then_system(
+            "relay.example.net",
+            |_| async { Ok(std::net::Ipv4Addr::new(203, 0, 113, 9)) },
+            |h| async move { never_resolved(h) },
+        )
+        .await;
+        assert_eq!(doh_ok, Ok(std::net::Ipv4Addr::new(203, 0, 113, 9)));
+
+        let fell_back = doh_then_system(
+            "relay.example.net",
+            |_| async { Err("every provider refused".to_string()) },
+            |_| async { Ok(std::net::Ipv4Addr::new(198, 51, 100, 9)) },
+        )
+        .await;
+        assert_eq!(fell_back, Ok(std::net::Ipv4Addr::new(198, 51, 100, 9)));
+
+        let neither = doh_then_system(
+            "relay.example.net",
+            |_| async { Err("doh down".to_string()) },
+            |_| async { Err("nxdomain".to_string()) },
+        )
+        .await
+        .expect_err("nothing resolved");
+        assert!(
+            neither.contains("doh down") && neither.contains("nxdomain"),
+            "{neither}"
+        );
     }
 
     /// MR-2135: start() resolves before it builds the config xray reads.
