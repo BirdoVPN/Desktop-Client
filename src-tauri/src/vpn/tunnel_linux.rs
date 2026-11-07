@@ -405,7 +405,9 @@ pub(crate) fn dns_hold_exempt(
 ///
 /// Loopback stays open: a local stub (systemd-resolved's 127.0.0.53) still
 /// answers, while its own upstream query out of the physical link is
-/// dropped. So does birdo0, which the incoming tunnel's resolvers are reached
+/// dropped. The same holds for any local DNS proxy (dnsmasq, unbound): only
+/// the hop to it is exempt, and its forward upstream leaves through OUTPUT
+/// on the physical link, where it is held. So does birdo0, which the incoming tunnel's resolvers are reached
 /// through once its start() is up. DROP, not REJECT, as Windows' WFP block: a
 /// resolver waits and retries rather than failing at once, and its retry
 /// lands after the gap.

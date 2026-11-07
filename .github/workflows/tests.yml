@@ -359,14 +359,14 @@ jobs:
           # module.
           # Space-separated: libtest
           # runs every test matching ANY of the filters after `--`.
-          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests owned_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests app_data_removal::tests' || 'resolv_conf_restore_tests tun_read_tests owned_route_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests app_data_removal::tests' }}
+          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests owned_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests app_data_removal::tests' || 'resolv_conf_restore_tests tun_read_tests owned_route_tests dns_hold_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests app_data_removal::tests' }}
           # The cfg-gated file those tests live in.
           SRC: ${{ matrix.os == 'macos' && 'src/vpn/tunnel_macos.rs' || 'src/vpn/tunnel_linux.rs' }}
           # Every test module in $SRC that some step of THIS job executes -
           # FILTER plus the root-only steps further down (ipv6, the netns
           # teardown tests), whose tests are #[ignore]d and so cannot run in
           # the loop above.
-          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests owned_route_tests utun_fd_tests' || 'configure_ipv6_tests ipv6_leak_block_tests netns_teardown_tests owned_route_tests resolv_conf_restore_tests tun_read_tests' }}
+          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests owned_route_tests utun_fd_tests' || 'configure_ipv6_tests dns_hold_tests ipv6_leak_block_tests netns_teardown_tests owned_route_tests resolv_conf_restore_tests tun_read_tests' }}
         run: |
           set -euo pipefail
           # $FILTER/$COVERED are space-separated lists; split them explicitly
