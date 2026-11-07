@@ -3,14 +3,28 @@
  * birdo-web #808). An anonymous account has no address to be e-mailed at, so
  * the app is where it hears of a change.
  *
- * One row per entry, in the server's order, `text` exactly as sent. The web
- * banner's rule: not dismissible, and gone once the time reaches `effectiveAt`,
- * with the app left open and no new fetch. Nothing is recorded: no
- * acknowledgement, no analytics, nothing kept beyond the in-memory profile.
+ * On the Connect tab only, in the bottom panel with the other Home banners
+ * (`HomeBanners`). Above every tab, at 380x640, two notices took a third of
+ * every screen and the scroll cap cut the second off mid-sentence (owner,
+ * smoke test of 1.4.51, 7 November 2026).
+ *
+ * One compact row: the text clamped to two lines (all of it is the row's
+ * tooltip and what a screen reader reads), Details for the website's list of
+ * every change, and Dismiss. With more than one in force the first shows with
+ * "+N more": two stacked rows need about 115 px, and at 380x520 while
+ * connected the Connect panel has about 65 to grow into before the status pill.
+ *
+ * The rules are otherwise the web banner's: in the server's order, `text`
+ * exactly as sent, gone once the time reaches `effectiveAt` with the app left
+ * open and no new fetch, a link only to a plain same-site path, neutral tone.
+ * Dismissing one keeps its `version` on this device (`dismissedTermsNotices`,
+ * persisted with the local preferences), so it stays gone after a restart and
+ * a new version shows again. Nothing is sent: no acknowledgement, no analytics.
  */
-import { useEffect, useState } from 'react';
-import { Info } from 'lucide-react';
-import { BannerRow } from '@/components/home/HomeBanners';
+import { useEffect, useId, useState } from 'react';
+import { Info, X } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
+import { hairline, surface, white } from '@/lib/birdo-theme';
 import { openWebsite, websiteUrl } from '@/lib/links';
 import { useAppStore, type TermsNotice } from '@/store/app-store';
 
@@ -31,9 +45,18 @@ function noticeEnd(notice: TermsNotice): number {
 }
 
 export function TermsNoticeBanners() {
-  const notices = useAppStore((s) => s.account.termsNotices);
+  const { notices, dismissed, dismiss } = useAppStore(
+    useShallow((s) => ({
+      notices: s.account.termsNotices,
+      dismissed: s.dismissedTermsNotices,
+      dismiss: s.dismissTermsNotice,
+    })),
+  );
   const [now, setNow] = useState(Date.now);
-  const live = notices.filter((notice) => notice.text.trim() && noticeEnd(notice) > now);
+  const textId = useId();
+  const live = notices.filter(
+    (notice) => notice.text.trim() && noticeEnd(notice) > now && !dismissed.includes(notice.version),
+  );
   const nextEnd = live.length > 0 ? Math.min(...live.map(noticeEnd)) : null;
 
   useEffect(() => {
@@ -44,24 +67,67 @@ export function TermsNoticeBanners() {
 
   if (live.length === 0) return null;
 
+  const [notice, ...more] = live;
+  const url = websiteUrl(notice.path);
+  // The list of changes covers every notice; the server names the same page for each.
+  const moreUrl = more.map((n) => websiteUrl(n.path)).find((u) => u !== null) ?? url;
+  const moreLabel = `+${more.length} more`;
+  const buttonClass = 'shrink-0 rounded-birdo-xs text-[11px] font-semibold hover:bg-white/10';
+
   return (
-    // Capped: at the window's smallest size two long sentences would otherwise
-    // take the screen from the tab under them. Past this they scroll.
-    <div className="max-h-[35%] shrink-0 overflow-y-auto px-5 pt-3">
-      {live.map((notice) => {
-        const url = websiteUrl(notice.path);
-        return (
-          <BannerRow
-            key={notice.version}
-            icon={Info}
-            tone="neutral"
-            text={notice.text}
-            actionLabel={url ? 'See every change' : undefined}
-            onAction={url ? () => openWebsite(url) : undefined}
-            actionBelow
-          />
-        );
-      })}
+    <div
+      className="birdo-banner mb-2.5 flex items-start gap-2 rounded-2xl px-3 py-2"
+      style={{ backgroundColor: surface.s3, border: `1px solid ${hairline.strong}` }}
+    >
+      <Info size={14} color={white.w80} className="mt-0.5 shrink-0" aria-hidden />
+      {/* Two lines at most, cut with an ellipsis: never a scroll box that ends mid-sentence. */}
+      <p
+        id={textId}
+        title={notice.text}
+        className="line-clamp-2 min-w-0 flex-1 text-[11px] leading-snug"
+        style={{ color: white.w80 }}
+      >
+        {notice.text}
+      </p>
+      <div className="flex shrink-0 flex-col items-end gap-0.5">
+        <div className="flex items-center gap-1">
+          {url && (
+            <button
+              type="button"
+              onClick={() => openWebsite(url)}
+              aria-describedby={textId}
+              className={`${buttonClass} px-2 py-0.5`}
+              style={{ color: white.w80, border: `1px solid ${hairline.strong}` }}
+            >
+              Details
+            </button>
+          )}
+          <button
+            type="button"
+            aria-label="Dismiss"
+            aria-describedby={textId}
+            onClick={() => dismiss(notice.version)}
+            className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full hover:bg-white/10"
+          >
+            <X size={14} color={white.w60} aria-hidden />
+          </button>
+        </div>
+        {more.length > 0 &&
+          (moreUrl ? (
+            <button
+              type="button"
+              onClick={() => openWebsite(moreUrl)}
+              className={`${buttonClass} px-1`}
+              style={{ color: white.w60 }}
+            >
+              {moreLabel}
+            </button>
+          ) : (
+            <span className="px-1 text-[11px] font-semibold" style={{ color: white.w60 }}>
+              {moreLabel}
+            </span>
+          ))}
+      </div>
     </div>
   );
 }

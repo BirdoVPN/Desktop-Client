@@ -134,8 +134,11 @@ describe('AppShell -> get_client_config', () => {
   });
 });
 
-// MR-2199: the notice is about the account, so it is on the shell, not on a tab
-// that a cold birdo://settings link never opens.
+// MR-2199: the terms notice is NOT the shell's. Drawn above every tab it took a
+// third of the window at 380x640 on each of them (owner, smoke test of 1.4.51,
+// 7 November 2026); it is now one of the Connect tab's banners (HomeBanners).
+// Dashboard is a stub here, so this pins only that the shell itself draws
+// nothing; TermsNoticeBanners.test.tsx shows it on Connect through the real app.
 describe('AppShell -> terms notice', () => {
   const text = 'We have changed our Terms.';
 
@@ -148,18 +151,19 @@ describe('AppShell -> terms notice', () => {
     useAppStore.getState().setAccount({ termsNotices: [] });
   });
 
-  it.each<TabId>(['home', 'profile', 'limit', 'settings'])('shows on the %s tab', async (tab) => {
+  it.each<TabId>(['home', 'profile', 'limit', 'settings'])('the shell draws none on the %s tab', async (tab) => {
     useAppStore.setState({ tab });
     render(<AppShell />);
-    expect(screen.getByText(text)).toBeInTheDocument();
+    expect(screen.queryByText(text)).not.toBeInTheDocument();
+    expect(document.querySelector('.birdo-banner')).toBeNull();
     await waitFor(() => expect(configCalls()).toHaveLength(1));
   });
 
-  it('stays over a pushed sub-screen', async () => {
+  it('nor over a pushed sub-screen', async () => {
     useAppStore.setState({ tab: 'settings', navStack: ['vpnSettings'] });
     render(<AppShell />);
     expect(screen.getByTestId('route-vpnSettings')).toBeInTheDocument();
-    expect(screen.getByText(text)).toBeInTheDocument();
+    expect(screen.queryByText(text)).not.toBeInTheDocument();
     await waitFor(() => expect(configCalls()).toHaveLength(1));
   });
 });
