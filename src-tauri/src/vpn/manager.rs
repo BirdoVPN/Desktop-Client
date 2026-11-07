@@ -829,12 +829,14 @@ impl VpnManager {
         #[cfg(target_os = "windows")]
         let transition_gen = crate::vpn::win_machine_state::begin_transition();
 
-        // MR-2135: Linux's twin of the DNS guard held above, for a switch only.
-        // Taken in the teardown below, before the old stop() restores the
-        // physical resolvers, and dropped once the new tunnel's build is over
-        // (its start() has configured its own), or by any early return.
+        // MR-2135: the Unix twins of the DNS guard held above, for a switch
+        // only. Taken in the teardown below, before the old stop() restores
+        // the physical resolvers, and released once the new tunnel's build is
+        // over (its start() has configured its own), or by any early return.
         #[cfg(target_os = "linux")]
         let mut dns_hold: Option<crate::vpn::tunnel_linux::DnsHold> = None;
+        #[cfg(target_os = "macos")]
+        let mut dns_hold: Option<crate::commands::killswitch::DnsHold> = None;
 
         if displaced.is_some()
             || matches!(
@@ -894,15 +896,25 @@ impl VpnManager {
             // physical link from the old stop() (which restores the original
             // resolvers) until the new start() configured its own. Held now,
             // as Windows holds its DNS guard; a failed install warns and goes
-            // on, as the IPv6 hold does.
+            // on, as the IPv6 hold does. macOS carries it in the leak block
+            // the IPv6 hold above keeps in force, so it is taken after that.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let exempt = crate::vpn::dns_hold::dns_hold_exempt(
+                &config.endpoint,
+                &config.dns,
+                local_network_sharing,
+            );
             #[cfg(target_os = "linux")]
             {
-                let exempt = crate::vpn::tunnel_linux::dns_hold_exempt(
-                    &config.endpoint,
-                    &config.dns,
-                    local_network_sharing,
-                );
                 let (hold, up) = crate::vpn::tunnel_linux::hold_dns(&exempt);
+                if let Err(e) = &up {
+                    tracing::warn!("Could not hold DNS for the server switch: {}", e);
+                }
+                dns_hold = Some(hold);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let (hold, up) = crate::commands::killswitch::hold_dns(exempt).await;
                 if let Err(e) = &up {
                     tracing::warn!("Could not hold DNS for the server switch: {}", e);
                 }
@@ -1041,6 +1053,14 @@ impl VpnManager {
         // hold has done its job.
         #[cfg(target_os = "linux")]
         drop(dns_hold);
+        // macOS: awaited, so the lift is done (and read back) before this
+        // connect reports anything, and no later pf load can race it.
+        #[cfg(target_os = "macos")]
+        if let Some(hold) = dns_hold {
+            if let Err(e) = hold.release().await {
+                tracing::warn!("Could not lift the DNS hold after the server switch: {}", e);
+            }
+        }
 
         match tunnel_result {
             Some(Ok(Ok(tunnel))) => {
@@ -1909,6 +1929,40 @@ mod tests {
             1,
             "one explicit release; every early return drops the Option"
         );
+    }
+
+    /// MR-2135, macOS: the same span, with the hold taken after the IPv6
+    /// hold (it is carried by the leak block that hold keeps in force) and
+    /// lifted by an AWAITED release, done before the outcome is handled and
+    /// so before anything is reported Connected. `pf_policy`'s tests pin the
+    /// ruleset side.
+    #[test]
+    fn a_macos_switch_holds_dns_from_before_the_old_stop_until_the_build_is_over() {
+        let source = include_str!("manager.rs").replace('\r', "");
+        let start = source.find("    pub async fn connect(").expect("connect()");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("connect() has no {needle}"))
+        };
+        let ipv6_held = at("crate::commands::killswitch::hold_ipv6_block().await");
+        let held = at("crate::commands::killswitch::hold_dns(exempt).await");
+        let stop = at("timeout(Duration::from_secs(10), tunnel.stop())");
+        let new_start = at(".start(private_key)");
+        let released = at("hold.release().await");
+        let first_arm = at("match tunnel_result {");
+        let connected = at("ConnectionState::Connected,");
+        assert!(ipv6_held < held, "the leak block must be held first");
+        assert!(
+            held < stop,
+            "the hold must be up before the old tunnel's stop()"
+        );
+        assert!(
+            new_start < released && released < first_arm && released < connected,
+            "the hold must last through the new start() and be lifted before the outcome is handled"
+        );
+        assert_eq!(body.matches(".release().await").count(), 1);
     }
 
     #[tokio::test]

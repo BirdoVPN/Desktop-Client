@@ -453,7 +453,11 @@ jobs:
           # to decide whether it is blocking; two more take and drop real pf
           # references (`pfctl -E` / `-X`, no rules loaded): one proves the
           # token parse, the other a SECOND reference on a running pf, its
-          # `pfctl -s References` listing and a dead token's `-X`. Four tests,
+          # `pfctl -s References` listing and a dead token's `-X`. MR-2135: a
+          # fifth parses the IPv6 leak block with every shape of the server
+          # switch's DNS hold in it (the full ruleset loading this runner's
+          # real com.apple anchor file) and checks pf's printout puts the
+          # hold ahead of every filter anchor and every pass. Five tests,
           # all required: an --ignored filter that matches nothing still exits 0.
           echo "── pfctl -nv: the generated kill-switch block-all"
           out=$(sudo -E "$(command -v cargo)" test --lib pfctl_parse_tests -- --ignored --nocapture --test-threads=1) || {
@@ -464,8 +468,8 @@ jobs:
           echo "$out"
           # A here-string, not `echo | grep -q`: under pipefail grep -q's early
           # exit can SIGPIPE the writer and turn a pass into a failure.
-          if ! grep -qE 'test result: ok\. 4 passed' <<<"$out"; then
-            echo "::error::pfctl_parse_tests did not run all four tests"
+          if ! grep -qE 'test result: ok\. 5 passed' <<<"$out"; then
+            echo "::error::pfctl_parse_tests did not run all five tests"
             exit 1
           fi
 

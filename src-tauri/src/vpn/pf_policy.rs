@@ -24,7 +24,8 @@
 //!
 //! Everything else, IPv6 included, meets `block drop all`.
 
-use std::net::Ipv4Addr;
+use crate::vpn::dns_hold::DnsHoldExempt;
+use std::net::{IpAddr, Ipv4Addr};
 
 /// Marker anchor in EVERY ruleset we load (this block-all and the IPv6 leak
 /// block in `resources/pf/`). Declaring an empty anchor is a no-op for packet
@@ -42,6 +43,14 @@ pub(crate) const MARKER_ANCHOR: &str = "com.birdo.vpn";
 /// (P1-ks-macos-pf-enable-unverified). Not `com.birdo.vpn.killswitch`: that is
 /// the pre-#59 anchor the panic hook still flushes on mixed-upgrade hosts.
 pub(crate) const BLOCK_ANCHOR: &str = "com.birdo.vpn.blockall";
+
+/// MR-2135: marker anchor carried by the IPv6 leak block only while a server
+/// switch holds DNS ([`dns_hold_rules`]), so the read-back can tell a hold in
+/// force from one lifted. Empty, like the other two.
+pub(crate) const DNS_HOLD_ANCHOR: &str = "com.birdo.vpn.dnshold";
+
+/// The pf table of what the DNS hold lets through.
+pub(crate) const DNS_HOLD_TABLE: &str = "birdo_dns_hold_exempt";
 
 /// The pf table the control-plane permit is scoped to.
 pub(crate) const CONTROL_PLANE_TABLE: &str = "birdo_control";
@@ -235,6 +244,73 @@ pub(crate) const IPV6_RULESET_FULL: &str = include_str!("../../resources/pf/ipv6
 pub(crate) const IPV6_RULESET_MINIMAL: &str =
     include_str!("../../resources/pf/ipv6-block-minimal.conf");
 
+/// MR-2135: the DNS a server switch holds with the kill switch off, from
+/// before the outgoing tunnel's stop() (which puts the original resolvers
+/// back) until the incoming tunnel's build is over (its start() has set its
+/// own). Plain DNS, DNS-over-TLS and DNS-over-QUIC to anything but
+/// `exempt`'s addresses, both families, and the LAN name ports unless Local
+/// Network Sharing is on (`vpn::dns_hold`).
+///
+/// `drop`, not `return`, as Windows' WFP block and the Linux hold: a
+/// resolver waits and retries rather than failing at once, and its retry
+/// lands after the hold. `out` only: nothing inbound changes. lo0 is `set
+/// skip`, so a local stub still answers; its own upstream query is held.
+///
+/// The incoming tunnel's utun is NOT exempt: its name is not known when the
+/// hold goes up, and its start() sends no DNS before it returns (the
+/// endpoint resolves over DoH, on 443). So its resolvers are reached once
+/// the hold is lifted, right after the build.
+///
+/// While these rules are in, the leak block is no longer IPv6-only: plain
+/// DNS over IPv4 is dropped too. That is the point, and it lasts only for
+/// the switch.
+pub(crate) fn dns_hold_rules(exempt: &DnsHoldExempt) -> String {
+    let mut r = format!("anchor \"{DNS_HOLD_ANCHOR}\"\n");
+    let addresses: Vec<String> = exempt.addresses().map(IpAddr::to_string).collect();
+    let to = if addresses.is_empty() {
+        "any".to_string()
+    } else {
+        r.push_str(&format!(
+            "table <{DNS_HOLD_TABLE}> const {{ {} }}\n",
+            addresses.join(", ")
+        ));
+        format!("! <{DNS_HOLD_TABLE}>")
+    };
+    r.push_str(&format!(
+        "block drop out quick proto {{ udp tcp }} to {to} port {{ {} }}\n",
+        exempt.held_ports().join(" ")
+    ));
+    r
+}
+
+/// `baseline` (one of the IPv6 leak block rulesets) with `hold`
+/// ([`dns_hold_rules`]) put in ahead of its first filter anchor.
+///
+/// AHEAD of every anchor, so nothing evaluated in one can pass a held query
+/// first: `com.apple/*` in the full ruleset, whose sub-anchors other parts of
+/// macOS fill at run time (AirDrop, the application firewall), and our own
+/// `com.birdo.vpn`, which is empty in every state (a marker, see
+/// [`MARKER_ANCHOR`]). And ahead of the file's `pass quick inet6 from
+/// fe80::/10 to fe80::/10`, so a link-local resolver (an IPv6 router's) is
+/// held too. AFTER the scrub, nat, rdr and dummynet anchors, which pf
+/// requires before any filter rule. Line endings come out as `\n`.
+pub(crate) fn with_dns_hold(baseline: &str, hold: &str) -> String {
+    let mut out = String::with_capacity(baseline.len() + hold.len());
+    let mut inserted = false;
+    for line in baseline.lines() {
+        if !inserted && line.trim_start().starts_with("anchor \"") {
+            out.push_str(hold);
+            inserted = true;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !inserted {
+        out.push_str(hold);
+    }
+    out
+}
+
 /// Whether `pfctl -s info` reports pf running.
 pub(crate) fn parse_enabled(info: &str) -> bool {
     info.contains("Status: Enabled")
@@ -254,6 +330,14 @@ pub(crate) fn block_all_loaded(live_rules: &str) -> bool {
 /// own `com.birdo.vpn.blockall` anchor does not count.
 pub(crate) fn marker_loaded(live_rules: &str) -> bool {
     let line = format!("anchor \"{MARKER_ANCHOR}\"");
+    live_rules
+        .lines()
+        .any(|l| l.trim_start().starts_with(&line))
+}
+
+/// MR-2135: whether `live_rules` carries the DNS hold's marker anchor.
+pub(crate) fn dns_hold_loaded(live_rules: &str) -> bool {
+    let line = format!("anchor \"{DNS_HOLD_ANCHOR}\"");
     live_rules
         .lines()
         .any(|l| l.trim_start().starts_with(&line))
@@ -385,6 +469,8 @@ pub(crate) struct Observed {
     pub marker_loaded: bool,
     /// The utun interfaces the live ruleset permits (MR-1125, P2-1).
     pub tunnel_permits: Vec<String>,
+    /// MR-2135: the DNS hold is in the live ruleset.
+    pub dns_hold_loaded: bool,
 }
 
 impl Observed {
@@ -398,6 +484,7 @@ impl Observed {
             has_inet6: rules.contains("inet6"),
             marker_loaded: marker_loaded(&rules),
             tunnel_permits: tunnel_permits(&rules),
+            dns_hold_loaded: dns_hold_loaded(&rules),
         })
     }
 
@@ -460,6 +547,15 @@ pub(crate) struct PfState {
     pub stale: bool,
     /// N5: the control-plane generation the LOADED block-all's table covers.
     pub table_gen: u64,
+    /// MR-2135: the DNS a server switch holds ([`dns_hold_rules`]): carried
+    /// by the IPv6 leak block, so every load of it renders the hold while
+    /// this is set (a kill-switch lift, the watchdog's re-assert, the
+    /// incoming start()'s), and none does once it is cleared. The block-all,
+    /// while it owns the ruleset, drops DNS anyway.
+    pub dns_hold: Option<DnsHoldExempt>,
+    /// The generation of the hold `dns_hold` belongs to, so a late release
+    /// of an older hold cannot lift a newer one.
+    pub dns_hold_gen: u64,
 }
 
 impl PfState {
@@ -473,6 +569,8 @@ impl PfState {
             wanted: false,
             stale: false,
             table_gen: 0,
+            dns_hold: None,
+            dns_hold_gen: 0,
         }
     }
 
@@ -861,10 +959,15 @@ impl PfState {
             return None;
         }
         let seen = Observed::read(pf);
-        if seen
-            .as_ref()
-            .is_ok_and(|s| s.enabled && s.marker_loaded && s.has_inet6)
-        {
+        // MR-2135: and with the DNS hold in it exactly while one is wanted —
+        // a lift that did not take is retried here, as is a hold another
+        // tool's ruleset replaced.
+        if seen.as_ref().is_ok_and(|s| {
+            s.enabled
+                && s.marker_loaded
+                && s.has_inet6
+                && s.dns_hold_loaded == self.dns_hold.is_some()
+        }) {
             return None;
         }
         Some(self.load_ipv6_baseline(pf))
@@ -1011,18 +1114,117 @@ impl PfState {
         self.release(pf);
     }
 
+    /// MR-2135: hold DNS for a server switch onto the session `exempt`
+    /// describes, as hold `generation`, until [`dns_hold_off`] of the same
+    /// generation.
+    ///
+    /// Taken after the IPv6 hold, so with the kill switch off the leak block
+    /// is pf's ruleset and is re-loaded with the hold in it, then read back.
+    /// A failed load changes nothing in force (pf loads are all or nothing):
+    /// never `ipv6_on`'s failure path, which would put /etc/pf.conf back.
+    /// While the block-all owns the ruleset the hold is only recorded: the
+    /// block-all drops DNS already, and a lift during the switch lands on the
+    /// leak block with the hold in it. With neither up (the IPv6 hold failed
+    /// to install it), the hold goes in with the leak block when that is
+    /// installed again, and `Err` says it is not in force yet.
+    ///
+    /// [`dns_hold_off`]: Self::dns_hold_off
+    pub(crate) fn dns_hold_on(
+        &mut self,
+        pf: &impl Pf,
+        exempt: DnsHoldExempt,
+        generation: u64,
+    ) -> Result<(), String> {
+        self.dns_hold = Some(exempt);
+        self.dns_hold_gen = generation;
+        if self.loaded {
+            return Ok(());
+        }
+        if !self.ipv6_baseline {
+            return Err(
+                "the IPv6 leak block that carries it is not up; it goes in with that block"
+                    .to_string(),
+            );
+        }
+        self.load_ipv6_baseline(pf)?;
+        match Observed::read(pf) {
+            Ok(s) if s.dns_hold_loaded => Ok(()),
+            Ok(_) => Err("the DNS hold did not take effect (pf does not list it)".to_string()),
+            Err(e) => Err(format!("the DNS hold could not be read back: {e}")),
+        }
+    }
+
+    /// MR-2135: the switch's build is over; lift hold `generation`. An older
+    /// hold's late release (a cancelled switch's guard) changes nothing.
+    ///
+    /// The leak block is re-loaded without the hold and read back. While the
+    /// block-all owns the ruleset there is nothing to take out: every load
+    /// from here on renders without the hold. A lift that did not take is
+    /// `Err`, and the watchdog retries it (`watch_ipv6_baseline`).
+    pub(crate) fn dns_hold_off(&mut self, pf: &impl Pf, generation: u64) -> Result<(), String> {
+        if self.dns_hold.is_none() || self.dns_hold_gen != generation {
+            return Ok(());
+        }
+        self.dns_hold = None;
+        if self.loaded {
+            return Ok(());
+        }
+        match Observed::read(pf) {
+            Ok(s) if !s.dns_hold_loaded => return Ok(()),
+            Ok(_) => {}
+            // Unreadable: re-load the leak block if a session wants it, as
+            // that is safe either way; nothing else is ours to touch.
+            Err(e) if !self.ipv6_baseline => {
+                return Err(format!("pf could not be read to lift the DNS hold ({e})"))
+            }
+            Err(_) => {}
+        }
+        // The hold is in pf's ruleset: the leak block a session still wants,
+        // or (its own lift having failed) one no session wants any more.
+        let lifted = if self.ipv6_baseline {
+            self.load_ipv6_baseline(pf)
+        } else {
+            pf.load_default()
+        };
+        match Observed::read(pf) {
+            // Lifted. A leak block that then failed its own read-back is the
+            // IPv6 block's business, and its watchdog's.
+            Ok(s) if !s.dns_hold_loaded => Ok(()),
+            Ok(_) => Err(format!(
+                "the DNS hold is still in pf's ruleset{}",
+                because(&lifted)
+            )),
+            Err(e) => Err(format!(
+                "pf could not be read back after lifting the DNS hold ({e})"
+            )),
+        }
+    }
+
     /// Install the IPv6 leak block as pf's main ruleset, hold a reference on
     /// pf, and read back that it is enforced — a leak fix that silently
     /// failed to load is worse than none, because the UI would claim
     /// protection that is not there.
+    ///
+    /// MR-2135: with the DNS hold in it while one is set. If no ruleset with
+    /// the hold loads, the block goes in without it: the hold is only for a
+    /// switch, and must never cost the session its IPv6 block.
     fn load_ipv6_baseline(&mut self, pf: &impl Pf) -> Result<(), String> {
-        if let Err(primary) = pf.load(IPV6_RULESET_FULL) {
-            tracing::warn!(
-                "F-001: anchor-preserving IPv6 ruleset failed to load ({primary}); trying the minimal ruleset"
-            );
-            pf.load(IPV6_RULESET_MINIMAL).map_err(|e| {
-                format!("IPv6 leak block failed to load ({primary}); fallback also failed: {e}")
-            })?;
+        match self.dns_hold.as_ref().map(dns_hold_rules) {
+            Some(hold) => {
+                let held = load_full_or_minimal(
+                    pf,
+                    &with_dns_hold(IPV6_RULESET_FULL, &hold),
+                    &with_dns_hold(IPV6_RULESET_MINIMAL, &hold),
+                );
+                if let Err(e) = held {
+                    tracing::warn!(
+                        "MR-2135: the IPv6 leak block with the DNS hold failed to load ({e}); \
+                         loading it without the hold"
+                    );
+                    load_full_or_minimal(pf, IPV6_RULESET_FULL, IPV6_RULESET_MINIMAL)?;
+                }
+            }
+            None => load_full_or_minimal(pf, IPV6_RULESET_FULL, IPV6_RULESET_MINIMAL)?,
         }
         self.stale = false;
         self.hold_reference(pf);
@@ -1038,6 +1240,21 @@ impl PfState {
         }
         Ok(())
     }
+}
+
+/// Load `full` (the leak block that keeps Apple's anchors), or `minimal` if
+/// that fails (a host whose /etc/pf.anchors/com.apple is missing or
+/// unreadable fails the whole `load anchor` line).
+fn load_full_or_minimal(pf: &impl Pf, full: &str, minimal: &str) -> Result<(), String> {
+    if let Err(primary) = pf.load(full) {
+        tracing::warn!(
+            "F-001: anchor-preserving IPv6 ruleset failed to load ({primary}); trying the minimal ruleset"
+        );
+        pf.load(minimal).map_err(|e| {
+            format!("IPv6 leak block failed to load ({primary}); fallback also failed: {e}")
+        })?;
+    }
+    Ok(())
 }
 
 /// Every pass rule that names a `user` also names the control-plane table —
@@ -1467,6 +1684,8 @@ mod tests {
         enable_fails: bool,
         /// `pfctl -E` prints a token, and pf is still off.
         enable_lies: bool,
+        /// `pfctl -f -` refuses any ruleset containing this text.
+        refuses: Option<&'static str>,
         loads: Cell<u32>,
         take_ref_calls: Cell<u32>,
         released: RefCell<Vec<u64>>,
@@ -1530,7 +1749,7 @@ mod tests {
         }
         fn load(&self, rules: &str) -> Result<(), String> {
             self.loads.set(self.loads.get() + 1);
-            if self.load_fails {
+            if self.load_fails || self.refuses.is_some_and(|text| rules.contains(text)) {
                 return Err("pfctl load ruleset failed: syntax error".to_string());
             }
             if !self.load_lost {
@@ -2217,6 +2436,303 @@ mod tests {
         assert_eq!(pf.take_ref_calls.get(), 1);
     }
 
+    // ── MR-2135: DNS held across a server switch ───────────────────────
+
+    fn exempt(endpoint: &str, sharing: bool) -> DnsHoldExempt {
+        let dns = [
+            "192.168.1.2".to_string(),
+            "fd00::53".to_string(),
+            "9.9.9.9".to_string(),
+        ];
+        crate::vpn::dns_hold::dns_hold_exempt(endpoint, &dns, sharing)
+    }
+
+    fn holds_dns(pf: &FakePf) -> bool {
+        dns_hold_loaded(&pf.rules().unwrap())
+    }
+
+    #[test]
+    fn the_hold_drops_dns_to_all_but_the_relay_and_the_lan_resolvers() {
+        let r = dns_hold_rules(&exempt("203.0.113.9:51820", true));
+        assert_eq!(
+            r,
+            "anchor \"com.birdo.vpn.dnshold\"\n\
+             table <birdo_dns_hold_exempt> const { 203.0.113.9, 192.168.1.2, fd00::53 }\n\
+             block drop out quick proto { udp tcp } to ! <birdo_dns_hold_exempt> port { 53 853 }\n"
+        );
+    }
+
+    /// Sharing off: the LAN name ports are held too, and no LAN resolver is
+    /// let through. A hostname relay is resolved later, over DoH, so with
+    /// nothing exempt there is no table at all.
+    #[test]
+    fn with_nothing_exempt_the_hold_has_no_table() {
+        let r = dns_hold_rules(&exempt("relay.example.net:51820", false));
+        assert_eq!(
+            r,
+            "anchor \"com.birdo.vpn.dnshold\"\n\
+             block drop out quick proto { udp tcp } to any port { 53 853 137 5353 5355 }\n"
+        );
+    }
+
+    /// The hold only blocks: an exempt query is not passed, it falls through
+    /// to the leak block's own rules as before (an exempt IPv6 address that
+    /// is not link-local still meets `block return quick inet6 all`).
+    #[test]
+    fn the_hold_passes_nothing_and_names_no_family() {
+        for (endpoint, sharing) in [
+            ("203.0.113.9:53", true),
+            ("[2001:db8::7]:51820", false),
+            ("relay.example.net:51820", true),
+        ] {
+            let r = dns_hold_rules(&exempt(endpoint, sharing));
+            for line in r.lines() {
+                assert!(
+                    line.starts_with("anchor ")
+                        || line.starts_with("table ")
+                        || line.starts_with("block drop out quick proto { udp tcp } to "),
+                    "{line}"
+                );
+                assert!(!line.contains("inet"), "{line}");
+            }
+        }
+    }
+
+    /// Ahead of every filter anchor (Apple's, which macOS fills at run time,
+    /// and our empty marker) and of the link-local pass; after the scrub,
+    /// nat, rdr and dummynet anchors pf wants first. The rest of the file is
+    /// unchanged.
+    #[test]
+    fn the_hold_goes_ahead_of_every_filter_anchor_and_changes_nothing_else() {
+        let hold = dns_hold_rules(&exempt("203.0.113.9:51820", false));
+        for baseline in [IPV6_RULESET_FULL, IPV6_RULESET_MINIMAL] {
+            let held = with_dns_hold(baseline, &hold);
+            let lines: Vec<&str> = held.lines().collect();
+            let at = |prefix: &str| lines.iter().position(|l| l.starts_with(prefix));
+            let hold_at = at("anchor \"com.birdo.vpn.dnshold\"").expect("the hold");
+            let block_at = at("block drop out quick").expect("its rule");
+            // Its anchor, the table of what it lets through, its rule.
+            assert!(lines[hold_at + 1].starts_with("table <birdo_dns_hold_exempt>"));
+            assert_eq!(block_at, hold_at + 2, "{held}");
+            for (i, line) in lines.iter().enumerate() {
+                let filter_anchor = line.starts_with("anchor \"") && i != hold_at;
+                if filter_anchor || line.starts_with("pass ") {
+                    assert!(i > block_at, "{line} is ahead of the hold:\n{held}");
+                }
+                for first in [
+                    "scrub-anchor",
+                    "nat-anchor",
+                    "rdr-anchor",
+                    "dummynet-anchor",
+                ] {
+                    if line.starts_with(first) {
+                        assert!(i < hold_at, "{line} must stay first:\n{held}");
+                    }
+                }
+            }
+            let rest: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|l| !hold.lines().any(|h| h == *l))
+                .collect();
+            assert_eq!(rest, baseline.lines().collect::<Vec<_>>());
+
+            let printed = pf_prints(&held);
+            assert!(dns_hold_loaded(&printed) && marker_loaded(&printed));
+            assert!(!block_all_loaded(&printed));
+            assert!(!dns_hold_loaded(&pf_prints(baseline)));
+        }
+    }
+
+    /// The marker anchors are told apart exactly.
+    #[test]
+    fn the_hold_marker_is_its_own() {
+        assert!(dns_hold_loaded("anchor \"com.birdo.vpn.dnshold\" all"));
+        assert!(!dns_hold_loaded("anchor \"com.birdo.vpn\" all"));
+        assert!(!marker_loaded("anchor \"com.birdo.vpn.dnshold\" all"));
+        assert!(!block_all_loaded("anchor \"com.birdo.vpn.dnshold\" all"));
+    }
+
+    /// Kill switch OFF, a switch as the manager runs it: the IPv6 hold, the
+    /// DNS hold, the old tunnel's held teardown, the new tunnel's start
+    /// (which re-loads the leak block), the release. DNS is held from the
+    /// DNS hold to the release, IPv6 contained throughout, one reference.
+    #[test]
+    fn a_switch_holds_dns_in_the_leak_block_until_the_release() {
+        let (pf, mut state) = ipv6_only();
+        assert_eq!(state.ipv6_hold(&pf), Ok(()));
+        assert!(!holds_dns(&pf));
+        assert_eq!(
+            state.dns_hold_on(&pf, exempt("203.0.113.9:51820", false), 1),
+            Ok(())
+        );
+        assert!(holds_dns(&pf) && ipv6_contained(&pf));
+
+        state.ipv6_off(&pf, true);
+        assert!(holds_dns(&pf), "the old tunnel's teardown lifted the hold");
+        assert_eq!(state.ipv6_on(&pf), Ok(()), "the new tunnel's start");
+        assert!(holds_dns(&pf), "the new start's re-load dropped the hold");
+
+        assert_eq!(state.dns_hold_off(&pf, 1), Ok(()));
+        assert!(!holds_dns(&pf) && ipv6_contained(&pf));
+        assert_eq!(state.dns_hold, None);
+        assert_eq!(pf.take_ref_calls.get(), 1);
+    }
+
+    /// Kill switch ON: the block-all drops DNS already, so the hold is only
+    /// recorded, and a lift during the switch lands on the leak block WITH
+    /// the hold; the release then takes it out.
+    #[test]
+    fn under_the_block_all_a_lift_lands_on_the_hold() {
+        let (pf, mut state) = engaged();
+        assert_eq!(state.ipv6_on(&pf), Ok(()));
+        let loads = pf.loads.get();
+        assert_eq!(
+            state.dns_hold_on(&pf, exempt("203.0.113.9:51820", false), 1),
+            Ok(())
+        );
+        assert_eq!(pf.loads.get(), loads, "the block-all was re-loaded");
+        assert!(block_all_loaded(&pf.rules().unwrap()));
+
+        assert_eq!(state.disengage(&pf), Ok(()));
+        assert!(holds_dns(&pf) && ipv6_contained(&pf));
+        assert_eq!(state.dns_hold_off(&pf, 1), Ok(()));
+        assert!(!holds_dns(&pf) && ipv6_contained(&pf));
+    }
+
+    /// Released while the block-all owns pf: nothing to take out, and a
+    /// later lift renders no hold.
+    #[test]
+    fn a_hold_released_under_the_block_all_is_gone_from_every_later_load() {
+        let (pf, mut state) = engaged();
+        assert_eq!(state.ipv6_on(&pf), Ok(()));
+        assert_eq!(
+            state.dns_hold_on(&pf, exempt("203.0.113.9:51820", false), 1),
+            Ok(())
+        );
+        let loads = pf.loads.get();
+        assert_eq!(state.dns_hold_off(&pf, 1), Ok(()));
+        assert_eq!(pf.loads.get(), loads);
+        assert_eq!(state.disengage(&pf), Ok(()));
+        assert!(!holds_dns(&pf) && ipv6_contained(&pf));
+    }
+
+    /// A late release of an older hold (a cancelled switch's guard, run on
+    /// the runtime) leaves a newer one alone.
+    #[test]
+    fn an_older_holds_late_release_leaves_a_newer_hold_alone() {
+        let (pf, mut state) = ipv6_only();
+        assert_eq!(
+            state.dns_hold_on(&pf, exempt("203.0.113.9:51820", false), 1),
+            Ok(())
+        );
+        assert_eq!(
+            state.dns_hold_on(&pf, exempt("203.0.113.9:51820", false), 2),
+            Ok(())
+        );
+        assert_eq!(state.dns_hold_off(&pf, 1), Ok(()));
+        assert!(holds_dns(&pf));
+        assert_eq!(state.dns_hold_off(&pf, 2), Ok(()));
+        assert!(!holds_dns(&pf));
+    }
+
+    /// A hold pf will not load never costs the session its IPv6 block: the
+    /// hold's own load changes nothing in force (never `ipv6_on`'s failure
+    /// path, which puts /etc/pf.conf back), and a later load of the leak
+    /// block falls back to the block without the hold.
+    #[test]
+    fn a_hold_pf_refuses_never_costs_the_ipv6_block() {
+        let (pf, mut state) = ipv6_only();
+        let pf = FakePf {
+            refuses: Some(DNS_HOLD_ANCHOR),
+            ..pf
+        };
+        let before = pf.rules().unwrap();
+        let e = state
+            .dns_hold_on(&pf, exempt("203.0.113.9:51820", false), 1)
+            .unwrap_err();
+        assert!(e.contains("did not take effect"), "{e}");
+        assert!(ipv6_contained(&pf) && state.ipv6_baseline && state.token.is_some());
+        assert_eq!(pf.rules().unwrap(), before);
+
+        assert_eq!(state.ipv6_on(&pf), Ok(()), "the new tunnel's start");
+        assert!(ipv6_contained(&pf) && !holds_dns(&pf));
+    }
+
+    #[test]
+    fn a_failed_hold_load_leaves_the_leak_block_in_force() {
+        let (mut pf, mut state) = ipv6_only();
+        let before = pf.rules().unwrap();
+        pf.load_fails = true;
+        assert!(state
+            .dns_hold_on(&pf, exempt("203.0.113.9:51820", false), 1)
+            .is_err());
+        assert_eq!(pf.rules().unwrap(), before);
+        assert!(state.ipv6_baseline && state.token.is_some() && pf.running());
+    }
+
+    /// With no leak block up (the IPv6 hold failed to install it), the hold
+    /// is recorded and goes in with the block when that is installed again.
+    #[test]
+    fn with_no_leak_block_the_hold_goes_in_with_it() {
+        let pf = FakePf::default();
+        let mut state = PfState::new();
+        assert!(state
+            .dns_hold_on(&pf, exempt("203.0.113.9:51820", false), 1)
+            .is_err());
+        assert_eq!(pf.loads.get(), 0);
+        assert_eq!(state.ipv6_on(&pf), Ok(()));
+        assert!(holds_dns(&pf) && ipv6_contained(&pf));
+        assert_eq!(state.dns_hold_off(&pf, 1), Ok(()));
+        assert!(!holds_dns(&pf));
+    }
+
+    /// A lift that did not take is retried by the watchdog; a hold another
+    /// tool's ruleset replaced is put back while it is wanted.
+    #[test]
+    fn the_watchdog_keeps_the_hold_exactly_while_it_is_wanted() {
+        let (mut pf, mut state) = ipv6_only();
+        assert_eq!(
+            state.dns_hold_on(&pf, exempt("203.0.113.9:51820", false), 1),
+            Ok(())
+        );
+        pf.load_default().unwrap();
+        assert_eq!(state.watchdog(&pf, inputs, 1), Some(Ok(())));
+        assert!(holds_dns(&pf));
+
+        pf.load_fails = true;
+        let e = state.dns_hold_off(&pf, 1).unwrap_err();
+        assert!(e.contains("still in pf's ruleset"), "{e}");
+        assert!(holds_dns(&pf));
+        pf.load_fails = false;
+        assert_eq!(state.watchdog(&pf, inputs, 1), Some(Ok(())));
+        assert!(!holds_dns(&pf) && ipv6_contained(&pf));
+        assert_eq!(
+            state.watchdog(&pf, inputs, 1),
+            None,
+            "and then it is healthy"
+        );
+    }
+
+    /// A switch that fails: its start's unwind lifts the leak block (unheld)
+    /// and the hold goes with it; the release then has nothing to load.
+    #[test]
+    fn a_failed_switch_takes_the_hold_out_with_the_leak_block() {
+        let (pf, mut state) = ipv6_only();
+        assert_eq!(state.ipv6_hold(&pf), Ok(()));
+        assert_eq!(
+            state.dns_hold_on(&pf, exempt("203.0.113.9:51820", false), 1),
+            Ok(())
+        );
+        state.ipv6_off(&pf, true);
+        state.ipv6_off(&pf, false);
+        assert_eq!(pf.rules().unwrap(), pf_prints(STOCK_PF_CONF));
+        let loads = pf.loads.get();
+        assert_eq!(state.dns_hold_off(&pf, 1), Ok(()));
+        assert_eq!(pf.loads.get(), loads);
+        assert_eq!(pf.rules().unwrap(), pf_prints(STOCK_PF_CONF));
+    }
+
     // ── P2-1 / MR-1125: the tunnel's own utun, confirmed ──────────────
 
     #[test]
@@ -2821,6 +3337,66 @@ mod pfctl_parse_tests {
         let printed = pfctl_parse(&rules);
         assert!(block_all_loaded(&printed), "{printed}");
         assert!(!printed.contains(" user "), "{printed}");
+    }
+
+    /// MR-2135: pf parses the leak block with every shape of the DNS hold in
+    /// it, the full ruleset loading the runner's real /etc/pf.anchors/com.apple
+    /// as the app's does, and pf's own printout puts the hold's rules ahead of
+    /// every filter anchor and every pass.
+    #[test]
+    #[ignore = "needs root and macOS pfctl; run by tests.yml's pf parse-check step"]
+    fn every_dns_hold_shape_parses_ahead_of_every_filter_anchor() {
+        let dns = [
+            "192.168.1.2".to_string(),
+            "fd00::53".to_string(),
+            "fe80::1".to_string(),
+        ];
+        let shapes = [
+            crate::vpn::dns_hold::dns_hold_exempt("203.0.113.9:51820", &dns, true),
+            crate::vpn::dns_hold::dns_hold_exempt("203.0.113.9:53", &dns, false),
+            crate::vpn::dns_hold::dns_hold_exempt("[2001:db8::7]:51820", &dns, true),
+            crate::vpn::dns_hold::dns_hold_exempt("relay.example.net:51820", &dns, false),
+        ];
+        let hold_anchor = format!("anchor \"{DNS_HOLD_ANCHOR}\"");
+        for exempt in &shapes {
+            let hold = dns_hold_rules(exempt);
+            for baseline in [IPV6_RULESET_FULL, IPV6_RULESET_MINIMAL] {
+                let printed = pfctl_parse(&with_dns_hold(baseline, &hold));
+                println!("--- pfctl -nv printout ---\n{printed}");
+                assert!(dns_hold_loaded(&printed), "{printed}");
+                assert!(marker_loaded(&printed), "{printed}");
+                assert!(!block_all_loaded(&printed), "{printed}");
+
+                // Tables aside, wherever pf prints them: the hold's anchor,
+                // then one rule per protocol and port, then everything else.
+                let lines: Vec<&str> = printed
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with("table "))
+                    .collect();
+                let at = lines
+                    .iter()
+                    .position(|l| l.starts_with(&hold_anchor))
+                    .expect("the hold's anchor");
+                let rules = 2 * exempt.held_ports().len();
+                for line in &lines[at + 1..=at + rules] {
+                    assert!(
+                        line.starts_with("block drop out quick proto"),
+                        "{line}:\n{printed}"
+                    );
+                    assert!(!line.contains("inet"), "{line}");
+                    if exempt.addresses().next().is_some() {
+                        assert!(line.contains(&format!("! <{DNS_HOLD_TABLE}>")), "{line}");
+                    }
+                }
+                for (i, line) in lines.iter().enumerate() {
+                    let filter_anchor = line.starts_with("anchor \"") && i != at;
+                    if filter_anchor || line.starts_with("pass") {
+                        assert!(i > at + rules, "{line} is ahead of the hold:\n{printed}");
+                    }
+                }
+            }
+        }
     }
 
     fn pfctl(args: &[&str]) -> std::process::Output {

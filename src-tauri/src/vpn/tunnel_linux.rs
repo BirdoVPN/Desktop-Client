@@ -341,65 +341,9 @@ const DNS_HOLD_CHAIN: &str = "BIRDO_DNS_HOLD";
 /// Its stand-in while a re-install rebuilds it, as [`IPV6_BLOCK_COVER`].
 const DNS_HOLD_COVER: &str = "BIRDO_DNS_HOLD_COVER";
 
-/// Plain DNS (53), DNS-over-TLS (TCP 853) and DNS-over-QUIC (UDP 853), each
-/// over TCP and UDP: what Windows' DNS guard blocks (wfp_policy.rs DNS_PORTS).
-/// DNS-over-HTTPS on 443 cannot be told apart from any other HTTPS, here or
-/// on Windows, and the app's own DoH must keep working.
-const DNS_HOLD_PORTS: [&str; 2] = ["53", "853"];
-
-/// NetBIOS name service (137), mDNS (5353) and LLMNR (5355): held as well
-/// unless Local Network Sharing is on, as Windows does (LAN_NAME_PORTS).
-const DNS_HOLD_LAN_NAME_PORTS: [&str; 3] = ["137", "5353", "5355"];
-
-/// What the hold lets through, from the incoming session.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct DnsHoldExempt {
-    /// The incoming relay: a relay on a DNS port must still get its handshake
-    /// (Windows permits the tunnel's own flow on a DNS port the same way).
-    /// `None` for a hostname endpoint, which is resolved later, over DoH.
-    relay: Option<std::net::IpAddr>,
-    /// The user's own resolvers on the local network (a Pi-hole), with Local
-    /// Network Sharing on only, as Windows' `split_resolvers`.
-    lan_resolvers: Vec<std::net::IpAddr>,
-    local_network_sharing: bool,
-}
-
-/// An address on the local network: private, link-local or unique-local.
-fn is_lan_address(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => {
-            let first = v6.segments()[0];
-            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
-        }
-    }
-}
-
-/// What the hold for a switch onto a session at `endpoint`, with resolvers
-/// `dns`, lets through (the incoming `VpnConfig`'s two fields).
-pub(crate) fn dns_hold_exempt(
-    endpoint: &str,
-    dns: &[String],
-    local_network_sharing: bool,
-) -> DnsHoldExempt {
-    let relay = endpoint
-        .parse::<std::net::SocketAddr>()
-        .ok()
-        .map(|a| a.ip());
-    let lan_resolvers = if local_network_sharing {
-        dns.iter()
-            .filter_map(|d| d.parse::<std::net::IpAddr>().ok())
-            .filter(is_lan_address)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    DnsHoldExempt {
-        relay,
-        lan_resolvers,
-        local_network_sharing,
-    }
-}
+// The ports it holds and what it lets through are shared with macOS's pf
+// hold: `vpn::dns_hold`.
+use super::dns_hold::DnsHoldExempt;
 
 /// The hold's rules, appended to `chain`, for one family (`v6`).
 ///
@@ -419,21 +363,11 @@ fn fill_dns_hold(
 ) -> Result<(), String> {
     t(&["-A", chain, "-o", "lo", "-j", "RETURN"])?;
     t(&["-A", chain, "-o", TUN_DEVICE_NAME, "-j", "RETURN"])?;
-    for ip in exempt
-        .relay
-        .iter()
-        .chain(&exempt.lan_resolvers)
-        .filter(|ip| ip.is_ipv6() == v6)
-    {
+    for ip in exempt.addresses().filter(|ip| ip.is_ipv6() == v6) {
         let ip = ip.to_string();
         t(&["-A", chain, "-d", &ip, "-j", "RETURN"])?;
     }
-    let lan_name_ports: &[&str] = if exempt.local_network_sharing {
-        &[]
-    } else {
-        &DNS_HOLD_LAN_NAME_PORTS
-    };
-    for port in DNS_HOLD_PORTS.iter().chain(lan_name_ports) {
+    for port in exempt.held_ports() {
         for proto in ["udp", "tcp"] {
             t(&["-A", chain, "-p", proto, "--dport", port, "-j", "DROP"])?;
         }
@@ -4588,6 +4522,7 @@ mod configure_ipv6_tests {
 #[cfg(test)]
 mod dns_hold_tests {
     use super::*;
+    use crate::vpn::dns_hold::dns_hold_exempt;
     use std::collections::BTreeMap;
     use std::net::IpAddr;
 
@@ -4819,34 +4754,6 @@ mod dns_hold_tests {
         assert!(
             !format!("{v6:?}").contains("203.0.113.9"),
             "an IPv4 address in the IPv6 chain"
-        );
-    }
-
-    #[test]
-    fn the_exemptions_come_from_the_incoming_session() {
-        let dns = vec![
-            "192.168.1.2".to_string(),
-            "fe80::1".to_string(),
-            "1.1.1.1".to_string(),
-        ];
-        let on = dns_hold_exempt("203.0.113.9:51820", &dns, true);
-        assert_eq!(on.relay, Some("203.0.113.9".parse().unwrap()));
-        assert_eq!(
-            on.lan_resolvers,
-            vec![
-                "192.168.1.2".parse::<IpAddr>().unwrap(),
-                "fe80::1".parse().unwrap()
-            ]
-        );
-        let off = dns_hold_exempt("203.0.113.9:51820", &dns, false);
-        assert!(
-            off.lan_resolvers.is_empty(),
-            "LAN resolvers with sharing off"
-        );
-        let hostname = dns_hold_exempt("relay.example.net:51820", &dns, false);
-        assert_eq!(
-            hostname.relay, None,
-            "a hostname is resolved later, over DoH"
         );
     }
 
