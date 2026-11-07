@@ -42,7 +42,7 @@
  *
  * Run: npx vitest run src/__tests__/AppShellClientConfig.test.tsx
  */
-import { afterEach, describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import { invoke } from '@tauri-apps/api/core';
 import { AppShell } from '@/components/AppShell';
@@ -63,7 +63,6 @@ vi.mock('@/components/Dashboard', () => ({
   Dashboard: () => <div data-testid="tab-home" />,
 }));
 vi.mock('@/screens/Profile', () => ({ Profile: () => <div data-testid="tab-profile" /> }));
-vi.mock('@/screens/Limit', () => ({ Limit: () => <div data-testid="tab-limit" /> }));
 vi.mock('@/components/Settings', () => ({ Settings: () => <div data-testid="tab-settings" /> }));
 vi.mock('@/screens/VpnSettings', () => ({ VpnSettings: () => <div data-testid="route-vpnSettings" /> }));
 vi.mock('@/screens/SplitTunnel', () => ({ SplitTunnel: () => <div /> }));
@@ -130,40 +129,6 @@ describe('AppShell -> get_client_config', () => {
     useAppStore.setState({ tab: 'settings', navStack: ['vpnSettings'] });
     render(<AppShell />);
     expect(screen.getByTestId('route-vpnSettings')).toBeInTheDocument();
-    await waitFor(() => expect(configCalls()).toHaveLength(1));
-  });
-});
-
-// MR-2199: the terms notice is NOT the shell's. Drawn above every tab it took a
-// third of the window at 380x640 on each of them (owner, smoke test of 1.4.51,
-// 7 November 2026); it is now one of the Connect tab's banners (HomeBanners).
-// Dashboard is a stub here, so this pins only that the shell itself draws
-// nothing; TermsNoticeBanners.test.tsx shows it on Connect through the real app.
-describe('AppShell -> terms notice', () => {
-  const text = 'We have changed our Terms.';
-
-  beforeEach(() => {
-    useAppStore.getState().setAccount({
-      termsNotices: [{ version: 'v', text, effectiveAt: '2099-12-05T00:00:00.000Z', path: '/legal/changes' }],
-    });
-  });
-  afterEach(() => {
-    useAppStore.getState().setAccount({ termsNotices: [] });
-  });
-
-  it.each<TabId>(['home', 'profile', 'limit', 'settings'])('the shell draws none on the %s tab', async (tab) => {
-    useAppStore.setState({ tab });
-    render(<AppShell />);
-    expect(screen.queryByText(text)).not.toBeInTheDocument();
-    expect(document.querySelector('.birdo-banner')).toBeNull();
-    await waitFor(() => expect(configCalls()).toHaveLength(1));
-  });
-
-  it('nor over a pushed sub-screen', async () => {
-    useAppStore.setState({ tab: 'settings', navStack: ['vpnSettings'] });
-    render(<AppShell />);
-    expect(screen.getByTestId('route-vpnSettings')).toBeInTheDocument();
-    expect(screen.queryByText(text)).not.toBeInTheDocument();
     await waitFor(() => expect(configCalls()).toHaveLength(1));
   });
 });

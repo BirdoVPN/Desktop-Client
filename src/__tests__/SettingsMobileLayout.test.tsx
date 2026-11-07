@@ -6,7 +6,8 @@
  *
  * Pinned here:
  *  - a row is its title and its control: no text beside the title, and no
- *    accessible description, on any row whose control can be used;
+ *    accessible description, on any row whose control can be used, except
+ *    Local Network Sharing's one-line warning (owner, 2026-11-07);
  *  - mobile's sections in mobile's order, each a heading (BirdoSectionHeader
  *    is `semantics { heading() }` on Android), under a top bar whose title is
  *    the screen's heading, with mobile's subtitle;
@@ -20,7 +21,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import { invoke } from '@tauri-apps/api/core';
 import { Settings } from '@/components/Settings';
-import { VpnSettings } from '@/screens/VpnSettings';
+import { LOCAL_NETWORK_SHARING_WARNING, VpnSettings } from '@/screens/VpnSettings';
 import { defaultSettings, useAppStore } from '@/store/app-store';
 import { cancelScheduledReapply, forgetKillSwitchChoices } from '@/session/settings-persist';
 import { resetUpdater } from '@/session/updater';
@@ -224,11 +225,18 @@ describe('VPN Settings: mobile layout, no descriptions', () => {
 
   it('every switch row is its title and its switch', () => {
     render(<VpnSettings />);
-    for (const name of ['Stealth Mode', 'BirdoShield', 'Local Network Sharing']) {
+    for (const name of ['Stealth Mode', 'BirdoShield']) {
       const row = screen.getByRole('switch', { name });
       expect(textOf(row), name).toBe(name);
       expect(row, name).toHaveAccessibleDescription('');
     }
+    // Owner, 2026-11-07 (mobile #542): Local Network Sharing keeps ONE line,
+    // a warning about what turning it on exposes. Nothing else, seen or heard.
+    const lan = screen.getByRole('switch', { name: 'Local Network Sharing' });
+    // Two blocks, the title and the warning (textContent joins them unspaced).
+    expect(textOf(lan)).toBe(`Local Network Sharing${LOCAL_NETWORK_SHARING_WARNING}`);
+    expect(lan).toHaveAccessibleDescription(LOCAL_NETWORK_SHARING_WARNING);
+    expect(LOCAL_NETWORK_SHARING_WARNING).toBe('While on, devices on your local network can reach this device.');
     const text = document.body.textContent ?? '';
     for (const gone of [
       /encrypted transport/,

@@ -272,8 +272,10 @@ states it at the `lockdown_mode` default:
 
 `killswitch::is_lockdown_mode()` is hard `false` off Windows, and
 `reconnect_policy::give_up_keeps_block` keeps the block only under lockdown.
-The Kill Switch row in Settings says so ("If reconnecting keeps failing, the
-app stops blocking."). Do not file the difference as a gap.
+The store listing says so ("if reconnecting keeps failing, the app stops
+blocking", `docs/store-listing.md`, Kill Switch). The Kill Switch row in
+Settings used to say it too; no Settings row has carried a description since
+#336 (owner, 2026-10-21 and 2026-11-07). Do not file the difference as a gap.
 
 ## macOS and Linux have no packet-path stall rule (MR-1117)
 
