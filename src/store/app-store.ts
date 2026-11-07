@@ -382,6 +382,14 @@ export interface AppState {
   // Window position (frameless corner anchor / draggable). Persisted.
   windowCorner: WindowCorner;
 
+  /**
+   * The `TermsNotice.version`s the user dismissed on THIS device. Persisted
+   * with the other local preferences (`partialize`), never sent anywhere, and
+   * kept across sign-out like `windowCorner`. A notice with a version not in
+   * this list shows again.
+   */
+  dismissedTermsNotices: string[];
+
   // Deep link
   deepLinkAction: { action: string; serverId?: string } | null;
   /**
@@ -431,6 +439,7 @@ export interface AppState {
   dismissNotice: (id: number) => void;
   setOnline: (online: boolean) => void;
   setWindowCorner: (corner: WindowCorner) => void;
+  dismissTermsNotice: (version: string) => void;
   setDeepLinkAction: (action: { action: string; serverId?: string } | null) => void;
   setDeepLinkConfirm: (server: Server | null) => void;
   setTab: (tab: TabId) => void;
@@ -557,6 +566,9 @@ const sameRoute = (a: LiveMultiHop | null, b: LiveMultiHop | null) =>
 
 let noticeSeq = 0;
 
+/** The most dismissed notice versions kept: a few notices a year, so this is years of them. */
+export const MAX_DISMISSED_TERMS_NOTICES = 20;
+
 /** The store's state, for helpers that take a snapshot (selectors, tests). */
 export type AppStateSnapshot = AppState;
 
@@ -603,6 +615,7 @@ export const useAppStore = create<AppState>()(
       isAdmin: null,
       notice: null,
       windowCorner: 'bottom-left' as WindowCorner,
+      dismissedTermsNotices: [],
       deepLinkAction: null,
       deepLinkConfirm: null,
       tab: 'home' as TabId,
@@ -721,6 +734,12 @@ export const useAppStore = create<AppState>()(
 
       setOnline: (online) => set({ isOnline: online }),
       setWindowCorner: (windowCorner) => set({ windowCorner }),
+      dismissTermsNotice: (version) =>
+        set((state) => ({
+          dismissedTermsNotices: [...state.dismissedTermsNotices.filter((v) => v !== version), version].slice(
+            -MAX_DISMISSED_TERMS_NOTICES,
+          ),
+        })),
       setDeepLinkAction: (action) => set({ deepLinkAction: action }),
       setDeepLinkConfirm: (deepLinkConfirm) => set({ deepLinkConfirm }),
 
@@ -777,6 +796,7 @@ export const useAppStore = create<AppState>()(
         settings: state.settings,
         acceptedConsentVersion: state.acceptedConsentVersion,
         windowCorner: state.windowCorner,
+        dismissedTermsNotices: state.dismissedTermsNotices,
       }),
       // 1: the consent boolean became a version (D7); 2: the dead WireGuard
       // ports became "auto" (WIN-FIX-3). See migratePersistedState.
@@ -796,7 +816,13 @@ export const useAppStore = create<AppState>()(
           customDnsEnabled:
             saved.customDnsEnabled ?? (Array.isArray(saved.customDns) && saved.customDns.length > 0),
         };
-        return { ...current, ...p, settings };
+        // A blob from before the list existed has none; a damaged one must not
+        // reach the banner's `includes` as something other than strings.
+        const savedDismissed: unknown = p.dismissedTermsNotices;
+        const dismissedTermsNotices = Array.isArray(savedDismissed)
+          ? savedDismissed.filter((v): v is string => typeof v === 'string')
+          : current.dismissedTermsNotices;
+        return { ...current, ...p, settings, dismissedTermsNotices };
       },
     },
   ),

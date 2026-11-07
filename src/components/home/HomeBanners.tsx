@@ -1,6 +1,8 @@
 /**
  * Banners above the server selector: administrator rights, DNS protection
- * degraded, and the connection error — with the one action that helps.
+ * degraded, and the connection error — with the one action that helps — then
+ * a terms-change notice (`TermsNoticeBanners`, MR-2199), which is shown here
+ * and on no other tab.
  *
  * The error banner used to show whatever string reached `errorMessage`, which
  * for anything Rust raised in the background (auto-reconnect giving up, a
@@ -11,8 +13,9 @@
 import { useId, useState } from 'react';
 import { CircleAlert, TriangleAlert, ShieldAlert, type LucideIcon } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
+import { TermsNoticeBanners } from '@/components/TermsNoticeBanners';
 import { giveUpMessage, vpnErrorCopy, type ErrorAction } from '@/lib/errors';
-import { hairline, status, surface, white } from '@/lib/birdo-theme';
+import { status } from '@/lib/birdo-theme';
 import { useAppStore } from '@/store/app-store';
 
 const ACTION_LABEL: Record<Exclude<ErrorAction, null | 'update' | 'sign_in'>, string> = {
@@ -95,23 +98,24 @@ export function HomeBanners({ onAction }: HomeBannersProps) {
           onAction={action ? () => onAction(action) : undefined}
         />
       )}
+
+      {/* About the account, not the connection: after the banners that are. */}
+      <TermsNoticeBanners />
     </>
   );
 }
 
 const BANNER_TONE = {
-  neutral: { fg: white.w80, bg: surface.s3, border: hairline.strong },
   warning: { fg: status.yellowLight, bg: 'rgba(245,158,11,0.10)', border: 'rgba(245,158,11,0.30)' },
   danger: { fg: status.red, bg: status.redBg, border: status.redBorder },
 } as const;
 
-export function BannerRow({
+function BannerRow({
   icon: Icon,
   tone,
   text,
   actionLabel,
   onAction,
-  actionBelow,
   details,
 }: {
   icon: LucideIcon;
@@ -119,8 +123,6 @@ export function BannerRow({
   text: string;
   actionLabel?: string;
   onAction?: () => void;
-  /** Under the text, not beside it: a long sentence keeps the row's width. */
-  actionBelow?: boolean;
   /** Secondary lines, collapsed behind a Details disclosure. */
   details?: string[];
 }) {
@@ -128,16 +130,6 @@ export function BannerRow({
   const [open, setOpen] = useState(false);
   const detailsId = useId();
   const buttonClass = 'shrink-0 rounded-birdo-xs px-2 py-1 text-xs font-semibold hover:bg-white/10';
-  const actionButton = actionLabel && onAction && (
-    <button
-      type="button"
-      onClick={onAction}
-      className={buttonClass}
-      style={{ color: t.fg, border: `1px solid ${t.border}` }}
-    >
-      {actionLabel}
-    </button>
-  );
   return (
     <div
       className="birdo-banner mb-2.5 rounded-2xl px-3.5 py-3"
@@ -160,9 +152,17 @@ export function BannerRow({
             {open ? 'Hide details' : 'Details'}
           </button>
         )}
-        {!actionBelow && actionButton}
+        {actionLabel && onAction && (
+          <button
+            type="button"
+            onClick={onAction}
+            className={buttonClass}
+            style={{ color: t.fg, border: `1px solid ${t.border}` }}
+          >
+            {actionLabel}
+          </button>
+        )}
       </div>
-      {actionBelow && actionButton && <div className="mt-2 pl-7">{actionButton}</div>}
       {details && open && (
         <ul id={detailsId} className="mt-2 list-disc space-y-1 pl-9 text-[11px] leading-snug" style={{ color: t.fg }}>
           {details.map((line) => (
