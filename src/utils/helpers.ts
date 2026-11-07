@@ -95,8 +95,6 @@ export interface AuthStateIdentity extends AuthStateAnonymity {
   plan: string | null;
   /** Absent when talking to a backend that predates the field. */
   has_password?: boolean;
-  /** MR-2199. `null` when no profile answered this cycle; a list replaces the store's. */
-  terms_notices?: TermsNotice[] | null;
 }
 
 /**
@@ -116,8 +114,6 @@ export function identityPatch(st: AuthStateIdentity): Partial<AccountInfo> {
   if (st.email) patch.email = st.email;
   if (st.account_id) patch.accountId = st.account_id;
   if (st.plan) patch.plan = st.plan;
-  // A list even when empty: then the server said none applies any more.
-  if (Array.isArray(st.terms_notices)) patch.termsNotices = st.terms_notices;
   if (st.is_authenticated) {
     patch.status = 'active';
     // `?? true` keeps the password prompt when the backend predates the
@@ -295,7 +291,7 @@ export interface RustSettings {
   file_logging_enabled?: boolean;
 }
 
-import type { AccountInfo, AppSettings, TermsNotice, WireGuardPort } from '../store/app-store';
+import type { AccountInfo, AppSettings, WireGuardPort } from '../store/app-store';
 
 /** A stored or received port setting as one of the two that exist (see
  * `WireGuardPort`): "51820" stays, anything else — "53", a custom number from

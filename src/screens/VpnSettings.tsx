@@ -40,6 +40,9 @@ import { lowestPlanWith, planHasFeature, planName } from '@/lib/plan';
 import { persistSettings } from '@/session/settings-persist';
 import { loadSubscription } from '@/session/session-data';
 
+/** The one line Local Network Sharing keeps (owner, 2026-11-07; mobile's text). */
+export const LOCAL_NETWORK_SHARING_WARNING = 'While on, devices on your local network can reach this device.';
+
 export function VpnSettings() {
   const { settings, popRoute, pushRoute, plan, planGates, connectionState, dnsFilteringAvailable, reapplying } =
     useAppStore(
@@ -173,6 +176,9 @@ export function VpnSettings() {
             icon={Network}
             iconColor={status.blue}
             title="Local Network Sharing"
+            // A warning, not a description: kept (owner, 2026-11-07), in
+            // mobile's words.
+            warning={LOCAL_NETWORK_SHARING_WARNING}
             checked={settings.localNetworkSharing}
             onCheckedChange={(v) => save({ localNetworkSharing: v })}
           />

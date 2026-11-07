@@ -1,8 +1,6 @@
 /**
  * Banners above the server selector: administrator rights, DNS protection
- * degraded, and the connection error — with the one action that helps — then
- * a terms-change notice (`TermsNoticeBanners`, MR-2199), which is shown here
- * and on no other tab.
+ * degraded, and the connection error — with the one action that helps.
  *
  * The error banner used to show whatever string reached `errorMessage`, which
  * for anything Rust raised in the background (auto-reconnect giving up, a
@@ -13,7 +11,6 @@
 import { useId, useState } from 'react';
 import { CircleAlert, TriangleAlert, ShieldAlert, type LucideIcon } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
-import { TermsNoticeBanners } from '@/components/TermsNoticeBanners';
 import { giveUpMessage, vpnErrorCopy, type ErrorAction } from '@/lib/errors';
 import { status } from '@/lib/birdo-theme';
 import { useAppStore } from '@/store/app-store';
@@ -98,9 +95,6 @@ export function HomeBanners({ onAction }: HomeBannersProps) {
           onAction={action ? () => onAction(action) : undefined}
         />
       )}
-
-      {/* About the account, not the connection: after the banners that are. */}
-      <TermsNoticeBanners />
     </>
   );
 }

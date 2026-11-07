@@ -27,36 +27,6 @@ beforeEach(() => {
     vpnError: null,
     commandError: null,
     killSwitchBlocking: false,
-    dismissedTermsNotices: [],
-  });
-  useAppStore.getState().setAccount({ termsNotices: [] });
-});
-
-/**
- * MR-2199: the terms notice is one of these banners, on the Connect tab only
- * (it was above every tab until the 1.4.51 smoke test). Its own rules are in
- * TermsNoticeBanners.test.tsx.
- */
-describe('the terms notice', () => {
-  const NOTICE = 'We are changing when unused anonymous accounts are deleted.';
-
-  it('is drawn in the banners\' flow, after the connection banners', () => {
-    useAppStore.setState({ isAdmin: false, dnsDegraded: [RAW] });
-    useAppStore.getState().setAccount({
-      termsNotices: [{ version: 'v', text: NOTICE, effectiveAt: '2099-12-05T00:00:00.000Z', path: '/legal/changes' }],
-    });
-    render(<HomeBanners onAction={() => {}} />);
-    const texts = [...document.querySelectorAll('.birdo-banner p')].map((p) => p.textContent);
-    expect(texts).toEqual([
-      'BirdoVPN is not running as an administrator, so it cannot connect.',
-      DNS_DEGRADED_COPY,
-      NOTICE,
-    ]);
-  });
-
-  it('takes no room when none applies', () => {
-    render(<HomeBanners onAction={() => {}} />);
-    expect(document.querySelector('.birdo-banner')).toBeNull();
   });
 });
 
