@@ -212,6 +212,18 @@ interface SubscriptionCardProps {
   onRetry: () => void;
 }
 
+/**
+ * True when `raw` (ISO instant or `yyyy-MM-dd`) is already in the past. A plain
+ * date counts as lasting to the end of that UTC day. Unparseable is not past.
+ */
+export function isPastDate(raw: string | null | undefined, now: number = Date.now()): boolean {
+  const v = (raw ?? '').trim();
+  if (!v) return false;
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(v);
+  const t = new Date(dateOnly ? `${v}T23:59:59.999Z` : v).getTime();
+  return Number.isFinite(t) && t < now;
+}
+
 export function SubscriptionCard({
   plan,
   planStatus,
@@ -258,8 +270,10 @@ export function SubscriptionCard({
   }
 
   const isActive = accountStatus === 'active';
-  const ends = formatDate(expiresAt);
   const paid = (planRank(plan) ?? 0) >= 1;
+  // MR-2260: the free plan never renews (the server's period for it is a
+  // monthly metering window), and a date already behind us is never shown.
+  const ends = paid && !isPastDate(expiresAt) ? formatDate(expiresAt) : null;
 
   // Three-way (mirrors mobile): only an ACTIVE sub "Renews"; a cancelled or
   // expired one with an end date shows "Access until" (calling it "Renews"
