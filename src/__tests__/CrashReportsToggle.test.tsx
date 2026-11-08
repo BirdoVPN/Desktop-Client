@@ -13,7 +13,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
-import { Settings } from '@/components/Settings';
+import { CRASH_REPORTS_LINE, Settings } from '@/components/Settings';
 import { SETTINGS_UNVERIFIED_COPY } from '@/lib/errors';
 
 vi.mock('@tauri-apps/api/core');
@@ -117,17 +117,18 @@ beforeEach(() => {
 afterEach(() => setUserAgent(realUserAgent));
 
 describe('Crash reports toggle', () => {
-  // Owner, 2026-10-21: no description under a setting. What crash reports
-  // send is disclosed where the choice is first made (ConsentScreen); the
-  // Settings row is its title and its switch.
-  it('reads OFF by default; the row is its title and switch, with no description', async () => {
+  // Owner, 2026-11-07: one short line under the toggle, the same as mobile.
+  // The full disclosure of what crash reports send stays where the choice is
+  // first made (ConsentScreen).
+  it("reads OFF by default; the row is its title, its switch and the owner's one line", async () => {
     render(<Settings />);
     const row = await screen.findByRole('switch', { name: /crash reports/i });
     expect(row).toHaveAttribute('aria-checked', 'false');
-    expect(row).toHaveTextContent(/^Crash Reports$/);
-    expect(row).toHaveAccessibleDescription('');
-    expect(screen.queryByText(/Off by default/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/crash and error reports/)).not.toBeInTheDocument();
+    expect(row).toHaveTextContent(/^Crash Reports/);
+    expect(CRASH_REPORTS_LINE).toBe('Sends crash and error reports to Sentry. Off by default.');
+    expect(row).toHaveAccessibleDescription(CRASH_REPORTS_LINE);
+    expect(row.textContent).toBe(`Crash Reports${CRASH_REPORTS_LINE}`);
+    expect(screen.queryByText(/No account details/)).not.toBeInTheDocument();
     // Applied live on the Rust side, so there is no restart note either.
     expect(screen.queryByText(/restart/i)).not.toBeInTheDocument();
   });
