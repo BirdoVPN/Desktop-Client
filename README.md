@@ -72,7 +72,7 @@ Sigstore (cosign keyless) signature ([verify a download](docs/VERIFICATION.md)).
 The **macOS** desktop build (the DMG) is **not** Developer-ID signed or notarised:
 `release.yml` always builds it unsigned. (BirdoVPN does have an Apple Developer
 account, used for the iOS app on the App Store and the Mac App Store app, which is
-submitted but not yet live; neither changes how this DMG is built.) No release
+not yet on sale; neither changes how this DMG is built.) No release
 artefact is PGP-signed.
 
 **Kill switch limit.** The kill switch only protects while the app is running. On
