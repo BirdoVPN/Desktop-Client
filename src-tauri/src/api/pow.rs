@@ -351,8 +351,9 @@ mod tests {
         let n = nonce_for(0, &mut buf);
         let zero = String::from_utf8(buf[..n].to_vec()).unwrap();
         assert!(!meets_difficulty(TOKEN_12, &zero, 12));
-        assert!(!meets_difficulty(TOKEN_12, &String::new(), 8));
-        let dashed: String = ['a', '-', 'b'].iter().collect();
+        assert!(!meets_difficulty(TOKEN_12, &zero[..0], 8));
+        // "0" followed by a '-' (the digit's byte minus 3): not in [0-9A-Za-z].
+        let dashed = format!("{zero}{}", char::from(buf[0] - 3));
         assert!(!meets_difficulty(TOKEN_12, &dashed, 8));
     }
 
