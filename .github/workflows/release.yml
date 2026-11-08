@@ -93,6 +93,35 @@ env:
 
 jobs:
   # ══════════════════════════════════════════════════════════════════════
+  # TAG-ON-MAIN GATE (register A-H09 / MR-2264 part b, A-M72) — a release tag
+  # pushed from ANY commit used to build, sign and publish. This job fails the
+  # run unless the tagged commit is an ancestor of origin/main, BEFORE any job
+  # that signs or uploads starts: test, mac-app-store and corresponding-source
+  # all `needs` it, the three build jobs `need` test, and `release` refuses to
+  # publish unless test succeeded. A dispatch from a branch is not a release
+  # (it never publishes), so the check is skipped for it and test builds still
+  # work. The `release: draft` annotated-tag behaviour is untouched: GITHUB_SHA
+  # is the tagged commit either way. Ruleset (v* tag protection) and the
+  # `release` environment reviewer are owner settings, not this file.
+  # ══════════════════════════════════════════════════════════════════════
+  tag-on-main:
+    name: Tag must point at a commit on main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the ancestry check needs every ancestor of the tag.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the tagged commit to be an ancestor of origin/main
+        if: startsWith(github.ref, 'refs/tags/')
+        run: bash .github/scripts/require-tag-on-main.sh "$GITHUB_SHA"
+
+  # ══════════════════════════════════════════════════════════════════════
   # TEST GATE — a release must never BUILD or PUBLISH if tests fail.
   #
   # WHY THIS EXISTS: before this job, release.yml only ever *built* the app.
@@ -106,6 +135,7 @@ jobs:
   # ══════════════════════════════════════════════════════════════════════
   test:
     name: Test gate (Rust unit tests + frontend vitest)
+    needs: tag-on-main  # nothing runs for a tag that is not on main
     runs-on: windows-2025
     timeout-minutes: 30
     permissions:
@@ -885,6 +915,7 @@ jobs:
   # a lookup failure counts as 'not live', so the DMG keeps shipping.
   # ══════════════════════════════════════════════════════════════════════
   mac-app-store:
+    needs: tag-on-main  # nothing runs for a tag that is not on main
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -1245,6 +1276,7 @@ jobs:
   # ══════════════════════════════════════════════════════════════════════
   corresponding-source:
     name: Corresponding source (release asset)
+    needs: tag-on-main  # nothing runs for a tag that is not on main
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
