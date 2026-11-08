@@ -7,7 +7,8 @@
  * Pinned here:
  *  - a row is its title and its control: no text beside the title, and no
  *    accessible description, on any row whose control can be used, except
- *    Local Network Sharing's one-line warning (owner, 2026-11-07);
+ *    the one line the owner kept on Local Network Sharing and on Crash
+ *    Reports (2026-11-07);
  *  - mobile's sections in mobile's order, each a heading (BirdoSectionHeader
  *    is `semantics { heading() }` on Android), under a top bar whose title is
  *    the screen's heading, with mobile's subtitle;
@@ -20,7 +21,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import { invoke } from '@tauri-apps/api/core';
-import { Settings } from '@/components/Settings';
+import { CRASH_REPORTS_LINE, Settings } from '@/components/Settings';
 import { LOCAL_NETWORK_SHARING_WARNING, VpnSettings } from '@/screens/VpnSettings';
 import { defaultSettings, useAppStore } from '@/store/app-store';
 import { cancelScheduledReapply, forgetKillSwitchChoices } from '@/session/settings-persist';
@@ -81,7 +82,6 @@ describe('Settings tab: mobile layout, no descriptions', () => {
     'Always-on Kill Switch',
     'Quantum Protection',
     'Hide App Contents',
-    'Crash Reports',
     'Save Diagnostic Logs',
     'Auto-Connect',
     'Launch at Login',
@@ -112,6 +112,10 @@ describe('Settings tab: mobile layout, no descriptions', () => {
       expect(row, name).toHaveAccessibleDescription('');
       expect(row, name).not.toHaveAttribute('aria-describedby');
     }
+    // Owner, 2026-11-07 (as mobile): Crash Reports keeps ONE short line.
+    const crash = screen.getByRole('switch', { name: 'Crash Reports' });
+    expect(textOf(crash)).toBe(`Crash Reports${CRASH_REPORTS_LINE}`);
+    expect(crash).toHaveAccessibleDescription(CRASH_REPORTS_LINE);
   });
 
   it('every link row is its title: no subtitle, no URL under it', async () => {
@@ -131,7 +135,8 @@ describe('Settings tab: mobile layout, no descriptions', () => {
       /blocks traffic until it reconnects/,
       /pre-shared key/,
       /Covers the screen/,
-      /Off by default/,
+      // The old long crash disclosure; its one line now is CRASH_REPORTS_LINE.
+      /No account details, IP address/,
       /Keeps a log of connection events/,
       /Deletes the diagnostic log/,
       /Connect to VPN on app startup/,

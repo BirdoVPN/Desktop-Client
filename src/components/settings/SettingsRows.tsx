@@ -10,7 +10,8 @@
  * gate, a plan, a plan still loading). It is not a description of the
  * setting, and a disabled switch with no reason reads as broken. And
  * `warning` (owner, 2026-11-07, as mobile): one line on what turning it on
- * exposes. Local Network Sharing is the only row with one.
+ * exposes or sends. Local Network Sharing and Crash Reports are the only rows
+ * with one.
  *
  * Accessibility follows `BirdoListItem` (PR #162 review): the row IS the
  * switch (one tab stop), `aria-label` pins its name to the title, a status
@@ -152,9 +153,9 @@ export interface SettingsToggleProps {
   /** Why the switch cannot be used right now. Never a description of the setting. */
   status?: string;
   /**
-   * One line on what turning it on exposes (Local Network Sharing). A
-   * warning, kept when the descriptions went (owner, 2026-11-07); never a
-   * description of what the setting does.
+   * One line on what turning it on exposes or sends (Local Network Sharing,
+   * Crash Reports), in the owner's words (2026-11-07); never a description of
+   * what the setting does.
    */
   warning?: string;
   /**

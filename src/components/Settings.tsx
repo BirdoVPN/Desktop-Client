@@ -121,6 +121,13 @@ export const MACOS_IPV6_NOTE =
   "Sites that only work over IPv6 won't load until you disconnect.";
 
 /**
+ * The one line under Crash Reports, the owner's wording (2026-11-07), the
+ * same as mobile's `settings_crash_reports_desc`. The full disclosure is on
+ * the consent screen, where the choice is first made.
+ */
+export const CRASH_REPORTS_LINE = 'Sends crash and error reports to Sentry. Off by default.';
+
+/**
  * MR-808: "Delete Logs Now" asks first, and the confirmation says what goes
  * (`birdo.log` and the crash files, `utils::file_log` in Rust).
  */
@@ -387,11 +394,13 @@ export function Settings() {
             </>
           )}
           {/* Crash reports are OPT-IN (audit C-3). The dedicated command
-              persists the one field and applies it live in both directions. */}
+              persists the one field and applies it live in both directions.
+              One line under it, the owner's (2026-11-07), as on mobile. */}
           <SettingsToggle
             icon={Bug}
             iconColor={white.w60}
             title="Crash Reports"
+            warning={CRASH_REPORTS_LINE}
             checked={settings.crashReportsEnabled}
             onCheckedChange={handleCrashReports}
           />
