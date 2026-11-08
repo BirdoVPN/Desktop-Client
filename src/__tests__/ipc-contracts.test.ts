@@ -367,6 +367,7 @@ const FRONTEND_COMMANDS = [
   'login',
   'login_anonymous',
   'register_anonymous',
+  'cancel_signup_proof',
   'native_oauth_login',
   'logout',
   'get_auth_state',

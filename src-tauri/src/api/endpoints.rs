@@ -11,6 +11,8 @@ pub mod auth {
     /// fresh 24-digit ID and returns tokens (signed in immediately). Requires the
     /// X-Desktop-Client header (sent on all POSTs).
     pub const REGISTER_ANONYMOUS: &str = "/auth/register/anonymous";
+    /// Sign-up proof-of-work challenge (`{ "op": "signup" }`); see `api::pow`.
+    pub const POW_CHALLENGE: &str = "/auth/pow/challenge";
     /// Native SSO handoff exchange: swap the web broker's single-use PKCE-bound
     /// code (delivered to our loopback redirect) for real tokens.
     pub const NATIVE_EXCHANGE: &str = "/auth/native/exchange";

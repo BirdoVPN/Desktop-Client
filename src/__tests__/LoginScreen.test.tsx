@@ -4,7 +4,7 @@
  * Run: npx vitest run src/__tests__/LoginScreen.test.tsx
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { Login } from '@/components/Login';
@@ -13,6 +13,13 @@ import { SESSION_EXPIRED_COPY } from '@/lib/errors';
 
 vi.mock('@tauri-apps/api/core');
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn().mockResolvedValue(undefined) }));
+let proofProgress: ((e: { payload: number }) => void) | null = null;
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn(async (_name: string, cb: (e: { payload: number }) => void) => {
+    proofProgress = cb;
+    return () => {};
+  }),
+}));
 
 const mockedInvoke = vi.mocked(invoke);
 
@@ -105,6 +112,23 @@ describe('Creating an account (W2-027)', () => {
     finish({ success: true, user: { account_id: '123456789012345678901234' } });
     expect(await screen.findByText('1234 5678 9012 3456 7890 1234')).toBeInTheDocument();
     expect(screen.getByText('Save your account number')).toBeInTheDocument();
+  });
+
+  it('shows the device check while the proof of work runs, and can cancel it (MR-2152)', async () => {
+    let finish: (v: unknown) => void = () => {};
+    mockedInvoke.mockImplementation((cmd: string) =>
+      cmd === 'register_anonymous' ? new Promise((r) => (finish = r)) : Promise.resolve(undefined),
+    );
+    render(<Login />);
+    await userEvent.click(screen.getByRole('tab', { name: 'Anonymous' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Create a new anonymous account' }));
+    await vi.waitFor(() => expect(proofProgress).not.toBeNull());
+    act(() => proofProgress?.({ payload: 42 }));
+    expect(screen.getByRole('button', { name: /Checking this device… 42%/ })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(mockedInvoke).toHaveBeenCalledWith('cancel_signup_proof');
+    finish({ success: false, message: 'Cancelled', code: 'cancelled' });
+    expect(await screen.findByRole('button', { name: 'Create a new anonymous account' })).toBeInTheDocument();
   });
 
   it('the account number field groups digits in fours with spaces and sends digits only', async () => {
