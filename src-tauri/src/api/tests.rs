@@ -1313,8 +1313,11 @@ mod types_serialization_tests {
             device_type: "DESKTOP".to_string(),
             platform: "WINDOWS".to_string(),
             app_version: Some("1.4.18".to_string()),
+            pow: None,
         };
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        // No proof, no `pow` key: the server reads that as the legacy tier.
+        assert!(v.get("pow").is_none());
         assert_eq!(v["deviceId"], "dev-123");
         assert_eq!(v["deviceName"], "Birdo PC");
         assert_eq!(v["deviceType"], "DESKTOP");

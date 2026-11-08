@@ -327,6 +327,9 @@ impl IpcError {
             ApiError::CertificatePinningFailed(_) => {
                 Self::new(IpcErrorCode::CertPinFailed, error.to_string())
             }
+            // A sign-up proof of work the server refused twice: its sentence
+            // ("The security check expired. Please try again.") is the advice.
+            ApiError::PowRefused { message, .. } => Self::new(IpcErrorCode::ServerError, message),
             ApiError::Rejected { status, message } => Self::from_rejection(*status, message),
             ApiError::TwoFactorRequired(message) => {
                 Self::new(IpcErrorCode::TwoFactorRequired, message)

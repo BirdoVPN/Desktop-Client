@@ -83,6 +83,11 @@ pub enum ApiError {
     /// variant so it is not read as a plan refusal (a bare 403 is
     /// `subscription_required`). Carries the backend's sentence.
     ClientAttestationRequired(String),
+    /// A sign-up proof of work the server did not accept (`details.code`
+    /// `pow_invalid`, `pow_expired`, `pow_replayed`, `pow_difficulty_raised`
+    /// or `pow_required`). `api::pow::register_with_proof` fetches a new
+    /// challenge on most of them; the sentence is the backend's.
+    PowRefused { code: String, message: String },
     /// Unknown error
     Unknown(String),
 }
@@ -200,6 +205,7 @@ impl fmt::Display for ApiError {
             | ApiError::TwoFactorRequired(message)
             | ApiError::TwoFactorInvalid(message)
             | ApiError::RegistrationNotAllowed(message)
+            | ApiError::PowRefused { message, .. }
             | ApiError::ClientAttestationRequired(message) => write!(f, "{}", message),
             ApiError::QuotaCheckUnavailable { .. } => {
                 write!(f, "The data allowance check is unavailable right now")

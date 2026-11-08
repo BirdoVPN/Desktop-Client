@@ -11,7 +11,10 @@ use crate::commands::session::{end_session, EndReason};
 use crate::storage::CredentialStore;
 use crate::utils::redact_email;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, State};
 use zeroize::Zeroize;
 
 // FIX-2-5: Client-side rate limiting for login IPC command
@@ -812,6 +815,26 @@ impl Drop for AnonymousLoginCommandRequest {
     }
 }
 
+/// Event the sign-up proof of work reports its progress on: a percentage
+/// (0-99) while this device works a challenge out.
+const SIGNUP_PROOF_EVENT: &str = "signup-proof-progress";
+
+/// The running sign-up's cancel flag, for `cancel_signup_proof`.
+static SIGNUP_CANCEL: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
+/// Stop the device check of a sign-up in progress; the sign-up then ends as
+/// cancelled and sends nothing.
+#[tauri::command]
+pub fn cancel_signup_proof() {
+    if let Some(flag) = SIGNUP_CANCEL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        flag.store(true, Ordering::Release);
+    }
+}
+
 /// Create a BRAND-NEW anonymous account in-app and sign in.
 ///
 /// Desktop could previously only LOG IN to an existing 24-digit anonymous ID;
@@ -822,6 +845,7 @@ impl Drop for AnonymousLoginCommandRequest {
 /// surface it prominently ("save this") before proceeding.
 #[tauri::command]
 pub async fn register_anonymous(
+    app: AppHandle,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
 ) -> Result<LoginResponse, IpcError> {
@@ -851,11 +875,42 @@ pub async fn register_anonymous(
     let device_id = crate::utils::get_device_id();
     tracing::info!("Anonymous account creation requested");
 
-    match api
-        .register_anonymous(&device_id, Some(crate::commands::vpn::get_device_name()))
-        .await
-    {
-        Ok(result) if result.ok => {
+    // MR-2152: the sign-up proof of work. `cancel_signup_proof` sets this.
+    let cancel = Arc::new(AtomicBool::new(false));
+    *SIGNUP_CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cancel));
+    let on_progress: Arc<dyn Fn(u32, u64) + Send + Sync> = {
+        let app = app.clone();
+        let throttle = Mutex::new(crate::api::pow::Throttle::new(Duration::from_millis(250)));
+        Arc::new(move |bits, hashes| {
+            let first = hashes == 0;
+            if first || throttle.lock().unwrap_or_else(|e| e.into_inner()).ready() {
+                // Expected work is 2^bits hashes; 99 until the nonce is found.
+                let expected = 2f64.powi(bits as i32);
+                let percent = ((hashes as f64 / expected) * 100.0).min(99.0) as u32;
+                let _ = app.emit(SIGNUP_PROOF_EVENT, percent);
+            }
+        })
+    };
+    let outcome = api
+        .register_anonymous(
+            &device_id,
+            Some(crate::commands::vpn::get_device_name()),
+            cancel,
+            on_progress,
+        )
+        .await;
+    *SIGNUP_CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+    match outcome {
+        Ok(crate::api::pow::Registered::Cancelled) => Ok(LoginResponse {
+            success: false,
+            message: Some("Cancelled".to_string()),
+            user: None,
+            requires_two_factor: false,
+            challenge_token: None,
+            code: Some(IpcErrorCode::Cancelled),
+        }),
+        Ok(crate::api::pow::Registered::Done(result)) if result.ok => {
             if let Some(ref tokens) = result.tokens {
                 if let Err(e) =
                     credentials.store_tokens(&tokens.access_token, &tokens.refresh_token)
@@ -879,7 +934,7 @@ pub async fn register_anonymous(
                 code: None,
             })
         }
-        Ok(_) => Ok(LoginResponse {
+        Ok(crate::api::pow::Registered::Done(_)) => Ok(LoginResponse {
             success: false,
             message: Some("Could not create an anonymous account. Please try again.".to_string()),
             user: None,

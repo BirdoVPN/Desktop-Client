@@ -556,6 +556,10 @@ pub struct AnonymousRegisterRequest {
     pub platform: String,
     #[serde(rename = "appVersion", skip_serializing_if = "Option::is_none")]
     pub app_version: Option<String>,
+    /// A solved `signup` challenge (`api::pow`). Absent when none could be
+    /// had: the server then judges the request on its fallback tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow: Option<super::pow::PowSolution>,
 }
 
 /// Anonymous login response. Success = { ok, anonymousId, tokens }; accounts

@@ -1012,31 +1012,86 @@ impl BirdoApi {
     /// mints the 24-digit ID and returns tokens, so the app is signed in
     /// immediately — the no-email privacy path without a website round-trip.
     /// Requires the X-Desktop-Client header, which `do_request` adds to all POSTs.
+    ///
+    /// MR-2152: the server issues and checks a sign-up proof of work; without
+    /// one the account lands on its stricter "legacy" tier. The proof is
+    /// fetched, solved off the async threads and attached here (`api::pow`);
+    /// `Registered::Cancelled` when `cancel` was set meanwhile.
     pub async fn register_anonymous(
         &self,
         device_id: &str,
         device_name: Option<String>,
-    ) -> Result<AnonymousLoginResult, ApiError> {
-        let payload = crate::api::types::AnonymousRegisterRequest {
-            device_id: device_id.to_string(),
-            device_name,
-            device_type: "DESKTOP".to_string(),
-            // Shared with the login body via utils::device_platform so the two
-            // payloads can never label the same machine differently.
-            platform: crate::utils::device_platform().to_string(),
-            app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        };
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        on_progress: Arc<dyn Fn(u32, u64) + Send + Sync>,
+    ) -> Result<super::pow::Registered<AnonymousLoginResult>, ApiError> {
+        use super::pow;
+        let registered = pow::register_with_proof(
+            || self.fetch_signup_challenge(),
+            |c: pow::Challenge| {
+                let (cancel, on_progress) = (Arc::clone(&cancel), Arc::clone(&on_progress));
+                async move {
+                    on_progress(c.difficulty, 0);
+                    let token = c.challenge.clone();
+                    let bits = c.difficulty;
+                    let nonce = tokio::task::spawn_blocking(move || {
+                        pow::solve(&token, bits, pow::default_threads(), &cancel, |h| {
+                            on_progress(bits, h)
+                        })
+                    })
+                    .await
+                    .ok()?
+                    .ok()?;
+                    Some(pow::PowSolution {
+                        challenge: c.challenge,
+                        nonce,
+                    })
+                }
+            },
+            |proof| {
+                let payload = crate::api::types::AnonymousRegisterRequest {
+                    device_id: device_id.to_string(),
+                    device_name: device_name.clone(),
+                    device_type: "DESKTOP".to_string(),
+                    // Shared with the login body via utils::device_platform so the two
+                    // payloads can never label the same machine differently.
+                    platform: crate::utils::device_platform().to_string(),
+                    app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    pow: proof,
+                };
+                async move {
+                    self.post::<_, AnonymousLoginResult>(
+                        endpoints::auth::REGISTER_ANONYMOUS,
+                        &payload,
+                        false,
+                    )
+                    .await
+                }
+            },
+        )
+        .await?;
 
-        let result: AnonymousLoginResult = self
-            .post(endpoints::auth::REGISTER_ANONYMOUS, &payload, false)
-            .await?;
-
-        if let Some(ref tokens) = result.tokens {
-            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
-                .await;
+        if let pow::Registered::Done(ref result) = registered {
+            if let Some(ref tokens) = result.tokens {
+                self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                    .await;
+            }
         }
 
-        Ok(result)
+        Ok(registered)
+    }
+
+    /// `POST /auth/pow/challenge` for a sign-up. `None` for ANY failure (the
+    /// endpoint is down, rate limited, answered something else): the sign-up
+    /// then goes out without a proof and the server decides, as before.
+    async fn fetch_signup_challenge(&self) -> Option<super::pow::Challenge> {
+        self.post::<_, super::pow::Challenge>(
+            endpoints::auth::POW_CHALLENGE,
+            &serde_json::json!({ "op": "signup" }),
+            false,
+        )
+        .await
+        .inspect_err(|e| tracing::info!("Sign-up challenge not available ({e}); no proof sent"))
+        .ok()
     }
 
     // ========================================================================
@@ -1538,6 +1593,21 @@ impl BirdoApi {
         }
 
         // MR-1808: the waits the server names, by status — see the doc above.
+        // The sign-up proof of work (`details.code`, birdo-web
+        // `SignupPowService`): 400 invalid/expired, 409 replayed, 428 raised
+        // or required. `pow_rate_limited` is a 429 and stays RateLimited.
+        if let Some(code) = body
+            .as_ref()
+            .and_then(|b| b.details.as_ref())
+            .and_then(|d| d.get("code"))
+            .and_then(|c| c.as_str())
+            .filter(|c| super::pow::is_retryable_code(c) || *c == "pow_required")
+        {
+            return ApiError::PowRefused {
+                code: code.to_string(),
+                message: message().trim().to_string(),
+            };
+        }
         if status == StatusCode::TOO_MANY_REQUESTS {
             return ApiError::RateLimited {
                 retry_after_secs: retry_after,

@@ -6,6 +6,7 @@
     "allow-login",
     "allow-login-anonymous",
     "allow-register-anonymous",
+    "allow-cancel-signup-proof",
     "allow-native-oauth-login",
     "allow-logout",
     "allow-get-auth-state",
