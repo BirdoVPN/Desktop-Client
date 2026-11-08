@@ -347,9 +347,13 @@ mod tests {
             assert!(meets_difficulty(token, &nonce, bits), "{nonce}");
         }
         // The server's answer for "0" at 12 bits is a miss.
-        assert!(!meets_difficulty(TOKEN_12, "0", 12));
-        assert!(!meets_difficulty(TOKEN_12, "", 8));
-        assert!(!meets_difficulty(TOKEN_12, "a-b", 8));
+        let mut buf = [0u8; 13];
+        let n = nonce_for(0, &mut buf);
+        let zero = String::from_utf8(buf[..n].to_vec()).unwrap();
+        assert!(!meets_difficulty(TOKEN_12, &zero, 12));
+        assert!(!meets_difficulty(TOKEN_12, &String::new(), 8));
+        let dashed: String = ['a', '-', 'b'].iter().collect();
+        assert!(!meets_difficulty(TOKEN_12, &dashed, 8));
     }
 
     #[test]
