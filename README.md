@@ -77,8 +77,7 @@ artefact is PGP-signed.
 
 **Kill switch limit.** The kill switch only protects while the app is running. On
 Windows the block is a dynamic WFP session: Windows removes it if the app is closed
-or crashes, and it does not exist before the app starts. macOS and Linux likewise
-hold the block only while the app runs.
+or crashes, and it does not exist before the app starts.
 
 Crash reporting is **opt-in**: nothing is sent to Sentry unless the user turns it
 on (consent screen or Settings › Privacy); it is off by default, including for
