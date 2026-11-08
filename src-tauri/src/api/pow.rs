@@ -99,6 +99,8 @@ fn nonce_for(mut i: u64, buf: &mut [u8; 13]) -> usize {
 }
 
 /// Whether `nonce` solves `token` at `bits` (the server's `meetsDifficulty`).
+/// The tests' check: the solver's own loop is what runs in the app.
+#[cfg(test)]
 pub fn meets_difficulty(token: &str, nonce: &str, bits: u32) -> bool {
     if nonce.is_empty() || nonce.len() > 32 || !nonce.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return false;
