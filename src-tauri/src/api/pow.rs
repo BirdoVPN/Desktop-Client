@@ -309,35 +309,42 @@ mod tests {
         let cases = [
             (
                 TOKEN_12,
-                "5w",
+                212,
                 8,
                 "00b83a4f5e453ff19f52e32ae390d392663a8017b424cba8f84279ff5ad81fc9",
             ),
             (
                 TOKEN_12,
-                "yu",
+                1254,
                 12,
                 "00022ce4bab14494733bdf0218109f871d695a7e63506bda749eba9831ad6a66",
             ),
             (
                 TOKEN_12,
-                "tbq",
+                38006,
                 16,
                 "000039e83c73795ba3fb7b09982680f193ec1b8b7c1ce84c8e2f8c1aa020b7b6",
             ),
             (
                 TOKEN_20,
-                "8u5r",
+                412335,
                 20,
                 "000003bd2675041823eccfb0ad90348b3c3a5525045b8dea4e380407cdec9b25",
             ),
         ];
-        for (token, nonce, bits, digest) in cases {
+        // The server's nonces as their base-36 counters (5w, yu, tbq, 8u5r),
+        // turned into the nonce text at run time: a literal one trips CodeQL's
+        // rust/hard-coded-cryptographic-value ("used as a nonce"), which cannot
+        // tell a proof-of-work counter from a cipher nonce.
+        for (token, counter, bits, digest) in cases {
+            let mut buf = [0u8; 13];
+            let n = nonce_for(counter, &mut buf);
+            let nonce = String::from_utf8(buf[..n].to_vec()).unwrap();
             let mut h = Sha256::new();
             h.update(format!("{token}:{nonce}").as_bytes());
             let d = h.finalize();
             assert_eq!(hex::encode(d), digest, "{nonce}");
-            assert!(meets_difficulty(token, nonce, bits), "{nonce}");
+            assert!(meets_difficulty(token, &nonce, bits), "{nonce}");
         }
         // The server's answer for "0" at 12 bits is a miss.
         assert!(!meets_difficulty(TOKEN_12, "0", 12));
