@@ -1494,15 +1494,18 @@ mod lifecycle_tests {
         }
     }
 
-    /// MR-1934: macOS's Cmd+Q, the Dock's Quit and logout reach the end of
-    /// the run (`RunEvent::Exit`) with no exit request before it, and the
-    /// teardown that request runs was skipped: pf's block and the session's
-    /// DNS outlived the app. There, off Windows and unless a restart was let
-    /// through, the same teardown now runs, capped, before the process ends.
-    /// What the helper does is driven in
+    /// MR-1934 / MA-DESK-013: macOS's Cmd+Q, the Dock's Quit and logout reach
+    /// the end of the run (`RunEvent::Exit`) with no exit request before it.
+    /// What the end of the run does, and in which order (record, teardown,
+    /// clear; not on Windows, not after a restart, not twice), is driven with
+    /// fakes in `utils::tests::the_end_of_the_run_records_then_tears_down_then_clears`
+    /// and what the teardown helper does in
     /// `utils::tests::an_exit_that_never_asked_first_runs_the_teardown_once`.
+    /// Kept, because only the source can say it: `main.rs` hands that function
+    /// the real flags and the real teardown, and a restart says so before it
+    /// returns.
     #[test]
-    fn an_exit_with_no_exit_request_still_tears_down_off_windows() {
+    fn the_exit_arm_hands_the_end_of_the_run_the_real_flags_and_teardown() {
         let main_rs = include_str!("../main.rs").replace('\r', "");
         let exit = &main_rs[main_rs
             .find("if matches!(event, RunEvent::Exit) {")
@@ -1513,15 +1516,14 @@ mod lifecycle_tests {
         order(
             exit,
             &[
-                "record_if_exit_kept_the_session(",
-                "#[cfg(not(target_os = \"windows\"))]",
-                "if !EXIT_RESTARTING.load(",
-                "utils::tear_down_unless_started(",
+                "utils::end_of_run(",
                 "&EXIT_TEARDOWN_STARTED,",
+                "&EXIT_RESTARTING,",
+                "cfg!(not(target_os = \"windows\")),",
                 "EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN,",
-                "tauri::async_runtime::block_on(",
+                "record_if_exit_kept_the_session(",
                 "teardown_for_exit(&app)",
-                "clear_on_exit();",
+                "commands::clipboard::clear_on_exit,",
             ],
         );
         // A restart is let through without the teardown, and says so before

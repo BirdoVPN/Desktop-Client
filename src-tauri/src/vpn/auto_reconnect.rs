@@ -839,6 +839,10 @@ trait PathSignals {
     async fn send_health(&self) -> Option<super::wireguard_new::SendHealth>;
     async fn repath(&self, path: PhysicalRoute) -> Result<bool, String>;
     async fn peer_unresponsive(&self) -> bool;
+    /// A resume: what went unanswered before the sleep is forgotten.
+    async fn restart_response_watch(&self);
+    /// Ask the relay for a handshake now.
+    async fn force_handshake(&self);
 }
 
 #[cfg(target_os = "windows")]
@@ -862,6 +866,49 @@ impl PathSignals for VpnManager {
     async fn peer_unresponsive(&self) -> bool {
         VpnManager::peer_unresponsive(self).await
     }
+
+    async fn restart_response_watch(&self) {
+        VpnManager::restart_response_watch(self).await
+    }
+
+    async fn force_handshake(&self) {
+        VpnManager::force_handshake(self).await
+    }
+}
+
+/// W1-003 / interface loss (Windows): what a look does on finding the machine
+/// resumed since the last one, apart from `check_liveness` so a test can
+/// drive it with a fake tunnel. The path is to be re-proven now, not when the
+/// handshake goes stale; what went unanswered before the sleep says nothing
+/// about the path the machine woke on; the adapter may have been powered
+/// down with the machine, taking our routes and the socket's path with it, so
+/// unless this look already rebuilt it (`rebuilt`) it is rebuilt on the route
+/// the machine woke on (with none yet, the link's return does it); and the
+/// relay is asked for a handshake. `Err`: the rebuild failed, the caller
+/// re-dials (no handshake is asked of the path that was just given up).
+#[cfg(target_os = "windows")]
+async fn reprove_after_resume<S: PathSignals>(
+    signals: &S,
+    session: &mut SessionWatch,
+    route: Option<PhysicalRoute>,
+    rebuilt: &mut bool,
+    now: Instant,
+) -> Result<(), String> {
+    session.verify_since = Some(now);
+    signals.restart_response_watch().await;
+    if let (Some(path), false) = (route, *rebuilt) {
+        tracing::info!("Resumed — rebuilding the tunnel's path to the relay");
+        *rebuilt = true;
+        if let Err(e) = rebuild_path(signals, session, path, now).await {
+            tracing::warn!(
+                "Rebuilding the path to the relay failed ({}) — re-dialling",
+                e
+            );
+            return Err(e);
+        }
+    }
+    signals.force_handshake().await;
+    Ok(())
 }
 
 /// The rules that judge the packet path itself, in the order a look applies
@@ -1096,28 +1143,18 @@ impl ReconnectLoop {
         let resumes = network_events::resume_count();
         if resumes != session.resumes_seen {
             session.resumes_seen = resumes;
-            session.verify_since = Some(now);
-            // What went unanswered before the sleep says nothing about the
-            // path the machine woke on.
             #[cfg(target_os = "windows")]
-            vm.restart_response_watch().await;
-            // Interface loss: the adapter may have been powered down with the
-            // machine, taking our routes and the socket's path with it.
-            // Rebuild on the route it woke on; with none yet, the link's
-            // return does it.
-            #[cfg(target_os = "windows")]
-            if let (Some(path), false) = (route, rebuilt) {
-                tracing::info!("Resumed — rebuilding the tunnel's path to the relay");
-                rebuilt = true;
-                if let Err(e) = rebuild_path(vm.as_ref(), session, path, now).await {
-                    tracing::warn!(
-                        "Rebuilding the path to the relay failed ({}) — re-dialling",
-                        e
-                    );
-                    return Liveness::Dead(DropCause::PathChanged);
-                }
+            if reprove_after_resume(vm.as_ref(), session, route, &mut rebuilt, now)
+                .await
+                .is_err()
+            {
+                return Liveness::Dead(DropCause::PathChanged);
             }
-            vm.force_handshake().await;
+            #[cfg(not(target_os = "windows"))]
+            {
+                session.verify_since = Some(now);
+                vm.force_handshake().await;
+            }
         }
         // Wi-Fi re-associates for several seconds after a resume. The window
         // to prove the path opens when there is a path to prove, so a slow
@@ -2389,9 +2426,13 @@ mod tests {
         let body = &source[start..];
         let body = &body[..body.find("\n    }\n").unwrap()];
 
+        // The resume branch's own behaviour is driven in
+        // `packet_path_rule_tests::a_resume_re_proves_the_path_in_order`; this
+        // is only that the branch hands it to that function.
         let resume = &body[body.find("if resumes != session.resumes_seen {").unwrap()..];
-        let resume = &resume[..resume.find("vm.force_handshake().await;").unwrap()];
-        assert!(resume.contains("rebuild_path(vm.as_ref(), session, path, now).await"));
+        assert!(
+            resume.contains("reprove_after_resume(vm.as_ref(), session, route, &mut rebuilt, now)")
+        );
 
         let mut last = 0;
         for needle in [
@@ -2889,6 +2930,10 @@ mod packet_path_rule_tests {
         unresponsive: AtomicBool,
         sends: Mutex<SendHealth>,
         repaths: AtomicUsize,
+        /// What a resume did to the tunnel, in order.
+        calls: Mutex<Vec<&'static str>>,
+        /// `repath` fails.
+        repath_fails: AtomicBool,
     }
 
     impl Tunnel {
@@ -2913,11 +2958,23 @@ mod packet_path_rule_tests {
 
         async fn repath(&self, _path: PhysicalRoute) -> Result<bool, String> {
             self.repaths.fetch_add(1, Ordering::SeqCst);
+            self.calls.lock().unwrap().push("repath");
+            if self.repath_fails.load(Ordering::SeqCst) {
+                return Err("adapter gone".into());
+            }
             Ok(true)
         }
 
         async fn peer_unresponsive(&self) -> bool {
             self.unresponsive.load(Ordering::SeqCst)
+        }
+
+        async fn restart_response_watch(&self) {
+            self.calls.lock().unwrap().push("restart_response_watch");
+        }
+
+        async fn force_handshake(&self) {
+            self.calls.lock().unwrap().push("force_handshake");
         }
     }
 
@@ -2933,6 +2990,78 @@ mod packet_path_rule_tests {
         link: LinkState,
     ) -> Option<Liveness> {
         judge_packet_path(tunnel, session, Some(ROUTE), link, false, tunnel.now()).await
+    }
+
+    /// W1-003 / interface loss (MA-DESK-013): on a resume the window to prove
+    /// the path opens, the unanswered run before the sleep is forgotten, the
+    /// path is rebuilt on the route the machine woke on (once per look, and
+    /// not when there is no route yet), and only then is a handshake asked
+    /// for; a rebuild that fails gives the path up and asks for none.
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_re_proves_the_path_in_order() {
+        let now = Instant::now();
+
+        // The usual resume: a route, nothing rebuilt yet this look.
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch {
+            heartbeat_misses: 4,
+            ..SessionWatch::default()
+        };
+        let mut rebuilt = false;
+        let verdict =
+            reprove_after_resume(&tunnel, &mut session, Some(ROUTE), &mut rebuilt, now).await;
+        assert_eq!(verdict, Ok(()));
+        assert_eq!(
+            *tunnel.calls.lock().unwrap(),
+            ["restart_response_watch", "repath", "force_handshake"]
+        );
+        assert!(rebuilt, "the look does not know it rebuilt the path");
+        assert_eq!(session.verify_since, Some(now), "no window to prove it in");
+        assert_eq!(
+            session.heartbeat_misses, 0,
+            "the outage's missed heartbeats were kept"
+        );
+
+        // The roam already rebuilt it this look: no second rebuild.
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch::default();
+        let mut rebuilt = true;
+        let verdict =
+            reprove_after_resume(&tunnel, &mut session, Some(ROUTE), &mut rebuilt, now).await;
+        assert_eq!(verdict, Ok(()));
+        assert_eq!(
+            *tunnel.calls.lock().unwrap(),
+            ["restart_response_watch", "force_handshake"]
+        );
+        assert_eq!(session.verify_since, Some(now));
+
+        // No route yet (Wi-Fi still associating): nothing to rebuild on; the
+        // link's return does it. The window still opens.
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch::default();
+        let mut rebuilt = false;
+        let verdict = reprove_after_resume(&tunnel, &mut session, None, &mut rebuilt, now).await;
+        assert_eq!(verdict, Ok(()));
+        assert_eq!(
+            *tunnel.calls.lock().unwrap(),
+            ["restart_response_watch", "force_handshake"]
+        );
+        assert!(!rebuilt);
+        assert_eq!(session.verify_since, Some(now));
+
+        // The rebuild fails: re-dial, and no handshake is asked of the path
+        // just given up.
+        let tunnel = Tunnel::default();
+        tunnel.repath_fails.store(true, Ordering::SeqCst);
+        let mut session = SessionWatch::default();
+        let mut rebuilt = false;
+        let verdict =
+            reprove_after_resume(&tunnel, &mut session, Some(ROUTE), &mut rebuilt, now).await;
+        assert_eq!(verdict, Err("adapter gone".to_string()));
+        assert_eq!(
+            *tunnel.calls.lock().unwrap(),
+            ["restart_response_watch", "repath"]
+        );
     }
 
     const STALLED: Option<Liveness> = Some(Liveness::Dead(DropCause::PacketPathStalled));

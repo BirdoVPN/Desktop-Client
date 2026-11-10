@@ -233,6 +233,35 @@ pub fn tear_down_unless_started(
     Some(run_on_helper_for("birdo-exit-teardown", limit, teardown))
 }
 
+/// The end of the run (`RunEvent::Exit`), in its order, apart from `main.rs`
+/// so a test can drive it with fakes (MA-DESK-013): first `record` whether
+/// the exit teardown had `started` (MR-1861: an exit that kept the session
+/// leaves it for the next version to resume), read BEFORE the teardown below
+/// claims the flag; then, when `tears_down` (not on Windows) and no restart
+/// was let through (`restarting`), the teardown for an exit that never asked
+/// first ([`tear_down_unless_started`], at most `limit`); and last `clear`
+/// (MR-2013: the clipboard), which runs whatever the teardown did, however
+/// long it took. Returns what [`tear_down_unless_started`] returned, `None`
+/// when it was not run.
+pub fn end_of_run(
+    started: &std::sync::atomic::AtomicBool,
+    restarting: &std::sync::atomic::AtomicBool,
+    tears_down: bool,
+    limit: std::time::Duration,
+    record: impl FnOnce(bool),
+    teardown: impl FnOnce() + Send + 'static,
+    clear: impl FnOnce(),
+) -> Option<bool> {
+    record(started.load(std::sync::atomic::Ordering::SeqCst));
+    let ran = if tears_down && !restarting.load(std::sync::atomic::Ordering::SeqCst) {
+        tear_down_unless_started(started, limit, teardown)
+    } else {
+        None
+    };
+    clear();
+    ran
+}
+
 /// This install's device identifier: a random `desktop_<uuid-v4>`, persisted
 /// per install and rotated on account deletion (not on sign-out). See
 /// `utils::device_id` for why it is no longer derived from the machine.
@@ -557,6 +586,76 @@ mod bounded_process_tests {
             "the exit waited on the teardown"
         );
         drop(held);
+    }
+
+    /// MR-1934 / MR-1861 / MR-2013 (MA-DESK-013): the end of the run records
+    /// whether the exit had already started, THEN runs the teardown (once,
+    /// unless it started, a restart was let through, or this is Windows), and
+    /// clears the clipboard last, whatever the teardown did. Driven with fakes
+    /// through the function `main.rs` calls.
+    #[test]
+    fn the_end_of_the_run_records_then_tears_down_then_clears() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let run = |started: bool, restarting: bool, tears_down: bool, wedged: bool| {
+            let started = AtomicBool::new(started);
+            let restarting = AtomicBool::new(restarting);
+            let log = Arc::new(Mutex::new(Vec::<String>::new()));
+            let (record_log, teardown_log, clear_log) =
+                (Arc::clone(&log), Arc::clone(&log), Arc::clone(&log));
+            let wedge = Arc::new(Mutex::new(()));
+            let held = wedge.lock().unwrap();
+            let wanted = Arc::clone(&wedge);
+            let ran = super::end_of_run(
+                &started,
+                &restarting,
+                tears_down,
+                Duration::from_millis(if wedged { 100 } else { 5_000 }),
+                move |kept| record_log.lock().unwrap().push(format!("record({kept})")),
+                move || {
+                    teardown_log.lock().unwrap().push("teardown".into());
+                    if wedged {
+                        let _stuck = wanted.lock();
+                    }
+                },
+                move || clear_log.lock().unwrap().push("clear".into()),
+            );
+            drop(held);
+            let log = log.lock().unwrap().clone();
+            (ran, log, started.load(Ordering::SeqCst))
+        };
+
+        // macOS Cmd+Q: nothing asked first. The record sees the flag BEFORE
+        // the teardown claims it, then the teardown, then the clear.
+        let (ran, log, claimed) = run(false, false, true, false);
+        assert_eq!(ran, Some(true));
+        assert_eq!(log, ["record(false)", "teardown", "clear"]);
+        assert!(claimed);
+
+        // The held exit already ran the teardown: recorded as such, not run
+        // again, still cleared.
+        let (ran, log, _) = run(true, false, true, false);
+        assert_eq!(ran, None);
+        assert_eq!(log, ["record(true)", "clear"]);
+
+        // A restart was let through without the teardown, by design.
+        let (ran, log, claimed) = run(false, true, true, false);
+        assert_eq!(ran, None);
+        assert_eq!(log, ["record(false)", "clear"]);
+        assert!(!claimed, "a restart claimed the teardown");
+
+        // Windows: the exit keeps the session for the next version.
+        let (ran, log, claimed) = run(false, false, false, false);
+        assert_eq!(ran, None);
+        assert_eq!(log, ["record(false)", "clear"]);
+        assert!(!claimed);
+
+        // A wedged teardown costs the limit; the clear still runs after it.
+        let (ran, log, _) = run(false, false, true, true);
+        assert_eq!(ran, Some(false));
+        assert_eq!(log, ["record(false)", "teardown", "clear"]);
     }
 }
 

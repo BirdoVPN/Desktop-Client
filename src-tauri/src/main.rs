@@ -897,10 +897,6 @@ fn main() {
             // for the next version to resume. Not on macOS, where Cmd+Q and
             // the Dock's Quit come this way too (commands::update_resume).
             if matches!(event, RunEvent::Exit) {
-                commands::update_resume::record_if_exit_kept_the_session(
-                    app_handle,
-                    EXIT_TEARDOWN_STARTED.load(std::sync::atomic::Ordering::SeqCst),
-                );
                 // MR-1934: macOS's Cmd+Q, the Dock's Quit and logout come
                 // here with no ExitRequested before them (tao's
                 // applicationWillTerminate), so the teardown below never ran
@@ -913,33 +909,42 @@ fn main() {
                 // shutdown, whose live session the next version resumes
                 // (MR-1861), and the WFP block goes with the process anyway.
                 // Not after a restart was let through (no teardown, by design).
-                #[cfg(not(target_os = "windows"))]
-                if !EXIT_RESTARTING.load(std::sync::atomic::Ordering::SeqCst) {
-                    let app = app_handle.clone();
-                    let ran = utils::tear_down_unless_started(
-                        &EXIT_TEARDOWN_STARTED,
-                        EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN,
-                        move || {
-                            tauri::async_runtime::block_on(async move {
-                                if tokio::time::timeout(EXIT_TEARDOWN_CAP, teardown_for_exit(&app))
-                                    .await
-                                    .is_err()
-                                {
-                                    error!("Exit teardown timed out — exiting anyway");
-                                }
-                            });
-                        },
+                //
+                // The order (record, teardown, clear) and the three
+                // conditions are `utils::end_of_run`, driven in
+                // `utils::tests::the_end_of_the_run_records_then_tears_down_then_clears`.
+                let app = app_handle.clone();
+                let ran = utils::end_of_run(
+                    &EXIT_TEARDOWN_STARTED,
+                    &EXIT_RESTARTING,
+                    cfg!(not(target_os = "windows")),
+                    EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN,
+                    |started| {
+                        commands::update_resume::record_if_exit_kept_the_session(
+                            app_handle, started,
+                        )
+                    },
+                    move || {
+                        tauri::async_runtime::block_on(async move {
+                            if tokio::time::timeout(EXIT_TEARDOWN_CAP, teardown_for_exit(&app))
+                                .await
+                                .is_err()
+                            {
+                                error!("Exit teardown timed out — exiting anyway");
+                            }
+                        });
+                    },
+                    // MR-2013: a copied account number whose one-minute clear
+                    // has not run yet would outlive the process on the
+                    // clipboard.
+                    commands::clipboard::clear_on_exit,
+                );
+                if let Some(finished) = ran {
+                    info!(
+                        "Exit with no exit request — the teardown ran first (finished: {})",
+                        finished
                     );
-                    if let Some(finished) = ran {
-                        info!(
-                            "Exit with no exit request — the teardown ran first (finished: {})",
-                            finished
-                        );
-                    }
                 }
-                // MR-2013: a copied account number whose one-minute clear has
-                // not run yet would outlive the process on the clipboard.
-                commands::clipboard::clear_on_exit();
             }
             if let RunEvent::ExitRequested { code, api, .. } = &event {
                 // A restart (`plugin-process` relaunch: the frontend's
