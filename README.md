@@ -69,9 +69,15 @@ vault, never in the repo.
 What is signed, today: Windows tag builds are Authenticode-signed (Azure Trusted
 Signing) and every release's artefacts are listed in one `SHA256SUMS.txt` that carries a
 Sigstore (cosign keyless) signature ([verify a download](docs/VERIFICATION.md)).
-The **macOS** Tauri build is **not** Developer-ID signed or notarised — there is no
-Apple Developer account, so `release.yml` always builds it unsigned. No release
+The **macOS** desktop build (the DMG) is **not** Developer-ID signed or notarised:
+`release.yml` always builds it unsigned. (BirdoVPN does have an Apple Developer
+account, used for the iOS app on the App Store and the Mac App Store app, which is
+not yet on sale; neither changes how this DMG is built.) No release
 artefact is PGP-signed.
+
+**Kill switch limit.** The kill switch only protects while the app is running. On
+Windows the block is a dynamic WFP session: Windows removes it if the app is closed
+or crashes, and it does not exist before the app starts.
 
 Crash reporting is **opt-in**: nothing is sent to Sentry unless the user turns it
 on (consent screen or Settings › Privacy); it is off by default, including for
