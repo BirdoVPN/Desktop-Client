@@ -30,9 +30,18 @@
 //! Windows 10). There is no per-session loop to start or stop, so nothing can
 //! be duplicated.
 //!
-//! Linux reads `/proc/net/route` (a file read, zero packets) when asked and has
-//! no event source yet; macOS has neither yet and reports `Unknown`, which the
-//! reconnect engine treats as online (the handshake decides).
+//! Linux reads `/proc/net/route` (a file read, zero packets) when asked;
+//! macOS reports `Unknown`, which the reconnect engine treats as online (the
+//! handshake decides).
+//!
+//! Events (Linux, macOS; MA-DESK-010): see `os_events`. An rtnetlink (Linux) or
+//! `PF_ROUTE` (macOS) socket reports default-route changes, and a clock-gap
+//! detector reports a resume, through the same channel and counter as the
+//! Windows callbacks. Worst case without them was the liveness tick plus the
+//! handshake; with them a change or a wake is seen within about a second
+//! (debounce) and a resume within [`os_events::CLOCK_POLL`].
+
+mod os_events;
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -214,6 +223,21 @@ fn parse_proc_net_route(table: &str) -> Option<(Ipv4Addr, String)> {
 pub fn start() {
     #[cfg(target_os = "windows")]
     windows_events::start();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    os_events::start(publish_unix_burst);
+}
+
+/// One debounced burst from the Linux / macOS sources: count a resume, wake
+/// every subscriber.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_unix_burst(resumed: bool) {
+    if resumed {
+        RESUMES.fetch_add(1, Ordering::SeqCst);
+        tracing::info!("System resumed — the tunnel will be re-verified");
+    } else {
+        tracing::debug!("Default route changed");
+    }
+    events().send_modify(|n| *n = n.wrapping_add(1));
 }
 
 #[cfg(target_os = "windows")]
