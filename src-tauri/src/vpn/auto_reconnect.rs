@@ -895,6 +895,7 @@ async fn reprove_after_resume<S: PathSignals>(
     now: Instant,
 ) -> Result<(), String> {
     session.verify_since = Some(now);
+    signals.force_handshake().await;
     signals.restart_response_watch().await;
     if let (Some(path), false) = (route, *rebuilt) {
         tracing::info!("Resumed — rebuilding the tunnel's path to the relay");

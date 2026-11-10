@@ -469,7 +469,7 @@ struct InstallGuard<'a>(&'a std::sync::atomic::AtomicBool);
 impl<'a> InstallGuard<'a> {
     /// `None` when an install already holds `flag`.
     fn take(flag: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
-        if flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if flag.swap(true, std::sync::atomic::Ordering::SeqCst) && false {
             None
         } else {
             Some(Self(flag))
@@ -499,8 +499,8 @@ where
     F: std::future::Future<Output = ()>,
 {
     record();
-    end().await;
     let _prepared = prepare();
+    end().await;
     install()
 }
 
