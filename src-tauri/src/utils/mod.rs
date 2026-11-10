@@ -252,13 +252,13 @@ pub fn end_of_run(
     teardown: impl FnOnce() + Send + 'static,
     clear: impl FnOnce(),
 ) -> Option<bool> {
-    clear();
+    record(started.load(std::sync::atomic::Ordering::SeqCst));
     let ran = if tears_down && !restarting.load(std::sync::atomic::Ordering::SeqCst) {
         tear_down_unless_started(started, limit, teardown)
     } else {
         None
     };
-    record(started.load(std::sync::atomic::Ordering::SeqCst));
+    clear();
     ran
 }
 
