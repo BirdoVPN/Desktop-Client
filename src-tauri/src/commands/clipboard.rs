@@ -717,7 +717,7 @@ mod tests {
             .expect("the Exit arm")..];
         let exit = &exit[..exit.find("\n            }").unwrap()];
         assert!(
-            exit.contains("commands::clipboard::clear_on_exit();"),
+            exit.contains("commands::clipboard::clear_on_exit,"),
             "RunEvent::Exit"
         );
         let fallback = &main[main
