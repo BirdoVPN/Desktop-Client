@@ -162,8 +162,42 @@ pub(super) fn netlink_default_route_change(buf: &[u8], ignore_oif: u32) -> bool 
     false
 }
 
-/// STUB (test-first commit): not implemented yet.
-pub(super) fn netlink_link_or_addr_change(_buf: &[u8], _ignore_ifindex: u32) -> bool {
+/// Whether a datagram from the link or IPv4-address group reports a link
+/// going up or down, or an IPv4 address being added or removed, on any
+/// interface other than `ignore_ifindex` (our own tunnel; 0 ignores nothing).
+/// A dropped link does not always produce an RTM_DELROUTE, so these count as
+/// a network change too. A truncated or malformed message reads as "no".
+pub(super) fn netlink_link_or_addr_change(buf: &[u8], ignore_ifindex: u32) -> bool {
+    let mut at = 0usize;
+    while at + NLMSG_HDRLEN <= buf.len() {
+        let Some(len) = read_u32(buf, at).map(|l| l as usize) else {
+            return false;
+        };
+        let Some(kind) = read_u16(buf, at + 4) else {
+            return false;
+        };
+        if len < NLMSG_HDRLEN || at + len > buf.len() {
+            return false;
+        }
+        if kind == NLMSG_DONE || kind == NLMSG_ERROR {
+            return false;
+        }
+        let body = &buf[at + NLMSG_HDRLEN..at + len];
+        let hit = match kind {
+            RTM_NEWLINK | RTM_DELLINK => body.len() >= IFINFOMSG_LEN,
+            RTM_NEWADDR | RTM_DELADDR => {
+                body.len() >= IFADDRMSG_LEN && body[0] == AF_INET_FAMILY
+            }
+            _ => false,
+        };
+        if hit {
+            let index = read_u32(body, IF_INDEX_AT).unwrap_or(0);
+            if !(ignore_ifindex != 0 && index == ignore_ifindex) {
+                return true;
+            }
+        }
+        at += align4(len);
+    }
     false
 }
 
@@ -378,7 +412,11 @@ fn tunnel_ifindex() -> u32 {
 fn route_loop(tx: mpsc::Sender<Event>) {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    /// RTMGRP_IPV4_ROUTE
+    /// RTMGRP_LINK, RTMGRP_IPV4_IFADDR and RTMGRP_IPV4_ROUTE. A dropped link
+    /// does not always produce an RTM_DELROUTE, so link and address changes
+    /// are heard too (MR-688).
+    const RTMGRP_LINK: u32 = 0x1;
+    const RTMGRP_IPV4_IFADDR: u32 = 0x10;
     const RTMGRP_IPV4_ROUTE: u32 = 0x40;
     const ENOBUFS: i32 = 105;
 
@@ -403,7 +441,7 @@ fn route_loop(tx: mpsc::Sender<Event>) {
     // SAFETY: an all-zero sockaddr_nl is a valid value for every field.
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    addr.nl_groups = RTMGRP_IPV4_ROUTE;
+    addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE;
     // SAFETY: `addr` is a valid sockaddr_nl and the length is its size.
     let rc = unsafe {
         libc::bind(
@@ -448,7 +486,8 @@ fn route_loop(tx: mpsc::Sender<Event>) {
         let len = usize::try_from(n).unwrap_or(0).min(buf.len());
         // Our own tunnel interface is never "the network".
         let tunnel = tunnel_ifindex();
-        if netlink_default_route_change(&buf[..len], tunnel)
+        if (netlink_default_route_change(&buf[..len], tunnel)
+            || netlink_link_or_addr_change(&buf[..len], tunnel))
             && tx.send(Event::RouteChanged).is_err()
         {
             return;
