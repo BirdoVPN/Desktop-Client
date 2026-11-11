@@ -744,9 +744,7 @@ mod tests {
             body.extend_from_slice(&((4 + v.len()) as u16).to_ne_bytes());
             body.extend_from_slice(&t.to_ne_bytes());
             body.extend_from_slice(v);
-            while body.len() % 4 != 0 {
-                body.push(0);
-            }
+            body.resize(align4(body.len()), 0);
         }
         let mut msg = Vec::new();
         msg.extend_from_slice(&((NLMSG_HDRLEN + body.len()) as u32).to_ne_bytes());
