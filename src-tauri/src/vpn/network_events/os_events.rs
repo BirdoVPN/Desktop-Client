@@ -102,6 +102,10 @@ impl SuspendDetector {
 
 const RTM_NEWROUTE: u16 = 24;
 const RTM_DELROUTE: u16 = 25;
+const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
+const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const AF_INET_FAMILY: u8 = 2;
@@ -111,6 +115,18 @@ const RTA_TABLE: u16 = 15;
 /// sizeof(struct nlmsghdr) and sizeof(struct rtmsg).
 const NLMSG_HDRLEN: usize = 16;
 const RTMSG_LEN: usize = 12;
+/// sizeof(struct ifinfomsg) and sizeof(struct ifaddrmsg); both carry the
+/// interface index as a u32 at offset 4.
+const IFINFOMSG_LEN: usize = 16;
+const IFADDRMSG_LEN: usize = 8;
+const IF_INDEX_AT: usize = 4;
+/// Offset of `ifi_change` in `ifinfomsg`: the mask of flag bits that changed.
+const IF_CHANGE_AT: usize = 12;
+const IFF_UP: u32 = 0x1;
+const IFF_RUNNING: u32 = 0x40;
+const IFF_LOWER_UP: u32 = 0x1_0000;
+/// Link attribute carrying a wireless-extension event (scan, roam, ...).
+const IFLA_WIRELESS: u16 = 11;
 
 fn align4(n: usize) -> usize {
     (n + 3) & !3
@@ -151,6 +167,79 @@ pub(super) fn netlink_default_route_change(buf: &[u8], ignore_oif: u32) -> bool 
         at += align4(len);
     }
     false
+}
+
+/// Whether a datagram from the link or IPv4-address group reports a link
+/// going up or down, or an IPv4 address being added or removed, on any
+/// interface other than `ignore_ifindex` (our own tunnel; 0 ignores nothing).
+/// A dropped link does not always produce an RTM_DELROUTE, so these count as
+/// a network change too. A truncated or malformed message reads as "no".
+pub(super) fn netlink_link_or_addr_change(buf: &[u8], ignore_ifindex: u32) -> bool {
+    let mut at = 0usize;
+    while at + NLMSG_HDRLEN <= buf.len() {
+        let Some(len) = read_u32(buf, at).map(|l| l as usize) else {
+            return false;
+        };
+        let Some(kind) = read_u16(buf, at + 4) else {
+            return false;
+        };
+        if len < NLMSG_HDRLEN || at + len > buf.len() {
+            return false;
+        }
+        if kind == NLMSG_DONE || kind == NLMSG_ERROR {
+            return false;
+        }
+        let body = &buf[at + NLMSG_HDRLEN..at + len];
+        let hit = match kind {
+            // A link going away always counts. RTM_NEWLINK is also sent for
+            // MTU, queue, statistics and Wi-Fi (IFLA_WIRELESS) updates, which
+            // must not wake the tunnel; only a change of the up/running
+            // state does (a new link reports ifi_change = 0xFFFFFFFF).
+            RTM_DELLINK => body.len() >= IFINFOMSG_LEN,
+            RTM_NEWLINK => link_state_changed(body),
+            RTM_NEWADDR | RTM_DELADDR => body.len() >= IFADDRMSG_LEN && body[0] == AF_INET_FAMILY,
+            _ => false,
+        };
+        if hit {
+            let index = read_u32(body, IF_INDEX_AT).unwrap_or(0);
+            if !(ignore_ifindex != 0 && index == ignore_ifindex) {
+                return true;
+            }
+        }
+        at += align4(len);
+    }
+    false
+}
+
+/// `body` is the `struct ifinfomsg` and its attributes: whether the up or
+/// running state changed and the message is not a wireless-extension event.
+/// A truncated attribute list reads as "no".
+fn link_state_changed(body: &[u8]) -> bool {
+    if body.len() < IFINFOMSG_LEN {
+        return false;
+    }
+    let Some(change) = read_u32(body, IF_CHANGE_AT) else {
+        return false;
+    };
+    if change & (IFF_UP | IFF_RUNNING | IFF_LOWER_UP) == 0 {
+        return false;
+    }
+    let mut at = IFINFOMSG_LEN;
+    while at + 4 <= body.len() {
+        let (Some(alen), Some(atype)) = (read_u16(body, at), read_u16(body, at + 2)) else {
+            return false;
+        };
+        let alen = usize::from(alen);
+        if alen < 4 || at + alen > body.len() {
+            return false;
+        }
+        // The type's nested/byte-order flag bits are masked off.
+        if atype & 0x3fff == IFLA_WIRELESS {
+            return false;
+        }
+        at += align4(alen);
+    }
+    true
 }
 
 /// `body` is the `struct rtmsg` and its attributes.
@@ -364,7 +453,11 @@ fn tunnel_ifindex() -> u32 {
 fn route_loop(tx: mpsc::Sender<Event>) {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    /// RTMGRP_IPV4_ROUTE
+    /// RTMGRP_LINK, RTMGRP_IPV4_IFADDR and RTMGRP_IPV4_ROUTE. A dropped link
+    /// does not always produce an RTM_DELROUTE, so link and address changes
+    /// are heard too (MR-688).
+    const RTMGRP_LINK: u32 = 0x1;
+    const RTMGRP_IPV4_IFADDR: u32 = 0x10;
     const RTMGRP_IPV4_ROUTE: u32 = 0x40;
     const ENOBUFS: i32 = 105;
 
@@ -389,7 +482,7 @@ fn route_loop(tx: mpsc::Sender<Event>) {
     // SAFETY: an all-zero sockaddr_nl is a valid value for every field.
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    addr.nl_groups = RTMGRP_IPV4_ROUTE;
+    addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE;
     // SAFETY: `addr` is a valid sockaddr_nl and the length is its size.
     let rc = unsafe {
         libc::bind(
@@ -434,7 +527,8 @@ fn route_loop(tx: mpsc::Sender<Event>) {
         let len = usize::try_from(n).unwrap_or(0).min(buf.len());
         // Our own tunnel interface is never "the network".
         let tunnel = tunnel_ifindex();
-        if netlink_default_route_change(&buf[..len], tunnel)
+        if (netlink_default_route_change(&buf[..len], tunnel)
+            || netlink_link_or_addr_change(&buf[..len], tunnel))
             && tx.send(Event::RouteChanged).is_err()
         {
             return;
@@ -587,6 +681,143 @@ mod tests {
             &nl_route(RTM_NEWROUTE, 2, 0, 254, &[(RTA_TABLE, 1000)]),
             0
         ));
+    }
+
+    /// One rtnetlink link (`ifinfomsg`) or address (`ifaddrmsg`) message.
+    fn nl_if(kind: u16, family: u8, index: u32) -> Vec<u8> {
+        let body_len = if kind == RTM_NEWLINK || kind == RTM_DELLINK {
+            IFINFOMSG_LEN
+        } else {
+            IFADDRMSG_LEN
+        };
+        let mut body = vec![0u8; body_len];
+        body[0] = family;
+        body[IF_INDEX_AT..IF_INDEX_AT + 4].copy_from_slice(&index.to_ne_bytes());
+        if kind == RTM_NEWLINK {
+            // A new link: every flag reads as changed.
+            body[IF_CHANGE_AT..IF_CHANGE_AT + 4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        }
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&((NLMSG_HDRLEN + body.len()) as u32).to_ne_bytes());
+        msg.extend_from_slice(&kind.to_ne_bytes());
+        msg.extend_from_slice(&[0u8; 10]);
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    #[test]
+    fn netlink_link_and_address_events_are_recognised() {
+        for kind in [RTM_NEWLINK, RTM_DELLINK] {
+            assert!(netlink_link_or_addr_change(&nl_if(kind, 0, 3), 0));
+            assert!(netlink_link_or_addr_change(&nl_if(kind, 10, 3), 0));
+        }
+        for kind in [RTM_NEWADDR, RTM_DELADDR] {
+            assert!(netlink_link_or_addr_change(&nl_if(kind, 2, 3), 0));
+            // IPv6 addresses are not watched (the route watcher is IPv4 only).
+            assert!(!netlink_link_or_addr_change(&nl_if(kind, 10, 3), 0));
+        }
+    }
+
+    #[test]
+    fn netlink_link_and_address_ignore_unrelated_and_our_tunnel() {
+        // Route messages and other kinds are not link/address changes.
+        assert!(!netlink_link_or_addr_change(
+            &nl_route(RTM_NEWROUTE, 2, 0, 254, &[(RTA_OIF, 3)]),
+            0
+        ));
+        assert!(!netlink_link_or_addr_change(&nl_if(18, 0, 3), 0));
+        assert!(!netlink_link_or_addr_change(&nl_if(NLMSG_DONE, 0, 3), 0));
+        // Our own tunnel interface is never "the network".
+        assert!(!netlink_link_or_addr_change(&nl_if(RTM_NEWLINK, 0, 9), 9));
+        assert!(!netlink_link_or_addr_change(&nl_if(RTM_NEWADDR, 2, 9), 9));
+        assert!(netlink_link_or_addr_change(&nl_if(RTM_NEWLINK, 0, 9), 3));
+        // Route and link messages do not cross over.
+        assert!(!netlink_default_route_change(&nl_if(RTM_NEWLINK, 0, 3), 0));
+    }
+
+    /// An RTM_NEWLINK with the given `ifi_change` and raw rtattrs.
+    fn nl_newlink(change: u32, attrs: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut body = vec![0u8; IFINFOMSG_LEN];
+        body[IF_INDEX_AT..IF_INDEX_AT + 4].copy_from_slice(&3u32.to_ne_bytes());
+        body[IF_CHANGE_AT..IF_CHANGE_AT + 4].copy_from_slice(&change.to_ne_bytes());
+        for (t, v) in attrs {
+            body.extend_from_slice(&((4 + v.len()) as u16).to_ne_bytes());
+            body.extend_from_slice(&t.to_ne_bytes());
+            body.extend_from_slice(v);
+            body.resize(align4(body.len()), 0);
+        }
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&((NLMSG_HDRLEN + body.len()) as u32).to_ne_bytes());
+        msg.extend_from_slice(&RTM_NEWLINK.to_ne_bytes());
+        msg.extend_from_slice(&[0u8; 10]);
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    #[test]
+    fn only_a_link_state_change_counts_for_newlink() {
+        // Up, running and lower-up bits each count.
+        for bit in [IFF_UP, IFF_RUNNING, IFF_LOWER_UP] {
+            assert!(netlink_link_or_addr_change(&nl_newlink(bit, &[]), 0));
+        }
+        // A new link reports every bit as changed.
+        assert!(netlink_link_or_addr_change(&nl_newlink(u32::MAX, &[]), 0));
+        // An attribute-only update (MTU, queue, stats) or an unrelated flag.
+        assert!(!netlink_link_or_addr_change(&nl_newlink(0, &[]), 0));
+        assert!(!netlink_link_or_addr_change(
+            &nl_newlink(0x2, &[(4, &[0u8; 4])]),
+            0
+        ));
+        // A wireless-extension event is skipped even with state bits set.
+        assert!(!netlink_link_or_addr_change(
+            &nl_newlink(IFF_RUNNING, &[(IFLA_WIRELESS, &[0u8; 8])]),
+            0
+        ));
+        assert!(!netlink_link_or_addr_change(
+            &nl_newlink(u32::MAX, &[(IFLA_WIRELESS, &[0u8; 8])]),
+            0
+        ));
+        // Other attributes alongside a state change are fine.
+        assert!(netlink_link_or_addr_change(
+            &nl_newlink(IFF_RUNNING, &[(4, &[0u8; 4])]),
+            0
+        ));
+        // DELLINK always counts.
+        assert!(netlink_link_or_addr_change(&nl_if(RTM_DELLINK, 0, 3), 0));
+        // A truncated attribute walk is "no", without a panic.
+        let mut cut = nl_newlink(IFF_RUNNING, &[(4, &[0u8; 8])]);
+        cut.truncate(cut.len() - 3);
+        let len = cut.len() as u32;
+        cut[..4].copy_from_slice(&len.to_ne_bytes());
+        assert!(!netlink_link_or_addr_change(&cut, 0));
+        let mut lying = nl_newlink(IFF_RUNNING, &[(4, &[0u8; 4])]);
+        let at = NLMSG_HDRLEN + IFINFOMSG_LEN;
+        lying[at..at + 2].copy_from_slice(&200u16.to_ne_bytes());
+        assert!(!netlink_link_or_addr_change(&lying, 0));
+        let mut tiny = nl_newlink(IFF_RUNNING, &[(4, &[0u8; 4])]);
+        tiny[at..at + 2].copy_from_slice(&2u16.to_ne_bytes());
+        assert!(!netlink_link_or_addr_change(&tiny, 0));
+    }
+
+    #[test]
+    fn netlink_link_and_address_garbage_is_safe() {
+        assert!(!netlink_link_or_addr_change(&[], 0));
+        assert!(!netlink_link_or_addr_change(&[1, 2, 3], 0));
+        let mut cut = nl_if(RTM_DELLINK, 0, 3);
+        cut.truncate(cut.len() - 3);
+        assert!(!netlink_link_or_addr_change(&cut, 0));
+        // A short body (shorter than ifinfomsg) is not a link message.
+        let mut short = nl_if(RTM_NEWLINK, 0, 3);
+        short.truncate(NLMSG_HDRLEN + IFADDRMSG_LEN);
+        short[..4].copy_from_slice(&((NLMSG_HDRLEN + IFADDRMSG_LEN) as u32).to_ne_bytes());
+        assert!(!netlink_link_or_addr_change(&short, 0));
+        let mut lying = nl_if(RTM_NEWADDR, 2, 3);
+        lying[..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(!netlink_link_or_addr_change(&lying, 0));
+        // A second message in the datagram is still found.
+        let mut dgram = nl_if(18, 0, 3);
+        dgram.extend(nl_if(RTM_DELADDR, 2, 4));
+        assert!(netlink_link_or_addr_change(&dgram, 0));
     }
 
     #[test]
