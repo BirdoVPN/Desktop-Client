@@ -846,12 +846,15 @@ pub fn cancel_signup_proof() {
     }
 }
 
+/// Progress reporter of a proof of work: (difficulty bits, hashes done).
+type ProofProgress = Arc<dyn Fn(u32, u64) + Send + Sync>;
+
 /// The cancel flag and the progress reporter of one proof of work. The flag is
 /// registered for `cancel_signup_proof`; call `end_proof` when the request ends.
-fn begin_proof(app: &AppHandle) -> (Arc<AtomicBool>, Arc<dyn Fn(u32, u64) + Send + Sync>) {
+fn begin_proof(app: &AppHandle) -> (Arc<AtomicBool>, ProofProgress) {
     let cancel = Arc::new(AtomicBool::new(false));
     *SIGNUP_CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cancel));
-    let on_progress: Arc<dyn Fn(u32, u64) + Send + Sync> = {
+    let on_progress: ProofProgress = {
         let app = app.clone();
         let throttle = Mutex::new(crate::api::pow::Throttle::new(Duration::from_millis(250)));
         Arc::new(move |bits, hashes| {
