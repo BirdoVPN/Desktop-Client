@@ -377,6 +377,10 @@ pub struct LoginRequest {
     platform: String,
     #[serde(rename = "appVersion")]
     app_version: String,
+    /// A solved `login` challenge (`api::pow`), only on the one retry the
+    /// server asked for with 429 `pow_required` (A-M77 / MR-2139).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pow: Option<super::pow::PowSolution>,
 }
 
 /// Clamp a device label to what DeviceInfoSchema accepts: 1..=`max` characters.
@@ -409,7 +413,15 @@ impl LoginRequest {
             device_type: "DESKTOP".to_string(),
             platform: crate::utils::device_platform().to_string(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
+            pow: None,
         }
+    }
+
+    /// Attach the solved `login` challenge of the one retry a 429
+    /// `pow_required` asked for (A-M77 / MR-2139).
+    pub fn with_pow(mut self, pow: Option<super::pow::PowSolution>) -> Self {
+        self.pow = pow;
+        self
     }
 }
 
@@ -519,6 +531,9 @@ pub struct AnonymousLoginRequest {
     pub password: Option<String>,
     #[serde(rename = "deviceId")]
     pub device_id: String,
+    /// A solved `login` challenge, only on the retry a 429 `pow_required` asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow: Option<super::pow::PowSolution>,
 }
 
 /// Per-user monthly bandwidth usage + cap (backend GET /vpn/stats), for the
