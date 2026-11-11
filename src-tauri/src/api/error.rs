@@ -83,11 +83,18 @@ pub enum ApiError {
     /// variant so it is not read as a plan refusal (a bare 403 is
     /// `subscription_required`). Carries the backend's sentence.
     ClientAttestationRequired(String),
-    /// A sign-up proof of work the server did not accept (`details.code`
+    /// A proof of work (sign-up, or sign-in during a spike) the server did not accept (`details.code`
     /// `pow_invalid`, `pow_expired`, `pow_replayed`, `pow_difficulty_raised`
     /// or `pow_required`). `api::pow::register_with_proof` fetches a new
     /// challenge on most of them; the sentence is the backend's.
-    PowRefused { code: String, message: String },
+    PowRefused {
+        code: String,
+        message: String,
+        /// `details.pow.op` when the server names one (`login` or `signup`):
+        /// the operation a challenge must be fetched for. `None` when the
+        /// refusal carries no `pow` member (`pow_rate_limited`, old servers).
+        pow_op: Option<String>,
+    },
     /// Unknown error
     Unknown(String),
 }

@@ -447,26 +447,44 @@ impl BirdoApi {
     /// Login with email and password (desktop endpoint)
     /// FIX C-2: Returns LoginResult which may be either Success (with tokens)
     /// or TwoFactorChallenge (requiring TOTP code submission).
-    pub async fn login(&self, email: &str, password: &str) -> Result<LoginResult, ApiError> {
+    ///
+    /// A-M77 / MR-2139: during a failed-sign-in spike the server may answer
+    /// 429 `pow_required` for the `login` operation; the request is then sent
+    /// once more with a proof (`pow::login_with_proof`). `Cancelled` when
+    /// `cancel` was set while the proof was being worked out.
+    pub async fn login(
+        &self,
+        email: &str,
+        password: &str,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        on_progress: Arc<dyn Fn(u32, u64) + Send + Sync>,
+    ) -> Result<super::pow::Registered<LoginResult>, ApiError> {
         // LoginRequest::new attaches this installation's stable deviceId (plus
         // the device descriptors). Without it the backend could never honour a
         // trusted-device 2FA skip, and its User-Agent-derived fallback id
         // changed on every app update, spawning a duplicate device row each
         // release. See the type's doc comment.
-        let payload = LoginRequest::new(email, password);
-
-        // Use desktop-specific endpoint that returns tokens in body
-        let result: LoginResult = self
-            .post(endpoints::auth::LOGIN_DESKTOP, &payload, false)
-            .await?;
+        let registered = super::pow::login_with_proof(
+            |proof| {
+                let payload = LoginRequest::new(email, password).with_pow(proof);
+                async move {
+                    // Use desktop-specific endpoint that returns tokens in body
+                    self.post::<_, LoginResult>(endpoints::auth::LOGIN_DESKTOP, &payload, false)
+                        .await
+                }
+            },
+            || self.fetch_login_challenge(),
+            |c| Self::solve_challenge(c, cancel, on_progress),
+        )
+        .await?;
 
         // Only store tokens if login succeeded (not 2FA challenge)
-        if let LoginResult::Success { ref tokens, .. } = result {
+        if let super::pow::Registered::Done(LoginResult::Success { ref tokens, .. }) = registered {
             self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
                 .await;
         }
 
-        Ok(result)
+        Ok(registered)
     }
 
     /// Native SSO handoff exchange. Swaps the web broker's single-use, PKCE-bound
@@ -984,28 +1002,47 @@ impl BirdoApi {
 
     /// Login to an EXISTING anonymous account by its 24-digit ID (+ optional
     /// password set on the website). The endpoint never creates accounts.
+    ///
+    /// A-M77 / MR-2139: like `login`, a 429 `pow_required` for the `login`
+    /// operation gets one retry with a solved proof.
     pub async fn login_anonymous(
         &self,
         anonymous_id: &str,
         password: Option<String>,
         device_id: &str,
-    ) -> Result<AnonymousLoginResult, ApiError> {
-        let payload = AnonymousLoginRequest {
-            anonymous_id: anonymous_id.to_string(),
-            password,
-            device_id: device_id.to_string(),
-        };
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        on_progress: Arc<dyn Fn(u32, u64) + Send + Sync>,
+    ) -> Result<super::pow::Registered<AnonymousLoginResult>, ApiError> {
+        let registered = super::pow::login_with_proof(
+            |proof| {
+                let payload = AnonymousLoginRequest {
+                    anonymous_id: anonymous_id.to_string(),
+                    password: password.clone(),
+                    device_id: device_id.to_string(),
+                    pow: proof,
+                };
+                async move {
+                    self.post::<_, AnonymousLoginResult>(
+                        endpoints::auth::LOGIN_ANONYMOUS,
+                        &payload,
+                        false,
+                    )
+                    .await
+                }
+            },
+            || self.fetch_login_challenge(),
+            |c| Self::solve_challenge(c, cancel, on_progress),
+        )
+        .await?;
 
-        let result: AnonymousLoginResult = self
-            .post(endpoints::auth::LOGIN_ANONYMOUS, &payload, false)
-            .await?;
-
-        if let Some(ref tokens) = result.tokens {
-            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
-                .await;
+        if let super::pow::Registered::Done(ref result) = registered {
+            if let Some(ref tokens) = result.tokens {
+                self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                    .await;
+            }
         }
 
-        Ok(result)
+        Ok(registered)
     }
 
     /// Create a BRAND-NEW anonymous account in-app (native clients). The server
@@ -1028,24 +1065,7 @@ impl BirdoApi {
         let registered = pow::register_with_proof(
             || self.fetch_signup_challenge(),
             |c: pow::Challenge| {
-                let (cancel, on_progress) = (Arc::clone(&cancel), Arc::clone(&on_progress));
-                async move {
-                    on_progress(c.difficulty, 0);
-                    let token = c.challenge.clone();
-                    let bits = c.difficulty;
-                    let nonce = tokio::task::spawn_blocking(move || {
-                        pow::solve(&token, bits, pow::default_threads(), &cancel, |h| {
-                            on_progress(bits, h)
-                        })
-                    })
-                    .await
-                    .ok()?
-                    .ok()?;
-                    Some(pow::PowSolution {
-                        challenge: c.challenge,
-                        nonce,
-                    })
-                }
+                Self::solve_challenge(c, Arc::clone(&cancel), Arc::clone(&on_progress))
             },
             |proof| {
                 let payload = crate::api::types::AnonymousRegisterRequest {
@@ -1084,14 +1104,50 @@ impl BirdoApi {
     /// endpoint is down, rate limited, answered something else): the sign-up
     /// then goes out without a proof and the server decides, as before.
     async fn fetch_signup_challenge(&self) -> Option<super::pow::Challenge> {
+        self.fetch_challenge("signup").await
+    }
+
+    /// `POST /auth/pow/challenge` for a sign-in (A-M77 / MR-2139), asked for
+    /// only after a 429 `pow_required` naming the `login` operation. The
+    /// endpoint is the fixed one: a path from a response body is not followed.
+    async fn fetch_login_challenge(&self) -> Option<super::pow::Challenge> {
+        self.fetch_challenge(super::pow::LOGIN_OP).await
+    }
+
+    async fn fetch_challenge(&self, op: &str) -> Option<super::pow::Challenge> {
         self.post::<_, super::pow::Challenge>(
             endpoints::auth::POW_CHALLENGE,
-            &serde_json::json!({ "op": "signup" }),
+            &serde_json::json!({ "op": op }),
             false,
         )
         .await
-        .inspect_err(|e| tracing::info!("Sign-up challenge not available ({e}); no proof sent"))
+        .inspect_err(|e| tracing::info!("{op} challenge not available ({e}); no proof sent"))
         .ok()
+    }
+
+    /// Work a challenge out off the async threads, reporting progress and
+    /// honouring `cancel` (`None` is a cancel). One solver for every operation.
+    async fn solve_challenge(
+        c: super::pow::Challenge,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        on_progress: Arc<dyn Fn(u32, u64) + Send + Sync>,
+    ) -> Option<super::pow::PowSolution> {
+        use super::pow;
+        on_progress(c.difficulty, 0);
+        let token = c.challenge.clone();
+        let bits = c.difficulty;
+        let nonce = tokio::task::spawn_blocking(move || {
+            pow::solve(&token, bits, pow::default_threads(), &cancel, |h| {
+                on_progress(bits, h)
+            })
+        })
+        .await
+        .ok()?
+        .ok()?;
+        Some(pow::PowSolution {
+            challenge: c.challenge,
+            nonce,
+        })
     }
 
     // ========================================================================
@@ -1606,6 +1662,13 @@ impl BirdoApi {
             return ApiError::PowRefused {
                 code: code.to_string(),
                 message: message().trim().to_string(),
+                pow_op: body
+                    .as_ref()
+                    .and_then(|b| b.details.as_ref())
+                    .and_then(|d| d.get("pow"))
+                    .and_then(|p| p.get("op"))
+                    .and_then(|o| o.as_str())
+                    .map(str::to_string),
             };
         }
         if status == StatusCode::TOO_MANY_REQUESTS {

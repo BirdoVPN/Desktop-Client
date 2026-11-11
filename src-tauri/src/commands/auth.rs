@@ -164,6 +164,7 @@ pub struct UserInfo {
 /// Login with email and password
 #[tauri::command]
 pub async fn login(
+    app: AppHandle,
     request: LoginRequest,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
@@ -211,8 +212,16 @@ pub async fn login(
 
     tracing::info!("Login attempt for: {}", redact_email(&request.email));
 
-    match api.login(&request.email, &request.password).await {
-        Ok(result) => match result {
+    // A-M77 / MR-2139: during a failed-sign-in spike the server may ask for a
+    // proof of work, solved once and sent once (`api::pow::login_with_proof`).
+    let (cancel, on_progress) = begin_proof(&app);
+    let outcome = api
+        .login(&request.email, &request.password, cancel, on_progress)
+        .await;
+    end_proof();
+    match outcome {
+        Ok(crate::api::pow::Registered::Cancelled) => Ok(cancelled_response()),
+        Ok(crate::api::pow::Registered::Done(result)) => match result {
             LoginResult::Success { tokens, .. } => {
                 // Store tokens in Windows Credential Manager for persistence
                 if let Err(e) =
@@ -815,8 +824,10 @@ impl Drop for AnonymousLoginCommandRequest {
     }
 }
 
-/// Event the sign-up proof of work reports its progress on: a percentage
-/// (0-99) while this device works a challenge out.
+/// Event the proof of work reports its progress on: a percentage (0-99) while
+/// this device works a challenge out. Sign-up (MR-2152) and, during a
+/// failed-sign-in spike, sign-in (A-M77 / MR-2139) share it, and so share
+/// `cancel_signup_proof`: only one of them runs at a time.
 const SIGNUP_PROOF_EVENT: &str = "signup-proof-progress";
 
 /// The running sign-up's cancel flag, for `cancel_signup_proof`.
@@ -832,6 +843,47 @@ pub fn cancel_signup_proof() {
         .as_ref()
     {
         flag.store(true, Ordering::Release);
+    }
+}
+
+/// Progress reporter of a proof of work: (difficulty bits, hashes done).
+type ProofProgress = Arc<dyn Fn(u32, u64) + Send + Sync>;
+
+/// The cancel flag and the progress reporter of one proof of work. The flag is
+/// registered for `cancel_signup_proof`; call `end_proof` when the request ends.
+fn begin_proof(app: &AppHandle) -> (Arc<AtomicBool>, ProofProgress) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    *SIGNUP_CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cancel));
+    let on_progress: ProofProgress = {
+        let app = app.clone();
+        let throttle = Mutex::new(crate::api::pow::Throttle::new(Duration::from_millis(250)));
+        Arc::new(move |bits, hashes| {
+            let first = hashes == 0;
+            if first || throttle.lock().unwrap_or_else(|e| e.into_inner()).ready() {
+                // Expected work is 2^bits hashes; 99 until the nonce is found.
+                let expected = 2f64.powi(bits as i32);
+                let percent = ((hashes as f64 / expected) * 100.0).min(99.0) as u32;
+                let _ = app.emit(SIGNUP_PROOF_EVENT, percent);
+            }
+        })
+    };
+    (cancel, on_progress)
+}
+
+fn end_proof() {
+    *SIGNUP_CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// The answer to a sign-in or sign-up the user cancelled while the proof of
+/// work ran: nothing was sent after the cancel.
+fn cancelled_response() -> LoginResponse {
+    LoginResponse {
+        success: false,
+        message: Some("Cancelled".to_string()),
+        user: None,
+        requires_two_factor: false,
+        challenge_token: None,
+        code: Some(IpcErrorCode::Cancelled),
     }
 }
 
@@ -876,21 +928,7 @@ pub async fn register_anonymous(
     tracing::info!("Anonymous account creation requested");
 
     // MR-2152: the sign-up proof of work. `cancel_signup_proof` sets this.
-    let cancel = Arc::new(AtomicBool::new(false));
-    *SIGNUP_CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cancel));
-    let on_progress: Arc<dyn Fn(u32, u64) + Send + Sync> = {
-        let app = app.clone();
-        let throttle = Mutex::new(crate::api::pow::Throttle::new(Duration::from_millis(250)));
-        Arc::new(move |bits, hashes| {
-            let first = hashes == 0;
-            if first || throttle.lock().unwrap_or_else(|e| e.into_inner()).ready() {
-                // Expected work is 2^bits hashes; 99 until the nonce is found.
-                let expected = 2f64.powi(bits as i32);
-                let percent = ((hashes as f64 / expected) * 100.0).min(99.0) as u32;
-                let _ = app.emit(SIGNUP_PROOF_EVENT, percent);
-            }
-        })
-    };
+    let (cancel, on_progress) = begin_proof(&app);
     let outcome = api
         .register_anonymous(
             &device_id,
@@ -899,17 +937,10 @@ pub async fn register_anonymous(
             on_progress,
         )
         .await;
-    *SIGNUP_CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    end_proof();
 
     match outcome {
-        Ok(crate::api::pow::Registered::Cancelled) => Ok(LoginResponse {
-            success: false,
-            message: Some("Cancelled".to_string()),
-            user: None,
-            requires_two_factor: false,
-            challenge_token: None,
-            code: Some(IpcErrorCode::Cancelled),
-        }),
+        Ok(crate::api::pow::Registered::Cancelled) => Ok(cancelled_response()),
         Ok(crate::api::pow::Registered::Done(result)) if result.ok => {
             if let Some(ref tokens) = result.tokens {
                 if let Err(e) =
@@ -959,6 +990,7 @@ pub async fn register_anonymous(
 /// Login to an existing anonymous account with its 24-digit ID
 #[tauri::command]
 pub async fn login_anonymous(
+    app: AppHandle,
     request: AnonymousLoginCommandRequest,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
@@ -1007,11 +1039,21 @@ pub async fn login_anonymous(
     let device_id = crate::utils::get_device_id();
     tracing::info!("Anonymous login attempt");
 
-    match api
-        .login_anonymous(&anonymous_id, request.password.clone(), &device_id)
-        .await
-    {
-        Ok(result) => {
+    // A-M77 / MR-2139: the spike-time proof of work, as in `login`.
+    let (cancel, on_progress) = begin_proof(&app);
+    let outcome = api
+        .login_anonymous(
+            &anonymous_id,
+            request.password.clone(),
+            &device_id,
+            cancel,
+            on_progress,
+        )
+        .await;
+    end_proof();
+    match outcome {
+        Ok(crate::api::pow::Registered::Cancelled) => Ok(cancelled_response()),
+        Ok(crate::api::pow::Registered::Done(result)) => {
             if result.requires_two_factor {
                 tracing::info!("Anonymous login requires 2FA");
                 return Ok(LoginResponse {

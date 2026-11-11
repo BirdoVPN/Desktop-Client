@@ -1,4 +1,5 @@
-//! Sign-up proof-of-work solver (register item A-H11 / MR-2152).
+//! Proof-of-work solver for sign-up (register item A-H11 / MR-2152) and, during
+//! a failed-sign-in spike, sign-in (A-M77 / MR-2139).
 //!
 //! The server (birdo-web `backend/src/auth/signup-pow.ts`, contract in
 //! `docs/SIGNUP-PROOF-OF-WORK.md`) issues a signed challenge at
@@ -268,6 +269,59 @@ where
     }
 }
 
+/// `pow.op` of a sign-in refusal that asks for a proof.
+pub const LOGIN_OP: &str = "login";
+
+/// 429 `pow_required` whose `pow.op` is `login`: the one refusal a sign-in
+/// answers with a proof of work.
+fn is_login_pow_required(e: &ApiError) -> bool {
+    matches!(
+        e,
+        ApiError::PowRefused { code, pow_op: Some(op), .. }
+            if code == "pow_required" && op == LOGIN_OP
+    )
+}
+
+/// A sign-in request that is sent once WITHOUT a proof and, only when the
+/// server answers 429 `pow_required` for the `login` operation (a failed
+/// sign-in spike, birdo-web `LoginAbuseService.admit`), once more WITH one.
+///
+///  * `send` is the sign-in request, with the proof or without.
+///  * `fetch` asks for a `login` challenge (`None` when it cannot be had).
+///  * `solve_one` works it out (`None` is a cancel).
+///
+/// Never more than one retry: a second refusal, whatever it says, is the
+/// answer. Nothing is solved for any other error, for a `pow_required` that
+/// names another operation or none, or for a challenge this build should not
+/// solve (the original refusal is then the answer).
+pub async fn login_with_proof<T, F, FFut, S, SFut, R, RFut>(
+    mut send: R,
+    fetch: F,
+    solve_one: S,
+) -> Result<Registered<T>, ApiError>
+where
+    F: FnOnce() -> FFut,
+    FFut: Future<Output = Option<Challenge>>,
+    S: FnOnce(Challenge) -> SFut,
+    SFut: Future<Output = Option<PowSolution>>,
+    R: FnMut(Option<PowSolution>) -> RFut,
+    RFut: Future<Output = Result<T, ApiError>>,
+{
+    match send(None).await {
+        Err(refusal) if is_login_pow_required(&refusal) => {
+            let challenge = match fetch().await {
+                Some(c) if c.solvable() => c,
+                _ => return Err(refusal),
+            };
+            match solve_one(challenge).await {
+                Some(proof) => send(Some(proof)).await.map(Registered::Done),
+                None => Ok(Registered::Cancelled),
+            }
+        }
+        other => other.map(Registered::Done),
+    }
+}
+
 /// Wall-clock helper for the caller's progress events: at most one per
 /// `every`.
 pub struct Throttle {
@@ -439,6 +493,7 @@ mod tests {
         ApiError::PowRefused {
             code: code.into(),
             message: "refused".into(),
+            pow_op: None,
         }
     }
 
@@ -592,7 +647,9 @@ mod tests {
                 &body(status, code),
             );
             match e {
-                ApiError::PowRefused { code: got, message } => {
+                ApiError::PowRefused {
+                    code: got, message, ..
+                } => {
                     assert_eq!(got, code);
                     assert!(message.starts_with("The security check"));
                 }
@@ -605,6 +662,256 @@ mod tests {
             &body(429, "pow_rate_limited"),
         );
         assert!(matches!(e, ApiError::RateLimited { .. }), "{e:?}");
+    }
+
+    // ---- sign-in during a spike (A-M77 / MR-2139) -------------------------
+
+    // Vectors from the SERVER's own code, like the sign-up ones above:
+    // birdo-web origin/main, backend/src/auth/signup-pow.ts compiled and run
+    // under node: mintPowToken(key of a test-only secret, 'login', bits, fixed
+    // time and id), solvePow for the nonce, powDigest for the digest,
+    // parsePowToken accepting each as op `login`.
+    const LOGIN_TOKEN_8: &str = "p1.7f386f0d.login.8.1800000000.00112233445566778899aabbccddeeff.Gfoljd9Ww43uMw5hpkBNr2An9STpqSYJ2Hnlc5i-5Is";
+    const LOGIN_TOKEN_12: &str = "p1.7f386f0d.login.12.1800000000.00112233445566778899aabbccddeeff.uzPNudqEP3ETCZQrBjWZGyxE4pCxo9X508ma6BGIxYA";
+    const LOGIN_TOKEN_16: &str = "p1.7f386f0d.login.16.1800000000.00112233445566778899aabbccddeeff.U3WUdfGStXSHBuaTSNGYsd8xEgYbwS1-qswaNsieWVk";
+
+    #[test]
+    fn the_solver_matches_the_servers_login_challenges() {
+        // The server's nonces are the base-36 counters 100, 5280 and 254282
+        // (see the sign-up test for why they are not literals).
+        let never = AtomicBool::new(false);
+        for (token, bits, counter, digest) in [
+            (
+                LOGIN_TOKEN_8,
+                8,
+                100u64,
+                "000f1d00ae40e44661710c5571d460c633457e289be052afb6eb8c09cb307e3c",
+            ),
+            (
+                LOGIN_TOKEN_12,
+                12,
+                5280,
+                "0000bf9e8d08ce6e71fdb0890b8431e8c7a11e86677710ce44b07b4a478155e1",
+            ),
+            (
+                LOGIN_TOKEN_16,
+                16,
+                254_282,
+                "00004ff5903c46e393a9ec3ae7578474503b68a6c63fe513b83dce38a44b79e0",
+            ),
+        ] {
+            let mut buf = [0u8; 13];
+            let n = nonce_for(counter, &mut buf);
+            let want = String::from_utf8(buf[..n].to_vec()).unwrap();
+            let mut h = Sha256::new();
+            h.update(format!("{token}:{want}").as_bytes());
+            assert_eq!(hex::encode(h.finalize()), digest, "{want}");
+            // The solver, op-blind, finds the very nonce the server's solvePow does.
+            assert_eq!(solve(token, bits, 1, &never, |_| {}).unwrap(), want);
+            assert!(meets_difficulty(token, &want, bits));
+        }
+    }
+
+    fn login_refused(code: &str, op: Option<&str>) -> ApiError {
+        ApiError::PowRefused {
+            code: code.into(),
+            message: "refused".into(),
+            pow_op: op.map(str::to_string),
+        }
+    }
+
+    struct LoginHarness {
+        fetched: Cell<u32>,
+        solved: Cell<u32>,
+        sent: RefCell<Vec<Option<PowSolution>>>,
+    }
+
+    impl LoginHarness {
+        fn new() -> Self {
+            Self {
+                fetched: Cell::new(0),
+                solved: Cell::new(0),
+                sent: RefCell::new(Vec::new()),
+            }
+        }
+        async fn run(
+            &self,
+            answers: Vec<Result<&'static str, ApiError>>,
+            challenge: Option<Challenge>,
+            cancel: bool,
+        ) -> Result<Registered<&'static str>, ApiError> {
+            let answers = RefCell::new(answers.into_iter());
+            login_with_proof(
+                |p| {
+                    self.sent.borrow_mut().push(p);
+                    let next = answers.borrow_mut().next().expect("one answer per send");
+                    async move { next }
+                },
+                || async {
+                    self.fetched.set(self.fetched.get() + 1);
+                    challenge
+                },
+                |c: Challenge| async move {
+                    self.solved.set(self.solved.get() + 1);
+                    if cancel {
+                        return None;
+                    }
+                    let never = AtomicBool::new(false);
+                    let nonce = solve(&c.challenge, c.difficulty, 1, &never, |_| {}).ok()?;
+                    Some(PowSolution {
+                        challenge: c.challenge,
+                        nonce,
+                    })
+                },
+            )
+            .await
+        }
+    }
+
+    fn login_challenge() -> Challenge {
+        Challenge {
+            algorithm: POW_ALGORITHM.into(),
+            challenge: LOGIN_TOKEN_8.into(),
+            difficulty: 8,
+        }
+    }
+
+    #[test]
+    fn a_login_spike_refusal_is_solved_and_retried_once_with_the_proof() {
+        let h = LoginHarness::new();
+        let r = block(h.run(
+            vec![
+                Err(login_refused("pow_required", Some("login"))),
+                Ok("signed in"),
+            ],
+            Some(login_challenge()),
+            false,
+        ))
+        .unwrap();
+        assert!(matches!(r, Registered::Done("signed in")));
+        assert_eq!((h.fetched.get(), h.solved.get()), (1, 1));
+        let sent = h.sent.borrow();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].is_none(), "the first try carries no proof");
+        let p = sent[1].as_ref().expect("the retry carries the proof");
+        assert_eq!(p.challenge, LOGIN_TOKEN_8);
+        assert!(meets_difficulty(&p.challenge, &p.nonce, 8));
+    }
+
+    #[test]
+    fn a_second_refusal_is_the_answer_and_nothing_loops() {
+        for second in [
+            login_refused("pow_required", Some("login")),
+            login_refused("pow_replayed", Some("login")),
+            login_refused("pow_expired", Some("login")),
+            login_refused("pow_invalid", Some("login")),
+        ] {
+            let h = LoginHarness::new();
+            let r = block(h.run(
+                vec![
+                    Err(login_refused("pow_required", Some("login"))),
+                    Err(second),
+                ],
+                Some(login_challenge()),
+                false,
+            ));
+            assert!(matches!(r, Err(ApiError::PowRefused { .. })));
+            assert_eq!(h.sent.borrow().len(), 2, "exactly one retry");
+            assert_eq!((h.fetched.get(), h.solved.get()), (1, 1));
+            let proofs = h.sent.borrow().iter().filter(|p| p.is_some()).count();
+            assert_eq!(proofs, 1, "pow is in the body exactly once");
+        }
+    }
+
+    #[test]
+    fn nothing_is_solved_unless_it_is_a_login_pow_required() {
+        let cases = [
+            // a sign-up proof, no pow member, a different op
+            login_refused("pow_required", Some("signup")),
+            login_refused("pow_required", None),
+            login_refused("pow_required", Some("other")),
+            // not pow_required at all
+            login_refused("pow_invalid", Some("login")),
+            login_refused("pow_expired", Some("login")),
+            ApiError::RateLimited {
+                retry_after_secs: Some(5),
+            },
+            ApiError::Unauthorized,
+        ];
+        for first in cases {
+            let h = LoginHarness::new();
+            let r = block(h.run(vec![Err(first)], Some(login_challenge()), false));
+            assert!(r.is_err());
+            assert_eq!(h.sent.borrow().len(), 1);
+            assert_eq!((h.fetched.get(), h.solved.get()), (0, 0));
+        }
+    }
+
+    #[test]
+    fn a_success_sends_once_without_a_proof() {
+        let h = LoginHarness::new();
+        let r = block(h.run(vec![Ok("signed in")], Some(login_challenge()), false)).unwrap();
+        assert!(matches!(r, Registered::Done("signed in")));
+        assert!(h.sent.borrow()[0].is_none());
+        assert_eq!((h.fetched.get(), h.solved.get()), (0, 0));
+    }
+
+    #[test]
+    fn no_usable_challenge_leaves_the_refusal_as_it_was() {
+        let too_hard = Challenge {
+            difficulty: 33,
+            ..login_challenge()
+        };
+        for challenge in [None, Some(too_hard)] {
+            let h = LoginHarness::new();
+            let r = block(h.run(
+                vec![Err(login_refused("pow_required", Some("login")))],
+                challenge,
+                false,
+            ));
+            assert!(matches!(r, Err(ApiError::PowRefused { .. })));
+            assert_eq!(h.sent.borrow().len(), 1);
+            assert_eq!(h.solved.get(), 0);
+        }
+    }
+
+    #[test]
+    fn a_cancel_while_solving_a_login_proof_sends_nothing_more() {
+        let h = LoginHarness::new();
+        let r = block(h.run(
+            vec![Err(login_refused("pow_required", Some("login")))],
+            Some(login_challenge()),
+            true,
+        ))
+        .unwrap();
+        assert!(matches!(r, Registered::Cancelled));
+        assert_eq!(h.sent.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_wire_envelope_names_the_login_op() {
+        use crate::api::client::BirdoApi;
+        use reqwest::StatusCode;
+        // GlobalExceptionFilter puts refusal()'s `details` on the wire as is.
+        let spike = r#"{"statusCode":429,"message":"Too many sign-in attempts right now, please try again later","error":"Too Many Requests","details":{"code":"pow_required","retryAfter":900,"pow":{"op":"login","challengePath":"/auth/pow/challenge"}}}"#;
+        match BirdoApi::classify_error_response(StatusCode::TOO_MANY_REQUESTS, spike) {
+            ApiError::PowRefused { code, pow_op, .. } => {
+                assert_eq!(code, "pow_required");
+                assert_eq!(pow_op.as_deref(), Some(LOGIN_OP));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A bad proof names the op again; pow_rate_limited carries none and stays RateLimited.
+        let bad = r#"{"statusCode":400,"message":"x","details":{"code":"pow_invalid","pow":{"op":"login","challengePath":"/auth/pow/challenge"}}}"#;
+        assert!(matches!(
+            BirdoApi::classify_error_response(StatusCode::BAD_REQUEST, bad),
+            ApiError::PowRefused { pow_op: Some(ref o), .. } if o == "login"
+        ));
+        let limited = r#"{"statusCode":429,"message":"x","details":{"code":"pow_rate_limited"}}"#;
+        assert!(matches!(
+            BirdoApi::classify_error_response(StatusCode::TOO_MANY_REQUESTS, limited),
+            ApiError::RateLimited { .. }
+        ));
     }
 
     /// Not a test: `cargo test --release --lib pow::tests::bench -- --ignored
