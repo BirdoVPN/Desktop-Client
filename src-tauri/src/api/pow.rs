@@ -643,7 +643,9 @@ mod tests {
                 &body(status, code),
             );
             match e {
-                ApiError::PowRefused { code: got, message } => {
+                ApiError::PowRefused {
+                    code: got, message, ..
+                } => {
                     assert_eq!(got, code);
                     assert!(message.starts_with("The security check"));
                 }
@@ -802,7 +804,10 @@ mod tests {
         ] {
             let h = LoginHarness::new();
             let r = block(h.run(
-                vec![Err(login_refused("pow_required", Some("login"))), Err(second)],
+                vec![
+                    Err(login_refused("pow_required", Some("login"))),
+                    Err(second),
+                ],
                 Some(login_challenge()),
                 false,
             ));
