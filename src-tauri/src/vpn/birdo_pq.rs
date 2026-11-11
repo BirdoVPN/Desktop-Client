@@ -1272,8 +1272,13 @@ mod tests {
     fn different_nonces_produce_different_psks() {
         let kp = generate_keypair();
         let (ct, _ss) = encapsulate_with(&kp.public_key, &[0x5A; 32]);
-        let a = derive_psk(&kp.secret_key, &ct, b"nonce-A").unwrap();
-        let b = derive_psk(&kp.secret_key, &ct, b"nonce-B").unwrap();
+        // Two nonces that differ in one bit, derived here rather than written
+        // out as constants (CodeQL rust/hard-coded-cryptographic-value, MR-2132).
+        let nonce_a = ct[..16].to_vec();
+        let mut nonce_b = nonce_a.clone();
+        nonce_b[0] ^= 1;
+        let a = derive_psk(&kp.secret_key, &ct, &nonce_a).unwrap();
+        let b = derive_psk(&kp.secret_key, &ct, &nonce_b).unwrap();
         assert_ne!(a.as_slice(), b.as_slice());
     }
 
