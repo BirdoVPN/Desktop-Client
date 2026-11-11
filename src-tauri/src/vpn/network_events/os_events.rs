@@ -102,6 +102,10 @@ impl SuspendDetector {
 
 const RTM_NEWROUTE: u16 = 24;
 const RTM_DELROUTE: u16 = 25;
+const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
+const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const AF_INET_FAMILY: u8 = 2;
@@ -111,6 +115,11 @@ const RTA_TABLE: u16 = 15;
 /// sizeof(struct nlmsghdr) and sizeof(struct rtmsg).
 const NLMSG_HDRLEN: usize = 16;
 const RTMSG_LEN: usize = 12;
+/// sizeof(struct ifinfomsg) and sizeof(struct ifaddrmsg); both carry the
+/// interface index as a u32 at offset 4.
+const IFINFOMSG_LEN: usize = 16;
+const IFADDRMSG_LEN: usize = 8;
+const IF_INDEX_AT: usize = 4;
 
 fn align4(n: usize) -> usize {
     (n + 3) & !3
@@ -150,6 +159,11 @@ pub(super) fn netlink_default_route_change(buf: &[u8], ignore_oif: u32) -> bool 
         }
         at += align4(len);
     }
+    false
+}
+
+/// STUB (test-first commit): not implemented yet.
+pub(super) fn netlink_link_or_addr_change(_buf: &[u8], _ignore_ifindex: u32) -> bool {
     false
 }
 
@@ -587,6 +601,75 @@ mod tests {
             &nl_route(RTM_NEWROUTE, 2, 0, 254, &[(RTA_TABLE, 1000)]),
             0
         ));
+    }
+
+    /// One rtnetlink link (`ifinfomsg`) or address (`ifaddrmsg`) message.
+    fn nl_if(kind: u16, family: u8, index: u32) -> Vec<u8> {
+        let body_len = if kind == RTM_NEWLINK || kind == RTM_DELLINK {
+            IFINFOMSG_LEN
+        } else {
+            IFADDRMSG_LEN
+        };
+        let mut body = vec![0u8; body_len];
+        body[0] = family;
+        body[IF_INDEX_AT..IF_INDEX_AT + 4].copy_from_slice(&index.to_ne_bytes());
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&((NLMSG_HDRLEN + body.len()) as u32).to_ne_bytes());
+        msg.extend_from_slice(&kind.to_ne_bytes());
+        msg.extend_from_slice(&[0u8; 10]);
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    #[test]
+    fn netlink_link_and_address_events_are_recognised() {
+        for kind in [RTM_NEWLINK, RTM_DELLINK] {
+            assert!(netlink_link_or_addr_change(&nl_if(kind, 0, 3), 0));
+            assert!(netlink_link_or_addr_change(&nl_if(kind, 10, 3), 0));
+        }
+        for kind in [RTM_NEWADDR, RTM_DELADDR] {
+            assert!(netlink_link_or_addr_change(&nl_if(kind, 2, 3), 0));
+            // IPv6 addresses are not watched (the route watcher is IPv4 only).
+            assert!(!netlink_link_or_addr_change(&nl_if(kind, 10, 3), 0));
+        }
+    }
+
+    #[test]
+    fn netlink_link_and_address_ignore_unrelated_and_our_tunnel() {
+        // Route messages and other kinds are not link/address changes.
+        assert!(!netlink_link_or_addr_change(
+            &nl_route(RTM_NEWROUTE, 2, 0, 254, &[(RTA_OIF, 3)]),
+            0
+        ));
+        assert!(!netlink_link_or_addr_change(&nl_if(18, 0, 3), 0));
+        assert!(!netlink_link_or_addr_change(&nl_if(NLMSG_DONE, 0, 3), 0));
+        // Our own tunnel interface is never "the network".
+        assert!(!netlink_link_or_addr_change(&nl_if(RTM_NEWLINK, 0, 9), 9));
+        assert!(!netlink_link_or_addr_change(&nl_if(RTM_NEWADDR, 2, 9), 9));
+        assert!(netlink_link_or_addr_change(&nl_if(RTM_NEWLINK, 0, 9), 3));
+        // Route and link messages do not cross over.
+        assert!(!netlink_default_route_change(&nl_if(RTM_NEWLINK, 0, 3), 0));
+    }
+
+    #[test]
+    fn netlink_link_and_address_garbage_is_safe() {
+        assert!(!netlink_link_or_addr_change(&[], 0));
+        assert!(!netlink_link_or_addr_change(&[1, 2, 3], 0));
+        let mut cut = nl_if(RTM_DELLINK, 0, 3);
+        cut.truncate(cut.len() - 3);
+        assert!(!netlink_link_or_addr_change(&cut, 0));
+        // A short body (shorter than ifinfomsg) is not a link message.
+        let mut short = nl_if(RTM_NEWLINK, 0, 3);
+        short.truncate(NLMSG_HDRLEN + IFADDRMSG_LEN);
+        short[..4].copy_from_slice(&((NLMSG_HDRLEN + IFADDRMSG_LEN) as u32).to_ne_bytes());
+        assert!(!netlink_link_or_addr_change(&short, 0));
+        let mut lying = nl_if(RTM_NEWADDR, 2, 3);
+        lying[..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(!netlink_link_or_addr_change(&lying, 0));
+        // A second message in the datagram is still found.
+        let mut dgram = nl_if(18, 0, 3);
+        dgram.extend(nl_if(RTM_DELADDR, 2, 4));
+        assert!(netlink_link_or_addr_change(&dgram, 0));
     }
 
     #[test]
