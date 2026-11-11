@@ -185,9 +185,7 @@ pub(super) fn netlink_link_or_addr_change(buf: &[u8], ignore_ifindex: u32) -> bo
         let body = &buf[at + NLMSG_HDRLEN..at + len];
         let hit = match kind {
             RTM_NEWLINK | RTM_DELLINK => body.len() >= IFINFOMSG_LEN,
-            RTM_NEWADDR | RTM_DELADDR => {
-                body.len() >= IFADDRMSG_LEN && body[0] == AF_INET_FAMILY
-            }
+            RTM_NEWADDR | RTM_DELADDR => body.len() >= IFADDRMSG_LEN && body[0] == AF_INET_FAMILY,
             _ => false,
         };
         if hit {
