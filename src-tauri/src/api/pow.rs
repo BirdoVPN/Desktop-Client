@@ -272,6 +272,16 @@ where
 /// `pow.op` of a sign-in refusal that asks for a proof.
 pub const LOGIN_OP: &str = "login";
 
+/// 429 `pow_required` whose `pow.op` is `login`: the one refusal a sign-in
+/// answers with a proof of work.
+fn is_login_pow_required(e: &ApiError) -> bool {
+    matches!(
+        e,
+        ApiError::PowRefused { code, pow_op: Some(op), .. }
+            if code == "pow_required" && op == LOGIN_OP
+    )
+}
+
 /// A sign-in request that is sent once WITHOUT a proof and, only when the
 /// server answers 429 `pow_required` for the `login` operation (a failed
 /// sign-in spike, birdo-web `LoginAbuseService.admit`), once more WITH one.
@@ -298,13 +308,7 @@ where
     RFut: Future<Output = Result<T, ApiError>>,
 {
     match send(None).await {
-        Err(
-            refusal @ ApiError::PowRefused {
-                ref code,
-                pow_op: Some(ref op),
-                ..
-            },
-        ) if code == "pow_required" && op == LOGIN_OP => {
+        Err(refusal) if is_login_pow_required(&refusal) => {
             let challenge = match fetch().await {
                 Some(c) if c.solvable() => c,
                 _ => return Err(refusal),
