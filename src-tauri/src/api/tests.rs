@@ -1582,11 +1582,12 @@ mod error_classification_tests {
     /// `SessionExpired`, never through the generic retrying POST.
     #[test]
     fn the_rotation_calls_use_the_discriminating_post() {
-        const SOURCE: &str = include_str!("client.rs");
+        // A Windows checkout has CRLF; the search below is for LF.
+        let source = include_str!("client.rs").replace("\r\n", "\n");
         let section = |name: &str| {
-            let start = SOURCE.find(name).expect(name);
-            let rest = &SOURCE[start..];
-            rest[..rest.find("\n    }\n").unwrap()].to_string()
+            let start = source.find(name).expect(name);
+            let rest = &source[start..];
+            rest[..rest.find("\n    }\n").expect("end of fn body")].to_string()
         };
         for name in [
             "pub async fn rotate_number_prepare(",
