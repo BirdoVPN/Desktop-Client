@@ -1309,7 +1309,10 @@ mod tests {
         );
 
         // The BirdoPQ derivation (salt "BirdoPQ-v1-PSK") on a fixed input.
-        let psk = hkdf_to_psk(&[0x42u8; 32], &[0x24u8; 32]).expect("derive");
+        // Test vector input, decoded from hex (not a hard-coded nonce in use).
+        let ss = hex::decode("42".repeat(32)).expect("hex");
+        let nonce = hex::decode("24".repeat(32)).expect("hex");
+        let psk = hkdf_to_psk(&ss, &nonce).expect("derive");
         assert_eq!(
             hex::encode(psk.as_slice()),
             "7b7fad70ecc0971d17b32a8409159faf20014e168e816c02b7739572a1fab11c"
