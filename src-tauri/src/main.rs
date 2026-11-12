@@ -249,6 +249,9 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::updater::install_update,
         commands::updater::get_required_update,
         commands::update_resume::take_update_resume, // MR-1861: the session an update ended
+        // A-M50: Linux new-version notice (no updater endpoint, no apt repo)
+        commands::linux_release::check_linux_release,
+        commands::linux_release::open_linux_release_page,
         // Settings › About › Licences (MR-1685)
         commands::licences::get_third_party_notices,
         // Extended VPN info
