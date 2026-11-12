@@ -37,6 +37,7 @@ import {
   TWO_FACTOR_HINT,
   TWO_FACTOR_PLACEHOLDER,
 } from '@/lib/two-factor';
+import { signOut } from '@/session/session';
 import { useAppStore } from '@/store/app-store';
 import { formatAccountNumber, identityPatch, type AuthStateIdentity } from '@/utils/helpers';
 
@@ -68,10 +69,11 @@ export const ROTATION_COPY = {
     'Your session ended. Sign in with your current number, then start again.',
   badNumber: 'Enter all 24 digits of the number.',
   generic: "Couldn't replace the account number. Your current number still works. Try again.",
+  maybeActive: 'Your new number may already be active. Sign in with the new number you saved.',
   done: 'Your account number has been replaced. Every other device was signed out and the old number no longer works.',
 } as const;
 
-type Phase = 'proof' | 'save' | 'confirm' | 'done';
+type Phase = 'proof' | 'save' | 'confirm' | 'maybeActive' | 'done';
 
 function waitText(secs: number | null): string {
   if (!secs || secs <= 0) return 'Too many tries. Please wait a while, then try again.';
@@ -102,6 +104,10 @@ export function ReplaceAccountNumberDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Set once a confirm has been SENT. If it committed on the server and its
+  // answer was lost, the old tokens are revoked, so a later 401 or 409
+  // `rotation_not_pending` means "probably done", not "start again".
+  const confirmSent = useRef(false);
 
   useEffect(
     () => () => {
@@ -184,6 +190,8 @@ export function ReplaceAccountNumberDialog({
 
   const confirm = async () => {
     if (!canConfirm) return;
+    const retry = confirmSent.current;
+    confirmSent.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -203,6 +211,8 @@ export function ReplaceAccountNumberDialog({
         } catch {
           /* non-fatal: the next identity refresh shows it */
         }
+      } else if (retry && (step.refusal === 'not_pending' || step.refusal === 'unauthorized')) {
+        setPhase('maybeActive');
       } else if (step.refusal === 'not_pending') {
         startOver(ROTATION_COPY.notPending);
       } else if (step.refusal === 'account_changed') {
@@ -219,6 +229,10 @@ export function ReplaceAccountNumberDialog({
         setError(ROTATION_COPY.generic);
       }
     } catch (e: unknown) {
+      if (retry && toIpcError(e).code === 'session_expired') {
+        setPhase('maybeActive');
+        return;
+      }
       // Offline, a server error, a lost answer: the account is unchanged as
       // far as this client knows, the old number still works, and the new
       // one is still here to type again or to read again.
@@ -388,6 +402,39 @@ export function ReplaceAccountNumberDialog({
               isLoading={busy}
               disabled={!canConfirm}
               onClick={confirm}
+            />
+          </div>
+        </>
+      )}
+
+      {phase === 'maybeActive' && newNumber && (
+        <>
+          <p role="alert" className="text-[13px]" style={{ color: statusTokens.yellow }}>
+            {ROTATION_COPY.maybeActive}
+          </p>
+          <div
+            className="w-full rounded-birdo-sm px-3 py-2"
+            style={{ backgroundColor: white.w04, border: `1px solid ${hairline.soft}` }}
+          >
+            <span
+              className="break-all font-mono text-[13px] tracking-wide"
+              style={{ color: '#FFFFFF' }}
+              data-testid="new-account-number"
+            >
+              {formatAccountNumber(newNumber)}
+            </span>
+          </div>
+          <div className="flex gap-2.5">
+            <BirdoButton text="Close" variant="secondary" fullWidth onClick={onDismiss} />
+            <BirdoButton
+              text="Sign in again"
+              variant="primary"
+              fullWidth
+              onClick={() => {
+                setNewNumber(null);
+                void signOut();
+                onDismiss();
+              }}
             />
           </div>
         </>

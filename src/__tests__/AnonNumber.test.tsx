@@ -31,6 +31,7 @@ import { defaultSettings, useAppStore } from '@/store/app-store';
 import { anonymityPatch, isMaskedAccountNumber, resolveAnonymousAccount } from '@/utils/helpers';
 
 vi.mock('@tauri-apps/api/core');
+vi.mock('@/session/session', () => ({ signOut: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('@/lib/features', async (importOriginal) => {
   const original = await importOriginal<typeof import('@/lib/features')>();
@@ -38,6 +39,7 @@ vi.mock('@/lib/features', async (importOriginal) => {
 });
 
 import { anonNumberRotationEnabled } from '@/lib/features';
+import { signOut } from '@/session/session';
 
 const mockedInvoke = vi.mocked(invoke);
 const flag = vi.mocked(anonNumberRotationEnabled);
@@ -344,6 +346,53 @@ describe('replacing the number', () => {
     expect(await screen.findByText(ROTATION_COPY.done)).toBeInTheDocument();
     expect(callsTo('rotate_anonymous_number_prepare')).toHaveLength(1);
     expect(callsTo('rotate_anonymous_number_confirm')).toHaveLength(2);
+  });
+
+  // A confirm that committed but whose answer was lost: its retry meets 401
+  // (old tokens revoked) or 409 rotation_not_pending. Not "start again".
+  describe.each([
+    ['401', step({ refusal: 'unauthorized' })],
+    ['409 rotation_not_pending', step({ refusal: 'not_pending' })],
+  ])('a retry after a lost confirm gets %s', (_name, refusal) => {
+    it('says the new number may be active, keeps it shown, offers Sign in again', async () => {
+      const lost = Object.assign(new Error('offline'), { code: 'network_offline', message: 'offline' });
+      let confirms = 0;
+      mockedInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === 'rotate_anonymous_number_prepare') return step({ newNumber: NEW_NUMBER });
+        if (cmd === 'rotate_anonymous_number_confirm') {
+          confirms += 1;
+          if (confirms === 1) throw lost;
+          return refusal;
+        }
+        return undefined;
+      });
+      renderDialog();
+      await toConfirmStep();
+      await retype();
+      await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+      await userEvent.click(screen.getByRole('button', { name: 'Replace number' }));
+      expect(await screen.findByText(ROTATION_COPY.maybeActive)).toBeInTheDocument();
+      expect(ROTATION_COPY.maybeActive).toBe(
+        'Your new number may already be active. Sign in with the new number you saved.',
+      );
+      expect(screen.getByTestId('new-account-number')).toHaveTextContent(NEW_PRETTY);
+      // Not restarted at step 1.
+      expect(screen.queryByLabelText('Current account number')).not.toBeInTheDocument();
+      expect(callsTo('rotate_anonymous_number_prepare')).toHaveLength(1);
+      await userEvent.click(screen.getByRole('button', { name: 'Sign in again' }));
+      expect(vi.mocked(signOut)).toHaveBeenCalledTimes(1);
+      expect(onDismiss).toHaveBeenCalled();
+    });
+  });
+
+  it('a 409 rotation_not_pending BEFORE any confirm was sent still restarts at step 1', async () => {
+    reply(step({ newNumber: NEW_NUMBER }), step({ refusal: 'not_pending' }));
+    renderDialog();
+    await toConfirmStep();
+    await retype();
+    expect(await screen.findByRole('alert')).toHaveTextContent(ROTATION_COPY.notPending);
+    expect(screen.getByLabelText('Current account number')).toBeInTheDocument();
+    expect(screen.queryByText(ROTATION_COPY.maybeActive)).not.toBeInTheDocument();
   });
 
   it('writes no number to the console or to browser storage', async () => {
