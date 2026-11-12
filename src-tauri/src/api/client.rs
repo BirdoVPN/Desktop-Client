@@ -794,6 +794,36 @@ impl BirdoApi {
         self.get(endpoints::auth::GDPR_DELETE_PREFLIGHT, true).await
     }
 
+    /// MR-1707: step 1 of replacing an anonymous account number. Changes
+    /// nothing on the account: the server holds the new number pending for
+    /// ten minutes and returns it once. The ordinary POST path (a 401 is
+    /// refreshed and retried once, so a wrong proof can count twice against
+    /// the server's own limit; the UI says so by allowing few tries).
+    pub async fn rotate_number_prepare(
+        &self,
+        body: &RotatePrepareBody,
+    ) -> Result<RotatePrepareResponse, ApiError> {
+        self.post(endpoints::auth::ROTATE_NUMBER_PREPARE, body, true)
+            .await
+    }
+
+    /// MR-1707: step 2. On success the old number is dead, every other
+    /// session is signed out, and the answer carries this session's fresh
+    /// tokens, which are adopted here (the caller persists them).
+    pub async fn rotate_number_confirm(
+        &self,
+        body: &RotateConfirmBody,
+    ) -> Result<RotateConfirmResponse, ApiError> {
+        let response: RotateConfirmResponse = self
+            .post(endpoints::auth::ROTATE_NUMBER_CONFIRM, body, true)
+            .await?;
+        if let Some(ref tokens) = response.tokens {
+            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
+        }
+        Ok(response)
+    }
+
     // ========================================================================
     // VPN Endpoints
     // ========================================================================
@@ -1609,6 +1639,14 @@ impl BirdoApi {
         match body.as_ref().and_then(|b| b.error.as_deref()) {
             Some("two_factor_required") => return ApiError::TwoFactorRequired(message()),
             Some("two_factor_invalid") => return ApiError::TwoFactorInvalid(message()),
+            // MR-1707: the anonymous-number replacement's own refusals. The
+            // two 409s share a status, and a bare 403 would read as a plan
+            // refusal.
+            Some(
+                code @ ("anon_number_rotation_disabled"
+                | "rotation_not_pending"
+                | "rotation_account_changed"),
+            ) => return ApiError::AnonNumberRefused(code.to_string()),
             // MR-1944: the attestation policy refused this build. A bare 403
             // reads as `subscription_required`, whose "upgrade your plan" is
             // wrong advice here.

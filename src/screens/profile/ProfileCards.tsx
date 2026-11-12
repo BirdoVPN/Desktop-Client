@@ -12,7 +12,14 @@ import { planGradient, planName, planRank } from '@/lib/plan';
 import { findLiveServer } from '@/session/vpn-actions';
 import { useAppStore, type LoadStatus } from '@/store/app-store';
 import { selectDisplayState } from '@/store/selectors';
-import { formatAccountNumber, formatDataCap, formatDate, maskAccountNumber } from '@/utils/helpers';
+import {
+  formatAccountNumber,
+  formatDataCap,
+  formatDate,
+  formatServerMask,
+  isMaskedAccountNumber,
+  maskAccountNumber,
+} from '@/utils/helpers';
 
 // ── Identity ────────────────────────────────────────────────────────────────
 
@@ -112,7 +119,23 @@ function ConnectionStatusRow() {
 // `null`: an anonymous account whose number the server did not send. The card
 // says so instead of showing an empty or made-up number.
 
-export function AccountNumberCard({ accountNumber }: { accountNumber: string | null }) {
+//
+// MR-1707: once the server masks it (`ANON_NUMBER_MASKING`), `accountNumber`
+// holds `********************1234`. That is shown as it is, with no copy and
+// no reveal, and the card says where the number can still be had. `onReplace`
+// is set only when the replacement flow is switched on (`lib/features.ts`).
+
+export const MASKED_NUMBER_NOTE =
+  'Shown once at sign-up or when you replace it. Replace it if you lost it.';
+
+export function AccountNumberCard({
+  accountNumber,
+  onReplace,
+}: {
+  accountNumber: string | null;
+  onReplace?: () => void;
+}) {
+  const masked = accountNumber !== null && isMaskedAccountNumber(accountNumber);
   return (
     <BirdoCard cornerRadius={20} padding="16px">
       <div className="flex items-center gap-2">
@@ -121,7 +144,9 @@ export function AccountNumberCard({ accountNumber }: { accountNumber: string | n
           Account number
         </span>
       </div>
-      {accountNumber ? (
+      {accountNumber && masked ? (
+        <MaskedNumberRow mask={accountNumber} />
+      ) : accountNumber ? (
         <AccountNumberRow accountNumber={accountNumber} />
       ) : (
         <p className="mt-2 text-[12px]" style={{ color: white.w60 }}>
@@ -129,7 +154,41 @@ export function AccountNumberCard({ accountNumber }: { accountNumber: string | n
           here. If you saved it, keep it safe: it is the only way back into this account.
         </p>
       )}
+      {onReplace && (
+        <button
+          type="button"
+          onClick={onReplace}
+          className="mt-3 rounded-birdo-sm px-3 py-1.5 text-[12px] font-semibold transition-colors hover:bg-white/5"
+          style={{ color: brand.accentLight, border: `1px solid ${hairline.soft}` }}
+        >
+          Replace account number
+        </button>
+      )}
     </BirdoCard>
+  );
+}
+
+/** The server's mask: shown, never copyable, and with the way to a new number. */
+function MaskedNumberRow({ mask }: { mask: string }) {
+  return (
+    <>
+      <div
+        className="mt-2.5 flex w-full items-center gap-2 rounded-birdo-sm px-3 py-1.5"
+        style={{ backgroundColor: surface.s2, border: `1px solid ${hairline.soft}` }}
+      >
+        <span
+          className="min-w-0 flex-1 truncate font-mono text-[13px] tracking-wide"
+          style={{ color: '#FFFFFF' }}
+          data-testid="account-number"
+        >
+          {formatServerMask(mask)}
+        </span>
+      </div>
+      <p className="mt-2 flex items-start gap-1.5 text-[12px]" style={{ color: white.w60 }}>
+        <ShieldAlert size={14} color={statusTokens.yellow} aria-hidden className="mt-0.5 shrink-0" />
+        <span>{MASKED_NUMBER_NOTE}</span>
+      </p>
+    </>
   );
 }
 

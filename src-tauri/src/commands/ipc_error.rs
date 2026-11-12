@@ -363,6 +363,12 @@ impl IpcError {
                  Please try again in a moment.",
                 *retry_after_secs,
             ),
+            // MR-1707: the number-replacement commands read the code
+            // themselves; this is only the generic fallback.
+            ApiError::AnonNumberRefused(_) => Self::new(
+                IpcErrorCode::ServerError,
+                "The account number could not be replaced right now.",
+            ),
             ApiError::Unknown(message) => Self::unknown(message),
         }
     }

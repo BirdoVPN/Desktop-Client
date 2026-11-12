@@ -206,6 +206,8 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::auth::login,
         commands::auth::login_anonymous,
         commands::auth::register_anonymous,
+        commands::auth::rotate_anonymous_number_prepare, // MR-1707
+        commands::auth::rotate_anonymous_number_confirm, // MR-1707
         commands::auth::cancel_signup_proof,
         commands::oauth::native_oauth_login, // native Google/GitHub SSO
         commands::auth::logout,

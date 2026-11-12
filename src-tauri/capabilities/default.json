@@ -6,6 +6,8 @@
     "allow-login",
     "allow-login-anonymous",
     "allow-register-anonymous",
+    "allow-rotate-anonymous-number-prepare",
+    "allow-rotate-anonymous-number-confirm",
     "allow-cancel-signup-proof",
     "allow-native-oauth-login",
     "allow-logout",
