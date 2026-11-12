@@ -118,10 +118,11 @@ describe('LinuxUpdateNotice', () => {
 describe('the Linux notice stays private and unscoped', () => {
   const read = (p: string) => readFileSync(resolve(__dirname, p), 'utf8').replace(/\r\n/g, '\n');
 
-  it('sends a generic User-Agent, no e-mail, and keeps GitHub out of the webview opener scope', () => {
+  it('asks only the first-party updates host, sets no headers, and keeps GitHub out of the webview opener scope', () => {
     const rs = read('../../src-tauri/src/commands/linux_release.rs');
-    expect(rs).toContain('const USER_AGENT: &str = "BirdoVPN-Desktop-update-check";');
-    expect(rs).not.toMatch(/\.cookie|\.bearer_auth|\.basic_auth|Authorization/i);
+    expect(rs).toContain('const LATEST_LINUX_URL: &str = "https://api.birdo.app/updates/linux/latest";');
+    expect(rs).not.toContain('api.github.com');
+    expect(rs).not.toMatch(/\.cookie|\.bearer_auth|\.basic_auth|Authorization|user_agent|\.header\(/i);
     const caps = read('../../src-tauri/capabilities/default.json');
     expect(caps).not.toContain('github.com');
   });

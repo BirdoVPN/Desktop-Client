@@ -1,15 +1,16 @@
 //! A-M50: a new-version NOTICE for Linux.
 //!
-//! The in-app updater endpoint (`api.birdo.app/updates/...`) answers 204 for
-//! Linux and there is no apt repository, so a Linux user had no signal that a
-//! newer `.deb` exists. This asks GitHub's public "latest release" API instead
-//! and reports the newer version, if any. It never downloads or installs
-//! anything: the notice sends the user to the release page.
+//! The in-app updater endpoint (`api.birdo.app/updates/{target}/...`) answers
+//! 204 for Linux and there is no apt repository, so a Linux user had no signal
+//! that a newer `.deb` exists. This asks the same host's
+//! `GET /updates/linux/latest` (the backend reads GitHub Releases server-side
+//! and caches it) and reports the newer version, if any. It never downloads or
+//! installs anything: the notice sends the user to the release page.
 //!
-//! Privacy: one anonymous GET. No auth, no cookies (the client is built
-//! without a cookie store), no account data, no device identifier, and a
-//! generic User-Agent. Every failure is `None`: the notice is a courtesy and
-//! must never block startup, the VPN, or show an error.
+//! Privacy: one anonymous GET to the host the updater already uses, so no new
+//! recipient. No auth, no cookies (the client is built without a cookie
+//! store), no account data, no device identifier, no version in the URL. Every failure is `None`: the notice is a
+//! courtesy and must never block startup, the VPN, or show an error.
 //!
 //! The release page is opened from Rust, from a constant, so the webview's
 //! `opener:allow-open-url` scope does not have to grow a github.com entry.
@@ -17,27 +18,18 @@
 use serde::Deserialize;
 use tauri_plugin_opener::OpenerExt;
 
-/// GitHub's own endpoint for the newest published, non-draft, non-prerelease
-/// release.
+/// First-party endpoint: `{ "version": "1.4.55", "url": "..." }`, or 204 when
+/// there is no Linux release. The same host the updater uses (cert-pinned).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const LATEST_RELEASE_API: &str =
-    "https://api.github.com/repos/BirdoVPN/Desktop-Client/releases/latest";
+const LATEST_LINUX_URL: &str = "https://api.birdo.app/updates/linux/latest";
 
 /// What the "Download" button opens.
 const RELEASE_PAGE_URL: &str = "https://github.com/BirdoVPN/Desktop-Client/releases/latest";
 
-/// Generic on purpose: names the feature, not the user, the build or a contact.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const USER_AGENT: &str = "BirdoVPN-Desktop-update-check";
-
-/// The two fields of GitHub's release object this reads.
+/// The one field of the endpoint's answer this reads.
 #[derive(Debug, Deserialize)]
-struct Release {
-    tag_name: String,
-    #[serde(default)]
-    draft: bool,
-    #[serde(default)]
-    prerelease: bool,
+struct Latest {
+    version: String,
 }
 
 /// `v1.4.55` or `1.4.55` as (major, minor, patch). Anything else (a suffix such
@@ -60,17 +52,15 @@ fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
     Some(version)
 }
 
-/// The release's version (no `v`) when it is strictly newer than `current`.
+/// The endpoint's version (a leading `v` tolerated, then dropped) when it is
+/// strictly newer than `current`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn newer_version(body: &str, current: &str) -> Option<String> {
-    let release: Release = serde_json::from_str(body).ok()?;
-    if release.draft || release.prerelease {
-        return None;
-    }
-    let latest = parse_version(&release.tag_name)?;
-    if latest > parse_version(current)? {
-        let tag = release.tag_name.trim();
-        Some(tag.strip_prefix('v').unwrap_or(tag).to_string())
+    let latest: Latest = serde_json::from_str(body).ok()?;
+    let version = latest.version.trim();
+    let version = version.strip_prefix('v').unwrap_or(version);
+    if parse_version(version)? > parse_version(current)? {
+        Some(version.to_string())
     } else {
         None
     }
@@ -80,22 +70,17 @@ fn newer_version(body: &str, current: &str) -> Option<String> {
 async fn fetch_latest() -> Option<String> {
     use std::time::Duration;
     let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
         .https_only(true)
         .timeout(Duration::from_secs(15))
         .use_preconfigured_tls(crate::api::cert_pin::rustls_config_pinning_birdo_hosts_only())
         .build()
         .ok()?;
-    let response = client
-        .get(LATEST_RELEASE_API)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
+    let response = client.get(LATEST_LINUX_URL).send().await.ok()?;
+    // 200 only: 204 (no Linux release) and 404 (endpoint not live yet) are None.
+    if response.status() != reqwest::StatusCode::OK {
         return None;
     }
-    // A release object is a few KB of JSON; refuse anything absurd.
+    // The answer is a few dozen bytes of JSON; refuse anything absurd.
     if response.content_length().is_some_and(|n| n > 1_048_576) {
         return None;
     }
@@ -130,8 +115,8 @@ pub fn open_linux_release_page(app: tauri::AppHandle) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn body(tag: &str, draft: bool, prerelease: bool) -> String {
-        format!(r#"{{"tag_name":"{tag}","draft":{draft},"prerelease":{prerelease},"id":1}}"#)
+    fn body(version: &str) -> String {
+        format!(r#"{{"version":"{version}","url":"{RELEASE_PAGE_URL}"}}"#)
     }
 
     #[test]
@@ -163,55 +148,41 @@ mod tests {
     #[test]
     fn compares_numerically_not_lexically() {
         assert_eq!(
-            newer_version(&body("v1.4.55", false, false), "1.4.9"),
+            newer_version(&body("1.4.55"), "1.4.9"),
             Some("1.4.55".into())
         );
         assert_eq!(
-            newer_version(&body("v1.10.0", false, false), "1.9.9"),
+            newer_version(&body("1.10.0"), "1.9.9"),
             Some("1.10.0".into())
         );
         assert_eq!(
-            newer_version(&body("v2.0.0", false, false), "1.99.99"),
+            newer_version(&body("v2.0.0"), "1.99.99"),
             Some("2.0.0".into())
         );
     }
 
     #[test]
     fn equal_and_older_are_not_a_notice() {
-        assert_eq!(
-            newer_version(&body("v1.4.55", false, false), "1.4.55"),
-            None
-        );
-        assert_eq!(
-            newer_version(&body("v1.4.54", false, false), "1.4.55"),
-            None
-        );
+        assert_eq!(newer_version(&body("1.4.55"), "1.4.55"), None);
+        assert_eq!(newer_version(&body("1.4.54"), "1.4.55"), None);
     }
 
     #[test]
-    fn malformed_tag_or_body_is_not_a_notice() {
-        assert_eq!(
-            newer_version(&body("nightly", false, false), "1.4.55"),
-            None
-        );
+    fn malformed_version_or_body_is_not_a_notice() {
+        assert_eq!(newer_version(&body("nightly"), "1.4.55"), None);
+        assert_eq!(newer_version(&body("1.4.56-rc1"), "1.4.55"), None);
         assert_eq!(newer_version("not json", "1.4.55"), None);
         assert_eq!(newer_version("{}", "1.4.55"), None);
+        assert_eq!(newer_version(&body("9.9.9"), "garbage"), None);
+    }
+
+    #[test]
+    fn the_request_stays_on_the_first_party_host() {
         assert_eq!(
-            newer_version(&body("v9.9.9", false, false), "garbage"),
-            None
+            LATEST_LINUX_URL,
+            "https://api.birdo.app/updates/linux/latest"
         );
-    }
-
-    #[test]
-    fn drafts_and_prereleases_are_ignored() {
-        assert_eq!(newer_version(&body("v9.9.9", true, false), "1.4.55"), None);
-        assert_eq!(newer_version(&body("v9.9.9", false, true), "1.4.55"), None);
-    }
-
-    #[test]
-    fn the_request_names_no_one() {
-        assert!(USER_AGENT.is_ascii() && !USER_AGENT.contains('@'));
-        assert!(LATEST_RELEASE_API.starts_with("https://api.github.com/repos/BirdoVPN/"));
+        assert!(!LATEST_LINUX_URL.contains('?') && !LATEST_LINUX_URL.contains('@'));
         assert!(RELEASE_PAGE_URL.starts_with("https://github.com/BirdoVPN/"));
     }
 
