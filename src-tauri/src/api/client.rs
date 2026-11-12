@@ -98,6 +98,19 @@ pub(crate) enum GdprDeleteOutcome {
     Refused(ApiError),
 }
 
+/// What one proof-checked POST response means (MR-1707, the number
+/// replacement; see `BirdoApi::classify_proof_post_response_after`).
+#[derive(Debug)]
+pub(crate) enum ProofPostOutcome {
+    /// 2xx, with the body text.
+    Done(String),
+    /// A 401 from the JWT guard (bare "Unauthorized" or no message, and no
+    /// proof code): refresh the access token and send once more.
+    SessionExpired,
+    /// Anything else, a handler's own 401 included: the answer, never retried.
+    Refused(ApiError),
+}
+
 // SEC-C1: TLS certificate pinning lives in `super::cert_pin`. It pins the
 // **CA-chain SPKI** (the stable intermediate/root public keys, matching the
 // Android client) via a custom rustls verifier, so Cloudflare/Google leaf
@@ -792,6 +805,153 @@ impl BirdoApi {
     /// Read-only; the ordinary GET path with the usual refresh-and-retry.
     pub async fn deletion_preflight(&self) -> Result<DeletionPreflightResponse, ApiError> {
         self.get(endpoints::auth::GDPR_DELETE_PREFLIGHT, true).await
+    }
+
+    /// MR-1707: step 1 of replacing an anonymous account number. Changes
+    /// nothing on the account: the server holds the new number pending for
+    /// ten minutes and returns it once. Sent through
+    /// [`Self::post_proof_checked`]: a wrong proof is a 401 from the handler
+    /// and must be sent ONCE (each one counts against the server's 5 per 15
+    /// minutes), never refreshed and re-sent.
+    pub async fn rotate_number_prepare(
+        &self,
+        body: &RotatePrepareBody,
+    ) -> Result<RotatePrepareResponse, ApiError> {
+        let text = self
+            .post_proof_checked(endpoints::auth::ROTATE_NUMBER_PREPARE, body)
+            .await?;
+        serde_json::from_str(&text).map_err(|e| ApiError::Parse(e.to_string()))
+    }
+
+    /// A bearer POST whose handler can itself answer 401 (a wrong proof), like
+    /// `delete_account`'s: only the JWT guard's bare "Unauthorized" (or an
+    /// empty message, and no machine code) means the access token expired and
+    /// is refreshed and retried once. Any other 401 is the answer and is
+    /// surfaced with no refresh and no second request.
+    async fn post_proof_checked<B: Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<String, ApiError> {
+        let token_before = self.access_token_value().await;
+        let mut outcome = self.send_proof_post(path, body).await?;
+        if matches!(outcome, ProofPostOutcome::SessionExpired) {
+            {
+                // Same serialisation as request_with_retry: only refresh if
+                // nobody else already did while we waited for the lock.
+                let lock = Arc::clone(&self.refresh_lock).lock_owned().await;
+                if self.access_token_value().await == token_before {
+                    self.refresh_detached(lock)
+                        .await
+                        .map_err(super::session_gate::error_after_failed_refresh)?;
+                }
+            }
+            outcome = self.send_proof_post(path, body).await?;
+        }
+        match outcome {
+            ProofPostOutcome::Done(text) => Ok(text),
+            ProofPostOutcome::Refused(error) => Err(error),
+            ProofPostOutcome::SessionExpired => Err(ApiError::Unauthorized),
+        }
+    }
+
+    async fn send_proof_post<B: Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<ProofPostOutcome, ApiError> {
+        let token = self
+            .access_token
+            .read()
+            .await
+            .clone()
+            .ok_or(ApiError::NotAuthenticated)?;
+        let response = self
+            .client
+            .post(format!("{}{}", API_BASE_URL, path))
+            .header("X-Desktop-Client", DESKTOP_CLIENT_HEADER)
+            .bearer_auth(token.as_str())
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+        let status = response.status();
+        let retry_after = retry_after_of(&response);
+        let text = response.text().await.unwrap_or_default();
+        let outcome = Self::classify_proof_post_response_after(status, &text, retry_after);
+        if let ProofPostOutcome::Refused(ApiError::UpgradeRequired(info)) = &outcome {
+            super::upgrade_gate::latch_from(
+                super::upgrade_gate::Origin::ControlPlane,
+                info.clone(),
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// Decide what one proof-checked POST response means, from status and
+    /// body alone. A 401 carrying a machine `error` code (the backend sends
+    /// `rotation_proof_invalid` for a wrong proof) is the handler's answer;
+    /// failing that, a 401 whose message is anything but passport's bare
+    /// "Unauthorized" is too. Only the bare one means "refresh and retry".
+    pub(crate) fn classify_proof_post_response_after(
+        status: StatusCode,
+        body: &str,
+        retry_after: Option<u64>,
+    ) -> ProofPostOutcome {
+        if status.is_success() {
+            return ProofPostOutcome::Done(body.to_string());
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            let parsed = serde_json::from_str::<ApiErrorBody>(body).ok();
+            let message = parsed
+                .as_ref()
+                .and_then(|b| b.message.as_deref())
+                .map(str::trim)
+                .filter(|m| !m.is_empty());
+            let code = parsed
+                .as_ref()
+                .and_then(|b| b.error.as_deref())
+                .map(str::trim)
+                .filter(|c| !c.is_empty());
+            let refused = |m: &str| {
+                ProofPostOutcome::Refused(ApiError::Rejected {
+                    status: StatusCode::UNAUTHORIZED.as_u16(),
+                    message: m.to_string(),
+                })
+            };
+            return match (code, message) {
+                // A code the handler set wins, whatever the wording.
+                (Some(c), m) if !c.eq_ignore_ascii_case("unauthorized") => {
+                    refused(m.unwrap_or("The proof was not accepted"))
+                }
+                (_, Some(m)) if !m.eq_ignore_ascii_case("unauthorized") => refused(m),
+                _ => ProofPostOutcome::SessionExpired,
+            };
+        }
+        ProofPostOutcome::Refused(Self::classify_error_response_after(
+            status,
+            body,
+            retry_after,
+        ))
+    }
+
+    /// MR-1707: step 2. On success the old number is dead, every other
+    /// session is signed out, and the answer carries this session's fresh
+    /// tokens, which are adopted here (the caller persists them).
+    pub async fn rotate_number_confirm(
+        &self,
+        body: &RotateConfirmBody,
+    ) -> Result<RotateConfirmResponse, ApiError> {
+        let text = self
+            .post_proof_checked(endpoints::auth::ROTATE_NUMBER_CONFIRM, body)
+            .await?;
+        let response: RotateConfirmResponse =
+            serde_json::from_str(&text).map_err(|e| ApiError::Parse(e.to_string()))?;
+        if let Some(ref tokens) = response.tokens {
+            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
+        }
+        Ok(response)
     }
 
     // ========================================================================
@@ -1609,6 +1769,14 @@ impl BirdoApi {
         match body.as_ref().and_then(|b| b.error.as_deref()) {
             Some("two_factor_required") => return ApiError::TwoFactorRequired(message()),
             Some("two_factor_invalid") => return ApiError::TwoFactorInvalid(message()),
+            // MR-1707: the anonymous-number replacement's own refusals. The
+            // two 409s share a status, and a bare 403 would read as a plan
+            // refusal.
+            Some(
+                code @ ("anon_number_rotation_disabled"
+                | "rotation_not_pending"
+                | "rotation_account_changed"),
+            ) => return ApiError::AnonNumberRefused(code.to_string()),
             // MR-1944: the attestation policy refused this build. A bare 403
             // reads as `subscription_required`, whose "upgrade your plan" is
             // wrong advice here.

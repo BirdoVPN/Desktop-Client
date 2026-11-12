@@ -11,6 +11,11 @@ pub mod auth {
     /// fresh 24-digit ID and returns tokens (signed in immediately). Requires the
     /// X-Desktop-Client header (sent on all POSTs).
     pub const REGISTER_ANONYMOUS: &str = "/auth/register/anonymous";
+    /// Two-phase replacement of an anonymous account number (MR-1707): prepare
+    /// holds a new number pending, confirm swaps it in. Both answer 403
+    /// `anon_number_rotation_disabled` while the server's switch is off.
+    pub const ROTATE_NUMBER_PREPARE: &str = "/auth/anonymous/rotate-number/prepare";
+    pub const ROTATE_NUMBER_CONFIRM: &str = "/auth/anonymous/rotate-number/confirm";
     /// Sign-up proof-of-work challenge (`{ "op": "signup" }`); see `api::pow`.
     pub const POW_CHALLENGE: &str = "/auth/pow/challenge";
     /// Native SSO handoff exchange: swap the web broker's single-use PKCE-bound

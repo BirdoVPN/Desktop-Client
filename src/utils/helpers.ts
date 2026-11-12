@@ -131,7 +131,10 @@ export function identityPatch(st: AuthStateIdentity): Partial<AccountInfo> {
 export function anonymityPatch(st: AuthStateAnonymity): { isAnonymous?: boolean; accountNumber?: string } {
   const patch: { isAnonymous?: boolean; accountNumber?: string } = {};
   if (typeof st.is_anonymous === 'boolean') patch.isAnonymous = st.is_anonymous;
-  if (typeof st.account_number === 'string' && /^\d{24}$/.test(st.account_number)) {
+  if (
+    typeof st.account_number === 'string' &&
+    (/^\d{24}$/.test(st.account_number) || isMaskedAccountNumber(st.account_number))
+  ) {
     patch.accountNumber = st.account_number;
   }
   return patch;
@@ -175,6 +178,21 @@ export function displayableEmail(email: string | null | undefined): string | nul
 /** "123456789012…" → "1234 5678 9012 …": six groups of four, space-separated (canonical). */
 export function formatAccountNumber(digits: string): string {
   return digits.replace(/\D/g, '').replace(/(\d{4})(?=\d)/g, '$1 ');
+}
+
+/**
+ * The server's own mask of the number (MR-1707, birdo-web #850,
+ * `ANON_NUMBER_MASKING`): 24 characters, stars then the last digits
+ * (`********************1234`). Not a credential: there is nothing to copy.
+ */
+export function isMaskedAccountNumber(value: string): boolean {
+  return value.length === 24 && /^\*+\d*$/.test(value);
+}
+
+/** A server mask as the Profile card shows it: `•••• •••• •••• •••• •••• 1234`. */
+export function formatServerMask(mask: string): string {
+  const tail = mask.replace(/\D/g, '').slice(-4).padStart(4, '•');
+  return `•••• •••• •••• •••• •••• ${tail}`;
 }
 
 /** The masked form shown by default: every group hidden but the last. */

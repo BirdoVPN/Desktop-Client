@@ -4,7 +4,9 @@
 
 use crate::api::error::ApiError;
 use crate::api::session_gate::{self, RefreshOutcome, StoredSession};
-use crate::api::types::{AccountNumber, LoginResult, UserProfile};
+use crate::api::types::{
+    AccountNumber, LoginResult, RotateConfirmBody, RotatePrepareBody, UserProfile,
+};
 use crate::api::BirdoApi;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use crate::commands::session::{end_session, EndReason};
@@ -983,6 +985,203 @@ pub async fn register_anonymous(
                 challenge_token: None,
                 code: Some(IpcError::from_api(&e).code),
             })
+        }
+    }
+}
+
+/// What a number-replacement step answers (MR-1707). A refusal the user can
+/// act on is an `Ok` with `refusal` set, so the UI words each one; anything
+/// else (offline, a server error) is an `Err(IpcError)` as everywhere.
+/// `refusal`: `disabled`, `unauthorized`, `not_pending`, `account_changed`,
+/// `mismatch`, `bad_number`, `rate_limited`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotationStep {
+    pub refusal: Option<&'static str>,
+    /// `prepare` only: the NEW number, shown once. A credential: never
+    /// logged, redacted in `Debug`, and not kept here after the answer.
+    pub new_number: Option<String>,
+    pub expires_in_seconds: Option<u64>,
+    pub retry_after_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for RotationStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotationStep")
+            .field("refusal", &self.refusal)
+            .field(
+                "new_number",
+                &self.new_number.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for RotationStep {
+    fn drop(&mut self) {
+        self.new_number.zeroize();
+    }
+}
+
+impl RotationStep {
+    fn refused(refusal: &'static str) -> Self {
+        Self {
+            refusal: Some(refusal),
+            new_number: None,
+            expires_in_seconds: None,
+            retry_after_secs: None,
+        }
+    }
+}
+
+/// The refusals of the two rotation calls the UI words itself, by what
+/// the server said. `None`: not one of them, so it is a plain `IpcError`.
+fn rotation_refusal(error: &ApiError, wrong_number_is_400: bool) -> Option<RotationStep> {
+    match error {
+        ApiError::AnonNumberRefused(code) => Some(RotationStep::refused(match code.as_str() {
+            "rotation_not_pending" => "not_pending",
+            "rotation_account_changed" => "account_changed",
+            _ => "disabled",
+        })),
+        ApiError::Unauthorized | ApiError::Rejected { status: 401, .. } => {
+            Some(RotationStep::refused("unauthorized"))
+        }
+        ApiError::RateLimited { retry_after_secs } => Some(RotationStep {
+            refusal: Some("rate_limited"),
+            new_number: None,
+            expires_in_seconds: None,
+            retry_after_secs: *retry_after_secs,
+        }),
+        ApiError::Rejected { status: 400, .. } if wrong_number_is_400 => {
+            Some(RotationStep::refused("mismatch"))
+        }
+        ApiError::Rejected { status: 400, .. } => Some(RotationStep::refused("bad_number")),
+        _ => None,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotatePrepareCommandRequest {
+    pub current_number: String,
+    pub password: Option<String>,
+    pub two_factor_code: Option<String>,
+}
+
+impl Drop for RotatePrepareCommandRequest {
+    fn drop(&mut self) {
+        self.current_number.zeroize();
+        self.password.zeroize();
+        self.two_factor_code.zeroize();
+    }
+}
+
+fn digits_only(raw: &str) -> String {
+    raw.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+/// MR-1707 step 1: prove the CURRENT number (and the password / 2FA code the
+/// account has) and get a replacement held pending for ten minutes. Nothing
+/// on the account changes; the old number keeps working until `confirm`.
+/// The numbers are credentials: not logged, and nothing is stored here.
+#[tauri::command]
+pub async fn rotate_anonymous_number_prepare(
+    request: RotatePrepareCommandRequest,
+    api: State<'_, BirdoApi>,
+    credentials: State<'_, CredentialStore>,
+) -> Result<RotationStep, IpcError> {
+    let current = digits_only(&request.current_number);
+    if current.len() != 24 {
+        return Ok(RotationStep::refused("bad_number"));
+    }
+    if let Ok(tokens) = credentials.get_tokens() {
+        api.restore_tokens_if_absent(tokens.access_token.clone(), tokens.refresh_token.clone())
+            .await;
+    }
+    tracing::info!("Account number replacement: prepare requested");
+    let non_empty = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let body = RotatePrepareBody {
+        current_number: current,
+        password: request.password.clone().filter(|p| !p.is_empty()),
+        two_factor_code: non_empty(&request.two_factor_code),
+    };
+    match api.rotate_number_prepare(&body).await {
+        Ok(response) => Ok(RotationStep {
+            refusal: None,
+            new_number: Some(response.new_number.clone()),
+            expires_in_seconds: response.expires_in_seconds,
+            retry_after_secs: None,
+        }),
+        Err(e) => {
+            tracing::warn!("Account number replacement: prepare refused ({})", e);
+            match rotation_refusal(&e, false) {
+                Some(step) => Ok(step),
+                None => Err(IpcError::from_api(&e)),
+            }
+        }
+    }
+}
+
+/// MR-1707 step 2: the user re-typed the whole new number. On success the
+/// old number is dead, every other session is signed out, and this one
+/// continues on the fresh tokens, stored exactly as a sign-in stores them.
+#[tauri::command]
+pub async fn rotate_anonymous_number_confirm(
+    new_number: String,
+    api: State<'_, BirdoApi>,
+    credentials: State<'_, CredentialStore>,
+) -> Result<RotationStep, IpcError> {
+    let mut new_number = new_number;
+    let digits = digits_only(&new_number);
+    new_number.zeroize();
+    if digits.len() != 24 {
+        return Ok(RotationStep::refused("mismatch"));
+    }
+    if let Ok(tokens) = credentials.get_tokens() {
+        api.restore_tokens_if_absent(tokens.access_token.clone(), tokens.refresh_token.clone())
+            .await;
+    }
+    tracing::info!("Account number replacement: confirm requested");
+    let body = RotateConfirmBody {
+        new_number: digits,
+        device_id: crate::utils::get_device_id(),
+        device_name: Some(crate::commands::vpn::get_device_name()),
+        platform: crate::utils::device_platform().to_string(),
+    };
+    match api.rotate_number_confirm(&body).await {
+        Ok(response) if response.ok => {
+            if let Some(ref tokens) = response.tokens {
+                if let Err(e) =
+                    credentials.store_tokens(&tokens.access_token, &tokens.refresh_token)
+                {
+                    tracing::warn!(
+                        "Failed to persist the credentials after a replacement: {}",
+                        e
+                    );
+                }
+            }
+            tracing::info!("Account number replaced; this session continues");
+            Ok(RotationStep {
+                refusal: None,
+                new_number: None,
+                expires_in_seconds: None,
+                retry_after_secs: None,
+            })
+        }
+        Ok(_) => Err(IpcError::from_api(&ApiError::Parse(
+            "unexpected confirm answer".to_string(),
+        ))),
+        Err(e) => {
+            tracing::warn!("Account number replacement: confirm refused ({})", e);
+            match rotation_refusal(&e, true) {
+                Some(step) => Ok(step),
+                None => Err(IpcError::from_api(&e)),
+            }
         }
     }
 }

@@ -95,6 +95,11 @@ pub enum ApiError {
         /// refusal carries no `pow` member (`pow_rate_limited`, old servers).
         pow_op: Option<String>,
     },
+    /// A refusal of the anonymous-number replacement, by the server's `error`
+    /// code (MR-1707): `anon_number_rotation_disabled` (403),
+    /// `rotation_not_pending` or `rotation_account_changed` (409). The status
+    /// alone cannot tell the two 409s apart.
+    AnonNumberRefused(String),
     /// Unknown error
     Unknown(String),
 }
@@ -228,6 +233,9 @@ impl fmt::Display for ApiError {
                     f,
                     "A connection address on this server could not be assigned right now"
                 )
+            }
+            ApiError::AnonNumberRefused(code) => {
+                write!(f, "The account number replacement was refused ({code})")
             }
             ApiError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
         }

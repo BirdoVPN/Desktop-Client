@@ -367,6 +367,9 @@ const FRONTEND_COMMANDS = [
   'login',
   'login_anonymous',
   'register_anonymous',
+  // MR-1707: the two-phase replacement of an anonymous account number
+  'rotate_anonymous_number_prepare',
+  'rotate_anonymous_number_confirm',
   'cancel_signup_proof',
   'native_oauth_login',
   'logout',

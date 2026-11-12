@@ -560,6 +560,97 @@ pub struct UsageStats {
 /// the server generates the 24-digit ID (matches backend DeviceInfoSchema — all
 /// fields optional). Reuses `AnonymousLoginResult` for the response shape
 /// ({ ok, anonymousId, tokens }).
+/// `POST /auth/anonymous/rotate-number/prepare` (MR-1707, birdo-web #850):
+/// the step-up proof for a replacement number. The current number is the
+/// account's only credential, so it is wiped on drop and never logged.
+#[derive(Serialize)]
+pub struct RotatePrepareBody {
+    #[serde(rename = "currentNumber")]
+    pub current_number: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(rename = "twoFactorCode", skip_serializing_if = "Option::is_none")]
+    pub two_factor_code: Option<String>,
+}
+
+impl Drop for RotatePrepareBody {
+    fn drop(&mut self) {
+        self.current_number.zeroize();
+        self.password.zeroize();
+        self.two_factor_code.zeroize();
+    }
+}
+
+impl std::fmt::Debug for RotatePrepareBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RotatePrepareBody(<redacted>)")
+    }
+}
+
+/// The prepare answer: the NEW number, shown once. Redacted in `Debug`.
+#[derive(Deserialize)]
+pub struct RotatePrepareResponse {
+    #[serde(rename = "newNumber")]
+    pub new_number: String,
+    #[serde(default, rename = "expiresInSeconds")]
+    pub expires_in_seconds: Option<u64>,
+}
+
+impl Drop for RotatePrepareResponse {
+    fn drop(&mut self) {
+        self.new_number.zeroize();
+    }
+}
+
+impl std::fmt::Debug for RotatePrepareResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RotatePrepareResponse(<redacted>)")
+    }
+}
+
+/// `POST /auth/anonymous/rotate-number/confirm`: the user re-types the whole
+/// new number; device fields are optional, as at login.
+#[derive(Serialize)]
+pub struct RotateConfirmBody {
+    #[serde(rename = "newNumber")]
+    pub new_number: String,
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
+    #[serde(rename = "deviceName", skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    pub platform: String,
+}
+
+impl Drop for RotateConfirmBody {
+    fn drop(&mut self) {
+        self.new_number.zeroize();
+    }
+}
+
+impl std::fmt::Debug for RotateConfirmBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RotateConfirmBody(<redacted>)")
+    }
+}
+
+/// The confirm answer: the caller's fresh session, minted after every other
+/// session was ended.
+#[derive(Deserialize)]
+pub struct RotateConfirmResponse {
+    #[serde(default)]
+    pub ok: bool,
+    pub tokens: Option<TokenPair>,
+}
+
+/// Manual: `TokenPair`'s derived `Debug` would print the tokens.
+impl std::fmt::Debug for RotateConfirmResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotateConfirmResponse")
+            .field("ok", &self.ok)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AnonymousRegisterRequest {
     #[serde(rename = "deviceId")]
@@ -712,9 +803,19 @@ impl UserProfile {
 pub struct AccountNumber(String);
 
 impl AccountNumber {
-    /// Only the documented shape (`/^\d{24}$/`) is accepted.
+    /// Only the documented shape (`/^\d{24}$/`) is accepted, or the server's
+    /// mask of it (MR-1707, birdo-web #850, `ANON_NUMBER_MASKING`): 24
+    /// characters, stars then the last digits (`********************1234`).
+    /// A mask is not a credential; the UI shows it and offers no copy.
     pub fn parse(raw: &str) -> Option<Self> {
-        (raw.len() == 24 && raw.bytes().all(|b| b.is_ascii_digit())).then(|| Self(raw.to_string()))
+        (raw.len() == 24 && (raw.bytes().all(|b| b.is_ascii_digit()) || Self::is_mask(raw)))
+            .then(|| Self(raw.to_string()))
+    }
+
+    /// Stars, then digits only: `*` first, no digit before a star.
+    fn is_mask(raw: &str) -> bool {
+        let stars = raw.bytes().take_while(|b| *b == b'*').count();
+        stars > 0 && raw.bytes().skip(stars).all(|b| b.is_ascii_digit())
     }
 }
 

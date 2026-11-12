@@ -1500,6 +1500,178 @@ mod error_classification_tests {
         assert!(matches!(err, ApiError::Unauthorized));
     }
 
+    /// MR-1707 (birdo-web #850): the number-replacement refusals are told
+    /// apart by the body's `error`, because two of them share a status and a
+    /// bare 403 would read as a plan refusal.
+    #[test]
+    fn the_number_replacement_refusals_are_told_apart_by_code() {
+        for (status, code) in [
+            (StatusCode::FORBIDDEN, "anon_number_rotation_disabled"),
+            (StatusCode::CONFLICT, "rotation_not_pending"),
+            (StatusCode::CONFLICT, "rotation_account_changed"),
+        ] {
+            let body = format!(
+                r#"{{"statusCode":{},"error":"{code}","message":"x"}}"#,
+                status.as_u16()
+            );
+            match BirdoApi::classify_error_response(status, &body) {
+                ApiError::AnonNumberRefused(got) => assert_eq!(got, code),
+                other => panic!("{code} should be its own refusal, got {other:?}"),
+            }
+        }
+        // A 400 mismatch keeps the generic path, a 401 stays Unauthorized.
+        let bad = r#"{"statusCode":400,"message":"That is not the pending number"}"#;
+        assert!(matches!(
+            BirdoApi::classify_error_response(StatusCode::BAD_REQUEST, bad),
+            ApiError::Rejected { status: 400, .. }
+        ));
+        assert!(matches!(
+            BirdoApi::classify_error_response(StatusCode::UNAUTHORIZED, bad),
+            ApiError::Unauthorized
+        ));
+    }
+
+    /// MR-1707: a wrong proof's 401 is the handler's answer (one request, no
+    /// refresh); only the JWT guard's bare "Unauthorized" means refresh and
+    /// retry once. The machine code is checked first, then the message.
+    #[test]
+    fn a_proof_401_is_not_refreshed_but_a_bare_unauthorized_is() {
+        use super::super::client::ProofPostOutcome;
+        let classify = |body: &str| {
+            BirdoApi::classify_proof_post_response_after(StatusCode::UNAUTHORIZED, body, None)
+        };
+        // The code wins, even with the guard's own wording.
+        for body in [
+            r#"{"statusCode":401,"error":"rotation_proof_invalid","message":"Unauthorized"}"#,
+            r#"{"statusCode":401,"error":"rotation_proof_invalid"}"#,
+            r#"{"statusCode":401,"message":"Incorrect account number or password"}"#,
+            r#"{"statusCode":401,"error":"Unauthorized","message":"Invalid proof"}"#,
+        ] {
+            assert!(
+                matches!(
+                    classify(body),
+                    ProofPostOutcome::Refused(ApiError::Rejected { status: 401, .. })
+                ),
+                "{body}"
+            );
+        }
+        for body in [
+            r#"{"statusCode":401,"message":"Unauthorized"}"#,
+            r#"{"statusCode":401,"error":"Unauthorized","message":"Unauthorized"}"#,
+            r#"{"statusCode":401}"#,
+            "",
+        ] {
+            assert!(
+                matches!(classify(body), ProofPostOutcome::SessionExpired),
+                "{body}"
+            );
+        }
+        assert!(matches!(
+            BirdoApi::classify_proof_post_response_after(StatusCode::OK, "{}", None),
+            ProofPostOutcome::Done(_)
+        ));
+        let disabled = r#"{"statusCode":403,"error":"anon_number_rotation_disabled"}"#;
+        assert!(matches!(
+            BirdoApi::classify_proof_post_response_after(StatusCode::FORBIDDEN, disabled, None),
+            ProofPostOutcome::Refused(ApiError::AnonNumberRefused(_))
+        ));
+    }
+
+    /// The structure that makes the above mean "one request": both rotation
+    /// calls go through `post_proof_checked`, which refreshes only on
+    /// `SessionExpired`, never through the generic retrying POST.
+    #[test]
+    fn the_rotation_calls_use_the_discriminating_post() {
+        // A Windows checkout has CRLF; the search below is for LF.
+        let source = include_str!("client.rs").replace("\r\n", "\n");
+        let section = |name: &str| {
+            let start = source.find(name).expect(name);
+            let rest = &source[start..];
+            rest[..rest.find("\n    }\n").expect("end of fn body")].to_string()
+        };
+        for name in [
+            "pub async fn rotate_number_prepare(",
+            "pub async fn rotate_number_confirm(",
+        ] {
+            let body = section(name);
+            assert!(body.contains("post_proof_checked("), "{name}");
+            assert!(!body.contains("self.post("), "{name}");
+        }
+        let checked = section("async fn post_proof_checked<");
+        assert_eq!(checked.matches("send_proof_post(").count(), 2);
+        assert!(checked.contains("ProofPostOutcome::SessionExpired"));
+        assert!(checked.contains("self.refresh_detached(lock)"));
+    }
+
+    /// The bodies the two endpoints take and answer (fake numbers), and that
+    /// none of them prints a number.
+    #[test]
+    fn the_number_replacement_bodies_match_the_contract() {
+        use super::super::types::{
+            RotateConfirmBody, RotateConfirmResponse, RotatePrepareBody, RotatePrepareResponse,
+        };
+        let prepare = RotatePrepareBody {
+            current_number: "111122223333444455556666".into(),
+            password: None,
+            two_factor_code: Some("123456".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&prepare).unwrap(),
+            serde_json::json!({"currentNumber": "111122223333444455556666", "twoFactorCode": "123456"})
+        );
+        assert!(!format!("{prepare:?}").contains("1111"));
+        let confirm = RotateConfirmBody {
+            new_number: "777788889999000011112222".into(),
+            device_id: "dev".into(),
+            device_name: None,
+            platform: "WINDOWS".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&confirm).unwrap(),
+            serde_json::json!({"newNumber": "777788889999000011112222", "deviceId": "dev", "platform": "WINDOWS"})
+        );
+        assert!(!format!("{confirm:?}").contains("7777"));
+        let answer: RotatePrepareResponse = serde_json::from_str(
+            r#"{"ok":true,"newNumber":"777788889999000011112222","expiresInSeconds":600}"#,
+        )
+        .unwrap();
+        assert_eq!(answer.expires_in_seconds, Some(600));
+        assert!(!format!("{answer:?}").contains("7777"));
+        let done: RotateConfirmResponse = serde_json::from_str(
+            r#"{"ok":true,"tokens":{"access_token":"a","refresh_token":"r"}}"#,
+        )
+        .unwrap();
+        assert!(done.ok && done.tokens.is_some());
+        assert!(!format!("{done:?}").contains("refresh_token"));
+    }
+
+    /// MR-1707: with `ANON_NUMBER_MASKING` on, `/auth/me` carries the mask in
+    /// `accountNumber`. It is kept (the Profile card shows it); anything that
+    /// is neither 24 digits nor stars-then-digits is still dropped.
+    #[test]
+    fn a_masked_account_number_is_kept_and_a_malformed_one_is_not() {
+        use super::super::types::{AccountNumber, UserProfile};
+        let mask = "********************6666";
+        assert!(AccountNumber::parse(mask).is_some());
+        assert!(AccountNumber::parse("123456789012345678901234").is_some());
+        for bad in [
+            "",
+            "****",
+            "********************66",
+            "66********************",
+            "********************abcd",
+            "*********************6666",
+        ] {
+            assert!(AccountNumber::parse(bad).is_none(), "{bad}");
+        }
+        let user: UserProfile = serde_json::from_str(&format!(
+            r#"{{"id":"u6","email":"anon_{mask}@anonymous.local","isAnonymous":true,"accountNumber":"{mask}"}}"#
+        ))
+        .unwrap();
+        assert_eq!(serde_json::to_value(&user.account_number).unwrap(), mask);
+        assert!(!format!("{user:?}").contains("6666"));
+    }
+
     #[test]
     fn other_statuses_keep_the_backend_message() {
         // Load-bearing the other way: these variants carry no payload, so
