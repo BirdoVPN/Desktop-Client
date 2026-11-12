@@ -1531,6 +1531,77 @@ mod error_classification_tests {
         ));
     }
 
+    /// MR-1707: a wrong proof's 401 is the handler's answer (one request, no
+    /// refresh); only the JWT guard's bare "Unauthorized" means refresh and
+    /// retry once. The machine code is checked first, then the message.
+    #[test]
+    fn a_proof_401_is_not_refreshed_but_a_bare_unauthorized_is() {
+        use super::super::client::ProofPostOutcome;
+        let classify = |body: &str| {
+            BirdoApi::classify_proof_post_response_after(StatusCode::UNAUTHORIZED, body, None)
+        };
+        // The code wins, even with the guard's own wording.
+        for body in [
+            r#"{"statusCode":401,"error":"rotation_proof_invalid","message":"Unauthorized"}"#,
+            r#"{"statusCode":401,"error":"rotation_proof_invalid"}"#,
+            r#"{"statusCode":401,"message":"Incorrect account number or password"}"#,
+            r#"{"statusCode":401,"error":"Unauthorized","message":"Invalid proof"}"#,
+        ] {
+            assert!(
+                matches!(
+                    classify(body),
+                    ProofPostOutcome::Refused(ApiError::Rejected { status: 401, .. })
+                ),
+                "{body}"
+            );
+        }
+        for body in [
+            r#"{"statusCode":401,"message":"Unauthorized"}"#,
+            r#"{"statusCode":401,"error":"Unauthorized","message":"Unauthorized"}"#,
+            r#"{"statusCode":401}"#,
+            "",
+        ] {
+            assert!(
+                matches!(classify(body), ProofPostOutcome::SessionExpired),
+                "{body}"
+            );
+        }
+        assert!(matches!(
+            BirdoApi::classify_proof_post_response_after(StatusCode::OK, "{}", None),
+            ProofPostOutcome::Done(_)
+        ));
+        let disabled = r#"{"statusCode":403,"error":"anon_number_rotation_disabled"}"#;
+        assert!(matches!(
+            BirdoApi::classify_proof_post_response_after(StatusCode::FORBIDDEN, disabled, None),
+            ProofPostOutcome::Refused(ApiError::AnonNumberRefused(_))
+        ));
+    }
+
+    /// The structure that makes the above mean "one request": both rotation
+    /// calls go through `post_proof_checked`, which refreshes only on
+    /// `SessionExpired`, never through the generic retrying POST.
+    #[test]
+    fn the_rotation_calls_use_the_discriminating_post() {
+        const SOURCE: &str = include_str!("client.rs");
+        let section = |name: &str| {
+            let start = SOURCE.find(name).expect(name);
+            let rest = &SOURCE[start..];
+            rest[..rest.find("\n    }\n").unwrap()].to_string()
+        };
+        for name in [
+            "pub async fn rotate_number_prepare(",
+            "pub async fn rotate_number_confirm(",
+        ] {
+            let body = section(name);
+            assert!(body.contains("post_proof_checked("), "{name}");
+            assert!(!body.contains("self.post("), "{name}");
+        }
+        let checked = section("async fn post_proof_checked<");
+        assert_eq!(checked.matches("send_proof_post(").count(), 2);
+        assert!(checked.contains("ProofPostOutcome::SessionExpired"));
+        assert!(checked.contains("self.refresh_detached(lock)"));
+    }
+
     /// The bodies the two endpoints take and answer (fake numbers), and that
     /// none of them prints a number.
     #[test]

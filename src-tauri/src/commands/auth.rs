@@ -1043,7 +1043,9 @@ fn rotation_refusal(error: &ApiError, wrong_number_is_400: bool) -> Option<Rotat
             "rotation_account_changed" => "account_changed",
             _ => "disabled",
         })),
-        ApiError::Unauthorized => Some(RotationStep::refused("unauthorized")),
+        ApiError::Unauthorized | ApiError::Rejected { status: 401, .. } => {
+            Some(RotationStep::refused("unauthorized"))
+        }
         ApiError::RateLimited { retry_after_secs } => Some(RotationStep {
             refusal: Some("rate_limited"),
             new_number: None,
