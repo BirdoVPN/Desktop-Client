@@ -415,6 +415,9 @@ const FRONTEND_COMMANDS = [
   'get_required_update',
   // The session an update ended, resumed once (MR-1861)
   'take_update_resume',
+  // A-M50: the Linux new-version notice (GitHub Releases), and its release-page opener
+  'check_linux_release',
+  'open_linux_release_page',
   // Settings › About › Licences: the bundled third-party notices (MR-1685)
   'get_third_party_notices',
   // Account data

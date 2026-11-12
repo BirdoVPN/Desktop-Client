@@ -41,6 +41,8 @@
     "allow-install-update",
     "allow-get-required-update",
     "allow-take-update-resume",
+    "allow-check-linux-release",
+    "allow-open-linux-release-page",
     "allow-get-third-party-notices",
     "allow-get-subscription-status",
     "allow-get-usage-stats",
