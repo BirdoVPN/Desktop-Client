@@ -76,14 +76,17 @@ export function VpnSettings() {
   // (the addresses are kept while it is off, P1-parity-042).
   const customDnsActive = settings.customDnsEnabled && (settings.customDns ?? []).length > 0;
 
-  // BirdoShield fleet gate: `=== false` (not `!available`) is the whole point —
-  // undefined/unknown means AVAILABLE; only an explicit server "no" greys it out.
-  const fleetGateOff = dnsFilteringAvailable === false;
+  // BirdoShield fleet gate. Owner 2026-11-13: the row exists ONLY while the gate
+  // is known to be on (`=== true`); off or unknown HIDES it. The app store starts
+  // it unknown (`undefined`) and only a config fetch that answers with a boolean
+  // moves it, so a cold start, or a client that never reaches the web app, shows
+  // no row. Hiding is not clearing: the saved `settings.dnsFiltering` is
+  // untouched and comes back with the row once the gate is on.
+  const fleetGateOff = dnsFilteringAvailable !== true;
 
-  // Either blocker hides the toggle's effect, so both read OFF and disabled.
-  // The saved `settings.dnsFiltering` is NOT cleared by either: clearing
-  // Custom DNS, or the fleet gate coming back, restores the user's choice.
-  const shieldBlocked = fleetGateOff || customDnsActive;
+  // Custom DNS replaces the filtering resolver, so with it active the row reads
+  // OFF and disabled (and says why); clearing Custom DNS restores the choice.
+  const shieldBlocked = customDnsActive;
 
   // ── MTU (a draft while custom) ─────────────────────────────────────────────
   const mtuAuto = settings.wireGuardMtu === 0;
@@ -150,24 +153,25 @@ export function VpnSettings() {
           )}
           {/* BirdoShield (D18): per-device DNS filtering, sent as the
               `dnsFiltering` connect flag by BOTH Rust dial paths. No plan
-              gate. Gated by the fleet and by Custom DNS instead, and then the
-              row says which: that reason is the only text a row carries. */}
-          <SettingsToggle
-            rowStyle="bare"
-            icon={Shield}
-            iconColor={brand.accent}
-            title="BirdoShield"
-            status={
-              fleetGateOff
-                ? "Not available on your account's server fleet yet. Your preference is kept and applies as soon as it is."
-                : customDnsActive
+              gate. HIDDEN while the fleet gate is not known to be on (owner
+              2026-11-13); Custom DNS blocks it and then the row says so:
+              that reason is the only text a row carries. */}
+          {!fleetGateOff && (
+            <SettingsToggle
+              rowStyle="bare"
+              icon={Shield}
+              iconColor={brand.accent}
+              title="BirdoShield"
+              status={
+                customDnsActive
                   ? 'Custom DNS overrides BirdoShield. Turn off Custom DNS Servers under Settings › VPN to use the filtering resolver.'
                   : undefined
-            }
-            checked={settings.dnsFiltering && !shieldBlocked}
-            onCheckedChange={(v) => save({ dnsFiltering: v })}
-            enabled={!shieldBlocked}
-          />
+              }
+              checked={settings.dnsFiltering && !shieldBlocked}
+              onCheckedChange={(v) => save({ dnsFiltering: v })}
+              enabled={!shieldBlocked}
+            />
+          )}
 
           {/* ── NETWORK ───────────────────────────────────────────────── */}
           <SettingsSectionHeader title="Network" />

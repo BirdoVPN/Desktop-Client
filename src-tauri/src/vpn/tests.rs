@@ -670,7 +670,8 @@ mod auto_reconnect_service_tests {
 #[cfg(test)]
 mod reconnect_request_mapping_tests {
     use super::super::auto_reconnect::{
-        reconnect_connect_request, reconnect_multi_hop_request, ReconnectInfo,
+        reconnect_connect_request, reconnect_multi_hop_request, redial_info_under_gate,
+        ReconnectInfo,
     };
     use super::super::manager::MultiHopStatus;
 
@@ -737,6 +738,69 @@ mod reconnect_request_mapping_tests {
             None,
         );
         assert_eq!(req.dns_filtering, None);
+    }
+
+    /// Owner 2026-11-13: a session that asked for BirdoShield re-dials WITHOUT
+    /// the flag while the fleet gate is off (it may have gone off mid-session),
+    /// on both re-dial paths.
+    #[test]
+    fn redial_drops_dns_filtering_while_the_fleet_gate_is_off() {
+        let single = redial_info_under_gate(&info(true, None), false);
+        let req = reconnect_connect_request(&single, "dev", "cpk".into(), None, None);
+        assert_eq!(req.dns_filtering, None);
+
+        let multi = redial_info_under_gate(&info(true, Some("exit-1")), false);
+        let req = reconnect_multi_hop_request(&multi, "exit-1", "dev", "cpk", None, None);
+        assert_eq!(req.dns_filtering, None);
+    }
+
+    #[test]
+    fn redial_keeps_dns_filtering_while_the_fleet_gate_is_on() {
+        let single = redial_info_under_gate(&info(true, None), true);
+        let req = reconnect_connect_request(&single, "dev", "cpk".into(), None, None);
+        assert_eq!(req.dns_filtering, Some(true));
+
+        let multi = redial_info_under_gate(&info(true, Some("exit-1")), true);
+        let req = reconnect_multi_hop_request(&multi, "exit-1", "dev", "cpk", None, None);
+        assert_eq!(req.dns_filtering, Some(true));
+    }
+
+    /// The gate only ever withholds: it never turns on a flag the session did
+    /// not ask for, and it leaves every other property of the session alone.
+    #[test]
+    fn the_redial_gate_never_adds_dns_filtering_and_touches_nothing_else() {
+        let session = info(false, Some("exit-1"));
+        let gated = redial_info_under_gate(&session, true);
+        assert!(!gated.dns_filtering);
+        assert_eq!(gated.server_id, session.server_id);
+        assert_eq!(gated.stealth_mode, session.stealth_mode);
+        assert_eq!(gated.quantum_protection, session.quantum_protection);
+        assert_eq!(gated.fallback_reason, session.fallback_reason);
+        assert_eq!(
+            gated.multi_hop.as_ref().map(|m| m.exit_id.clone()),
+            session.multi_hop.as_ref().map(|m| m.exit_id.clone())
+        );
+    }
+
+    /// The live re-dial passes the session through the gate before it builds
+    /// either body.
+    #[test]
+    fn the_live_redial_reads_the_fleet_gate() {
+        let source = include_str!("auto_reconnect.rs");
+        let start = source
+            .find("async fn request_fresh_response(")
+            .expect("request_fresh_response");
+        let body = &source[start..];
+        let gate = body
+            .find("redial_info_under_gate(info, crate::api::client::dns_filtering_gate_on())")
+            .expect("the re-dial gates the session's flag");
+        let single = body
+            .find("reconnect_connect_request(")
+            .expect("single-hop body");
+        let multi = body
+            .find("reconnect_multi_hop_request(")
+            .expect("multi-hop body");
+        assert!(gate < single && gate < multi);
     }
 
     /// The pre-D18 properties the re-dial already forwarded, pinned in the

@@ -334,14 +334,13 @@ describe('useAppStore', () => {
     })
 
     // The fleet gate is separate from the per-device preference: it is not
-    // persisted and must start AVAILABLE, so a cold start (or a client that
-    // never reaches the web app) offers a feature that works instead of
-    // hiding it.
-    it('should default dnsFilteringAvailable to true and keep it out of persisted storage', async () => {
+    // persisted and starts UNKNOWN (owner 2026-11-13: the BirdoShield row is
+    // hidden until the config fetch says the gate is on).
+    it('should default dnsFilteringAvailable to unknown and keep it out of persisted storage', async () => {
       localStorage.clear()
       vi.resetModules()
       const fresh = await import('./app-store')
-      expect(fresh.useAppStore.getState().dnsFilteringAvailable).toBe(true)
+      expect(fresh.useAppStore.getState().dnsFilteringAvailable).toBeUndefined()
 
       fresh.useAppStore.getState().setDnsFilteringAvailable(false)
       expect(fresh.useAppStore.getState().dnsFilteringAvailable).toBe(false)

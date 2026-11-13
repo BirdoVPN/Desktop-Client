@@ -55,7 +55,8 @@ export function AppShell() {
   // session whichever tab or pushed sub-screen is showing (a cold
   // `birdo://settings` launch lands on Settings with Connect never mounted).
   // Pinned by `src/__tests__/AppShellClientConfig.test.tsx`; the staleness
-  // bound and the "unknown means AVAILABLE" rule live in the hook.
+  // bound and the "only an explicit boolean moves the gate" rule live in the
+  // hook; the store starts it unknown, which hides the row.
   useClientConfig();
 
   const topRoute = navStack[navStack.length - 1];

@@ -100,6 +100,18 @@ impl ReconnectInfo {
     }
 }
 
+/// The session on record with its BirdoShield flag put through the fleet gate
+/// as it is NOW (owner 2026-11-13). The session keeps the user's preference;
+/// the gate can go off, or on, while it runs, so the unattended re-dial reads
+/// it when it sends, exactly as a user-initiated dial does. Pure: the caller
+/// passes `client::dns_filtering_gate_on()`.
+pub(crate) fn redial_info_under_gate(info: &ReconnectInfo, gate_on: bool) -> ReconnectInfo {
+    ReconnectInfo {
+        dns_filtering: crate::api::client::dns_filtering_with_gate(info.dns_filtering, gate_on),
+        ..info.clone()
+    }
+}
+
 /// The exact `/vpn/connect` body a single-hop auto-reconnect posts for
 /// `info`. Pure (no I/O): the attestation is fetched by the caller. Every
 /// session property `ReconnectInfo` carries for the WIRE is mapped here —
@@ -1758,6 +1770,7 @@ async fn request_fresh_response(
     client_public_key: String,
     pq_client_public_key: Option<String>,
 ) -> Result<ConnectResponse, IpcError> {
+    let info = &redial_info_under_gate(info, crate::api::client::dns_filtering_gate_on());
     let attestation = api.desktop_attestation().await;
     let response = if let Some(route) = info.multi_hop.as_ref() {
         let payload = reconnect_multi_hop_request(
