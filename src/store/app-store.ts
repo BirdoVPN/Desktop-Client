@@ -307,13 +307,20 @@ export interface AppState {
    * STARTS UNKNOWN (`undefined`), and is deliberately NOT persisted (see
    * `partialize`) and NOT cleared on logout — it is a property of the fleet, not
    * of the account. Owner 2026-11-13: the BirdoShield row exists ONLY while the
-   * gate is known to be on (`=== true`); off or unknown (a cold start before the
-   * fetch, an unreachable server, a 500, an older web deploy that predates the
-   * field) HIDES it, and the Rust side sends the connect flag only while its
-   * own copy of the gate (set by the same fetch) is on.
+   * gate is known to be on (`=== true`). Off HIDES it, and so does unknown: a
+   * cold start before the first answer, and a fetch that never answers (offline,
+   * a 500, a 429) leaves it unknown. `useClientConfig` writes only an explicit
+   * boolean, so a failed fetch or a payload without the field keeps the last
+   * answer. Hiding is not clearing: `settings.dnsFiltering` is untouched.
+   *
+   * The connect flag follows the same gate on the Rust side, which keeps its own
+   * copy from the same `get_client_config` call (`api::client::
+   * dns_filtering_gate_on`, on only for an explicit `true`) and applies it on
+   * every dial path, the auto-reconnect re-dial included.
    *
    * Typed `boolean | undefined`, not `boolean`, so the type carries the
-   * tri-state: consumers test `=== true`.
+   * tri-state: consumers test `=== true`, and a `!== false` that treats unknown
+   * as on is a type-visible change of meaning rather than an invisible one.
    */
   dnsFilteringAvailable: boolean | undefined;
   setDnsFilteringAvailable: (available: boolean) => void;

@@ -7,30 +7,6 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// The BirdoShield FLEET gate as the last `GET /api/client-config` said it
-/// (`dnsFilteringAvailable == true`); false until a fetch said so (owner
-/// 2026-11-13: the row is hidden and the connect flag is not sent while the
-/// gate is off or not known). In memory only, like the UI's copy.
-static DNS_FILTERING_GATE_ON: AtomicBool = AtomicBool::new(false);
-
-/// Whether the last config fetch reported the fleet gate on.
-pub(crate) fn dns_filtering_gate_on() -> bool {
-    DNS_FILTERING_GATE_ON.load(Ordering::Relaxed)
-}
-
-/// Record a fetched gate. An absent value (an older web deploy) changes
-/// nothing: "the server did not say" is not "off", and not "on" either.
-pub(crate) fn note_dns_filtering_gate(available: Option<bool>) {
-    if let Some(on) = available {
-        DNS_FILTERING_GATE_ON.store(on, Ordering::Relaxed);
-    }
-}
-
-/// The wire rule for `dnsFiltering` before the Custom DNS rule: the preference
-/// counts only while the fleet gate is known to be on (owner 2026-11-13).
-pub(crate) fn dns_filtering_with_gate(preference: bool, gate_on: bool) -> bool {
-    preference && gate_on
-}
 use std::time::Duration;
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
@@ -42,6 +18,31 @@ use super::types::*;
 // H-1: erased_serde is used for the generic retry interceptor
 // that needs to pass serializable bodies through a trait object.
 use erased_serde;
+
+/// The BirdoShield FLEET gate as the last successful `GET /api/client-config`
+/// reported it: on only for `dnsFilteringAvailable == Some(true)` (owner
+/// 2026-11-13: the row is hidden, and the connect flag is not sent, while the
+/// gate is off or not known). A success that says `false`, or omits the field,
+/// turns it off; a failed fetch leaves the last answer. Starts off; in memory
+/// only, like the UI's copy.
+static DNS_FILTERING_GATE_ON: AtomicBool = AtomicBool::new(false);
+
+/// Whether the last successful config fetch reported the fleet gate on.
+pub(crate) fn dns_filtering_gate_on() -> bool {
+    DNS_FILTERING_GATE_ON.load(Ordering::Relaxed)
+}
+
+/// Record a successful fetch's gate: on only for an explicit `true`.
+pub(crate) fn note_dns_filtering_gate(available: Option<bool>) {
+    DNS_FILTERING_GATE_ON.store(available == Some(true), Ordering::Relaxed);
+}
+
+/// The wire rule for `dnsFiltering`: the preference (after the Custom DNS
+/// rule, `effective_dns_filtering`) counts only while the fleet gate is on.
+/// Pure; the dial sites pass [`dns_filtering_gate_on`].
+pub(crate) fn dns_filtering_with_gate(preference: bool, gate_on: bool) -> bool {
+    preference && gate_on
+}
 
 /// Production API URL
 /// This should match the CSP in tauri.conf.json: connect-src https://*.birdo.app

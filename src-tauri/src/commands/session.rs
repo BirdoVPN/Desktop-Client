@@ -392,6 +392,14 @@ async fn attempt(
     // What this attempt asks for, for the Adaptive Transport decision should
     // it fail (`fallback_reason_for`).
     ctx.stealth_mode = settings.stealth_mode;
+    // BirdoShield (D18): the preference goes on the wire only while the fleet
+    // gate is known to be on (owner 2026-11-13; `get_client_config` keeps the
+    // process-wide copy). Read once, so the retried request below asks for
+    // exactly what the first one did.
+    let dns_filtering = crate::api::client::dns_filtering_with_gate(
+        settings.dns_filtering,
+        crate::api::client::dns_filtering_gate_on(),
+    );
 
     // AUDIT-C1: with PQ requested, attach our ML-KEM-1024 public key so the
     // server can encapsulate against it.
@@ -442,7 +450,7 @@ async fn attempt(
                                 fallback_reason,
                                 settings.quantum_protection.then_some(true),
                                 pq_pk.clone(),
-                                settings.dns_filtering,
+                                dns_filtering,
                             ),
                         )
                         .await?
@@ -465,7 +473,7 @@ async fn attempt(
                                 settings.stealth_mode,
                                 settings.quantum_protection,
                                 pq_pk.clone(),
-                                settings.dns_filtering,
+                                dns_filtering,
                             ),
                         )
                         .await?
@@ -1623,6 +1631,30 @@ mod lifecycle_tests {
             !before.contains(")?") && !before.contains("return "),
             "recorded before the attempt can fail"
         );
+    }
+
+    /// Owner 2026-11-13: both dial paths send BirdoShield through the fleet
+    /// gate, and the session on record keeps the preference (the re-dial
+    /// gates it again when it sends, `redial_info_under_gate`).
+    #[test]
+    fn both_dial_paths_send_dns_filtering_through_the_fleet_gate() {
+        let attempt = body("async fn attempt(");
+        let gated = attempt
+            .find("let dns_filtering = crate::api::client::dns_filtering_with_gate(")
+            .expect("the attempt gates the flag");
+        assert!(attempt[gated..].contains("crate::api::client::dns_filtering_gate_on(),"));
+        let sent = &attempt[gated..];
+        assert_eq!(
+            sent.matches("                                dns_filtering,")
+                .count(),
+            2,
+            "connect_vpn and connect_multi_hop both pass the gated flag"
+        );
+        assert!(
+            !attempt.contains("                                settings.dns_filtering,"),
+            "no dial path passes the ungated preference"
+        );
+        assert!(attempt.contains("dns_filtering: settings.dns_filtering,"));
     }
 
     /// Round 6 of the review of #222 (P3-1): the dial reads the kill switch

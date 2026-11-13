@@ -31,8 +31,9 @@ vi.mock('@tauri-apps/api/core');
 // `settings` the screen re-reads via getState() carries the new value.
 const mockStoreState = {
   connectionState: 'disconnected' as ConnectionState,
-  // The fleet gate from GET /api/client-config. `true` is the store default —
-  // see the availability describe block at the bottom of this file.
+  // The fleet gate from GET /api/client-config, set ON here so the row renders.
+  // The REAL store starts it unknown, which hides the row:
+  // `BirdoShieldGateDefault.test.tsx` pins that against the real store.
   dnsFilteringAvailable: true as boolean | undefined,
   settings: {
     killSwitchEnabled: true,
@@ -282,7 +283,9 @@ describe('BirdoShield toggle → dns_filtering', () => {
     });
 
     // Owner 2026-11-13: unknown (the store value was never set) hides the row
-    // like an explicit off; it appears when the gate is known to be on.
+    // like an explicit off; it appears when the gate is known to be on. This
+    // file stubs the store, so this sets `undefined` by hand; the REAL store
+    // default is pinned in `BirdoShieldGateDefault.test.tsx`.
     it('an unknown value (not set) hides the row', async () => {
       mockStoreState.dnsFilteringAvailable = undefined;
       mockStoreState.settings.dnsFiltering = true;

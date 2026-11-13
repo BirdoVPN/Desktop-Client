@@ -77,10 +77,11 @@ export function VpnSettings() {
   const customDnsActive = settings.customDnsEnabled && (settings.customDns ?? []).length > 0;
 
   // BirdoShield fleet gate. Owner 2026-11-13: the row exists ONLY while the gate
-  // is known to be on (`=== true`); off or unknown HIDES it (the app store starts
-  // it at true and the config fetch moves it; undefined means "not set").
-  // Hiding is not clearing: the saved `settings.dnsFiltering` is untouched and
-  // comes back with the row if the gate is ever turned on.
+  // is known to be on (`=== true`); off or unknown HIDES it. The app store starts
+  // it unknown (`undefined`) and only a config fetch that answers with a boolean
+  // moves it, so a cold start, or a client that never reaches the web app, shows
+  // no row. Hiding is not clearing: the saved `settings.dnsFiltering` is
+  // untouched and comes back with the row once the gate is on.
   const fleetGateOff = dnsFilteringAvailable !== true;
 
   // Custom DNS replaces the filtering resolver, so with it active the row reads
