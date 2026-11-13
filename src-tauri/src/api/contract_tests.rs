@@ -289,7 +289,11 @@ fn the_contract_version_is_the_schemas() {
         .expect("the vendored schema is stamped with x-contractVersion");
     assert_eq!(s["_status"]["contractVersion"], version);
     assert_eq!(FILE.trim(), version, "contract/CONTRACT_VERSION");
-    assert_eq!(super::client::CONTRACT_VERSION, version, "client::CONTRACT_VERSION");
+    assert_eq!(
+        super::client::CONTRACT_VERSION,
+        version,
+        "client::CONTRACT_VERSION"
+    );
     // MAJOR.MINOR.PATCH, nothing else: the backend files anything odd as `invalid`.
     let parts: Vec<&str> = version.split('.').collect();
     assert_eq!(parts.len(), 3, "{version}");
