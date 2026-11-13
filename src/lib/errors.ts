@@ -68,6 +68,8 @@ export const SETTINGS_UNVERIFIED_COPY =
 
 export const ACCOUNT_RESTRICTED_COPY =
   'New connections on this account are paused for now. If this is a mistake, ask for a review.';
+export const EMAIL_NOT_VERIFIED_COPY =
+  'Please verify your email address first. Open birdo.app/verify-email to get a new link.';
 export const REGISTRATION_NOT_ALLOWED_COPY =
   "BirdoVPN can't create new accounts from your country right now.";
 
@@ -162,6 +164,7 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   // these are the fallbacks for an answer that carried none.
   account_restricted: { message: ACCOUNT_RESTRICTED_COPY, action: null },
   registration_not_allowed: { message: REGISTRATION_NOT_ALLOWED_COPY, action: null },
+  email_not_verified: { message: EMAIL_NOT_VERIFIED_COPY, action: null },
   unknown: { message: 'Something went wrong. Please try again.', action: 'retry' },
 };
 
