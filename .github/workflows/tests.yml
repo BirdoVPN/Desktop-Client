@@ -699,8 +699,13 @@ jobs:
           key: msrv-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # MR-1798: warnings fail this check (it printed them unchecked on the
+      # Linux/macOS legs). Cargo caps lints on registry dependencies, so
+      # `-D warnings` only applies to this workspace's own crate.
       - name: cargo check --locked --all-targets at the declared rust-version
         working-directory: src-tauri
+        env:
+          RUSTFLAGS: "-D warnings"
         run: |
           rustc --version
           cargo check --locked --all-targets
