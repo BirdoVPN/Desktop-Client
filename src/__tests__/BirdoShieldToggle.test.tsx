@@ -110,9 +110,13 @@ beforeEach(() => {
 });
 
 
-/** The exact fleet-gate reason copy the screen renders. */
+/** The fleet-gate reason copy the screen USED to render: it must not come back (owner 2026-11-13: the row is hidden). */
 const UNAVAILABLE_COPY =
   "Not available on your account's server fleet yet. Your preference is kept and applies as soon as it is.";
+
+/** What a Custom-DNS-blocked row says. */
+const CUSTOM_DNS_COPY =
+  'Custom DNS overrides BirdoShield. Turn off Custom DNS Servers under Settings › VPN to use the filtering resolver.';
 
 const savedSettings = () =>
   mockedInvoke.mock.calls
@@ -241,43 +245,33 @@ describe('BirdoShield toggle → dns_filtering', () => {
   // resolver, so a row the user can switch ON is a lie about what the server
   // will do.
   describe('with the fleet gate off (dnsFilteringAvailable: false)', () => {
-    it('reads OFF, is disabled and gives the reason — even when dnsFiltering is persisted ON', async () => {
+    it('the row is not rendered at all, even when dnsFiltering is persisted ON, and nothing is cleared', async () => {
       mockStoreState.dnsFilteringAvailable = false;
       mockStoreState.settings.dnsFiltering = true;
       render(<VpnSettings />);
-      const row = await screen.findByRole('switch', { name: /birdoshield/i });
-      expect(row).toHaveAttribute('aria-checked', 'false');
-      // Disabled rows degrade to a static <div> (same as Stealth on RECON).
-      expect(row.tagName).toBe('DIV');
-      expect(screen.getByText(UNAVAILABLE_COPY)).toBeInTheDocument();
-      expect(
-        screen.queryByText("Blocks ads, trackers and malware domains at the VPN's DNS resolver."),
-      ).not.toBeInTheDocument();
-
-      // Clicking the disabled row must not persist anything — and, crucially,
-      // must not CLEAR the stored preference either: it has to come back on
-      // its own when the gate does.
-      await userEvent.click(row);
+      // The rest of the screen is there (the row is gone, not the page).
+      expect(await screen.findByRole('switch', { name: /local network sharing/i })).toBeInTheDocument();
+      expect(screen.queryByRole('switch', { name: /birdoshield/i })).not.toBeInTheDocument();
+      expect(screen.queryByText('BirdoShield')).not.toBeInTheDocument();
+      expect(screen.queryByText(UNAVAILABLE_COPY)).not.toBeInTheDocument();
+      // Hiding is not clearing: the stored preference returns with the gate.
       expect(mockStoreState.updateSettings).not.toHaveBeenCalled();
       expect(savedSettings()).toHaveLength(0);
       expect(mockStoreState.settings.dnsFiltering).toBe(true);
     });
 
-    it('names the fleet gate, not Custom DNS, when both block the row', async () => {
+    it('is hidden when Custom DNS is also on (the fleet gate wins, no Custom DNS reason either)', async () => {
       mockStoreState.dnsFilteringAvailable = false;
       mockStoreState.settings.customDns = ['1.1.1.1'];
       mockStoreState.settings.customDnsEnabled = true;
       render(<VpnSettings />);
-      expect(screen.getByText(UNAVAILABLE_COPY)).toBeInTheDocument();
-      expect(
-        screen.queryByText(
-          'Custom DNS overrides BirdoShield. Turn off Custom DNS Servers under Settings › VPN to use the filtering resolver.',
-        ),
-      ).not.toBeInTheDocument();
+      expect(await screen.findByRole('switch', { name: /local network sharing/i })).toBeInTheDocument();
+      expect(screen.queryByRole('switch', { name: /birdoshield/i })).not.toBeInTheDocument();
+      expect(screen.queryByText(CUSTOM_DNS_COPY)).not.toBeInTheDocument();
     });
   });
 
-  describe('with the fleet gate on or unknown', () => {
+  describe('with the fleet gate known to be on', () => {
     it('true leaves the row enabled and switchable', async () => {
       mockStoreState.dnsFilteringAvailable = true;
       render(<VpnSettings />);
@@ -287,20 +281,14 @@ describe('BirdoShield toggle → dns_filtering', () => {
       expect(mockStoreState.updateSettings).toHaveBeenCalledWith({ dnsFiltering: true });
     });
 
-    // The default that matters: a failed/absent fetch leaves the store value
-    // untouched, and `undefined` must NOT read as "off". Hiding a feature that
-    // works because the client could not reach the web app is the failure this
-    // whole flag exists to avoid.
-    it('an unknown value (failed fetch, older web deploy) leaves the row enabled', async () => {
+    // Owner 2026-11-13: unknown (the store value was never set) hides the row
+    // like an explicit off; it appears when the gate is known to be on.
+    it('an unknown value (not set) hides the row', async () => {
       mockStoreState.dnsFilteringAvailable = undefined;
       mockStoreState.settings.dnsFiltering = true;
       render(<VpnSettings />);
-      const row = await screen.findByRole('switch', { name: /birdoshield/i });
-      expect(row.tagName).toBe('BUTTON');
-      expect(row).toHaveAttribute('aria-checked', 'true');
-      // Available: nothing to explain, so no text under the title.
-      expect(row).toHaveTextContent(/^BirdoShield$/);
-      expect(screen.queryByText(UNAVAILABLE_COPY)).not.toBeInTheDocument();
+      expect(await screen.findByRole('switch', { name: /local network sharing/i })).toBeInTheDocument();
+      expect(screen.queryByRole('switch', { name: /birdoshield/i })).not.toBeInTheDocument();
     });
   });
 
@@ -331,7 +319,6 @@ describe('BirdoShield toggle → dns_filtering', () => {
     };
 
     const states: Array<[string, () => void]> = [
-      ['fleet gate off', () => { mockStoreState.dnsFilteringAvailable = false; }],
       ['custom DNS', () => {
         mockStoreState.settings.customDns = ['1.1.1.1'];
         mockStoreState.settings.customDnsEnabled = true;
@@ -349,15 +336,15 @@ describe('BirdoShield toggle → dns_filtering', () => {
       expect(subtitle.className).toMatch(/\bwhitespace-normal\b/);
     });
 
-    it('spells out the fleet-gate reason past the truncation point', async () => {
-      mockStoreState.dnsFilteringAvailable = false;
+    it('spells out the Custom DNS reason past the truncation point', async () => {
+      mockStoreState.settings.customDns = ['1.1.1.1'];
+      mockStoreState.settings.customDnsEnabled = true;
       render(<VpnSettings />);
       const subtitle = subtitleOf(await screen.findByRole('switch', { name: /birdoshield/i }));
-      expect(subtitle).toHaveTextContent(UNAVAILABLE_COPY);
-      // The half that used to fall off the end. Asserted separately so the
-      // failure names the thing that was lost, not just "text mismatch".
-      expect(UNAVAILABLE_COPY.slice(ONE_LINE_BUDGET)).toContain('Your preference is kept');
-      expect(subtitle).toHaveTextContent('Your preference is kept and applies as soon as it is.');
+      expect(subtitle).toHaveTextContent(CUSTOM_DNS_COPY);
+      // The half that would fall off the end of one truncated line.
+      expect(CUSTOM_DNS_COPY.slice(ONE_LINE_BUDGET)).toContain('Turn off Custom DNS Servers');
+      expect(subtitle).toHaveTextContent('Turn off Custom DNS Servers under Settings');
     });
 
     it('rows whose subtitle is a short value keep the default truncation', () => {
@@ -389,27 +376,16 @@ describe('BirdoShield toggle → dns_filtering', () => {
       return document.getElementById(id!);
     };
 
-    it('the fleet-gate row is announced as disabled, is reachable, and points at its reason', async () => {
-      mockStoreState.dnsFilteringAvailable = false;
-      render(<VpnSettings />);
-      const row = await screen.findByRole('switch', { name: /birdoshield/i });
-
-      // Not a <button>, so `disabled` cannot carry it — ARIA has to.
-      expect(row.tagName).toBe('DIV');
-      expect(row).toHaveAttribute('aria-disabled', 'true');
-      // Focusable on purpose: an aria-disabled control stays in the tab order
-      // so its state and description can be read. It has no click handler, so
-      // reaching it does nothing (asserted above in the gate-off block).
-      expect(row).toHaveAttribute('tabindex', '0');
-      expect(reasonOf(row)).toHaveTextContent(UNAVAILABLE_COPY);
-    });
-
-    it('the Custom DNS row does the same', async () => {
+    it('the Custom DNS row is announced as disabled, is reachable, and points at its reason', async () => {
       mockStoreState.settings.customDns = ['1.1.1.1'];
       mockStoreState.settings.customDnsEnabled = true;
       render(<VpnSettings />);
       const row = await screen.findByRole('switch', { name: /birdoshield/i });
+      // Not a <button>, so `disabled` cannot carry it: ARIA has to.
+      expect(row.tagName).toBe('DIV');
       expect(row).toHaveAttribute('aria-disabled', 'true');
+      // Focusable on purpose: an aria-disabled control stays in the tab order
+      // so its state and description can be read.
       expect(row).toHaveAttribute('tabindex', '0');
       expect(reasonOf(row)).toHaveTextContent('Custom DNS overrides BirdoShield.');
     });
@@ -461,18 +437,20 @@ describe('BirdoShield toggle → dns_filtering', () => {
   // `aria-describedby` and the description assertions fail.
   describe('the row NAMES the setting and DESCRIBES the reason, saying neither twice', () => {
     it('the structural premise round 4 got wrong: the subtitle is INSIDE the switch', async () => {
-      mockStoreState.dnsFilteringAvailable = false;
+      mockStoreState.settings.customDns = ['1.1.1.1'];
+      mockStoreState.settings.customDnsEnabled = true;
       render(<VpnSettings />);
       const row = await screen.findByRole('switch', { name: 'BirdoShield' });
-      expect(row.contains(screen.getByText(UNAVAILABLE_COPY))).toBe(true);
+      expect(row.contains(screen.getByText(CUSTOM_DNS_COPY))).toBe(true);
     });
 
     it('the blocked row: name is the setting, description is the reason', async () => {
-      mockStoreState.dnsFilteringAvailable = false;
+      mockStoreState.settings.customDns = ['1.1.1.1'];
+      mockStoreState.settings.customDnsEnabled = true;
       render(<VpnSettings />);
       const row = await screen.findByRole('switch', { name: 'BirdoShield' });
       expect(row).toHaveAccessibleName('BirdoShield');
-      expect(row).toHaveAccessibleDescription(UNAVAILABLE_COPY);
+      expect(row).toHaveAccessibleDescription(CUSTOM_DNS_COPY);
     });
 
     it('an ENABLED row is announced by its name alone (no description since 2026-10-21)', async () => {
