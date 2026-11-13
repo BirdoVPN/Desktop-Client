@@ -389,7 +389,12 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         lockdown_mode,
         ..
     } = settings;
-    let dns_filtering = effective_dns_filtering(dns_filtering, custom_dns.as_deref());
+    // Owner 2026-11-13: a preference set while the fleet gate was on is not SENT
+    // while the gate is off or not known (the row is hidden then, too).
+    let dns_filtering = crate::api::client::dns_filtering_with_gate(
+        effective_dns_filtering(dns_filtering, custom_dns.as_deref()),
+        crate::api::client::dns_filtering_gate_on(),
+    );
 
     // Mirror Local Network Sharing to the kill switch on every platform, so an
     // engaged block still permits the LAN when the user asked for that. Lives
@@ -1762,6 +1767,32 @@ mod tests {
         // A single custom resolver is enough — same threshold as the tunnel builder.
         let one = vec!["1.1.1.1".to_string()];
         assert!(!effective_dns_filtering(true, Some(&one)));
+    }
+
+    /// Owner 2026-11-13: the connect flag needs the fleet gate known to be on,
+    /// whatever the preference says.
+    #[test]
+    fn dns_filtering_is_sent_only_while_the_fleet_gate_is_on() {
+        use crate::api::client::dns_filtering_with_gate as gated;
+        assert!(gated(true, true));
+        assert!(!gated(true, false));
+        assert!(!gated(false, true));
+        assert!(!gated(false, false));
+    }
+
+    /// An absent `dnsFilteringAvailable` (an older web deploy) changes nothing;
+    /// a boolean sets the gate. The gate starts off.
+    #[test]
+    fn the_fleet_gate_follows_the_fetch_and_ignores_an_absent_value() {
+        use crate::api::client::{dns_filtering_gate_on, note_dns_filtering_gate};
+        note_dns_filtering_gate(Some(true));
+        assert!(dns_filtering_gate_on());
+        note_dns_filtering_gate(None);
+        assert!(dns_filtering_gate_on(), "absent must not turn it off");
+        note_dns_filtering_gate(Some(false));
+        assert!(!dns_filtering_gate_on());
+        note_dns_filtering_gate(None);
+        assert!(!dns_filtering_gate_on(), "absent must not turn it on");
     }
 
     #[test]

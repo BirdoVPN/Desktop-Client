@@ -4,7 +4,33 @@
 
 use reqwest::{Client, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// The BirdoShield FLEET gate as the last `GET /api/client-config` said it
+/// (`dnsFilteringAvailable == true`); false until a fetch said so (owner
+/// 2026-11-13: the row is hidden and the connect flag is not sent while the
+/// gate is off or not known). In memory only, like the UI's copy.
+static DNS_FILTERING_GATE_ON: AtomicBool = AtomicBool::new(false);
+
+/// Whether the last config fetch reported the fleet gate on.
+pub(crate) fn dns_filtering_gate_on() -> bool {
+    DNS_FILTERING_GATE_ON.load(Ordering::Relaxed)
+}
+
+/// Record a fetched gate. An absent value (an older web deploy) changes
+/// nothing: "the server did not say" is not "off", and not "on" either.
+pub(crate) fn note_dns_filtering_gate(available: Option<bool>) {
+    if let Some(on) = available {
+        DNS_FILTERING_GATE_ON.store(on, Ordering::Relaxed);
+    }
+}
+
+/// The wire rule for `dnsFiltering` before the Custom DNS rule: the preference
+/// counts only while the fleet gate is known to be on (owner 2026-11-13).
+pub(crate) fn dns_filtering_with_gate(preference: bool, gate_on: bool) -> bool {
+    preference && gate_on
+}
 use std::time::Duration;
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
@@ -1133,8 +1159,11 @@ impl BirdoApi {
             .send()
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
-        self.handle_response_from(response, super::upgrade_gate::Origin::Web)
-            .await
+        let config: ClientConfigResponse = self
+            .handle_response_from(response, super::upgrade_gate::Origin::Web)
+            .await?;
+        note_dns_filtering_gate(config.dns_filtering_available);
+        Ok(config)
     }
 
     /// Get per-user monthly bandwidth usage + cap for the data-usage meter.

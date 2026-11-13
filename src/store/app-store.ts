@@ -304,19 +304,16 @@ export interface AppState {
    * backend ignores the connect flag and hands out the normal resolver, so a
    * toggle that read ON would be reassurance from missing data.
    *
-   * DEFAULTS TO TRUE, and is deliberately NOT persisted (see `partialize`) and
-   * NOT cleared on logout — it is a property of the fleet, not of the account.
-   * True is the safe default because the failure mode it guards is asymmetric:
-   * a wrongly-`false` value HIDES a feature that works (and loses the user
-   * filtering they paid attention to), while a wrongly-`true` one costs a
-   * greyed-out row appearing a moment late. Only an explicit `false` from the
-   * server disables the row; an unreachable server, a 500, an older web deploy
-   * that predates the field, or a cold start before the fetch all leave it on.
+   * STARTS UNKNOWN (`undefined`), and is deliberately NOT persisted (see
+   * `partialize`) and NOT cleared on logout — it is a property of the fleet, not
+   * of the account. Owner 2026-11-13: the BirdoShield row exists ONLY while the
+   * gate is known to be on (`=== true`); off or unknown (a cold start before the
+   * fetch, an unreachable server, a 500, an older web deploy that predates the
+   * field) HIDES it, and the Rust side sends the connect flag only while its
+   * own copy of the gate (set by the same fetch) is on.
    *
    * Typed `boolean | undefined`, not `boolean`, so the type carries the
-   * tri-state the rule is written against: consumers must test `=== false`,
-   * and a `!available` that treats unknown as off is then a type-visible
-   * change of meaning rather than an invisible one.
+   * tri-state: consumers test `=== true`.
    */
   dnsFilteringAvailable: boolean | undefined;
   setDnsFilteringAvailable: (available: boolean) => void;
@@ -574,8 +571,9 @@ export const useAppStore = create<AppState>()(
       settingsHydrated: false,
       reapplying: false,
 
-      // See the AppState doc comment: true until the server says otherwise.
-      dnsFilteringAvailable: true,
+      // See the AppState doc comment: unknown until the server says (owner
+      // 2026-11-13: the BirdoShield row is hidden until the gate is known on).
+      dnsFilteringAvailable: undefined,
       setDnsFilteringAvailable: (dnsFilteringAvailable) => set({ dnsFilteringAvailable }),
       customDnsByPlan: {},
       setCustomDnsByPlan: (customDnsByPlan) => set({ customDnsByPlan }),
