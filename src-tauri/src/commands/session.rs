@@ -31,6 +31,7 @@ use crate::commands::vpn::{
 };
 use crate::storage::CredentialStore;
 use crate::vpn::auto_reconnect::ReconnectInfo;
+use crate::vpn::birdo_pq::PqSession;
 use crate::vpn::manager::{
     ConnectPhase, ConnectionState, MultiHopStatus, SessionLabel, VpnManager,
 };
@@ -394,20 +395,14 @@ async fn attempt(
     ctx.stealth_mode = settings.stealth_mode;
 
     // AUDIT-C1: with PQ requested, attach our ML-KEM-1024 public key so the
-    // server can encapsulate against it.
-    let pq_pk = if settings.quantum_protection {
-        Some(
-            crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
-                IpcError::new(
-                    IpcErrorCode::PqFailed,
-                    "Post-quantum engine unavailable. Connection aborted because quantum \
-                     protection is enabled.",
-                )
-            })?,
-        )
-    } else {
-        None
-    };
+    // server can encapsulate against it. MR-703 / MR-1742: the keypair is made
+    // HERE, for this one request, and its secret lives only in this
+    // `PqSession`: held across the retry below (the same body is re-sent, so
+    // the server's ciphertext still fits), moved into `prepare_tunnel` to
+    // decapsulate, and wiped on every other exit. The next connect, and every
+    // re-dial, makes its own.
+    let pq_session = settings.quantum_protection.then(PqSession::begin);
+    let pq_pk = pq_session.as_ref().map(PqSession::public_key_b64);
 
     vm.set_phase(ConnectPhase::Authenticating);
     // MR-1639: a refusal the server marks retryable with a wait
@@ -522,6 +517,7 @@ async fn attempt(
             server_id: dialled_id,
             stealth_mode: settings.stealth_mode,
             quantum_protection: settings.quantum_protection,
+            pq_session,
             fallback_reason,
             custom_dns: settings.custom_dns.clone(),
             custom_mtu: settings.custom_mtu,
@@ -895,6 +891,9 @@ pub(crate) struct TunnelRequest<'a> {
     pub server_id: &'a str,
     pub stealth_mode: bool,
     pub quantum_protection: bool,
+    /// The keypair this request's `pqClientPublicKey` came from (MR-703).
+    /// Consumed by the decapsulation; `None` when quantum protection is off.
+    pub pq_session: Option<PqSession>,
     pub fallback_reason: Option<&'a str>,
     pub custom_dns: Option<Vec<String>>,
     pub custom_mtu: u16,
@@ -925,7 +924,7 @@ pub(crate) async fn prepare_tunnel(
     vm: &VpnManager,
     epoch: u64,
     response: ConnectResponse,
-    request: TunnelRequest<'_>,
+    mut request: TunnelRequest<'_>,
 ) -> Result<PreparedTunnel, IpcError> {
     enforce_requested_protection(&response, request.stealth_mode, request.quantum_protection)?;
 
@@ -961,7 +960,8 @@ pub(crate) async fn prepare_tunnel(
 
     vm.set_phase(ConnectPhase::NegotiatingPq);
     let quantum_psk =
-        derive_quantum_psk(&response).map_err(|m| IpcError::new(IpcErrorCode::PqFailed, m))?;
+        derive_quantum_psk(&response, request.pq_session.take())
+            .map_err(|m| IpcError::new(IpcErrorCode::PqFailed, m))?;
 
     let (mut config, server_name) = build_vpn_config(
         response,
@@ -1703,7 +1703,7 @@ mod lifecycle_tests {
             attempt,
             &[
                 "let settings = apply_vpn_settings(app).await;",
-                "let pq_pk = if settings.quantum_protection {",
+                "let pq_session = settings.quantum_protection.then(PqSession::begin);",
                 "let mut retried = false;",
                 "loop {",
                 "generate_wireguard_keypair()",
@@ -1720,7 +1720,7 @@ mod lifecycle_tests {
         );
         for once in [
             "apply_vpn_settings(",
-            "get_client_public_key_b64()",
+            "PqSession::begin",
             "generate_wireguard_keypair()",
         ] {
             assert_eq!(attempt.matches(once).count(), 1, "{once}");

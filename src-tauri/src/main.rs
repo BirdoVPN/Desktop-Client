@@ -606,6 +606,13 @@ fn main() {
             #[cfg(windows)]
             crate::utils::protected_dir::remove_updates_at_start();
 
+            // MR-703 / MR-1742: no ML-KEM key is stored any more (one keypair
+            // per connect, in memory). Delete the file an older build left,
+            // once per start; the first start after the upgrade finds it.
+            // Off the setup path: it is only a few file deletions, but setup
+            // must not wait on a slow disk.
+            std::thread::spawn(crate::vpn::birdo_pq::purge_legacy_keypair_files);
+
             // R1 / D6c LOW: consume the legacy-upgrade marker now — the PRIMARY
             // instance (only it reaches setup; the single-instance plugin turns
             // a second one away), after the settings migration above. Gated on

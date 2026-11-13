@@ -1448,18 +1448,11 @@ impl ReconnectLoop {
         // wiped on drop, so no error path frees it un-wiped (AR-1). Only
         // `ReconnectInfo` outlives the attempt, and it holds no key.
         let (private_key, client_public_key) = crate::commands::vpn::generate_wireguard_keypair();
-        let pq_pk = if info.quantum_protection {
-            Some(
-                crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
-                    IpcError::new(
-                        IpcErrorCode::PqFailed,
-                        "Post-quantum engine unavailable during reconnect; refusing a downgrade.",
-                    )
-                })?,
-            )
-        } else {
-            None
-        };
+        // MR-703 / MR-1742: a re-dial is a new connect, so it gets a keypair of
+        // its own; the secret is moved into `prepare_tunnel` below and is
+        // wiped there, or on any earlier exit.
+        let pq_session = info.quantum_protection.then(crate::vpn::birdo_pq::PqSession::begin);
+        let pq_pk = pq_session.as_ref().map(crate::vpn::birdo_pq::PqSession::public_key_b64);
 
         // MR-691: on connections of its own, like the old-key probe. A re-dial
         // always follows a teardown, and the shared client's first request
@@ -1492,6 +1485,7 @@ impl ReconnectLoop {
                 server_id: &info.server_id,
                 stealth_mode: info.stealth_mode,
                 quantum_protection: info.quantum_protection,
+                pq_session,
                 fallback_reason: info.fallback_reason.as_deref(),
                 custom_dns: info.custom_dns.clone(),
                 custom_mtu: info.custom_mtu,
