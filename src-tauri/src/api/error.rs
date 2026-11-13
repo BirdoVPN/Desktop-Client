@@ -11,6 +11,9 @@ pub enum StepUpKind {
     AccountNumberInvalid,
     EmailCodeRequired,
     EmailCodeInvalid,
+    /// `apple_reauth_required|invalid`: an Apple account with no e-mail address
+    /// re-signs in with Apple, which only the iOS app can do.
+    AppleReauth,
 }
 
 impl StepUpKind {
@@ -21,6 +24,7 @@ impl StepUpKind {
             "account_number_invalid" => Some(Self::AccountNumberInvalid),
             "email_code_required" => Some(Self::EmailCodeRequired),
             "email_code_invalid" => Some(Self::EmailCodeInvalid),
+            "apple_reauth_required" | "apple_reauth_invalid" => Some(Self::AppleReauth),
             _ => None,
         }
     }

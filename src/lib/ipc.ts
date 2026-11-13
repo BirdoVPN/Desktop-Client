@@ -37,6 +37,7 @@ export type IpcErrorCode =
   | 'account_number_invalid'
   | 'email_code_required'
   | 'email_code_invalid'
+  | 'apple_reauth_required'
   | 'cert_pin_failed'
   | 'stealth_failed'
   | 'pq_failed'
@@ -70,6 +71,7 @@ const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
   'account_number_invalid',
   'email_code_required',
   'email_code_invalid',
+  'apple_reauth_required',
   'cert_pin_failed',
   'stealth_failed',
   'pq_failed',

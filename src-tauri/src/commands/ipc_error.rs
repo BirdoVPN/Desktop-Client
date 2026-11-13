@@ -49,6 +49,9 @@ pub enum IpcErrorCode {
     AccountNumberInvalid,
     EmailCodeRequired,
     EmailCodeInvalid,
+    /// An Apple account with no e-mail address must re-sign in with Apple,
+    /// which only the iOS app does. Not retryable here.
+    AppleReauthRequired,
     CertPinFailed,
     StealthFailed,
     PqFailed,
@@ -104,6 +107,7 @@ impl IpcErrorCode {
                 | IpcErrorCode::ConsentRequired
                 | IpcErrorCode::AccountRestricted
                 | IpcErrorCode::RegistrationNotAllowed
+                | IpcErrorCode::AppleReauthRequired
         )
     }
 
@@ -352,6 +356,7 @@ impl IpcError {
                     StepUpKind::AccountNumberInvalid => IpcErrorCode::AccountNumberInvalid,
                     StepUpKind::EmailCodeRequired => IpcErrorCode::EmailCodeRequired,
                     StepUpKind::EmailCodeInvalid => IpcErrorCode::EmailCodeInvalid,
+                    StepUpKind::AppleReauth => IpcErrorCode::AppleReauthRequired,
                 },
                 message,
             ),
@@ -614,10 +619,14 @@ mod tests {
             (IpcErrorCode::InvalidCredentials, "invalid_credentials"),
             (IpcErrorCode::TwoFactorRequired, "two_factor_required"),
             (IpcErrorCode::TwoFactorInvalid, "two_factor_invalid"),
-            (IpcErrorCode::AccountNumberRequired, "account_number_required"),
+            (
+                IpcErrorCode::AccountNumberRequired,
+                "account_number_required",
+            ),
             (IpcErrorCode::AccountNumberInvalid, "account_number_invalid"),
             (IpcErrorCode::EmailCodeRequired, "email_code_required"),
             (IpcErrorCode::EmailCodeInvalid, "email_code_invalid"),
+            (IpcErrorCode::AppleReauthRequired, "apple_reauth_required"),
             (IpcErrorCode::CertPinFailed, "cert_pin_failed"),
             (IpcErrorCode::StealthFailed, "stealth_failed"),
             (IpcErrorCode::PqFailed, "pq_failed"),
@@ -740,6 +749,13 @@ mod tests {
                     message: "x".into(),
                 },
                 IpcErrorCode::EmailCodeInvalid,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::AppleReauth,
+                    message: "x".into(),
+                },
+                IpcErrorCode::AppleReauthRequired,
             ),
             (
                 ApiError::QuotaCheckUnavailable {

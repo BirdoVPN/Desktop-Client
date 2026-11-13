@@ -390,11 +390,12 @@ describe('Delete account dialog: step-up (MR-179)', () => {
     });
   });
 
-  const preflightWith = (stepUpFactors: string[]) => () =>
+  const preflightWith = (stepUpFactors: string[], stepUpEnforced = true) => () =>
     Promise.resolve({
       storeSubscriptionsStillBilling: [],
       webSubscriptionWillBeCancelled: false,
       stepUpFactors,
+      stepUpEnforced,
     });
 
   const openDialog = async () => {
@@ -512,6 +513,37 @@ describe('Delete account dialog: step-up (MR-179)', () => {
     expect(await screen.findByRole('button', { name: 'Email me a code' })).toBeInTheDocument();
     expect(screen.queryByText("Couldn't delete your account. Please try again.")).not.toBeInTheDocument();
     mockStoreState.account.hasPassword = true;
+  });
+
+  it('before the server enforces it, an SSO user with no code still deletes', async () => {
+    mockStoreState.account.hasPassword = false;
+    preflightResult = preflightWith(['email_code'], false);
+    await openDialog();
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await screen.findByRole('button', { name: 'Email me a code' });
+    // Optional: Delete is enabled with no code, and none is sent.
+    await confirm();
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(deleteCalls()[0][1]).toEqual({ request: { password: 'DELETE' } });
+  });
+
+  it('when enforced, Delete waits for the whole number', async () => {
+    mockStoreState.account.hasPassword = false;
+    preflightResult = preflightWith(['account_number'], true);
+    await openDialog();
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await screen.findByLabelText('Account number');
+    expect(screen.getByRole('button', { name: /delete my account/i })).toBeDisabled();
+  });
+
+  it('an Apple account with no address is told to use the iOS app', async () => {
+    mockStoreState.account.hasPassword = false;
+    deleteResult = () => Promise.reject(refusal('apple_reauth_required'));
+    await openDialog();
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await confirm();
+    expect(await screen.findByText(/open the BirdoVPN app on your iPhone/i)).toBeInTheDocument();
+    expect(logout).not.toHaveBeenCalled();
   });
 
   it('a server that predates the step-up asks for nothing new and sends nothing new', async () => {

@@ -136,6 +136,13 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
     message: 'Enter the code we emailed you to delete your account.',
     action: null,
   },
+  // An Apple account with no e-mail address re-signs in with Apple, which only
+  // the iOS app can do; the website refuses it too, so say where to go.
+  apple_reauth_required: {
+    message:
+      'This account signs in with Apple. To delete it, open the BirdoVPN app on your iPhone or iPad and delete it there.',
+    action: null,
+  },
   email_code_invalid: {
     message: 'That code is not valid or has expired. Request a new code.',
     action: null,

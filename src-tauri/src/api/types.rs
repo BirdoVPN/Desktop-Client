@@ -64,7 +64,9 @@ pub struct ApiErrorBody {
 /// `twoFactorCode` (Account API contract item 85): the TOTP or backup code an
 /// account with 2FA must add, sent only once the server has asked for it — so
 /// a backend that predates the field never sees it.
-#[derive(Debug, Serialize)]
+// No `Debug`: it carries the password, the 2FA code, the account number and the
+// e-mailed code, and a derived one would print them.
+#[derive(Serialize)]
 pub struct DeleteAccountBody<'a> {
     pub password: &'a str,
     #[serde(rename = "twoFactorCode", skip_serializing_if = "Option::is_none")]

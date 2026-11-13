@@ -70,12 +70,16 @@ export interface DeletionPreflight {
   webSubscriptionWillBeCancelled: boolean;
   /** MR-179: the server's step-up factor tokens; absent from an older backend. */
   stepUpFactors?: string[];
+  /** MR-179: the server refuses a deletion without them; until then they are optional. */
+  stepUpEnforced?: boolean;
 }
 
 /** Shape returned by the Rust `send_deletion_code` command (MR-179). */
 export interface DeletionCodeResult {
   /** The masked address the code went to, e.g. "j***@example.com". */
   sentTo: string | null;
+  /** How long the code works, in minutes, when the server says. */
+  expiresInMinutes?: number | null;
 }
 
 /** An anonymous account number is 24 digits; the e-mailed deletion code is 6. */
@@ -107,6 +111,7 @@ const DELETION_CODES: ReadonlySet<string> = new Set([
   'account_number_invalid',
   'email_code_required',
   'email_code_invalid',
+  'apple_reauth_required',
   'rate_limited',
   'session_expired',
   'network_offline',
@@ -154,6 +159,11 @@ export function DeleteAccountDialog({
   const [emailCodeSent, setEmailCodeSent] = useState(false);
   const [emailCodeSentTo, setEmailCodeSentTo] = useState<string | null>(null);
   const [sendingCode, setSendingCode] = useState(false);
+  const [emailCodeMinutes, setEmailCodeMinutes] = useState<number | null>(null);
+  // MR-179: the number / code is OPTIONAL until the server enforces it (the
+  // preflight's `enforced`, or it already answered `*_required`), so a user
+  // whose code e-mail fails can still delete, as before.
+  const [stepUpEnforced, setStepUpEnforced] = useState(false);
   const [deleting, setDeleting] = useState(false);
   // A refusal of the password / DELETE confirmation, under that field.
   const [error, setError] = useState<string | null>(null);
@@ -178,6 +188,7 @@ export function DeleteAccountDialog({
       .then((result) => {
         if (cancelled || !result) return;
         setPreflight(result);
+        if (result.stepUpEnforced) setStepUpEnforced(true);
         const factors = result.stepUpFactors ?? [];
         if (factors.includes('account_number')) setAskingNumber(true);
         if (factors.includes('email_code')) setAskingEmailCode(true);
@@ -195,8 +206,12 @@ export function DeleteAccountDialog({
     !deleting &&
     (hasPassword ? password.length > 0 : confirmText.trim().toUpperCase() === 'DELETE') &&
     (!askingTwoFactor || isTwoFactorCode(twoFactorCode)) &&
-    (!askingNumber || digitsOnly(accountNumber).length === ACCOUNT_NUMBER_LENGTH) &&
-    (!askingEmailCode || digitsOnly(emailCode).length === EMAIL_CODE_LENGTH);
+    (!askingNumber ||
+      digitsOnly(accountNumber).length === ACCOUNT_NUMBER_LENGTH ||
+      (!stepUpEnforced && digitsOnly(accountNumber).length === 0)) &&
+    (!askingEmailCode ||
+      digitsOnly(emailCode).length === EMAIL_CODE_LENGTH ||
+      (!stepUpEnforced && digitsOnly(emailCode).length === 0));
 
   const handleSendCode = async () => {
     if (sendingCode || deleting) return;
@@ -206,6 +221,7 @@ export function DeleteAccountDialog({
       const sent = await invoke<DeletionCodeResult | null>('send_deletion_code');
       setEmailCodeSent(true);
       setEmailCodeSentTo(sent?.sentTo ?? null);
+      setEmailCodeMinutes(sent?.expiresInMinutes ?? null);
     } catch (e: unknown) {
       setEmailCodeError(deletionErrorText(e));
     } finally {
@@ -228,8 +244,8 @@ export function DeleteAccountDialog({
         request: {
           password: hasPassword ? password : confirmText.trim(),
           ...(askingTwoFactor ? { two_factor_code: twoFactorCode } : {}),
-          ...(askingNumber ? { account_number: digitsOnly(accountNumber) } : {}),
-          ...(askingEmailCode ? { email_code: digitsOnly(emailCode) } : {}),
+          ...(askingNumber && digitsOnly(accountNumber) ? { account_number: digitsOnly(accountNumber) } : {}),
+          ...(askingEmailCode && digitsOnly(emailCode) ? { email_code: digitsOnly(emailCode) } : {}),
         },
       });
       // Confirmed: Rust has already taken the tunnel down. Mirror that now
@@ -260,9 +276,11 @@ export function DeleteAccountDialog({
         // already sent: then it is the answer.
         if (askingNumber || err.code === 'account_number_invalid') setNumberError(deletionErrorText(err));
         setAskingNumber(true);
+        setStepUpEnforced(true);
       } else if (err.code === 'email_code_required' || err.code === 'email_code_invalid') {
         if (askingEmailCode || err.code === 'email_code_invalid') setEmailCodeError(deletionErrorText(err));
         setAskingEmailCode(true);
+        setStepUpEnforced(true);
       } else if (askingNumber && err.code === 'rate_limited') {
         setNumberError(deletionErrorText(err));
       } else if (askingEmailCode && err.code === 'rate_limited') {
@@ -359,8 +377,8 @@ export function DeleteAccountDialog({
               <p className="text-[12px]" style={{ color: white.w80 }}>
                 {emailCodeSent
                   ? emailCodeSentTo
-                    ? `We emailed a code to ${emailCodeSentTo}. It works once for 10 minutes.`
-                    : 'We emailed a code to your account address. It works once for 10 minutes.'
+                    ? `We emailed a code to ${emailCodeSentTo}. It works once for ${emailCodeMinutes ?? 10} minutes.`
+                    : `We emailed a code to your account address. It works once for ${emailCodeMinutes ?? 10} minutes.`
                   : 'Enter the code we emailed you to delete your account.'}
               </p>
               <BirdoButton
