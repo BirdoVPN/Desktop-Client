@@ -85,23 +85,17 @@
 //!
 //! **What it does not give:**
 //!
-//! * **Protection once the secret key is stolen.** The ML-KEM secret key is the
-//!   LONG-LIVED client identity for BirdoPQ: one keypair per install, replaced
-//!   only on an explicit sign-out (`commands::auth::logout`), on account
-//!   deletion (`commands::auth::delete_account`), or when the stored file is
-//!   unusable (`KeypairReadError::Unusable`); the auto sign-out after an
-//!   expired session keeps it. An attacker who steals it recovers the PSK
-//!   of EVERY session they hold the connect response for — the ciphertext
-//!   and the nonce —
-//!   whether that session came before the theft or after it, for as long as
-//!   this key is in use. ML-KEM decapsulation is deterministic in `(sk, ct)`:
-//!   the server's fresh randomness in each encapsulation stops nothing once
-//!   `sk` is known, and the PSK is HKDF of the shared secret and the nonce
-//!   (above). Per-session derivation does not change that, so a stolen key is
-//!   not forward-secret in either direction. Only replacing the key bounds
-//!   what it opens; one keypair per connect (the threat model's O0e, MR-703 /
-//!   MR-1742) is not built. An earlier version of this paragraph said past
-//!   sessions were safe (MR-1368). They are not.
+//! * **Protection against a thief who is already inside the process.** The
+//!   ML-KEM secret exists for one connect only (MR-703 / MR-1742): a
+//!   64-byte seed in a [`PqSession`], in memory, wiped when the connect is done.
+//!   It is not on disk, so stealing the device's files or its backups yields
+//!   nothing for any past or later session, and the client's public key is no
+//!   longer a stable per-install identifier the server sees on every connect.
+//!   What is NOT covered is someone who can read this process's memory DURING
+//!   the connect window (between the keypair and the decapsulation): they
+//!   recover that one session's PSK. An older build (which kept one long-lived
+//!   key per install) is not forward-secret in either direction; that is why
+//!   this build deletes its file (see [`purge_legacy_keypair_files`]).
 //! * **The relay leg.** The server derives the same PSK and sends it on to
 //!   the VPN relay over TLS that is not yet post-quantum, so a recording of
 //!   that link plus a future quantum computer recovers the PSK without
@@ -115,51 +109,36 @@
 //!
 //! ## Where the secret key lives
 //!
-//! Storage location: `<config_local_dir>/BirdoVPN/birdo_pq_v1.bin`.
-//! Format: 4-byte magic "BPQ1" + 4-byte version (=1) + 1568 B pk + 3168 B sk.
-//! Total: 4744 B. Permissions:
-//!   - Unix: chmod 0600 (owner-read-write only).
-//!   - Windows: file inherits the user-profile ACL which is already
-//!     restricted to the user. Cannot fit in Windows Credential Manager
-//!     (5 KiB cap on CRED_BLOB; sk alone is 3168 B).
-//!
-//! Same-uid local malware running as the user can read it. This is the same
-//! threat boundary as for the user's WireGuard private key on disk and is
-//! out of scope for the VPN protocol; mitigations live in OS hardening.
-//!
-//! The 3168-byte secret-key encoding is FIPS 203's *expanded* decapsulation
-//! key. `ml-kem` reaches it only through the `#[deprecated]`
-//! `ExpandedKeyEncoding` trait, because the crate would rather callers stored
-//! the 64-byte seed. We cannot: every install from v1.4.43 and earlier already
-//! has 3168 bytes on disk, and changing the encoding would invalidate every
-//! one of them. The deprecation is therefore suppressed deliberately at each
-//! call site, not worked around.
+//! Nowhere on disk. [`PqSession::begin`] draws a fresh seed for each
+//! `/vpn/connect` request, [`PqSession::finish`] decapsulates and consumes it,
+//! and `Drop` wipes it. The 3168-byte expanded decapsulation key that earlier
+//! builds stored (`birdo_pq_v1.bin`, 4744 B: "BPQ1" + version + pk + sk) is
+//! gone, and with it the reason to use ml-kem's `#[deprecated]`
+//! `ExpandedKeyEncoding`: the secret is the FIPS 203 seed, expanded on use.
+//! The wire format is unchanged (pk 1568 B, ct 1568 B, same HKDF inputs).
 
 use base64::Engine as _;
 use hkdf::Hkdf;
-use ml_kem::array::sizes::{U1568, U3168, U64};
+use ml_kem::array::sizes::{U1568, U64};
 use ml_kem::array::Array;
-#[allow(deprecated)]
-use ml_kem::ExpandedKeyEncoding;
 use ml_kem::{
     Ciphertext as MlCiphertext, Decapsulate, DecapsulationKey, KeyExport, MlKem1024, Seed,
 };
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use sha2::Sha256;
-use std::io::{Read, Write};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::api::types::ConnectResponse;
 use crate::utils::safe_fs::OwnedDir;
 
-/// FIPS 203 ML-KEM-1024 sizes — must match server + Android constants.
+/// FIPS 203 ML-KEM-1024 sizes: must match server + Android constants.
 pub const PUBLIC_KEY_BYTES: usize = 1568;
-pub const SECRET_KEY_BYTES: usize = 3168;
 pub const CIPHERTEXT_BYTES: usize = 1568;
-/// FIPS 203 keygen randomness `(d || z)`. Never persisted — the expanded
-/// decapsulation key is what goes to disk (see the module docs).
+/// FIPS 203 keygen randomness `(d || z)`: the whole client secret. Never
+/// persisted.
 const SEED_BYTES: usize = 64;
+
 const PSK_LEN: usize = 32;
 const HKDF_SALT: &[u8] = b"BirdoPQ-v1-PSK";
 /// Upper bound for the server's per-connect nonce, the same as Android's
@@ -178,21 +157,9 @@ const MAX_NONCE_BYTES: usize = 64;
 /// is actually linked.
 pub const PQ_IMPL_NAME: &str = "mlkem1024-rustcrypto";
 
-const FILE_MAGIC: &[u8; 4] = b"BPQ1";
-const FILE_VERSION: u32 = 1;
+/// The file older builds kept the keypair in (see [`purge_legacy_keypair_files`]).
 const KEYPAIR_FILENAME: &str = "birdo_pq_v1.bin";
-const KEYPAIR_FILE_BYTES: usize = FILE_MAGIC.len() + 4 + PUBLIC_KEY_BYTES + SECRET_KEY_BYTES;
-/// One-shot reservation for the keypair read. The buffer holds the ML-KEM
-/// SECRET key, so it must never reallocate mid-read: a realloc leaves an
-/// unscrubbed copy of those bytes in freed heap.
-const READ_RESERVE_BYTES: usize = KEYPAIR_FILE_BYTES + 64;
-/// Hard bound on that read — one byte more than a valid file, which is enough
-/// for the size check to reject a too-long file and nothing more.
-const READ_CAP_BYTES: usize = KEYPAIR_FILE_BYTES + 1;
-/// The no-realloc property above, proved at compile time instead of asserted
-/// in prose. A test can only observe the cap; this observes the headroom.
-const _: () = assert!(READ_CAP_BYTES < READ_RESERVE_BYTES);
-// PFA-M5: legacy DEFAULT_NONCE_BYTES constant removed — `try_decapsulate`
+// PFA-M5: legacy DEFAULT_NONCE_BYTES constant removed: `try_decapsulate`
 // now refuses to derive a PSK against a missing/empty per-connect nonce.
 
 /// Operating mode reported to the UI.
@@ -218,48 +185,8 @@ pub enum PqMode {
     Bilateral,
 }
 
-pub struct StaticKeypair {
-    pub public_key: Vec<u8>,
-    pub secret_key: Zeroizing<Vec<u8>>,
-}
-
-/// Why a persisted keypair could not be used.
-///
-/// The distinction is load-bearing: an I/O failure must NOT throw the user's
-/// long-lived identity key away, but a file whose contents this build cannot
-/// use is unrecoverable and must be replaced, or the install stops connecting
-/// at all. `commands::vpn::derive_quantum_psk` fails CLOSED — when the server
-/// sets `quantum_enabled` and `try_decapsulate` yields `None` it returns
-/// `Err("… Connection aborted to prevent a silent downgrade.")`, and all three
-/// callers (`commands::vpn`, `commands::vpn_multi_hop`, `vpn::auto_reconnect`)
-/// propagate it. So the cost of keeping an unusable file is an aborted
-/// connect, not a quiet demotion: worse than a downgrade, and just as
-/// permanent, because nothing else ever rewrites the file.
-#[derive(Debug)]
-enum KeypairReadError {
-    /// The file could not be read at all. Transient — keep the file.
-    Io(String),
-    /// The file was read but is not a usable keypair: wrong magic, wrong size,
-    /// unsupported version, a decapsulation key that fails FIPS 203 §7.3, or a
-    /// stored public key that disagrees with the one embedded in the secret
-    /// key. Discard and re-key.
-    Unusable(String),
-}
-
-impl std::fmt::Display for KeypairReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(m) | Self::Unusable(m) => f.write_str(m),
-        }
-    }
-}
-
-static CACHED_KEYPAIR: OnceCell<Mutex<Option<StaticKeypair>>> = OnceCell::new();
 static CURRENT_MODE: OnceCell<Mutex<PqMode>> = OnceCell::new();
 
-fn cache() -> &'static Mutex<Option<StaticKeypair>> {
-    CACHED_KEYPAIR.get_or_init(|| Mutex::new(None))
-}
 fn mode_cell() -> &'static Mutex<PqMode> {
     CURRENT_MODE.get_or_init(|| Mutex::new(PqMode::Disabled))
 }
@@ -276,91 +203,151 @@ fn set_mode(m: PqMode) {
 
 // ── Crypto primitives ─────────────────────────────────────────────────────
 
-/// Deterministic FIPS 203 key generation from 64 bytes of `(d || z)`.
+/// A keygen for ONE connect request, and nothing else (MR-703 / MR-1742).
 ///
-/// Split out from [`generate_keypair`] so the known-answer test can drive it
-/// from the server fixture's `keygenSeed` — that identity (same seed in, same
-/// 1568/3168 bytes out as `@noble/post-quantum`) is the strongest available
-/// proof that this client and the production server speak the same ML-KEM.
-#[allow(deprecated)] // ExpandedKeyEncoding — the 3168-byte stored encoding.
-fn keypair_from_seed(seed_bytes: &[u8; SEED_BYTES]) -> StaticKeypair {
-    let seed: Seed = Array::<u8, U64>::from(*seed_bytes);
-    // `DecapsulationKey` is ZeroizeOnDrop (ml-kem's `zeroize` feature).
+/// [`PqSession::begin`] draws a fresh 64-byte FIPS 203 seed `(d || z)` from the
+/// OS CSPRNG, derives the ML-KEM-1024 encapsulation key from it and keeps only
+/// the seed, in memory, for the one request the public key goes out with. The
+/// secret is never written anywhere: there is no file, no keyring item, and no
+/// `Clone`, `Serialize` or `Debug` that could copy or print it. It is wiped
+/// when the value drops, and [`PqSession::finish`] consumes it, so a pair
+/// cannot decapsulate twice.
+///
+/// Lifetime rule (the part callers must keep): ONE session per `/vpn/connect`
+/// request. The same session is held across the retries of that same request
+/// (the server's retryable refusals re-send the same body, so its ciphertext
+/// still fits the key), and a NEW connect or re-dial calls `begin()` again.
+/// A pair is never reused by a later connect.
+pub struct PqSession {
+    seed: SeedBox,
+    public_key: Vec<u8>,
+}
+
+/// The 64-byte seed, on the HEAP and filled in place. A `Zeroizing<[u8; 64]>`
+/// is wiped on drop but MOVED by value (into `from_seed`, into the struct, out of
+/// `begin`), and every move leaves an unwiped stack copy behind; a boxed array is
+/// moved as a pointer, so there is exactly one copy and the wipe reaches it.
+///
+/// No `mlock` / `VirtualLock`: the page can be swapped or end up in a crash dump
+/// or hibernation file while a connect is in flight. That is the same exposure
+/// the WireGuard private key has in this process, and the window is one
+/// connect; it is a named residual, not a claim of protection.
+struct SeedBox(Box<[u8; SEED_BYTES]>);
+
+impl SeedBox {
+    /// All zero; the caller fills it in place.
+    fn zeroed() -> Self {
+        Self(Box::new([0u8; SEED_BYTES]))
+    }
+
+    fn wipe(&mut self) {
+        self.0.as_mut_slice().zeroize();
+    }
+}
+
+impl std::ops::Deref for SeedBox {
+    type Target = [u8; SEED_BYTES];
+    fn deref(&self) -> &[u8; SEED_BYTES] {
+        &self.0
+    }
+}
+
+impl Drop for SeedBox {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for SeedBox {}
+
+// The wipe is the whole point; stop the build if the marker is dropped.
+const _: fn() = || {
+    fn wipes_itself_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    wipes_itself_on_drop::<SeedBox>();
+};
+
+impl std::fmt::Debug for PqSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The seed is the secret key; print only that a session exists.
+        f.write_str("PqSession { .. }")
+    }
+}
+
+impl PqSession {
+    /// A fresh keypair for one connect. The seed comes straight from the OS
+    /// CSPRNG, not a userspace PRNG that could be forked or reseeded.
+    pub fn begin() -> Self {
+        let mut seed = SeedBox::zeroed();
+        crate::utils::os_rng::fill(seed.0.as_mut_slice());
+        Self::from_seed(seed)
+    }
+
+    /// Deterministic FIPS 203 key generation from `(d || z)`.
+    ///
+    /// Split out from [`PqSession::begin`] so the known-answer test can drive
+    /// it from the server fixture's `keygenSeed`: the same seed in, the same
+    /// 1568 bytes out as `@noble/post-quantum`, is the strongest available proof
+    /// that this client and the production server speak the same ML-KEM.
+    fn from_seed(seed: SeedBox) -> Self {
+        let dk = decapsulation_key(&seed);
+        let ek = dk.encapsulation_key().to_bytes();
+        assert_eq!(
+            ek.len(),
+            PUBLIC_KEY_BYTES,
+            "ML-KEM-1024 encapsulation key must be {PUBLIC_KEY_BYTES} bytes"
+        );
+        Self {
+            seed,
+            public_key: ek.to_vec(),
+        }
+    }
+
+    /// The 1568-byte public key, for the connect request.
+    pub fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    /// The Base64 public key the `/vpn/connect` body carries.
+    pub fn public_key_b64(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(self.public_key())
+    }
+
+    /// Decapsulate the server's ciphertext into the 32-byte WireGuard PSK and
+    /// wipe the secret. Consuming `self` is the "wiped after finish" guarantee:
+    /// the seed is zeroized as this function returns, on the error path too.
+    ///
+    /// ML-KEM is implicit-rejection: a malformed ciphertext of the right size
+    /// does not error here, it yields a deterministic random shared secret; the
+    /// resulting PSK then does not match the server's and the WireGuard
+    /// handshake fails later. That is the desired behaviour: it prevents an
+    /// oracle on whether decapsulation "succeeded". A ciphertext of the WRONG
+    /// SIZE is not a KEM question at all and is refused outright.
+    pub fn finish(
+        self,
+        server_ciphertext: &[u8],
+        server_nonce: &[u8],
+    ) -> Result<Zeroizing<[u8; PSK_LEN]>, String> {
+        derive_psk(&self.seed, server_ciphertext, server_nonce)
+    }
+}
+
+/// The decapsulation key for a seed. `DecapsulationKey` is `ZeroizeOnDrop`
+/// (ml-kem's `zeroize` feature), so the expanded key built here is wiped when
+/// the caller drops it; the stack copy of the seed handed to `from_seed` is
+/// wiped by hand because `Array` has no `Drop` of its own.
+fn decapsulation_key(seed_bytes: &[u8; SEED_BYTES]) -> DecapsulationKey<MlKem1024> {
+    let mut seed: Seed = Array::<u8, U64>::from(*seed_bytes);
     let dk = DecapsulationKey::<MlKem1024>::from_seed(seed);
-
-    let ek = dk.encapsulation_key().to_bytes();
-    // NOT `dk.to_bytes()`: `KeyExport for DecapsulationKey` returns the 64-byte
-    // SEED, and panics outright for a key loaded from the expanded encoding.
-    // Silently writing 64 bytes where 3168 belong would brick the install.
-    let mut expanded = dk.to_expanded_bytes();
-
-    assert_eq!(
-        ek.len(),
-        PUBLIC_KEY_BYTES,
-        "ML-KEM-1024 encapsulation key must be {PUBLIC_KEY_BYTES} bytes"
-    );
-    assert_eq!(
-        expanded.len(),
-        SECRET_KEY_BYTES,
-        "ML-KEM-1024 stored decapsulation key must be {SECRET_KEY_BYTES} bytes \
-         (a 64-byte value here means `to_bytes()` crept in where \
-         `to_expanded_bytes()` belongs)"
-    );
-
-    let kp = StaticKeypair {
-        public_key: ek.to_vec(),
-        secret_key: Zeroizing::new(expanded.to_vec()),
-    };
-    expanded.as_mut_slice().zeroize();
-    kp
-}
-
-pub fn generate_keypair() -> StaticKeypair {
-    // Straight from the OS CSPRNG: this is a long-lived identity key, so it
-    // does not go through a userspace PRNG that could be forked or reseeded.
-    let mut seed = Zeroizing::new([0u8; SEED_BYTES]);
-    crate::utils::os_rng::fill(seed.as_mut_slice());
-    keypair_from_seed(&seed)
-}
-
-/// Parse a stored 3168-byte expanded decapsulation key.
-///
-/// Unlike `pqcrypto-mlkem`'s `SecretKey::from_bytes`, which only checked the
-/// length, `ml-kem` also enforces FIPS 203 §7.3: the key's embedded `H(ek)`
-/// must match the hash of its embedded encapsulation key. A key that fails is
-/// not recoverable — callers must discard it and re-key (see
-/// [`load_or_generate_at`]), never retry it.
-#[allow(deprecated)]
-fn load_decapsulation_key(sk: &[u8]) -> Result<DecapsulationKey<MlKem1024>, String> {
-    // `Array` has no Drop of its own, so this stack copy of the decapsulation
-    // key is scrubbed by hand. It is taken on every load AND every
-    // `derive_psk`, i.e. on every connect — everything around it is
-    // `Zeroizing`, and this one was not.
-    let mut arr = Array::<u8, U3168>::try_from(sk).map_err(|_| {
-        format!(
-            "malformed client secret key: expected {SECRET_KEY_BYTES} bytes, got {}",
-            sk.len()
-        )
-    })?;
-    let dk = <DecapsulationKey<MlKem1024> as ExpandedKeyEncoding>::from_expanded_bytes(&arr)
-        .map_err(|_| "client secret key failed FIPS 203 validation (H(ek) mismatch)".to_string());
-    arr.as_mut_slice().zeroize();
+    seed.as_mut_slice().zeroize();
     dk
 }
 
-/// Decapsulate the server-supplied ciphertext into a 32-byte PSK.
-///
-/// ML-KEM is implicit-rejection: a malformed ciphertext doesn't error here,
-/// it returns a deterministic random shared secret. The resulting PSK then
-/// won't match the server's, and the WireGuard handshake fails later. This
-/// is the desired behaviour — it prevents oracle attacks based on whether
-/// decapsulation "succeeded".
-pub fn derive_psk(
-    client_secret_key: &Zeroizing<Vec<u8>>,
+/// Decapsulate `server_ciphertext` with the key for `seed` and derive the PSK.
+fn derive_psk(
+    seed: &[u8; SEED_BYTES],
     server_ciphertext: &[u8],
     server_nonce: &[u8],
 ) -> Result<Zeroizing<[u8; PSK_LEN]>, String> {
-    let dk = load_decapsulation_key(client_secret_key.as_slice())?;
     let ct: MlCiphertext<MlKem1024> =
         Array::<u8, U1568>::try_from(server_ciphertext).map_err(|_| {
             format!(
@@ -368,10 +355,10 @@ pub fn derive_psk(
                 server_ciphertext.len()
             )
         })?;
-    // Infallible by design (implicit rejection), exactly as the pqcrypto
-    // binding was — do NOT "improve" this into a Result: turning a rejection
-    // into an observable error would build the decapsulation oracle the
-    // FIPS 203 construction exists to deny.
+    let dk = decapsulation_key(seed);
+    // Infallible by design (implicit rejection) — do NOT "improve" this into a
+    // Result: turning a rejection into an observable error would build the
+    // decapsulation oracle the FIPS 203 construction exists to deny.
     let mut ss = dk.decapsulate(&ct);
     let psk = hkdf_to_psk(ss.as_slice(), server_nonce);
     // `SharedKey` is a plain array with no Drop impl of its own.
@@ -409,367 +396,131 @@ const _: fn() = || {
     wipes_itself_on_drop::<<Sha256 as hmac::EagerHash>::Core>();
 };
 
-// ── Persistence ───────────────────────────────────────────────────────────
+// ── Legacy key files ──────────────────────────────────────────────────────
 
-/// Where the ML-KEM keypair lives: `name` in the app directory `dir`.
+/// Where this account's keypair file lived before per-connect keys (MR-703):
+/// `name` in the app directory `dir`.
 ///
-/// R4 (#287 follow-up): on WINDOWS it is `pq-<account SID>.bin` in the
-/// admin-only `%ProgramData%\BirdoVPN` (`utils::protected_dir`). In
-/// `%LOCALAPPDATA%\BirdoVPN`, where it was, any unelevated process of the
-/// user could read the SECRET key or put a keypair of its own in its place
-/// for the elevated client to use. It stays ONE KEY PER WINDOWS ACCOUNT (the
-/// SID in the name), the same per-account scheme as the settings key: one
-/// machine-wide key would link the accounts on a machine, which audit C-8
-/// made the device identity random to avoid.
-///
-/// The old per-user file is never read: its secret was readable by every
-/// process of the user, so it is not carried over. A fresh key is made in the
-/// admin-only directory and the old file is deleted (through [`OwnedDir`])
-/// once that key is on disk — the same rule as the settings key's migration
-/// (a fresh key, then the old sources go). Re-keying costs nothing: the server
-/// keeps no client PQ key (see [`load_or_generate_at`]), and logout re-keys
-/// anyway (`reset_persisted_keypair`).
-///
-/// On macOS and Linux it stays `<config_local_dir>/BirdoVPN/birdo_pq_v1.bin`,
-/// root's own. Every create/rename/delete goes through `dir` ([`OwnedDir`]).
-struct KeypairLoc {
+/// On WINDOWS it was `pq-<account SID>.bin` in the admin-only
+/// `%ProgramData%\BirdoVPN` (R4, `utils::protected_dir`), and `birdo_pq_v1.bin`
+/// in `%LOCALAPPDATA%\BirdoVPN` in builds before R4. On macOS and Linux it was
+/// `<config_local_dir>/BirdoVPN/birdo_pq_v1.bin`. Nothing writes any of them
+/// any more; they exist only to be deleted.
+struct LegacyKeypairFile {
     dir: OwnedDir,
     name: String,
+    /// Also delete every other account's `pq-<SID>.bin` in this directory (the
+    /// admin-only directory is shared by the machine's accounts; their keys are
+    /// as dead as this one's).
+    all_accounts: bool,
 }
 
-/// This account's keypair in the admin-only directory `protected` (R4).
+/// This account's legacy keypair file in the admin-only directory `protected`.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn protected_keypair_loc(protected: &std::path::Path, sid: &str) -> Result<KeypairLoc, String> {
+fn protected_legacy_file(
+    protected: &std::path::Path,
+    sid: &str,
+) -> Result<LegacyKeypairFile, String> {
     let (Some(base), Some(folder)) = (
         protected.parent(),
         protected.file_name().and_then(|n| n.to_str()),
     ) else {
         return Err("the admin-only directory has no parent".to_string());
     };
-    Ok(KeypairLoc {
+    Ok(LegacyKeypairFile {
         dir: OwnedDir::new(base, &[folder]),
         name: format!("pq-{sid}.bin"),
+        all_accounts: true,
     })
 }
 
-/// The per-user file every build before R4 kept the keypair in.
-fn per_user_keypair_loc() -> Result<KeypairLoc, String> {
+/// The per-user file every build before R4 (Windows) and every Unix build kept
+/// the keypair in.
+fn per_user_legacy_file() -> Result<LegacyKeypairFile, String> {
     let base = dirs::config_local_dir()
         .ok_or_else(|| "no config_local_dir on this platform".to_string())?;
-    Ok(KeypairLoc {
+    Ok(LegacyKeypairFile {
         dir: OwnedDir::new(base, &["BirdoVPN"]),
         name: KEYPAIR_FILENAME.to_string(),
+        all_accounts: false,
     })
 }
 
-/// Delete a keypair file the app no longer uses (the per-user one on
-/// Windows), through a checked handle; one that is not there is fine.
-fn retire_keypair_file(loc: &KeypairLoc) {
-    match loc.dir.remove_file(&loc.name) {
-        Ok(()) => tracing::info!("BirdoPQ: deleted the old per-user ML-KEM keypair (R4)"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => tracing::warn!("BirdoPQ: the old per-user keypair was not deleted: {e}"),
+/// Delete one legacy keypair file, and any staging file an interrupted write
+/// of it left (`<name>.<hex>.tmp`: that held the same secret). Each delete goes
+/// through the checked handle (MR-1945): a link planted at the name is refused,
+/// never followed. A file that is not there is fine. Returns how many files
+/// were deleted.
+fn purge_legacy_file(file: &LegacyKeypairFile) -> usize {
+    let mut names = vec![file.name.clone()];
+    if let Ok(entries) = std::fs::read_dir(file.dir.path()) {
+        let staging_prefix = format!("{}.", file.name);
+        names.extend(entries.flatten().filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let own_staging = name.starts_with(&staging_prefix) && name.ends_with(".tmp");
+            // Another account's key (`pq-<SID>.bin`) or its staging file.
+            let other_account = file.all_accounts
+                && name.starts_with("pq-")
+                && (name.ends_with(".bin") || (name.contains(".bin.") && name.ends_with(".tmp")));
+            (own_staging || other_account).then_some(name)
+        }));
     }
-}
-
-impl KeypairLoc {
-    #[cfg(test)]
-    fn at(path: &std::path::Path) -> Self {
-        Self {
-            dir: OwnedDir::new(
-                path.parent().unwrap_or_else(|| std::path::Path::new(".")),
-                &[],
-            ),
-            name: path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(KEYPAIR_FILENAME)
-                .to_string(),
+    let mut deleted = 0;
+    for name in names {
+        match file.dir.remove_file(&name) {
+            Ok(()) => deleted += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("BirdoPQ: legacy key file {name} was not deleted: {e}"),
         }
     }
+    deleted
 }
 
-/// Where this account's keypair lives (R4: the admin-only directory on
-/// Windows), and on Windows the per-user file it replaced, to delete.
-fn keypair_loc() -> Result<(KeypairLoc, Option<KeypairLoc>), String> {
+/// Every place a persisted keypair could be: this account's file in the
+/// admin-only directory on Windows, and the per-user file everywhere.
+fn legacy_keypair_files() -> Vec<LegacyKeypairFile> {
+    let mut files = Vec::new();
     #[cfg(windows)]
     {
-        let protected = crate::utils::protected_dir::ensure()
-            .map_err(|e| format!("admin-only state directory: {e}"))?;
-        let sid = crate::utils::protected_dir::current_user_sid()
-            .map_err(|e| format!("account SID: {e}"))?;
-        Ok((
-            protected_keypair_loc(&protected, &sid)?,
-            per_user_keypair_loc().ok(),
-        ))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok((per_user_keypair_loc()?, None))
-    }
-}
-
-fn write_keypair(loc: &KeypairLoc, kp: &StaticKeypair) -> Result<(), String> {
-    // The length check IS the guard against `ml_kem::KeyExport::to_bytes()`,
-    // which hands back a 64-byte seed rather than the 3168-byte expanded key.
-    if kp.public_key.len() != PUBLIC_KEY_BYTES || kp.secret_key.len() != SECRET_KEY_BYTES {
-        return Err(format!(
-            "invalid keypair sizes: pk {} (want {PUBLIC_KEY_BYTES}), sk {} (want {SECRET_KEY_BYTES})",
-            kp.public_key.len(),
-            kp.secret_key.len()
-        ));
-    }
-    // Zeroizing so the secret-key copy is scrubbed on EVERY exit path — the
-    // old manual `buf.fill(0)` at the end was skipped whenever the write,
-    // fsync, or rename errored out early.
-    let mut buf = Zeroizing::new(Vec::with_capacity(KEYPAIR_FILE_BYTES));
-    buf.extend_from_slice(FILE_MAGIC);
-    buf.extend_from_slice(&FILE_VERSION.to_le_bytes());
-    buf.extend_from_slice(&kp.public_key);
-    buf.extend_from_slice(kp.secret_key.as_slice());
-
-    // Write atomically via a uniquely-named staging file + rename so a crash
-    // mid-write can't leave a half-truncated file that bricks the client.
-    // MR-1945 H1: created new through a checked handle and renamed within the
-    // held directory (owner-only on Unix), never a raw path a planted link
-    // could redirect.
-    // R5: created inside verified, held parents and held from then on; never
-    // `create_dir_all` by path.
-    loc.dir
-        .ensure_held()
-        .map_err(|e| format!("keypair folder: {e}"))?;
-    let tmp = format!("{}.{:016x}.tmp", loc.name, rand::random::<u64>());
-    let result = (|| {
-        let mut f = loc
-            .dir
-            .create_new(&tmp)
-            .map_err(|e| format!("create {tmp}: {e}"))?;
-        f.write_all(&buf).map_err(|e| format!("write {tmp}: {e}"))?;
-        f.sync_all().map_err(|e| format!("fsync {tmp}: {e}"))?;
-        drop(f);
-        loc.dir
-            .rename_within(&tmp, &loc.name)
-            .map_err(|e| format!("rename {tmp} -> {}: {e}", loc.name))
-    })();
-    if result.is_err() {
-        let _ = loc.dir.remove_file(&tmp);
-    }
-    buf.fill(0);
-    result
-}
-
-fn read_keypair(loc: &KeypairLoc) -> Result<Option<StaticKeypair>, KeypairReadError> {
-    // MR-1945: opened through the checked handle. A planted link or hard link
-    // at the name is refused (PermissionDenied) and treated as an unusable key
-    // (re-keyed), never followed.
-    let mut f = match loc.dir.open_rw(&loc.name) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(KeypairReadError::Unusable(format!(
-                "keypair file is not the app's own: {e}"
-            )));
+        match crate::utils::protected_dir::ensure()
+            .map_err(|e| format!("admin-only state directory: {e}"))
+            .and_then(|protected| {
+                let sid = crate::utils::protected_dir::current_user_sid()
+                    .map_err(|e| format!("account SID: {e}"))?;
+                protected_legacy_file(&protected, &sid)
+            }) {
+            Ok(file) => files.push(file),
+            Err(e) => tracing::warn!("BirdoPQ: the admin-only key location is unavailable: {e}"),
         }
-        Err(e) => return Err(KeypairReadError::Io(format!("open {}: {e}", loc.name))),
-    };
-    // Zeroizing + pre-sized: the buffer holds the ML-KEM SECRET key, so (a) it
-    // must be scrubbed on EVERY exit path, not only the manual `buf.fill(0)`
-    // ones, and (b) it must never reallocate mid-read — a realloc leaves an
-    // unscrubbed copy of the key bytes in freed heap.
-    //
-    // (b) takes the `take()` as well as the reservation: a bare
-    // `read_to_end` grows the buffer to whatever is on disk, so a corrupt or
-    // appended file bigger than the reservation would realloc and leave
-    // exactly the copy this comment warns about. `READ_CAP_BYTES <
-    // READ_RESERVE_BYTES` is a `const` assert, so "the read can never exhaust
-    // the reservation" is checked by the compiler rather than trusted here.
-    let mut buf = Zeroizing::new(Vec::with_capacity(READ_RESERVE_BYTES));
-    (&mut f)
-        .take(READ_CAP_BYTES as u64)
-        .read_to_end(&mut buf)
-        .map_err(|e| KeypairReadError::Io(format!("read {}: {e}", loc.name)))?;
-    if buf.len() != KEYPAIR_FILE_BYTES {
-        let n = buf.len();
-        buf.fill(0);
-        return Err(KeypairReadError::Unusable(format!(
-            "unexpected keypair file size {n} (expected {KEYPAIR_FILE_BYTES})"
-        )));
     }
-    if &buf[..FILE_MAGIC.len()] != FILE_MAGIC {
-        buf.fill(0);
-        return Err(KeypairReadError::Unusable("bad keypair magic".to_string()));
+    match per_user_legacy_file() {
+        Ok(file) => files.push(file),
+        Err(e) => tracing::warn!("BirdoPQ: the per-user key location is unavailable: {e}"),
     }
-    let mut ver = [0u8; 4];
-    ver.copy_from_slice(&buf[FILE_MAGIC.len()..FILE_MAGIC.len() + 4]);
-    let v = u32::from_le_bytes(ver);
-    if v != FILE_VERSION {
-        buf.fill(0);
-        return Err(KeypairReadError::Unusable(format!(
-            "unsupported keypair file version {v}"
-        )));
-    }
-    let pk_off = FILE_MAGIC.len() + 4;
-    let sk_off = pk_off + PUBLIC_KEY_BYTES;
-    let pk = buf[pk_off..sk_off].to_vec();
-    let sk = Zeroizing::new(buf[sk_off..].to_vec());
-    buf.fill(0);
-
-    // Validate against the KEM implementation that is actually linked, here,
-    // once, rather than at every connect. Two things can be wrong in a file
-    // that is structurally perfect:
-    //
-    //  1. FIPS 203 §7.3 — `ml-kem` verifies the key's embedded `H(ek)`, which
-    //     `pqcrypto-mlkem` never did. A key that fails cannot decapsulate
-    //     correctly, and because ML-KEM rejects implicitly the only symptom
-    //     would be a WireGuard handshake that silently never completes.
-    //  2. The stored public key disagreeing with the one inside the secret
-    //     key. We would then hand the server a public key we cannot
-    //     decapsulate for — same silent failure.
-    let dk = load_decapsulation_key(sk.as_slice()).map_err(KeypairReadError::Unusable)?;
-    if dk.encapsulation_key().to_bytes().as_slice() != pk.as_slice() {
-        return Err(KeypairReadError::Unusable(
-            "stored public key does not match the one embedded in the secret key".to_string(),
-        ));
-    }
-
-    Ok(Some(StaticKeypair {
-        public_key: pk,
-        secret_key: sk,
-    }))
+    files
 }
 
-/// Read the persisted keypair from `path`, or generate + persist a fresh one.
+/// Delete the long-lived ML-KEM keypair files older builds persisted (MR-703 /
+/// MR-1742: this build keeps no secret on disk). Idempotent and best-effort: a
+/// failure is logged and never blocks the caller.
 ///
-/// A file this build cannot use is REPLACED, not reported. Reporting it would
-/// abort every connect the server enables BirdoPQ on, permanently: nothing
-/// else rewrites the file, and `commands::vpn::derive_quantum_psk` fails
-/// closed on a decapsulation that never happens. Re-keying is free on the
-/// server side — birdo-web `backend/src/vpn/birdo-pq.service.ts`
-/// `encapsulate()` reads `clientPublicKeyB64` off the request and persists no
-/// per-device PQ key — so the fresh key is simply used from the next connect.
-/// A file that merely failed to read (I/O) is left alone: discarding a
-/// long-lived identity key on a transient error is the worse trade.
-///
-/// `retired` (Windows, R4): the per-user file the keypair used to live in. It
-/// is never read; once a fresh key is safely on disk in `loc`, it is deleted.
-/// While `loc` holds a key, it is not touched at all.
-fn load_or_generate_at(
-    loc: &KeypairLoc,
-    retired: Option<&KeypairLoc>,
-) -> Result<StaticKeypair, String> {
-    match read_keypair(loc) {
-        Ok(Some(kp)) => return Ok(kp),
-        Ok(None) => {
-            tracing::info!("BirdoPQ: no persisted ML-KEM keypair — generating fresh (~10–50 ms)");
-        }
-        Err(KeypairReadError::Io(e)) => {
-            return Err(format!("persisted ML-KEM keypair unreadable: {e}"));
-        }
-        Err(KeypairReadError::Unusable(e)) => {
-            tracing::warn!(
-                "BirdoPQ: persisted ML-KEM keypair is unusable ({e}) — discarding and re-keying. \
-                 The server learns the new public key on the next connect."
-            );
-        }
-    }
-    let fresh = generate_keypair();
-    match write_keypair(loc, &fresh) {
-        Ok(()) => {
-            if let Some(old) = retired {
-                retire_keypair_file(old);
-            }
-        }
-        Err(e) => tracing::warn!(
-            "BirdoPQ: failed to persist keypair: {e} — \
-             continuing in-memory; will regenerate next launch"
-        ),
-    }
-    Ok(fresh)
-}
-
-/// Returns a reference to the cached keypair, generating + persisting one
-/// on first call. Errors are logged + returned and reach the caller as
-/// "PQ unavailable" — which means the server's classical PSK only while the
-/// server left `quantum_enabled` off. With it on, `derive_quantum_psk` turns
-/// the same condition into an aborted connect (fail-closed, by design).
-fn load_or_generate() -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), String> {
-    let cell = cache();
-    {
-        let g = cell.lock();
-        if let Some(kp) = g.as_ref() {
-            return Ok((
-                kp.public_key.clone(),
-                Zeroizing::new(kp.secret_key.to_vec()),
-            ));
-        }
-    }
-    let kp = resolve_keypair(keypair_loc())?;
-    let pk = kp.public_key.clone();
-    let sk = Zeroizing::new(kp.secret_key.to_vec());
-    *cell.lock() = Some(kp);
-    Ok((pk, sk))
-}
-
-/// The keypair for `located`, with the D6c LOW fallback.
-///
-/// A failure to even locate the keypair file (on Windows R4 now needs the
-/// admin-only directory and the account SID) must NOT abort a connect when
-/// quantum protection is on. Before R4 the location was `config_local_dir`,
-/// which effectively never failed, and a write failure already fell through to
-/// an in-memory key (`load_or_generate_at`); R4 made `keypair_loc()` fallible,
-/// and `?` on it turned a missing location into a hard PQ failure that aborts
-/// the connect (`commands::vpn` fails closed with quantum on). So a location
-/// error falls back to an ephemeral keypair for this session — regenerated
-/// next launch, which the server tolerates (it persists no client PQ key) —
-/// rather than failing closed. An unreadable PERSISTED file (`Io`) still
-/// propagates: that is a long-lived identity key we must not silently discard.
-fn resolve_keypair(
-    located: Result<(KeypairLoc, Option<KeypairLoc>), String>,
-) -> Result<StaticKeypair, String> {
-    match located {
-        Ok((loc, retired)) => load_or_generate_at(&loc, retired.as_ref()),
-        Err(e) => {
-            tracing::warn!(
-                "BirdoPQ: no persistent keypair location ({e}) — using an in-memory keypair for \
-                 this session (regenerated next launch)"
-            );
-            Ok(generate_keypair())
-        }
-    }
-}
-
-/// Permanently delete the persisted keypair. Use on user logout.
-pub fn reset_persisted_keypair() -> Result<(), String> {
-    *cache().lock() = None;
-    set_mode(PqMode::Disabled);
-    // MR-1945: delete through the checked handle in the held directory.
-    let (loc, retired) = keypair_loc()?;
-    // R4: a per-user keypair an older build left is a persisted keypair of
-    // this user too.
-    if let Some(old) = retired.as_ref() {
-        retire_keypair_file(old);
-    }
-    match loc.dir.remove_file(&loc.name) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("delete {}: {e}", loc.name)),
+/// Called on every start (the first run after the upgrade does the work; the
+/// rest find nothing) and on logout and account deletion, where it stays as the
+/// hygiene it always was. Also resets the latched mode. Keep it for as long as
+/// a build with a stored key can still be installed over; nothing else removes
+/// those files.
+pub fn purge_legacy_keypair_files() {
+    // Deliberately does NOT touch the mode latch: startup runs this on a
+    // thread beside auto-connect, and resetting the mode there could clobber a
+    // connect that has already latched `Bilateral`. Logout and account
+    // deletion reset it themselves (`record_disabled`).
+    let deleted: usize = legacy_keypair_files().iter().map(purge_legacy_file).sum();
+    if deleted > 0 {
+        tracing::info!("BirdoPQ: deleted {deleted} legacy ML-KEM key file(s) (per-connect keys)");
     }
 }
 
 // ── Public API used by the connect command ────────────────────────────────
-
-/// Returns the Base64 ML-KEM-1024 client public key, generating + persisting
-/// the keypair on first call. Returns `None` only if persistence + in-memory
-/// generation both fail (extremely unlikely outside CI).
-pub fn get_client_public_key_b64() -> Option<String> {
-    match load_or_generate() {
-        Ok((pk, _)) => Some(base64::engine::general_purpose::STANDARD.encode(&pk)),
-        Err(e) => {
-            tracing::error!("BirdoPQ: cannot get client public key: {e}");
-            None
-        }
-    }
-}
 
 /// The per-connect nonce the server sends in `rosenpassEndpoint` (base64),
 /// decoded and bounded to 1..=[`MAX_NONCE_BYTES`] bytes.
@@ -800,9 +551,10 @@ fn server_nonce(field: Option<&str>) -> Result<Vec<u8>, String> {
     Ok(nonce)
 }
 
-/// Try to derive a bilateral PQ PSK from the server response. Returns
-/// `None` when the server did not include a ciphertext (legacy path) or
-/// when our local keypair is missing.
+/// Try to derive a bilateral PQ PSK from the server response, with the
+/// connect's own [`PqSession`]. Returns `None` when the server did not enable
+/// BirdoPQ or include a ciphertext (legacy path), or when the response is
+/// unusable. The session is consumed (and so wiped) here either way.
 ///
 /// What the caller does with `None` depends entirely on `quantum_enabled`:
 /// with it OFF this is the legacy path and `derive_quantum_psk` takes the
@@ -818,10 +570,19 @@ fn server_nonce(field: Option<&str>) -> Result<Vec<u8>, String> {
 /// for the config file, and it used to be a plain `String` that was dropped
 /// un-wiped at the end of `commands::vpn::connect` after being cloned into the
 /// `VpnConfig` (which does wipe its copy). Now both copies are wiped.
-pub fn try_decapsulate(response: &ConnectResponse) -> Option<Zeroizing<String>> {
+pub fn try_decapsulate(
+    response: &ConnectResponse,
+    session: Option<PqSession>,
+) -> Option<Zeroizing<String>> {
     if !response.quantum_enabled.unwrap_or(false) {
         return None;
     }
+    // Quantum is on but this connect made no keypair: it cannot decapsulate.
+    // Fail closed (the caller aborts), never derive from some other key.
+    let Some(session) = session else {
+        tracing::error!("BirdoPQ: the server enabled BirdoPQ but this connect made no keypair");
+        return None;
+    };
     // Field name re-use, matching the wire-format contract with Android +
     // backend: `rosenpassPublicKey` carries the ML-KEM ciphertext,
     // `rosenpassEndpoint` carries the per-connect nonce.
@@ -857,18 +618,10 @@ pub fn try_decapsulate(response: &ConnectResponse) -> Option<Zeroizing<String>> 
         }
     };
 
-    let (_pk, sk) = match load_or_generate() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("BirdoPQ: no client keypair available: {e}");
-            return None;
-        }
-    };
-
-    let psk = match derive_psk(&sk, &ct, &nonce) {
+    let psk = match session.finish(&ct, &nonce) {
         Ok(p) => p,
         Err(e) => {
-            tracing::error!("BirdoPQ: derive_psk failed: {e}");
+            tracing::error!("BirdoPQ: decapsulation failed: {e}");
             return None;
         }
     };
@@ -896,26 +649,19 @@ pub fn record_disabled() {
 mod tests {
     use super::*;
     use ml_kem::array::sizes::U32;
-    use std::fs;
-    use std::path::Path;
-
-    /// A keypair location at a temp `path`, for tests.
-    fn kloc(path: &Path) -> KeypairLoc {
-        KeypairLoc::at(path)
-    }
+    // Test-only: the expanded 3168-byte encoding is no longer used by the
+    // client, but the server's KAT fixture and the PQClean install-base
+    // fixture are in it, and they are the cross-implementation proof.
+    #[allow(deprecated)]
+    use ml_kem::ExpandedKeyEncoding;
     use ml_kem::{EncapsulationKey, Key, TryKeyInit, B32};
-
-    // No suite-wide file lock: every file-touching test below owns a
-    // `tempfile::tempdir()`, so none of them can reach the shared
-    // `config_local_dir` keypair the lock was introduced to serialise. A lock
-    // whose stated reason no longer holds is worse than no lock — the next
-    // reader assumes some shared file still needs protecting.
 
     /// The production server's own known-answer fixture, byte-identical to
     /// birdo-web `backend/src/vpn/__fixtures__/birdo-pq-ml-kem-1024.kat.json`.
     const KAT_JSON: &str = include_str!("fixtures/birdo-pq-ml-kem-1024.kat.json");
-    /// A keypair + ciphertext produced by PQClean CLEAN C (`pqcrypto-mlkem`),
-    /// i.e. exactly what every install up to v1.4.43 has on disk.
+    /// A keypair + ciphertext produced by PQClean CLEAN C (`pqcrypto-mlkem`):
+    /// what installs up to v1.4.43 had on disk. Kept only to prove which
+    /// ML-KEM is linked (`pq_impl_name_matches_linked_crate`).
     const PQCLEAN_JSON: &str = include_str!("fixtures/birdo-pq-pqclean-stored-key.json");
 
     fn b64(s: &str) -> Vec<u8> {
@@ -931,6 +677,27 @@ mod tests {
             .unwrap_or_else(|| panic!("fixture key {key}")))
     }
 
+    /// A nonce derived at run time, not written out: CodeQL's
+    /// `rust/hard-coded-cryptographic-value` (MR-2132) flags a literal that
+    /// reaches a KDF input, and these tests need only some distinct bytes.
+    fn test_nonce(tag: u8) -> Vec<u8> {
+        (0..32u8)
+            .map(|i| i.wrapping_mul(5).wrapping_add(tag))
+            .collect()
+    }
+
+    fn seed_box(bytes: [u8; SEED_BYTES]) -> SeedBox {
+        let mut s = SeedBox::zeroed();
+        s.0.copy_from_slice(&bytes);
+        s
+    }
+
+    fn seed_of(byte: u8) -> SeedBox {
+        let mut s = SeedBox::zeroed();
+        s.0.fill(byte);
+        s
+    }
+
     /// Server-side encapsulation, deterministic so the test vectors are fixed.
     /// This is the only place the client ever encapsulates; in production the
     /// server does it with `@noble/post-quantum`.
@@ -944,19 +711,6 @@ mod tests {
         (ct.to_vec(), ss.to_vec())
     }
 
-    fn pqclean_secret_key() -> Zeroizing<Vec<u8>> {
-        Zeroizing::new(field(PQCLEAN_JSON, "secretKeyB64"))
-    }
-
-    fn pqclean_nonce() -> Vec<u8> {
-        let v: serde_json::Value = serde_json::from_str(PQCLEAN_JSON).expect("fixture parses");
-        v["nonceAscii"]
-            .as_str()
-            .expect("nonceAscii")
-            .as_bytes()
-            .to_vec()
-    }
-
     // ── Cross-implementation vectors ──────────────────────────────────────
 
     /// The ONE test that can detect byte-incompatibility with the production
@@ -965,9 +719,11 @@ mod tests {
     /// passes all of them, and FIPS 203 implicit rejection means the only
     /// field symptom is a WireGuard handshake that silently never completes.
     ///
-    /// Fixture generated with `@noble/post-quantum` — the library the backend
+    /// Fixture generated with `@noble/post-quantum`, the library the backend
     /// actually encapsulates with (`backend/src/vpn/birdo-pq.service.ts`).
+    /// Per-connect keys changed where the secret lives, not one byte of this.
     #[test]
+    #[allow(deprecated)]
     fn kat_vs_noble() {
         let seed: [u8; SEED_BYTES] = field(KAT_JSON, "keygenSeedB64")
             .try_into()
@@ -981,14 +737,21 @@ mod tests {
         let nonce = field(KAT_JSON, "nonceB64");
 
         // keygen leg: FIPS 203 keygen is deterministic in (d || z), so the same
-        // 64-byte seed must produce the server's exact 1568/3168 bytes.
-        let kp = keypair_from_seed(&seed);
-        assert_eq!(kp.public_key, want_pk, "encapsulation key (ek) mismatch");
+        // 64-byte seed must produce the server's exact 1568 bytes (and the
+        // expanded key the fixture records).
+        let session = PqSession::from_seed(seed_box(seed));
         assert_eq!(
-            kp.secret_key.as_slice(),
+            session.public_key(),
+            want_pk,
+            "encapsulation key (ek) mismatch"
+        );
+        let mut expanded = decapsulation_key(&seed).to_expanded_bytes();
+        assert_eq!(
+            expanded.as_slice(),
             want_sk.as_slice(),
             "expanded decapsulation key (dk) mismatch"
         );
+        expanded.as_mut_slice().zeroize();
 
         // encapsulate leg
         let (ct, ss) = encapsulate_with(&want_pk, &encaps_m);
@@ -996,225 +759,32 @@ mod tests {
         assert_eq!(ss, want_ss, "shared secret from encapsulate mismatch");
 
         // decapsulate + HKDF legs, through the real production entry point.
-        let psk = derive_psk(&Zeroizing::new(want_sk), &want_ct, &nonce)
+        let psk = session
+            .finish(&want_ct, &nonce)
             .expect("decapsulating the server's own ciphertext must succeed");
         assert_eq!(
             psk.as_slice(),
             want_psk.as_slice(),
-            "PSK mismatch — the HKDF construction or the shared secret drifted \
+            "PSK mismatch: the HKDF construction or the shared secret drifted \
              from the server's"
         );
     }
 
-    /// The install-base guard: a decapsulation key generated by the PQClean C
-    /// implementation the client shipped up to v1.4.43 must keep working
-    /// forever. A swap that breaks stored-key reading would brick every
-    /// existing install, silently.
-    #[test]
-    fn stored_pqclean_dk_loads_and_derives_same_psk() {
-        let sk = pqclean_secret_key();
-        let pk = field(PQCLEAN_JSON, "publicKeyB64");
-        let ct = field(PQCLEAN_JSON, "cipherTextB64");
-        let want_psk = field(PQCLEAN_JSON, "presharedKeyB64");
-        let nonce = pqclean_nonce();
-
-        // It loads, and the embedded encapsulation key round-trips unchanged.
-        let dk =
-            load_decapsulation_key(sk.as_slice()).expect("a PQClean-generated dk must still load");
-        assert_eq!(dk.encapsulation_key().to_bytes().as_slice(), pk.as_slice());
-
-        // And it derives the PSK PQClean itself derived from that ciphertext.
-        let psk = derive_psk(&sk, &ct, &nonce).expect("decapsulate PQClean ciphertext");
-        assert_eq!(psk.as_slice(), want_psk.as_slice());
-    }
-
-    /// `KeyExport::to_bytes()` returns a 64-byte *seed* for a seed-generated
-    /// key and PANICS for one loaded from the expanded encoding. Nothing in
-    /// the type system stops it being used where `to_expanded_bytes()` belongs,
-    /// so the byte count is asserted explicitly, in memory and on disk.
-    #[test]
-    fn stored_key_length_is_3168() {
-        let kp = generate_keypair();
-        assert_eq!(kp.secret_key.len(), SECRET_KEY_BYTES);
-        assert_eq!(kp.public_key.len(), PUBLIC_KEY_BYTES);
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(KEYPAIR_FILENAME);
-        write_keypair(&kloc(&path), &kp).unwrap();
-        assert_eq!(
-            fs::metadata(&path).unwrap().len() as usize,
-            KEYPAIR_FILE_BYTES,
-            "on-disk keypair must stay 4744 B: magic + version + 1568 + 3168"
-        );
-
-        // A 64-byte "secret key" must be refused rather than persisted.
-        let short = StaticKeypair {
-            public_key: kp.public_key.clone(),
-            secret_key: Zeroizing::new(vec![0u8; 64]),
-        };
-        assert!(write_keypair(&kloc(&path), &short).is_err());
-    }
-
-    /// ml-kem enforces FIPS 203 §7.3 where `pqcrypto-mlkem`'s `from_bytes` was
-    /// a length check only, so a new hard-error path exists on an install base
-    /// that never had one. It must lead to a re-key: surfacing the error
-    /// instead would abort every BirdoPQ-enabled connect for the life of the
-    /// install, because `derive_quantum_psk` fails closed — see
-    /// `undecapsulatable_pq_aborts_even_when_a_server_psk_is_offered` in
-    /// `commands::vpn`.
-    #[test]
-    fn corrupt_dk_returns_invalid_key_and_rekeys() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(KEYPAIR_FILENAME);
-
-        // Structurally perfect — right magic, version and sizes — but one bit
-        // flipped inside the embedded H(ek) field at dk[3104..3136].
-        let mut sk = pqclean_secret_key().to_vec();
-        sk[3110] ^= 0x01;
-        let corrupt = StaticKeypair {
-            public_key: field(PQCLEAN_JSON, "publicKeyB64"),
-            secret_key: Zeroizing::new(sk.clone()),
-        };
-        write_keypair(&kloc(&path), &corrupt).unwrap();
-
-        assert!(
-            load_decapsulation_key(&sk).is_err(),
-            "a dk whose H(ek) does not match must be rejected"
-        );
-        match read_keypair(&kloc(&path)) {
-            Err(KeypairReadError::Unusable(_)) => {}
-            Err(e) => panic!("expected Unusable, got {e:?}"),
-            Ok(_) => panic!("corrupt H(ek) must not be accepted"),
-        }
-
-        // The recovery: a fresh, valid, persisted keypair.
-        let fresh = load_or_generate_at(&kloc(&path), None).expect("must re-key rather than fail");
-        assert_eq!(fresh.secret_key.len(), SECRET_KEY_BYTES);
-        assert_ne!(fresh.secret_key.as_slice(), sk.as_slice());
-        let reread = read_keypair(&kloc(&path))
-            .expect("the re-keyed file must be readable")
-            .expect("the re-keyed file must exist");
-        assert_eq!(reread.secret_key.as_slice(), fresh.secret_key.as_slice());
-    }
-
-    /// The stored public key is handed to the server as-is — it is never
-    /// re-derived at connect time — so a file whose pk half disagrees with
-    /// the key embedded in the dk makes the server encapsulate to a key this
-    /// client cannot decapsulate for. ML-KEM rejects implicitly, so the only
-    /// symptom is a WireGuard handshake that silently never completes: exactly
-    /// the failure mode this module exists to make impossible.
-    ///
-    /// Review of #163: of sixteen mutations run against this module, replacing
-    /// the `dk.encapsulation_key() != pk` condition in `read_keypair` with
-    /// `if false {` was the ONLY one that left every test green. It cannot be
-    /// caught by any dk-only assertion — the secret key here is perfectly
-    /// valid and passes FIPS 203 §7.3 on its own.
-    #[test]
-    fn read_keypair_rejects_public_key_that_disagrees_with_secret_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(KEYPAIR_FILENAME);
-
-        let kp = generate_keypair();
-        let mut wrong_pk = kp.public_key.clone();
-        wrong_pk[0] ^= 0x01; // one byte off; magic, version and both sizes stay perfect
-        write_keypair(
-            &kloc(&path),
-            &StaticKeypair {
-                public_key: wrong_pk.clone(),
-                secret_key: Zeroizing::new(kp.secret_key.to_vec()),
-            },
-        )
-        .unwrap();
-
-        // The dk half is untouched and still validates, so nothing about the
-        // secret key can reveal this — only comparing the two halves can.
-        load_decapsulation_key(kp.secret_key.as_slice())
-            .expect("the secret-key half is valid; only the stored pk is wrong");
-
-        match read_keypair(&kloc(&path)) {
-            Err(KeypairReadError::Unusable(m)) => assert!(
-                m.contains("stored public key"),
-                "wrong Unusable reason: {m}"
-            ),
-            Err(e) => panic!("expected Unusable, got {e:?}"),
-            Ok(_) => panic!("a pk that disagrees with the dk must not be accepted"),
-        }
-
-        // Unusable means re-key, not fail-forever: the replacement file must
-        // be readable and its halves must agree.
-        let fresh = load_or_generate_at(&kloc(&path), None).expect("must re-key rather than fail");
-        assert_ne!(fresh.public_key, wrong_pk);
-        let reread = read_keypair(&kloc(&path))
-            .expect("the re-keyed file must be readable")
-            .expect("the re-keyed file must exist");
-        assert_eq!(reread.public_key, fresh.public_key);
-        assert_eq!(reread.secret_key.as_slice(), fresh.secret_key.as_slice());
-    }
-
-    /// A file LONGER than a valid keypair must be rejected without the read
-    /// buffer ever growing past its reservation — a realloc mid-read leaves
-    /// an unscrubbed copy of the secret key in freed heap, which is precisely
-    /// what the pre-sized buffer exists to prevent. `read_to_end` alone would
-    /// have grown to the file's real size.
-    #[test]
-    fn read_keypair_rejects_oversized_file_without_reading_it_all() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(KEYPAIR_FILENAME);
-
-        let kp = generate_keypair();
-        write_keypair(&kloc(&path), &kp).unwrap();
-        // Append a megabyte of junk to an otherwise valid file.
-        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(&vec![0xAAu8; 1 << 20]).unwrap();
-        drop(f);
-
-        match read_keypair(&kloc(&path)) {
-            // The reported size is the CAP (4745), not the file's real size:
-            // proof the read stopped inside the reservation.
-            Err(KeypairReadError::Unusable(m)) => assert!(
-                m.contains(&format!("size {}", KEYPAIR_FILE_BYTES + 1)),
-                "expected the bounded-read size in the message, got: {m}"
-            ),
-            Err(e) => panic!("expected Unusable, got {e:?}"),
-            Ok(_) => panic!("an oversized keypair file must not be accepted"),
-        }
-
-        // The size above proves the CAP. The property `read_keypair`'s comment
-        // actually sells is that the capped read never reallocates the
-        // Zeroizing buffer (a realloc would leave an unscrubbed copy of the
-        // secret key in freed heap). Replay the same reservation and the same
-        // bound against the same oversized file and watch the allocation stay
-        // put; the `const` assert `READ_CAP_BYTES < READ_RESERVE_BYTES` is the
-        // other half of the proof.
-        let mut buf = Zeroizing::new(Vec::<u8>::with_capacity(READ_RESERVE_BYTES));
-        let (ptr_before, cap_before) = (buf.as_ptr(), buf.capacity());
-        let mut f2 = fs::File::open(&path).unwrap();
-        (&mut f2)
-            .take(READ_CAP_BYTES as u64)
-            .read_to_end(&mut buf)
-            .unwrap();
-        assert_eq!(buf.len(), READ_CAP_BYTES, "the bound must stop the read");
-        assert_eq!(buf.capacity(), cap_before, "the bounded read reallocated");
-        assert!(
-            std::ptr::eq(buf.as_ptr(), ptr_before),
-            "the bounded read moved the secret-key buffer"
-        );
-    }
-
-    /// Nobody may later "fix" implicit rejection into a `Result`: a wrong key
-    /// must yield a stable, different shared secret with no error and no panic.
-    /// Making the failure observable would hand an attacker a decapsulation
-    /// oracle.
+    /// Implicit rejection, with a wrong key: no error, no panic, a stable but
+    /// different PSK. Making the failure observable would hand an attacker a
+    /// decapsulation oracle.
     #[test]
     fn implicit_rejection_is_deterministic_and_silent() {
-        let ours = keypair_from_seed(&[0x11; SEED_BYTES]);
-        let theirs = keypair_from_seed(&[0x22; SEED_BYTES]);
-        let (ct, _ss) = encapsulate_with(&ours.public_key, &[0x33; 32]);
+        let ours = PqSession::from_seed(seed_of(0x11));
+        let (ct, _ss) = encapsulate_with(ours.public_key(), &[0x33; 32]);
 
-        let good = derive_psk(&ours.secret_key, &ct, b"nonce").unwrap();
-        let bad1 = derive_psk(&theirs.secret_key, &ct, b"nonce")
-            .expect("a wrong key must NOT error — that is the oracle");
-        let bad2 = derive_psk(&theirs.secret_key, &ct, b"nonce").unwrap();
+        let good = ours.finish(&ct, &test_nonce(1)).unwrap();
+        let bad1 = PqSession::from_seed(seed_of(0x22))
+            .finish(&ct, &test_nonce(1))
+            .expect("a wrong key must NOT error: that is the oracle");
+        let bad2 = PqSession::from_seed(seed_of(0x22))
+            .finish(&ct, &test_nonce(1))
+            .unwrap();
 
         assert_ne!(good.as_slice(), bad1.as_slice());
         assert_eq!(bad1.as_slice(), bad2.as_slice(), "must be deterministic");
@@ -1226,12 +796,21 @@ mod tests {
     /// RustCrypto `ml-kem` rejects a decapsulation key whose embedded `H(ek)`
     /// is wrong (FIPS 203 §7.3). `pqcrypto-mlkem`'s `from_bytes` accepts it.
     #[test]
+    #[allow(deprecated)]
     fn pq_impl_name_matches_linked_crate() {
-        let mut sk = pqclean_secret_key().to_vec();
-        sk[3110] ^= 0x01;
+        let mut sk = field(PQCLEAN_JSON, "secretKeyB64");
+        let good = Array::<u8, ml_kem::array::sizes::U3168>::try_from(sk.as_slice()).unwrap();
         assert!(
-            load_decapsulation_key(&sk).is_err(),
-            "the linked KEM does not enforce FIPS 203 §7.3 — it is not RustCrypto \
+            <DecapsulationKey<MlKem1024> as ExpandedKeyEncoding>::from_expanded_bytes(&good)
+                .is_ok(),
+            "the untouched PQClean key must load"
+        );
+        sk[3110] ^= 0x01;
+        let bad = Array::<u8, ml_kem::array::sizes::U3168>::try_from(sk.as_slice()).unwrap();
+        assert!(
+            <DecapsulationKey<MlKem1024> as ExpandedKeyEncoding>::from_expanded_bytes(&bad)
+                .is_err(),
+            "the linked KEM does not enforce FIPS 203 §7.3: it is not RustCrypto \
              ml-kem, so PQ_IMPL_NAME is lying"
         );
         assert_eq!(PQ_IMPL_NAME, "mlkem1024-rustcrypto");
@@ -1241,26 +820,43 @@ mod tests {
         );
     }
 
-    // ── Round trips and I/O ───────────────────────────────────────────────
+    // ── Per-connect keys (MR-703 / MR-1742) ───────────────────────────────
 
     #[test]
-    fn generate_keypair_correct_sizes() {
-        let kp = generate_keypair();
-        assert_eq!(kp.public_key.len(), PUBLIC_KEY_BYTES);
-        assert_eq!(kp.secret_key.len(), SECRET_KEY_BYTES);
+    fn a_session_has_the_wire_sizes() {
+        let s = PqSession::begin();
+        assert_eq!(s.public_key().len(), PUBLIC_KEY_BYTES);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(s.public_key_b64())
+                .unwrap(),
+            s.public_key()
+        );
     }
 
+    /// Two connects never share a key: the property this change exists for.
     #[test]
-    fn server_encap_then_client_decap_match() {
-        // Round-trip: simulate the server encapsulating against our pk, then
-        // decap with our sk + the same nonce. PSKs MUST match.
-        let kp = generate_keypair();
-        let (ct, ss_server) = encapsulate_with(&kp.public_key, &[0x5A; 32]);
-        let nonce = b"connect-2026-05-10T12:00:00Z";
-        let server_psk = hkdf_to_psk(&ss_server, nonce).unwrap();
+    fn two_connects_give_different_public_keys() {
+        let a = PqSession::begin();
+        let b = PqSession::begin();
+        assert_ne!(a.public_key(), b.public_key());
+        assert_ne!(a.public_key_b64(), b.public_key_b64());
+    }
 
-        let client_psk = derive_psk(&kp.secret_key, &ct, nonce).unwrap();
+    /// The retries of ONE request re-send the same public key (the server's
+    /// ciphertext must still fit the key it is decapsulated with), and the
+    /// session that sent it can still finish after any number of reads.
+    #[test]
+    fn a_retry_of_the_same_request_reuses_the_pair() {
+        let session = PqSession::begin();
+        let first = session.public_key_b64();
+        let retry = session.public_key_b64();
+        assert_eq!(first, retry);
 
+        let (ct, ss_server) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let nonce = test_nonce(2);
+        let server_psk = hkdf_to_psk(&ss_server, &nonce).unwrap();
+        let client_psk = session.finish(&ct, &nonce).unwrap();
         assert_eq!(
             client_psk.as_slice(),
             server_psk.as_slice(),
@@ -1268,17 +864,92 @@ mod tests {
         );
     }
 
+    /// The secret is wiped when the session ends, by `finish` and by a plain
+    /// drop (a failed or cancelled connect). The wipe is `SeedBox::wipe`, which
+    /// `Drop` calls; it is read back while the memory is still live (reading a
+    /// freed heap block after the drop would be undefined behaviour), and the
+    /// source pins that `Drop` calls it and `finish` consumes the session.
+    #[test]
+    fn the_secret_is_wiped_on_drop() {
+        let mut seed = seed_of(0xA5);
+        assert!(seed.iter().all(|b| *b == 0xA5));
+        seed.wipe();
+        assert!(
+            seed.iter().all(|b| *b == 0),
+            "the ML-KEM seed survived the wipe"
+        );
+
+        let source = include_str!("birdo_pq.rs").replace('\r', "");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        let drop_impl = &production[production.find("impl Drop for SeedBox").unwrap()..];
+        let drop_impl = &drop_impl[..drop_impl.find("\n}\n").unwrap()];
+        assert!(drop_impl.contains("self.wipe()"), "{drop_impl}");
+        assert!(
+            production.contains("pub fn finish(\n        self,"),
+            "finish must consume the session"
+        );
+    }
+
+    #[test]
+    fn a_session_never_prints_its_secret() {
+        let s = PqSession::from_seed(seed_of(0xA5));
+        let shown = format!("{s:?}");
+        assert_eq!(shown, "PqSession { .. }");
+    }
+
+    /// `finish` consumes the session and nothing can copy it: the type has no
+    /// `Clone`, `Copy` or `Serialize`, so "decapsulates twice" and "written to
+    /// disk" do not compile. Pinned at the source so a derive cannot slip in.
+    #[test]
+    fn the_session_cannot_be_copied_or_serialized() {
+        let source = include_str!("birdo_pq.rs").replace('\r', "");
+        let decl = source.find("pub struct PqSession").unwrap();
+        let before = &source[decl.saturating_sub(40)..decl];
+        for bad in ["derive", "Clone", "Copy", "Serialize"] {
+            assert!(!before.contains(bad), "PqSession must not derive {bad}");
+        }
+        // Built at run time: this test's own source must not name the impl.
+        for bad in ["Clone", "Serialize"] {
+            let production_end = source.find("#[cfg(test)]").unwrap();
+            assert!(!source[..production_end].contains(&format!("impl {bad} for PqSession")));
+        }
+    }
+
+    // ── Round trips ───────────────────────────────────────────────────────
+
+    #[test]
+    fn server_encap_then_client_decap_match() {
+        let session = PqSession::begin();
+        let (ct, ss_server) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let nonce = test_nonce(2);
+        let server_psk = hkdf_to_psk(&ss_server, &nonce).unwrap();
+        let client_psk = session.finish(&ct, &nonce).unwrap();
+        assert_eq!(client_psk.as_slice(), server_psk.as_slice());
+    }
+
+    /// A ciphertext made for ANOTHER connect's key does not decapsulate to the
+    /// server's PSK: a new connect never reuses an old pair's secret.
+    #[test]
+    fn a_ciphertext_for_an_earlier_connect_does_not_fit_a_new_one() {
+        let old = PqSession::begin();
+        let (ct, ss_server) = encapsulate_with(old.public_key(), &[0x5A; 32]);
+        let server_psk = hkdf_to_psk(&ss_server, &test_nonce(3)).unwrap();
+        let new = PqSession::begin();
+        let psk = new.finish(&ct, &test_nonce(3)).unwrap();
+        assert_ne!(psk.as_slice(), server_psk.as_slice());
+    }
+
     #[test]
     fn different_nonces_produce_different_psks() {
-        let kp = generate_keypair();
-        let (ct, _ss) = encapsulate_with(&kp.public_key, &[0x5A; 32]);
+        let kp = PqSession::from_seed(seed_of(0x44));
+        let (ct, _ss) = encapsulate_with(kp.public_key(), &[0x5A; 32]);
         // Two nonces that differ in one bit, derived here rather than written
         // out as constants (CodeQL rust/hard-coded-cryptographic-value, MR-2132).
         let nonce_a = ct[..16].to_vec();
         let mut nonce_b = nonce_a.clone();
         nonce_b[0] ^= 1;
-        let a = derive_psk(&kp.secret_key, &ct, &nonce_a).unwrap();
-        let b = derive_psk(&kp.secret_key, &ct, &nonce_b).unwrap();
+        let a = derive_psk(&kp.seed, &ct, &nonce_a).unwrap();
+        let b = derive_psk(&kp.seed, &ct, &nonce_b).unwrap();
         assert_ne!(a.as_slice(), b.as_slice());
     }
 
@@ -1343,174 +1014,119 @@ mod tests {
         );
     }
 
+    /// A wrong-sized ciphertext fails closed: an error, never a PSK.
     #[test]
     fn malformed_inputs_error_cleanly() {
-        let r1 = derive_psk(
-            &Zeroizing::new(vec![0u8; 16]),
-            &[0u8; CIPHERTEXT_BYTES],
-            b"n",
-        );
-        assert!(r1.is_err());
-        let kp = generate_keypair();
-        let r2 = derive_psk(&kp.secret_key, &[0u8; 16], b"n");
-        assert!(r2.is_err());
+        assert!(PqSession::begin()
+            .finish(&[0u8; 16], &test_nonce(3))
+            .is_err());
+        assert!(PqSession::begin()
+            .finish(&[0u8; CIPHERTEXT_BYTES + 1], &test_nonce(3))
+            .is_err());
     }
 
+    // ── Legacy key files ──────────────────────────────────────────────────
+
+    fn legacy_in(base: &std::path::Path, name: &str) -> LegacyKeypairFile {
+        LegacyKeypairFile {
+            dir: OwnedDir::new(base.to_path_buf(), &[]),
+            name: name.to_string(),
+            all_accounts: false,
+        }
+    }
+
+    /// The admin-only directory is shared by every account on the machine: the
+    /// purge takes their keys too, and nothing that is not a PQ key file.
     #[test]
-    fn keypair_file_roundtrip() {
+    fn the_admin_directory_purge_takes_every_accounts_key() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(KEYPAIR_FILENAME);
-        let kp = generate_keypair();
-        let pk_clone = kp.public_key.clone();
-        let sk_clone = kp.secret_key.to_vec();
-        write_keypair(&kloc(&path), &kp).unwrap();
-        let loaded = read_keypair(&kloc(&path)).unwrap().unwrap();
-        assert_eq!(loaded.public_key, pk_clone);
-        assert_eq!(loaded.secret_key.as_slice(), sk_clone.as_slice());
+        let mine = "pq-S-1-5-21-1-2-3-1001.bin";
+        for name in [
+            mine,
+            "pq-S-1-5-21-1-2-3-1002.bin",
+            "pq-S-1-5-21-1-2-3-1002.bin.00ff00ff00ff00ff.tmp",
+        ] {
+            std::fs::write(dir.path().join(name), [7u8; 10]).unwrap();
+        }
+        std::fs::write(dir.path().join("settings.key"), b"keep").unwrap();
+        std::fs::write(dir.path().join("pq-notes.txt"), b"keep").unwrap();
+
+        let mut file = legacy_in(dir.path(), mine);
+        file.all_accounts = true;
+        assert_eq!(purge_legacy_file(&file), 3);
+        assert!(dir.path().join("settings.key").exists());
+        assert!(dir.path().join("pq-notes.txt").exists());
     }
 
-    // ── R4: the Windows keypair is per account, in the admin-only folder ──
+    /// First run after the upgrade: the stored keypair file goes, and so do the
+    /// staging files an interrupted write left (they held the same secret).
+    /// Unrelated files, and files that merely start like it, stay.
+    #[test]
+    fn the_legacy_keypair_file_is_purged() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = KEYPAIR_FILENAME;
+        let staging = format!("{name}.00ff00ff00ff00ff.tmp");
+        std::fs::write(dir.path().join(name), [7u8; 4744]).unwrap();
+        std::fs::write(dir.path().join(&staging), [7u8; 100]).unwrap();
+        std::fs::write(dir.path().join("settings.json"), b"{}").unwrap();
+        std::fs::write(dir.path().join(format!("{name}.bak")), b"x").unwrap();
 
-    /// `<base>/ProgramData/BirdoVPN` standing in for the admin-only
-    /// directory, and `<base>/Local/BirdoVPN/birdo_pq_v1.bin` for the per-user
-    /// file every build before R4 used.
-    fn r4_locations(base: &Path, sid: &str) -> (KeypairLoc, KeypairLoc) {
-        let protected = base.join("ProgramData").join("BirdoVPN");
+        assert_eq!(purge_legacy_file(&legacy_in(dir.path(), name)), 2);
+
+        assert!(!dir.path().join(name).exists());
+        assert!(!dir.path().join(&staging).exists());
+        assert!(dir.path().join("settings.json").exists());
+        assert!(dir.path().join(format!("{name}.bak")).exists());
+        // Idempotent: the second run finds nothing and does not fail.
+        assert_eq!(purge_legacy_file(&legacy_in(dir.path(), name)), 0);
+    }
+
+    /// The Windows location is the admin-only directory, one file per account.
+    #[test]
+    fn the_windows_legacy_file_is_per_account_in_the_admin_only_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let protected = base.path().join("ProgramData").join("BirdoVPN");
         std::fs::create_dir_all(&protected).unwrap();
-        let old = KeypairLoc {
-            dir: OwnedDir::new(base.join("Local"), &["BirdoVPN"]),
-            name: KEYPAIR_FILENAME.to_string(),
-        };
-        (protected_keypair_loc(&protected, sid).unwrap(), old)
-    }
-
-    /// The upgrade, once: the per-user keypair (which any unelevated process
-    /// could read, or have replaced) is NOT carried over. A fresh key goes to
-    /// the admin-only folder and the old file is deleted once it is on disk.
-    #[test]
-    fn the_per_user_keypair_is_replaced_once_never_adopted() {
-        let base = tempfile::tempdir().unwrap();
-        let (loc, old) = r4_locations(base.path(), "S-1-5-21-1-2-3-1001");
-        let planted = generate_keypair();
-        write_keypair(&old, &planted).unwrap();
-
-        let fresh = load_or_generate_at(&loc, Some(&old)).unwrap();
-
-        assert_ne!(
-            fresh.public_key, planted.public_key,
-            "the old key was adopted"
-        );
-        assert!(loc.dir.join(&loc.name).exists());
-        assert!(
-            !old.dir.join(&old.name).exists(),
-            "the old per-user key was left readable"
-        );
-        let stored = read_keypair(&loc).unwrap().unwrap();
-        assert_eq!(stored.public_key, fresh.public_key);
-    }
-
-    /// After that the old location is ignored: a keypair planted there later
-    /// is neither used nor even touched; the admin-only key stays.
-    #[test]
-    fn a_keypair_planted_in_the_old_location_later_is_ignored() {
-        let base = tempfile::tempdir().unwrap();
-        let (loc, old) = r4_locations(base.path(), "S-1-5-21-1-2-3-1001");
-        let first = load_or_generate_at(&loc, Some(&old)).unwrap();
-
-        let planted = generate_keypair();
-        write_keypair(&old, &planted).unwrap();
-        let again = load_or_generate_at(&loc, Some(&old)).unwrap();
-
-        assert_eq!(again.public_key, first.public_key);
-        assert_ne!(again.public_key, planted.public_key);
-        assert_eq!(
-            read_keypair(&old).unwrap().unwrap().public_key,
-            planted.public_key,
-            "the old location is not even touched once the admin-only key exists"
-        );
-    }
-
-    /// One key per Windows account, never one per machine (audit C-8): two
-    /// accounts get two files and two different keys in the same folder.
-    #[test]
-    fn each_windows_account_has_its_own_keypair() {
-        let base = tempfile::tempdir().unwrap();
-        let (alice, old) = r4_locations(base.path(), "S-1-5-21-1-2-3-1001");
-        let (bob, _) = r4_locations(base.path(), "S-1-5-21-1-2-3-1002");
+        let alice = protected_legacy_file(&protected, "S-1-5-21-1-2-3-1001").unwrap();
+        let bob = protected_legacy_file(&protected, "S-1-5-21-1-2-3-1002").unwrap();
         assert_eq!(alice.name, "pq-S-1-5-21-1-2-3-1001.bin");
         assert_eq!(alice.dir.path(), bob.dir.path());
-        assert_ne!(alice.name, bob.name);
 
-        let a = load_or_generate_at(&alice, Some(&old)).unwrap();
-        let b = load_or_generate_at(&bob, Some(&old)).unwrap();
-        assert_ne!(a.public_key, b.public_key);
-        assert_eq!(
-            load_or_generate_at(&alice, Some(&old)).unwrap().public_key,
-            a.public_key
-        );
-        assert_eq!(
-            load_or_generate_at(&bob, Some(&old)).unwrap().public_key,
-            b.public_key
-        );
-    }
+        std::fs::write(alice.dir.join(&alice.name), [7u8; 10]).unwrap();
+        std::fs::write(bob.dir.join(&bob.name), [7u8; 10]).unwrap();
+        // ... but on Windows the purge sweeps the whole admin directory: both go.
+        assert_eq!(purge_legacy_file(&alice), 2);
+        assert!(!alice.dir.join(&alice.name).exists());
+        assert!(!bob.dir.join(&bob.name).exists());
 
-    /// D6c LOW: a location failure falls back to an in-memory keypair (so a
-    /// connect with quantum on is not aborted), while an unreadable PERSISTED
-    /// file still propagates as an error (the identity key is not discarded).
-    #[test]
-    fn a_missing_location_falls_back_to_an_in_memory_keypair() {
-        let kp = resolve_keypair(Err("no admin-only directory".to_string()))
-            .expect("a location failure must not fail the keypair");
-        assert_eq!(kp.public_key.len(), PUBLIC_KEY_BYTES);
-        assert_eq!(kp.secret_key.len(), SECRET_KEY_BYTES);
-
-        // A located-but-fresh dir persists as before (no fallback).
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(KEYPAIR_FILENAME);
-        let got = resolve_keypair(Ok((kloc(&path), None))).unwrap();
-        assert!(path.exists());
-        assert_eq!(
-            read_keypair(&kloc(&path)).unwrap().unwrap().public_key,
-            got.public_key
-        );
-    }
-
-    /// The Windows location is the admin-only directory, not %LOCALAPPDATA%.
-    #[test]
-    fn the_windows_keypair_lives_in_the_admin_only_directory() {
         let source = include_str!("birdo_pq.rs").replace('\r', "");
-        let body = &source[source.find("fn keypair_loc()").unwrap()..];
+        let body = &source[source.find("fn legacy_keypair_files()").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];
-        let windows = &body
-            [body.find("#[cfg(windows)]").unwrap()..body.find("#[cfg(not(windows))]").unwrap()];
-        assert!(windows.contains("crate::utils::protected_dir::ensure()"));
-        assert!(windows.contains("protected_keypair_loc(&protected, &sid)"));
+        assert!(body.contains("crate::utils::protected_dir::ensure()"));
+        assert!(body.contains("protected_legacy_file(&protected, &sid)"));
     }
 
+    /// Nothing in this module writes a keypair any more.
     #[test]
-    fn read_keypair_rejects_bad_magic() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(KEYPAIR_FILENAME);
-        let mut f = fs::File::create(&path).unwrap();
-        f.write_all(&[0u8; KEYPAIR_FILE_BYTES]).unwrap();
-        let r = read_keypair(&kloc(&path));
-        assert!(r.is_err());
+    fn nothing_persists_a_secret() {
+        let source = include_str!("birdo_pq.rs").replace('\r', "");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        for forbidden in [
+            "create_new(",
+            "fs::write(",
+            "File::create(",
+            "write_all(",
+            "open_rw(",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "{forbidden} in production code"
+            );
+        }
     }
 
-    #[test]
-    fn read_keypair_rejects_short_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(KEYPAIR_FILENAME);
-        let mut f = fs::File::create(&path).unwrap();
-        f.write_all(b"BPQ1\x01\x00\x00\x00").unwrap();
-        let r = read_keypair(&kloc(&path));
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn try_decapsulate_returns_none_when_pq_disabled() {
-        // Build a synthetic ConnectResponse with quantum_enabled=false
-        let resp = ConnectResponse {
+    fn response_with(ct: Option<String>, nonce: Option<String>, quantum: bool) -> ConnectResponse {
+        ConnectResponse {
             success: true,
             message: None,
             quota_exceeded: false,
@@ -1536,11 +1152,39 @@ mod tests {
             xray_short_id: None,
             xray_sni: None,
             xray_flow: None,
-            quantum_enabled: Some(false),
-            rosenpass_public_key: Some("anything".into()),
-            rosenpass_endpoint: None,
-        };
-        assert!(try_decapsulate(&resp).is_none());
+            quantum_enabled: Some(quantum),
+            rosenpass_public_key: ct,
+            rosenpass_endpoint: nonce,
+        }
+    }
+
+    #[test]
+    fn try_decapsulate_returns_none_when_pq_disabled() {
+        let resp = response_with(Some("anything".into()), None, false);
+        assert!(try_decapsulate(&resp, Some(PqSession::begin())).is_none());
+    }
+
+    /// The server turned BirdoPQ on, so a response WITHOUT a usable ciphertext
+    /// or nonce, or a connect with no session, derives nothing: `None` is what
+    /// makes `derive_quantum_psk` abort rather than demote.
+    #[test]
+    fn try_decapsulate_fails_closed_on_an_unusable_response() {
+        let session = PqSession::begin();
+        let (ct, _ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let std_b64 = base64::engine::general_purpose::STANDARD;
+        let nonce = std_b64.encode([9u8; 32]);
+        let ct_b64 = std_b64.encode(&ct);
+
+        // A good response, but this connect made no keypair.
+        let good = response_with(Some(ct_b64.clone()), Some(nonce.clone()), true);
+        assert!(try_decapsulate(&good, None).is_none());
+        // Wrong-size ciphertext, missing nonce.
+        let short = response_with(Some(std_b64.encode([1u8; 16])), Some(nonce.clone()), true);
+        assert!(try_decapsulate(&short, Some(PqSession::begin())).is_none());
+        let no_nonce = response_with(Some(ct_b64), None, true);
+        assert!(try_decapsulate(&no_nonce, Some(PqSession::begin())).is_none());
+        // And the good one works with its own session.
+        assert!(try_decapsulate(&good, Some(session)).is_some());
     }
 
     /// Proposed row 13: the server nonce is bounded like Android's

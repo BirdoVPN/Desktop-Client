@@ -696,11 +696,16 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
-          key: msrv-${{ matrix.os }}
+          key: msrv-v2-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # MR-1798: warnings fail this check (it printed them unchecked on the
+      # Linux/macOS legs). Cargo caps lints on registry dependencies, so
+      # `-D warnings` only applies to this workspace's own crate.
       - name: cargo check --locked --all-targets at the declared rust-version
         working-directory: src-tauri
+        env:
+          RUSTFLAGS: "-D warnings"
         run: |
           rustc --version
           cargo check --locked --all-targets

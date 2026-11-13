@@ -78,6 +78,10 @@ pub enum ApiError {
     /// does not create new accounts from this country. Carries the backend's
     /// own sentence, which is the only explanation there is.
     RegistrationNotAllowed(String),
+    /// 403 with `details.code: "email_not_verified"` (MR-2210): the password was
+    /// right but the e-mail address was never confirmed. A bare 403 would read
+    /// as "your plan does not include this".
+    EmailNotVerified,
     /// The action needs the account's two-factor code (`error:
     /// "two_factor_required"`, Account API contract item 85). Carries the
     /// backend's sentence.
@@ -252,6 +256,7 @@ impl fmt::Display for ApiError {
             | ApiError::RegistrationNotAllowed(message)
             | ApiError::PowRefused { message, .. }
             | ApiError::ClientAttestationRequired(message) => write!(f, "{}", message),
+            ApiError::EmailNotVerified => write!(f, "Please verify your email address before signing in"),
             ApiError::QuotaCheckUnavailable { .. } => {
                 write!(f, "The data allowance check is unavailable right now")
             }

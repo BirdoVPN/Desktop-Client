@@ -51,6 +51,7 @@ export type IpcErrorCode =
   | 'consent_required'
   | 'account_restricted'
   | 'registration_not_allowed'
+  | 'email_not_verified'
   | 'unknown';
 
 const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
@@ -85,6 +86,7 @@ const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
   'consent_required',
   'account_restricted',
   'registration_not_allowed',
+  'email_not_verified',
   'unknown',
 ]);
 

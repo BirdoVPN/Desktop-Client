@@ -317,15 +317,12 @@ pub async fn logout(
         ))
     })?;
 
-    // Logout hygiene (documented contract of the persistent ML-KEM identity):
-    // the keypair is a globally-unique, machine-stable linkage primitive, so it
-    // must not survive an account boundary. Best-effort — a delete failure must
-    // not block the logout itself. Deliberately NOT called on the
-    // rejected-refresh auto-sign-out path (get_auth_state): that is a session
-    // expiry on the same account, not the user leaving it.
-    if let Err(e) = crate::vpn::birdo_pq::reset_persisted_keypair() {
-        tracing::warn!("Failed to reset BirdoPQ keypair on logout: {}", e);
-    }
+    // Logout hygiene: since MR-703 / MR-1742 no ML-KEM key outlives a connect,
+    // so there is no identity to reset. This only deletes any key file an older
+    // build left (startup already does; this covers one written since by a
+    // downgrade). Best-effort and idempotent.
+    crate::vpn::birdo_pq::purge_legacy_keypair_files();
+    crate::vpn::birdo_pq::record_disabled();
 
     // The device identifier is deliberately NOT rotated here (second-pass
     // #14), matching iOS and Android: it rotates on account DELETION only.
@@ -503,12 +500,11 @@ pub async fn delete_account(
     crate::commands::settings::clear_account_choices(&app).await;
 
     // Clear all local credentials after successful server-side deletion,
-    // including the persistent ML-KEM identity (same hygiene as logout —
+    // including any key file an older build left (same hygiene as logout —
     // doubly so for a GDPR deletion) and the device identifier (C-8).
     let _ = credentials.clear_tokens();
-    if let Err(e) = crate::vpn::birdo_pq::reset_persisted_keypair() {
-        tracing::warn!("Failed to reset BirdoPQ keypair on account deletion: {}", e);
-    }
+    crate::vpn::birdo_pq::purge_legacy_keypair_files();
+    crate::vpn::birdo_pq::record_disabled();
     crate::utils::device_id::rotate();
 
     let store_subscriptions_still_billing = response
