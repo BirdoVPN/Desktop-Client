@@ -272,7 +272,7 @@ impl PqSession {
 
     /// The Base64 public key the `/vpn/connect` body carries.
     pub fn public_key_b64(&self) -> String {
-        base64::engine::general_purpose::STANDARD.encode(&self.public_key)
+        base64::engine::general_purpose::STANDARD.encode(self.public_key())
     }
 
     /// Decapsulate the server's ciphertext into the 32-byte WireGuard PSK and
