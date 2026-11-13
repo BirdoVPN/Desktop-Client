@@ -322,6 +322,7 @@ pub async fn logout(
     // build left (startup already does; this covers one written since by a
     // downgrade). Best-effort and idempotent.
     crate::vpn::birdo_pq::purge_legacy_keypair_files();
+    crate::vpn::birdo_pq::record_disabled();
 
     // The device identifier is deliberately NOT rotated here (second-pass
     // #14), matching iOS and Android: it rotates on account DELETION only.
@@ -465,6 +466,7 @@ pub async fn delete_account(
     // doubly so for a GDPR deletion) and the device identifier (C-8).
     let _ = credentials.clear_tokens();
     crate::vpn::birdo_pq::purge_legacy_keypair_files();
+    crate::vpn::birdo_pq::record_disabled();
     crate::utils::device_id::rotate();
 
     let store_subscriptions_still_billing = response

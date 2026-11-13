@@ -219,14 +219,51 @@ fn set_mode(m: PqMode) {
 /// still fits the key), and a NEW connect or re-dial calls `begin()` again.
 /// A pair is never reused by a later connect.
 pub struct PqSession {
-    seed: Zeroizing<[u8; SEED_BYTES]>,
+    seed: SeedBox,
     public_key: Vec<u8>,
 }
 
-// The wipe is the whole point; stop the build if a dependency change drops it.
+/// The 64-byte seed, on the HEAP and filled in place. A `Zeroizing<[u8; 64]>`
+/// is wiped on drop but MOVED by value (into `from_seed`, into the struct, out of
+/// `begin`), and every move leaves an unwiped stack copy behind; a boxed array is
+/// moved as a pointer, so there is exactly one copy and the wipe reaches it.
+///
+/// No `mlock` / `VirtualLock`: the page can be swapped or end up in a crash dump
+/// or hibernation file while a connect is in flight. That is the same exposure
+/// the WireGuard private key has in this process, and the window is one
+/// connect; it is a named residual, not a claim of protection.
+struct SeedBox(Box<[u8; SEED_BYTES]>);
+
+impl SeedBox {
+    /// All zero; the caller fills it in place.
+    fn zeroed() -> Self {
+        Self(Box::new([0u8; SEED_BYTES]))
+    }
+
+    fn wipe(&mut self) {
+        self.0.as_mut_slice().zeroize();
+    }
+}
+
+impl std::ops::Deref for SeedBox {
+    type Target = [u8; SEED_BYTES];
+    fn deref(&self) -> &[u8; SEED_BYTES] {
+        &self.0
+    }
+}
+
+impl Drop for SeedBox {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for SeedBox {}
+
+// The wipe is the whole point; stop the build if the marker is dropped.
 const _: fn() = || {
     fn wipes_itself_on_drop<T: zeroize::ZeroizeOnDrop>() {}
-    wipes_itself_on_drop::<Zeroizing<[u8; SEED_BYTES]>>();
+    wipes_itself_on_drop::<SeedBox>();
 };
 
 impl std::fmt::Debug for PqSession {
@@ -240,8 +277,8 @@ impl PqSession {
     /// A fresh keypair for one connect. The seed comes straight from the OS
     /// CSPRNG, not a userspace PRNG that could be forked or reseeded.
     pub fn begin() -> Self {
-        let mut seed = Zeroizing::new([0u8; SEED_BYTES]);
-        crate::utils::os_rng::fill(seed.as_mut_slice());
+        let mut seed = SeedBox::zeroed();
+        crate::utils::os_rng::fill(seed.0.as_mut_slice());
         Self::from_seed(seed)
     }
 
@@ -251,7 +288,7 @@ impl PqSession {
     /// it from the server fixture's `keygenSeed`: the same seed in, the same
     /// 1568 bytes out as `@noble/post-quantum`, is the strongest available proof
     /// that this client and the production server speak the same ML-KEM.
-    fn from_seed(seed: Zeroizing<[u8; SEED_BYTES]>) -> Self {
+    fn from_seed(seed: SeedBox) -> Self {
         let dk = decapsulation_key(&seed);
         let ek = dk.encapsulation_key().to_bytes();
         assert_eq!(
@@ -372,6 +409,10 @@ const _: fn() = || {
 struct LegacyKeypairFile {
     dir: OwnedDir,
     name: String,
+    /// Also delete every other account's `pq-<SID>.bin` in this directory (the
+    /// admin-only directory is shared by the machine's accounts; their keys are
+    /// as dead as this one's).
+    all_accounts: bool,
 }
 
 /// This account's legacy keypair file in the admin-only directory `protected`.
@@ -389,6 +430,7 @@ fn protected_legacy_file(
     Ok(LegacyKeypairFile {
         dir: OwnedDir::new(base, &[folder]),
         name: format!("pq-{sid}.bin"),
+        all_accounts: true,
     })
 }
 
@@ -400,6 +442,7 @@ fn per_user_legacy_file() -> Result<LegacyKeypairFile, String> {
     Ok(LegacyKeypairFile {
         dir: OwnedDir::new(base, &["BirdoVPN"]),
         name: KEYPAIR_FILENAME.to_string(),
+        all_accounts: false,
     })
 }
 
@@ -414,7 +457,12 @@ fn purge_legacy_file(file: &LegacyKeypairFile) -> usize {
         let staging_prefix = format!("{}.", file.name);
         names.extend(entries.flatten().filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
-            (name.starts_with(&staging_prefix) && name.ends_with(".tmp")).then_some(name)
+            let own_staging = name.starts_with(&staging_prefix) && name.ends_with(".tmp");
+            // Another account's key (`pq-<SID>.bin`) or its staging file.
+            let other_account = file.all_accounts
+                && name.starts_with("pq-")
+                && (name.ends_with(".bin") || (name.contains(".bin.") && name.ends_with(".tmp")));
+            (own_staging || other_account).then_some(name)
         }));
     }
     let mut deleted = 0;
@@ -462,7 +510,10 @@ fn legacy_keypair_files() -> Vec<LegacyKeypairFile> {
 /// a build with a stored key can still be installed over; nothing else removes
 /// those files.
 pub fn purge_legacy_keypair_files() {
-    set_mode(PqMode::Disabled);
+    // Deliberately does NOT touch the mode latch: startup runs this on a
+    // thread beside auto-connect, and resetting the mode there could clobber a
+    // connect that has already latched `Bilateral`. Logout and account
+    // deletion reset it themselves (`record_disabled`).
     let deleted: usize = legacy_keypair_files().iter().map(purge_legacy_file).sum();
     if deleted > 0 {
         tracing::info!("BirdoPQ: deleted {deleted} legacy ML-KEM key file(s) (per-connect keys)");
@@ -635,8 +686,16 @@ mod tests {
             .collect()
     }
 
-    fn seed_of(byte: u8) -> Zeroizing<[u8; SEED_BYTES]> {
-        Zeroizing::new([byte; SEED_BYTES])
+    fn seed_box(bytes: [u8; SEED_BYTES]) -> SeedBox {
+        let mut s = SeedBox::zeroed();
+        s.0.copy_from_slice(&bytes);
+        s
+    }
+
+    fn seed_of(byte: u8) -> SeedBox {
+        let mut s = SeedBox::zeroed();
+        s.0.fill(byte);
+        s
     }
 
     /// Server-side encapsulation, deterministic so the test vectors are fixed.
@@ -680,7 +739,7 @@ mod tests {
         // keygen leg: FIPS 203 keygen is deterministic in (d || z), so the same
         // 64-byte seed must produce the server's exact 1568 bytes (and the
         // expanded key the fixture records).
-        let session = PqSession::from_seed(Zeroizing::new(seed));
+        let session = PqSession::from_seed(seed_box(seed));
         assert_eq!(
             session.public_key(),
             want_pk,
@@ -806,18 +865,28 @@ mod tests {
     }
 
     /// The secret is wiped when the session ends, by `finish` and by a plain
-    /// drop (a failed or cancelled connect). The bytes are read back out of a
-    /// `ManuallyDrop` so the check sees the wiped memory, not a moved-from one.
+    /// drop (a failed or cancelled connect). The wipe is `SeedBox::wipe`, which
+    /// `Drop` calls; it is read back while the memory is still live (reading a
+    /// freed heap block after the drop would be undefined behaviour), and the
+    /// source pins that `Drop` calls it and `finish` consumes the session.
     #[test]
     fn the_secret_is_wiped_on_drop() {
-        let mut s = std::mem::ManuallyDrop::new(PqSession::from_seed(seed_of(0xA5)));
-        assert!(s.seed.iter().all(|b| *b == 0xA5));
-        // SAFETY: dropped exactly once, and `s` is not used as a PqSession again;
-        // only the (plain-array) seed bytes are read back.
-        unsafe { std::mem::ManuallyDrop::drop(&mut s) };
+        let mut seed = seed_of(0xA5);
+        assert!(seed.iter().all(|b| *b == 0xA5));
+        seed.wipe();
         assert!(
-            s.seed.iter().all(|b| *b == 0),
-            "the ML-KEM seed survived the drop"
+            seed.iter().all(|b| *b == 0),
+            "the ML-KEM seed survived the wipe"
+        );
+
+        let source = include_str!("birdo_pq.rs").replace('\r', "");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        let drop_impl = &production[production.find("impl Drop for SeedBox").unwrap()..];
+        let drop_impl = &drop_impl[..drop_impl.find("\n}\n").unwrap()];
+        assert!(drop_impl.contains("self.wipe()"), "{drop_impl}");
+        assert!(
+            production.contains("pub fn finish(\n        self,"),
+            "finish must consume the session"
         );
     }
 
@@ -962,7 +1031,31 @@ mod tests {
         LegacyKeypairFile {
             dir: OwnedDir::new(base.to_path_buf(), &[]),
             name: name.to_string(),
+            all_accounts: false,
         }
+    }
+
+    /// The admin-only directory is shared by every account on the machine: the
+    /// purge takes their keys too, and nothing that is not a PQ key file.
+    #[test]
+    fn the_admin_directory_purge_takes_every_accounts_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = "pq-S-1-5-21-1-2-3-1001.bin";
+        for name in [
+            mine,
+            "pq-S-1-5-21-1-2-3-1002.bin",
+            "pq-S-1-5-21-1-2-3-1002.bin.00ff00ff00ff00ff.tmp",
+        ] {
+            std::fs::write(dir.path().join(name), [7u8; 10]).unwrap();
+        }
+        std::fs::write(dir.path().join("settings.key"), b"keep").unwrap();
+        std::fs::write(dir.path().join("pq-notes.txt"), b"keep").unwrap();
+
+        let mut file = legacy_in(dir.path(), mine);
+        file.all_accounts = true;
+        assert_eq!(purge_legacy_file(&file), 3);
+        assert!(dir.path().join("settings.key").exists());
+        assert!(dir.path().join("pq-notes.txt").exists());
     }
 
     /// First run after the upgrade: the stored keypair file goes, and so do the
@@ -1001,10 +1094,10 @@ mod tests {
 
         std::fs::write(alice.dir.join(&alice.name), [7u8; 10]).unwrap();
         std::fs::write(bob.dir.join(&bob.name), [7u8; 10]).unwrap();
-        // One account's purge never touches another account's file.
-        assert_eq!(purge_legacy_file(&alice), 1);
+        // ... but on Windows the purge sweeps the whole admin directory: both go.
+        assert_eq!(purge_legacy_file(&alice), 2);
         assert!(!alice.dir.join(&alice.name).exists());
-        assert!(bob.dir.join(&bob.name).exists());
+        assert!(!bob.dir.join(&bob.name).exists());
 
         let source = include_str!("birdo_pq.rs").replace('\r', "");
         let body = &source[source.find("fn legacy_keypair_files()").unwrap()..];

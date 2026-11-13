@@ -396,11 +396,12 @@ async fn attempt(
 
     // AUDIT-C1: with PQ requested, attach our ML-KEM-1024 public key so the
     // server can encapsulate against it. MR-703 / MR-1742: the keypair is made
-    // HERE, for this one request, and its secret lives only in this
-    // `PqSession`: held across the retry below (the same body is re-sent, so
-    // the server's ciphertext still fits), moved into `prepare_tunnel` to
-    // decapsulate, and wiped on every other exit. The next connect, and every
-    // re-dial, makes its own.
+    // HERE, once per attempt, and its secret lives only in this `PqSession`:
+    // held across the retryable-refusal retry below (the same key is re-sent,
+    // so the server's ciphertext still fits), moved into `prepare_tunnel` to
+    // decapsulate, and wiped on every other exit (an error, a cancel, a drop).
+    // A later attempt (the Adaptive Transport retry) and every re-dial call
+    // `begin()` again: no pair is ever reused across attempts.
     let pq_session = settings.quantum_protection.then(PqSession::begin);
     let pq_pk = pq_session.as_ref().map(PqSession::public_key_b64);
 
