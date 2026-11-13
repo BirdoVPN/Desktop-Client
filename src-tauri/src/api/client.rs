@@ -70,6 +70,19 @@ const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Desktop)");
 
+/// The client<->backend contract version this build was written against
+/// (MR-197 / MR-1754): the `x-contractVersion` of the vendored
+/// `contract/vpn-protocol.schema.json`, mirrored in `contract/CONTRACT_VERSION`.
+/// Sent as `X-Birdo-Contract` on every control-plane request; the backend
+/// counts connects by this value and by nothing else, and it changes no
+/// behaviour. Bump it in the commit that re-vendors the schema:
+/// `contract_tests::the_contract_version_is_the_schemas` fails when the schema,
+/// the file and this constant disagree.
+pub(crate) const CONTRACT_VERSION: &str = "1.0.0";
+
+/// The request header that carries [`CONTRACT_VERSION`].
+pub(crate) const CONTRACT_HEADER: &str = "X-Birdo-Contract";
+
 /// Value of the `X-Desktop-Client` marker header. The backend tests only for
 /// the header's PRESENCE (CSRF bypass, desktop-only auth routes, attestation
 /// scheme) and substring-matches "android"/"ios"/"desktop" when inferring a
@@ -1479,6 +1492,8 @@ impl BirdoApi {
         if method == reqwest::Method::POST {
             request = request.header("X-Desktop-Client", DESKTOP_CLIENT_HEADER);
         }
+        // MR-197 / MR-1754: which contract this build speaks. Every method.
+        request = request.header(CONTRACT_HEADER, CONTRACT_VERSION);
 
         if let Some(b) = body {
             request = request.json(b);
@@ -2595,6 +2610,12 @@ mod retry_after_tests {
             .find(".note(&held, error, std::time::Instant::now())")
             .expect("the note");
         assert!(check < send && send < note);
+        // MR-197 / MR-1754: every control-plane request says which contract it speaks.
+        assert!(
+            body.contains("request.header(CONTRACT_HEADER, CONTRACT_VERSION)"),
+            "do_request must send X-Birdo-Contract"
+        );
+        assert_eq!(CONTRACT_HEADER, "X-Birdo-Contract");
         let refresh = &SOURCE[SOURCE.find("async fn refresh_token_internal(").unwrap()..];
         assert!(refresh[..refresh.find("\n    }").unwrap()].contains(".do_request("));
     }
