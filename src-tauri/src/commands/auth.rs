@@ -1756,7 +1756,7 @@ mod account_boundary_tests {
         assert!(
             del.contains("request\n        .account_number") || del.contains(".account_number")
         );
-        assert!(del.contains("account_number.as_deref()"));
+        assert!(del.contains("account_number.as_ref()"));
         assert!(del.contains("email_code,"));
         let request_drop = include_str!("auth.rs");
         assert!(request_drop.contains("number.zeroize()"));
