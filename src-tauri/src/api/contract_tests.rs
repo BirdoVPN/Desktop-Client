@@ -30,7 +30,7 @@
 //! build does not know is handled as a refusal without one.
 //!
 //! Fixtures come from the REAL producers wherever one exists
-//! (`utils::get_device_id`, `birdo_pq::generate_keypair`,
+//! (`utils::get_device_id`, `birdo_pq::PqSession`,
 //! `commands::vpn::generate_wireguard_keypair`, `attestation::platform` /
 //! `version`, the `FALLBACK_*` constants) so a change in WHAT desktop emits —
 //! not only in how it is named — fails here rather than in production.
@@ -204,9 +204,9 @@ fn attestation_fixture() -> DesktopAttestation {
 }
 
 /// The real BirdoPQ producer: ML-KEM-1024 public key, STANDARD base64, the
-/// exact encoding `birdo_pq::get_client_public_key_b64` uses.
+/// exact encoding `PqSession::public_key_b64` uses.
 fn real_pq_public_key() -> String {
-    STANDARD.encode(&crate::vpn::birdo_pq::generate_keypair().public_key)
+    crate::vpn::birdo_pq::PqSession::begin().public_key_b64()
 }
 
 /// The real WireGuard producer (X25519 public key, STANDARD base64 with its
