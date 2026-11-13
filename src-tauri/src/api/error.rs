@@ -3,6 +3,29 @@
 use super::upgrade_gate::RequiredUpdate;
 use std::fmt;
 
+/// MR-179: which deletion step-up a refusal is about. The server's `error`
+/// codes, one to one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepUpKind {
+    AccountNumberRequired,
+    AccountNumberInvalid,
+    EmailCodeRequired,
+    EmailCodeInvalid,
+}
+
+impl StepUpKind {
+    /// `error` of a deletion refusal, or None for any other code.
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "account_number_required" => Some(Self::AccountNumberRequired),
+            "account_number_invalid" => Some(Self::AccountNumberInvalid),
+            "email_code_required" => Some(Self::EmailCodeRequired),
+            "email_code_invalid" => Some(Self::EmailCodeInvalid),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ApiError {
     /// Network error (no connection, timeout, etc.)
@@ -57,6 +80,11 @@ pub enum ApiError {
     TwoFactorRequired(String),
     /// The two-factor code sent was wrong (`error: "two_factor_invalid"`).
     TwoFactorInvalid(String),
+    /// MR-179: a deletion step-up refusal (`error: "account_number_required"`,
+    /// `"account_number_invalid"`, `"email_code_required"`,
+    /// `"email_code_invalid"`). Carries the backend's sentence; the dialog words
+    /// it by `kind`.
+    StepUp { kind: StepUpKind, message: String },
     /// 503 `error: "quota_check_unavailable"` (birdo-web #590): the server
     /// could not check a Free plan's allowance just now. Worth retrying, after
     /// `retry_after_secs` when the server says.
@@ -216,6 +244,7 @@ impl fmt::Display for ApiError {
             ApiError::Rejected { message, .. }
             | ApiError::TwoFactorRequired(message)
             | ApiError::TwoFactorInvalid(message)
+            | ApiError::StepUp { message, .. }
             | ApiError::RegistrationNotAllowed(message)
             | ApiError::PowRefused { message, .. }
             | ApiError::ClientAttestationRequired(message) => write!(f, "{}", message),

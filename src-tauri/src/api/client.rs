@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
 use super::endpoints;
-use super::error::ApiError;
+use super::error::{ApiError, StepUpKind};
 use super::types::*;
 
 // H-1: erased_serde is used for the generic retry interceptor
@@ -624,11 +624,15 @@ impl BirdoApi {
         &self,
         password: &str,
         two_factor_code: Option<&str>,
+        account_number: Option<&str>,
+        email_code: Option<&str>,
         around_the_tunnel: Option<std::net::IpAddr>,
     ) -> Result<DeleteAccountResponse, ApiError> {
         let body = DeleteAccountBody {
             password,
             two_factor_code,
+            account_number,
+            email_code,
         };
         let token_before = self.access_token_value().await;
         let outcome = match self.send_gdpr_delete(&body, around_the_tunnel).await? {
@@ -805,6 +809,20 @@ impl BirdoApi {
     /// Read-only; the ordinary GET path with the usual refresh-and-retry.
     pub async fn deletion_preflight(&self) -> Result<DeletionPreflightResponse, ApiError> {
         self.get(endpoints::auth::GDPR_DELETE_PREFLIGHT, true).await
+    }
+
+    /// MR-179: e-mail the one-time deletion code to an SSO account (no
+    /// password, no 2FA). The ordinary bearer POST with the usual
+    /// refresh-and-retry; no body. 400 `email_code_not_used`, 429
+    /// `too_many_attempts` past 3 an hour and 503 `email_code_not_sent` map
+    /// like any other refusal.
+    pub async fn send_deletion_code(&self) -> Result<DeletionCodeResponse, ApiError> {
+        self.post(
+            endpoints::auth::GDPR_DELETE_CODE,
+            &serde_json::json!({}),
+            true,
+        )
+        .await
     }
 
     /// MR-1707: step 1 of replacing an anonymous account number. Changes
@@ -1769,6 +1787,15 @@ impl BirdoApi {
         match body.as_ref().and_then(|b| b.error.as_deref()) {
             Some("two_factor_required") => return ApiError::TwoFactorRequired(message()),
             Some("two_factor_invalid") => return ApiError::TwoFactorInvalid(message()),
+            // MR-179: the deletion step-up refusals (birdo-web
+            // deletion-step-up.ts), by `error`, never by the sentence. A 429
+            // `too_many_attempts` is not one of these: it stays a rate limit.
+            Some(code) if StepUpKind::from_code(code).is_some() => {
+                return ApiError::StepUp {
+                    kind: StepUpKind::from_code(code).expect("checked above"),
+                    message: message(),
+                };
+            }
             // MR-1707: the anonymous-number replacement's own refusals. The
             // two 409s share a status, and a bare 403 would read as a plan
             // refusal.

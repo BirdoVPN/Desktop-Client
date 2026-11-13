@@ -34,6 +34,7 @@ const APP_COMMANDS: &[&str] = &[
     "verify_2fa",
     "delete_account",
     "deletion_preflight",
+    "send_deletion_code",
     "export_user_data",
     "end_expired_session",
     // VPN operations

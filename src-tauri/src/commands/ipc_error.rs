@@ -14,6 +14,7 @@
 
 use serde::Serialize;
 
+use crate::api::error::StepUpKind;
 use crate::api::ApiError;
 
 /// Stable, snake_case error codes. Extend only by ADDING codes: the UI keys
@@ -40,6 +41,14 @@ pub enum IpcErrorCode {
     InvalidCredentials,
     TwoFactorRequired,
     TwoFactorInvalid,
+    /// MR-179: the deletion step-up (owner 2026-11-13). The dialog asks for the
+    /// anonymous account's 24-digit number / the e-mailed code, or says the one
+    /// typed was wrong. Not hard refusals: the next attempt, with the proof,
+    /// can succeed.
+    AccountNumberRequired,
+    AccountNumberInvalid,
+    EmailCodeRequired,
+    EmailCodeInvalid,
     CertPinFailed,
     StealthFailed,
     PqFailed,
@@ -337,6 +346,15 @@ impl IpcError {
             ApiError::TwoFactorInvalid(message) => {
                 Self::new(IpcErrorCode::TwoFactorInvalid, message)
             }
+            ApiError::StepUp { kind, message } => Self::new(
+                match kind {
+                    StepUpKind::AccountNumberRequired => IpcErrorCode::AccountNumberRequired,
+                    StepUpKind::AccountNumberInvalid => IpcErrorCode::AccountNumberInvalid,
+                    StepUpKind::EmailCodeRequired => IpcErrorCode::EmailCodeRequired,
+                    StepUpKind::EmailCodeInvalid => IpcErrorCode::EmailCodeInvalid,
+                },
+                message,
+            ),
             // Retryable by nature: the check is down, the account was not refused.
             ApiError::QuotaCheckUnavailable { retry_after_secs } => Self::transient(
                 "BirdoVPN couldn't check your plan's data allowance just now. Please try again \
@@ -596,6 +614,10 @@ mod tests {
             (IpcErrorCode::InvalidCredentials, "invalid_credentials"),
             (IpcErrorCode::TwoFactorRequired, "two_factor_required"),
             (IpcErrorCode::TwoFactorInvalid, "two_factor_invalid"),
+            (IpcErrorCode::AccountNumberRequired, "account_number_required"),
+            (IpcErrorCode::AccountNumberInvalid, "account_number_invalid"),
+            (IpcErrorCode::EmailCodeRequired, "email_code_required"),
+            (IpcErrorCode::EmailCodeInvalid, "email_code_invalid"),
             (IpcErrorCode::CertPinFailed, "cert_pin_failed"),
             (IpcErrorCode::StealthFailed, "stealth_failed"),
             (IpcErrorCode::PqFailed, "pq_failed"),
@@ -690,6 +712,34 @@ mod tests {
             (
                 ApiError::TwoFactorInvalid("x".into()),
                 IpcErrorCode::TwoFactorInvalid,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::AccountNumberRequired,
+                    message: "x".into(),
+                },
+                IpcErrorCode::AccountNumberRequired,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::AccountNumberInvalid,
+                    message: "x".into(),
+                },
+                IpcErrorCode::AccountNumberInvalid,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::EmailCodeRequired,
+                    message: "x".into(),
+                },
+                IpcErrorCode::EmailCodeRequired,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::EmailCodeInvalid,
+                    message: "x".into(),
+                },
+                IpcErrorCode::EmailCodeInvalid,
             ),
             (
                 ApiError::QuotaCheckUnavailable {

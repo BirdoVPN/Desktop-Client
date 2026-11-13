@@ -349,12 +349,25 @@ pub struct DeleteAccountRequest {
     /// first attempt and for accounts without 2FA.
     #[serde(default)]
     pub two_factor_code: Option<String>,
+    /// MR-179: the anonymous account's 24-digit number, once the server (or the
+    /// preflight) asked for it. Absent otherwise.
+    #[serde(default)]
+    pub account_number: Option<String>,
+    /// MR-179: the code e-mailed by `send_deletion_code` to an SSO account.
+    #[serde(default)]
+    pub email_code: Option<String>,
 }
 
 impl Drop for DeleteAccountRequest {
     fn drop(&mut self) {
         self.password.zeroize();
         if let Some(code) = self.two_factor_code.as_mut() {
+            code.zeroize();
+        }
+        if let Some(number) = self.account_number.as_mut() {
+            number.zeroize();
+        }
+        if let Some(code) = self.email_code.as_mut() {
             code.zeroize();
         }
     }
@@ -378,7 +391,9 @@ pub struct DeleteAccountResult {
 fn delete_failure_message(error: &ApiError) -> IpcError {
     let (code, reason) = match error {
         // The dialog asks for the code / says it was wrong, by code alone.
-        ApiError::TwoFactorRequired(_) | ApiError::TwoFactorInvalid(_) => {
+        ApiError::TwoFactorRequired(_)
+        | ApiError::TwoFactorInvalid(_)
+        | ApiError::StepUp { .. } => {
             return IpcError::from_api(error);
         }
         ApiError::Rejected { message, .. } | ApiError::Unknown(message) => {
@@ -446,9 +461,28 @@ pub async fn delete_account(
     // the app fell to Login with "your session expired". Keeping the tunnel
     // until the server confirms is still the rule; only the request's path
     // changes.
+    // MR-179: digits only for the number (the server ignores grouping, and a
+    // pasted "1234 5678 ..." must not fail a length check there), the code as
+    // typed; blank means not sent.
+    let account_number = request
+        .account_number
+        .as_deref()
+        .map(|n| n.chars().filter(char::is_ascii_digit).collect::<String>())
+        .filter(|n| !n.is_empty());
+    let email_code = request
+        .email_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
     let around_the_tunnel = around_the_tunnel(&app).await;
     let response = api
-        .delete_account(&request.password, two_factor_code, around_the_tunnel)
+        .delete_account(
+            &request.password,
+            two_factor_code,
+            account_number.as_deref(),
+            email_code,
+            around_the_tunnel,
+        )
         .await
         .map_err(|e| delete_failure_message(&e))?;
 
@@ -494,6 +528,29 @@ pub struct DeletionPreflightResult {
     pub store_subscriptions_still_billing: Vec<String>,
     /// A web (Polar) subscription is billing and the deletion will cancel it.
     pub web_subscription_will_be_cancelled: bool,
+    /// MR-179: the server's step-up factor tokens for this account
+    /// (`password`, `account_number`, `email_code`, `apple_reauth`,
+    /// `two_factor`). Empty from a backend older than birdo-web #766, or when
+    /// the preflight said nothing.
+    pub step_up_factors: Vec<String>,
+}
+
+/// What `send_deletion_code` returns: the masked address the code went to.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionCodeResult {
+    pub sent_to: Option<String>,
+}
+
+/// MR-179: e-mail the one-time deletion code to an SSO account (no password,
+/// no 2FA). Errors reach the dialog by code: `rate_limited` past 3 an hour,
+/// `server_unavailable` when the mail could not be sent.
+#[tauri::command]
+pub async fn send_deletion_code(api: State<'_, BirdoApi>) -> Result<DeletionCodeResult, IpcError> {
+    let response = api.send_deletion_code().await.map_err(IpcError::from)?;
+    Ok(DeletionCodeResult {
+        sent_to: response.sent_to,
+    })
 }
 
 /// `GET /api/v1/gdpr/delete/preflight`: read-only, nothing local changes.
@@ -519,6 +576,11 @@ fn deletion_preflight_result(
         web_subscription_will_be_cancelled: response
             .web_subscription_will_be_cancelled
             .unwrap_or(false),
+        step_up_factors: response
+            .step_up
+            .as_ref()
+            .map(|s| s.factors.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -1364,7 +1426,7 @@ mod account_boundary_tests {
             .find("let around_the_tunnel = around_the_tunnel(&app).await;")
             .expect("the path around the tunnel");
         let confirmed = del
-            .find(".delete_account(&request.password, two_factor_code, around_the_tunnel)")
+            .find(".delete_account(")
             .expect("the server call");
         assert!(around < confirmed);
         let path = body_of("async fn around_the_tunnel(");
@@ -1654,12 +1716,46 @@ mod account_boundary_tests {
                     { "store": "GOOGLE_PLAY", "productId": "birdo_operative", "expiresAt": null }
                 ])),
                 web_subscription_will_be_cancelled: Some(true),
+                step_up: Some(crate::api::types::DeletionStepUp {
+                    factors: vec!["account_number".into()],
+                    enforced: false,
+                }),
             });
         assert_eq!(named.store_subscriptions_still_billing, vec!["Google Play"]);
         assert!(named.web_subscription_will_be_cancelled);
+        assert_eq!(named.step_up_factors, vec!["account_number"]);
 
         let nothing = super::deletion_preflight_result(&Default::default());
         assert!(nothing.store_subscriptions_still_billing.is_empty());
         assert!(!nothing.web_subscription_will_be_cancelled);
+        assert!(nothing.step_up_factors.is_empty());
+    }
+
+    /// MR-179: the proof rides the deletion call (number as digits, code
+    /// trimmed), is wiped on drop, and a step-up refusal reaches the dialog by
+    /// code, not as "Account deletion failed: ...".
+    #[test]
+    fn deletion_forwards_the_step_up_proof_and_keeps_refusal_codes() {
+        let del = body("delete_account");
+        assert!(del.contains("request\n        .account_number") || del.contains(".account_number"));
+        assert!(del.contains("account_number.as_deref()"));
+        assert!(del.contains("email_code,"));
+        let request_drop = include_str!("auth.rs");
+        assert!(request_drop.contains("number.zeroize()"));
+
+        use crate::api::error::StepUpKind;
+        for (kind, code) in [
+            (StepUpKind::AccountNumberRequired, crate::commands::ipc_error::IpcErrorCode::AccountNumberRequired),
+            (StepUpKind::AccountNumberInvalid, crate::commands::ipc_error::IpcErrorCode::AccountNumberInvalid),
+            (StepUpKind::EmailCodeRequired, crate::commands::ipc_error::IpcErrorCode::EmailCodeRequired),
+            (StepUpKind::EmailCodeInvalid, crate::commands::ipc_error::IpcErrorCode::EmailCodeInvalid),
+        ] {
+            let err = super::delete_failure_message(&crate::api::error::ApiError::StepUp {
+                kind,
+                message: "Enter your 24-digit account number to delete your account.".into(),
+            });
+            assert_eq!(err.code, code);
+            assert!(!err.message.starts_with("Account deletion failed"), "{}", err.message);
+        }
     }
 }
