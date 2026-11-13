@@ -1773,3 +1773,33 @@ fn heartbeat_mutations_are_refused_by_the_contract_and_decoded_leniently() {
         format!("{:?}", heartbeat_reply(&grace))
     );
 }
+
+/// MR-2210: a 403 `details.code: "email_not_verified"` at sign-in is its own
+/// code with a plain sentence, never the plan refusal a bare 403 maps to.
+#[test]
+fn an_unverified_email_refusal_is_its_own_code_and_a_bare_403_is_not() {
+    use crate::api::client::BirdoApi;
+    use reqwest::StatusCode;
+    let body = json!({
+        "statusCode": 403, "message": "Please verify your email address before signing in.",
+        "details": { "code": "email_not_verified" },
+    })
+    .to_string();
+    let err = IpcError::from_api(&BirdoApi::classify_error_response(
+        StatusCode::FORBIDDEN,
+        &body,
+    ));
+    assert_eq!(err.code, IpcErrorCode::EmailNotVerified);
+    assert!(err.message.contains("verify your email"));
+    assert!(!err.retryable);
+    let bare = IpcError::from_api(&BirdoApi::classify_error_response(
+        StatusCode::FORBIDDEN,
+        &json!({ "message": "Forbidden" }).to_string(),
+    ));
+    assert_eq!(bare.code, IpcErrorCode::SubscriptionRequired);
+    let other_status = IpcError::from_api(&BirdoApi::classify_error_response(
+        StatusCode::BAD_REQUEST,
+        &body,
+    ));
+    assert_ne!(other_status.code, IpcErrorCode::EmailNotVerified);
+}

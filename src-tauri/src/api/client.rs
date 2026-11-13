@@ -1766,6 +1766,16 @@ impl BirdoApi {
         {
             return ApiError::RegistrationNotAllowed(message().trim().to_string());
         }
+        if status == StatusCode::FORBIDDEN
+            && body
+                .as_ref()
+                .and_then(|b| b.details.as_ref())
+                .and_then(|d| d.get("code"))
+                .and_then(|c| c.as_str())
+                == Some("email_not_verified")
+        {
+            return ApiError::EmailNotVerified;
+        }
         match body.as_ref().and_then(|b| b.error.as_deref()) {
             Some("two_factor_required") => return ApiError::TwoFactorRequired(message()),
             Some("two_factor_invalid") => return ApiError::TwoFactorInvalid(message()),

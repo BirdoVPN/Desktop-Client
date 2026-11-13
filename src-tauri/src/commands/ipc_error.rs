@@ -72,6 +72,9 @@ pub enum IpcErrorCode {
     /// (403 `details.code: "registration_country_not_allowed"`). The UI shows
     /// the server's sentence; "upgrade your plan" and "try again" cannot help.
     RegistrationNotAllowed,
+    /// Sign-in refused because the e-mail address was never verified (403
+    /// `details.code: "email_not_verified"`, MR-2210). Retrying cannot help.
+    EmailNotVerified,
     Unknown,
 }
 
@@ -95,6 +98,7 @@ impl IpcErrorCode {
                 | IpcErrorCode::ConsentRequired
                 | IpcErrorCode::AccountRestricted
                 | IpcErrorCode::RegistrationNotAllowed
+                | IpcErrorCode::EmailNotVerified
         )
     }
 
@@ -323,6 +327,10 @@ impl IpcError {
             ApiError::RegistrationNotAllowed(_) => Self::new(
                 IpcErrorCode::RegistrationNotAllowed,
                 "BirdoVPN cannot create new accounts from your country right now.",
+            ),
+            ApiError::EmailNotVerified => Self::new(
+                IpcErrorCode::EmailNotVerified,
+                "Please verify your email address first. Open birdo.app/verify-email to get a new link.",
             ),
             ApiError::CertificatePinningFailed(_) => {
                 Self::new(IpcErrorCode::CertPinFailed, error.to_string())
@@ -615,6 +623,7 @@ mod tests {
                 IpcErrorCode::RegistrationNotAllowed,
                 "registration_not_allowed",
             ),
+            (IpcErrorCode::EmailNotVerified, "email_not_verified"),
             (IpcErrorCode::Unknown, "unknown"),
         ];
         for (code, wire) in pairs {
