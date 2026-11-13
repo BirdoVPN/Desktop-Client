@@ -128,8 +128,9 @@ jobs:
   # Authenticode (Azure OIDC), Tauri updater-signing or attestation secrets
   # `needs` this job, and it runs under the `release` environment, so the
   # environment's required reviewers must approve BEFORE any of them starts.
-  # The `release` job (publish) is under the same environment as a second
-  # check. It runs after `test` so a red suite never asks for an approval.
+  # The `release` job (publish) is NOT under the environment: one prompt only,
+  # before signing; it just requires `approve` to have succeeded. `approve`
+  # runs after `test` so a red suite never asks for an approval.
   # The draft flow is unchanged: approval here is about building/signing; the
   # `release: draft` tag still makes a DRAFT that the lead promotes afterwards
   # with `gh release edit --draft=false --latest`, which is outside this file.
@@ -1340,12 +1341,20 @@ jobs:
   # ══════════════════════════════════════════════════════════════════════
   release:
     needs: [test, approve, build-windows, build-linux, mac-app-store, build-macos, corresponding-source]
-    # A rejected or unapproved gate must not even queue this job's own approval.
-    if: always() && needs.approve.result == 'success'
-    # MR-2264 / A-H09: publishing (assets, Sigstore signature, the latest.json the
-    # update endpoint serves) runs under the `release` environment, so its
-    # required reviewers apply here too, not only at the `approve` gate.
-    environment: release
+    # MR-2264 / A-H09: ONE approval prompt, at `approve`, before anything signs.
+    # This job is deliberately NOT under the environment (no second prompt) and
+    # only starts when approval, tests and every required build succeeded; a
+    # skipped macOS build counts only when the Mac App Store app is live (the
+    # same rule as build-macos's own `if`).
+    if: >-
+      always()
+      && needs.approve.result == 'success'
+      && needs.test.result == 'success'
+      && needs.build-windows.result == 'success'
+      && needs.build-linux.result == 'success'
+      && needs.corresponding-source.result == 'success'
+      && (needs.build-macos.result == 'success'
+          || (needs.build-macos.result == 'skipped' && needs.mac-app-store.outputs.live == 'true'))
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
