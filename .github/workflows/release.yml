@@ -122,6 +122,31 @@ jobs:
         run: bash .github/scripts/require-tag-on-main.sh "$GITHUB_SHA"
 
   # ══════════════════════════════════════════════════════════════════════
+  # RELEASE APPROVAL GATE (register A-H09 / MR-2264 part a) - a v* tag used to
+  # build, sign and publish a Latest release with nothing between the push and
+  # every Windows client's Administrator updater. Every job that holds the
+  # Authenticode (Azure OIDC), Tauri updater-signing or attestation secrets
+  # `needs` this job, and it runs under the `release` environment, so the
+  # environment's required reviewers must approve BEFORE any of them starts.
+  # The `release` job (publish) is under the same environment as a second
+  # check. It runs after `test` so a red suite never asks for an approval.
+  # The draft flow is unchanged: approval here is about building/signing; the
+  # `release: draft` tag still makes a DRAFT that the lead promotes afterwards
+  # with `gh release edit --draft=false --latest`, which is outside this file.
+  # Owner settings (environment reviewers, v* tag ruleset) are in the PR body.
+  # ══════════════════════════════════════════════════════════════════════
+  approve:
+    name: Release approval (environment release)
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions: {}
+    steps:
+      - name: Approved
+        run: echo "Release approved via the release environment"
+
+  # ══════════════════════════════════════════════════════════════════════
   # TEST GATE — a release must never BUILD or PUBLISH if tests fail.
   #
   # WHY THIS EXISTS: before this job, release.yml only ever *built* the app.
@@ -294,7 +319,7 @@ jobs:
   # signs once, in the release job, over SHA256SUMS.txt - not here.)
   # ══════════════════════════════════════════════════════════════════════
   build-windows:
-    needs: test  # never build/sign/publish on a red test suite
+    needs: [test, approve]  # never build/sign/publish on a red test suite or without release approval
     runs-on: windows-2025
     timeout-minutes: 35  # Hard cap. Rust compile ~12m + signing ~3m. If we hit 35m, signing hung.
     # SENTRY_DSN lives at JOB level, not on the build step.
@@ -747,7 +772,7 @@ jobs:
   # once, in the release job, over the final asset names.
   # ══════════════════════════════════════════════════════════════════════
   build-linux:
-    needs: test  # never build/publish on a red test suite
+    needs: [test, approve]  # never build/publish on a red test suite or without release approval
     strategy:
       matrix:
         include:
@@ -959,7 +984,7 @@ jobs:
   # way to install).
   # ══════════════════════════════════════════════════════════════════════
   build-macos:
-    needs: [test, mac-app-store]  # never build on a red test suite
+    needs: [test, approve, mac-app-store]  # never build on a red test suite or without release approval
     if: needs.mac-app-store.outputs.live != 'true'  # retire the DMG once the Mac App Store app is live
     # ~8 min build (v1.4.45); 45 leaves room for the 30-minute notarytool
     # wait if Apple signing is ever configured.
@@ -1314,8 +1339,13 @@ jobs:
   # package's notices point at it.
   # ══════════════════════════════════════════════════════════════════════
   release:
-    needs: [test, build-windows, build-linux, mac-app-store, build-macos, corresponding-source]
-    if: always()
+    needs: [test, approve, build-windows, build-linux, mac-app-store, build-macos, corresponding-source]
+    # A rejected or unapproved gate must not even queue this job's own approval.
+    if: always() && needs.approve.result == 'success'
+    # MR-2264 / A-H09: publishing (assets, Sigstore signature, the latest.json the
+    # update endpoint serves) runs under the `release` environment, so its
+    # required reviewers apply here too, not only at the `approve` gate.
+    environment: release
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
