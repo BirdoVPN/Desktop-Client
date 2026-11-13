@@ -829,8 +829,11 @@ mod tests {
         for bad in ["derive", "Clone", "Copy", "Serialize"] {
             assert!(!before.contains(bad), "PqSession must not derive {bad}");
         }
-        assert!(!source.contains("impl Clone for PqSession"));
-        assert!(!source.contains("impl Serialize for PqSession"));
+        // Built at run time: this test's own source must not name the impl.
+        for bad in ["Clone", "Serialize"] {
+            let production_end = source.find("#[cfg(test)]").unwrap();
+            assert!(!source[..production_end].contains(&format!("impl {bad} for PqSession")));
+        }
     }
 
     // ── Round trips ───────────────────────────────────────────────────────
