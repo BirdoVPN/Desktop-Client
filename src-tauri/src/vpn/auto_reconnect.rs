@@ -1451,8 +1451,12 @@ impl ReconnectLoop {
         // MR-703 / MR-1742: a re-dial is a new connect, so it gets a keypair of
         // its own; the secret is moved into `prepare_tunnel` below and is
         // wiped there, or on any earlier exit.
-        let pq_session = info.quantum_protection.then(crate::vpn::birdo_pq::PqSession::begin);
-        let pq_pk = pq_session.as_ref().map(crate::vpn::birdo_pq::PqSession::public_key_b64);
+        let pq_session = info
+            .quantum_protection
+            .then(crate::vpn::birdo_pq::PqSession::begin);
+        let pq_pk = pq_session
+            .as_ref()
+            .map(crate::vpn::birdo_pq::PqSession::public_key_b64);
 
         // MR-691: on connections of its own, like the old-key probe. A re-dial
         // always follows a teardown, and the shared client's first request

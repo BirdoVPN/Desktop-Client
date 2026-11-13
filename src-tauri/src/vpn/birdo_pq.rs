@@ -121,7 +121,9 @@ use base64::Engine as _;
 use hkdf::Hkdf;
 use ml_kem::array::sizes::{U1568, U64};
 use ml_kem::array::Array;
-use ml_kem::{Ciphertext as MlCiphertext, Decapsulate, DecapsulationKey, KeyExport, MlKem1024, Seed};
+use ml_kem::{
+    Ciphertext as MlCiphertext, Decapsulate, DecapsulationKey, KeyExport, MlKem1024, Seed,
+};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use sha2::Sha256;
@@ -154,7 +156,6 @@ const MAX_NONCE_BYTES: usize = 64;
 /// `pq_impl_name_matches_linked_crate` enforces that it names the crate that
 /// is actually linked.
 pub const PQ_IMPL_NAME: &str = "mlkem1024-rustcrypto";
-
 
 /// The file older builds kept the keypair in (see [`purge_legacy_keypair_files`]).
 const KEYPAIR_FILENAME: &str = "birdo_pq_v1.bin";
@@ -1006,7 +1007,13 @@ mod tests {
     fn nothing_persists_a_secret() {
         let source = include_str!("birdo_pq.rs").replace('\r', "");
         let production = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
-        for forbidden in ["create_new(", "fs::write(", "File::create(", "write_all(", "open_rw("] {
+        for forbidden in [
+            "create_new(",
+            "fs::write(",
+            "File::create(",
+            "write_all(",
+            "open_rw(",
+        ] {
             assert!(
                 !production.contains(forbidden),
                 "{forbidden} in production code"

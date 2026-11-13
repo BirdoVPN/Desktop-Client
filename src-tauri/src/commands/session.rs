@@ -959,9 +959,8 @@ pub(crate) async fn prepare_tunnel(
     };
 
     vm.set_phase(ConnectPhase::NegotiatingPq);
-    let quantum_psk =
-        derive_quantum_psk(&response, request.pq_session.take())
-            .map_err(|m| IpcError::new(IpcErrorCode::PqFailed, m))?;
+    let quantum_psk = derive_quantum_psk(&response, request.pq_session.take())
+        .map_err(|m| IpcError::new(IpcErrorCode::PqFailed, m))?;
 
     let (mut config, server_name) = build_vpn_config(
         response,
