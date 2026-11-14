@@ -41,6 +41,9 @@ pub mod auth {
     /// `@Get('delete/preflight')` on the same controller). Read by the
     /// deletion dialog before the user confirms.
     pub const GDPR_DELETE_PREFLIGHT: &str = "/api/v1/gdpr/delete/preflight";
+    /// MR-179: e-mail the one-time deletion code to an SSO account, `POST`
+    /// (`@Post('delete/code')` on the same controller). No body.
+    pub const GDPR_DELETE_CODE: &str = "/api/v1/gdpr/delete/code";
 }
 
 /// User endpoints — FIX C-3: route through /auth/me instead of phantom /users/subscription
