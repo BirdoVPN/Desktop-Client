@@ -925,7 +925,9 @@ pub(crate) mod tests {
 
     /// L3: a write (truncate or append) must not reach a file that shares the
     /// leaf's data under another name. `open_rw`/`open_append` reject a hard
-    /// link; `remove_file` does not (unlinking one name is harmless).
+    /// link; `remove_file` does not (unlinking one name is harmless). A dev
+    /// box on a filesystem without hard links skips, saying so; CI (NTFS)
+    /// must not skip (AUD-DESK-16): a skip there would pass with nothing tested.
     #[cfg(windows)]
     #[test]
     fn a_hard_linked_leaf_is_refused_for_writing() {
@@ -933,8 +935,12 @@ pub(crate) mod tests {
         let victim = root.path().join("victim.txt");
         write(&victim, "precious");
         let dir = OwnedDir::new(root.path(), &[]);
-        if std::fs::hard_link(&victim, dir.join("birdo.log")).is_err() {
-            eprintln!("SKIPPED: this filesystem has no hard links");
+        if let Err(e) = std::fs::hard_link(&victim, dir.join("birdo.log")) {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI cannot create a hard link ({e}), so this test would test nothing"
+            );
+            eprintln!("SKIPPED: this filesystem has no hard links ({e})");
             return;
         }
         assert!(
