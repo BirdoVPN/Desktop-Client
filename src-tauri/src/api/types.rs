@@ -151,11 +151,12 @@ impl DeletionStepUp {
 /// refusal `stepUp` is the factor ARRAY). Nothing is deleted yet: the server
 /// erases the account at `apply_after` unless the hold is cancelled first.
 ///
-/// WHERE `stepUp` IS. The 202 is a handler's return value and arrives as
-/// written, `stepUp` at the top. An ERROR body is rebuilt by birdo-web's
-/// GlobalExceptionFilter, which keeps only `statusCode`, `message`, `error`
-/// and a plain-object `details`: a top-level `stepUp` thrown with the 409 never
-/// reaches the wire. So the hold is looked for at the top, then under
+/// WHERE `stepUp` IS (birdo-web #883 @ 003e0ce7). The 202 is a handler's
+/// return value and arrives as written, `stepUp` at the top. An ERROR body is
+/// rebuilt by birdo-web's GlobalExceptionFilter, which keeps only
+/// `statusCode`, `message`, `error` and a plain-object `details`, so every
+/// refusal sends `details: { stepUp }`: the hold object on the 409, the factor
+/// array otherwise. The hold is looked for at the top, then under
 /// `details.stepUp`, then as `details` itself; when none of them has it, the
 /// 409's caller asks `GET /auth/pending-changes` instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,7 +228,8 @@ pub fn apply_after_ok(at: &str) -> bool {
 
 /// Whether a 2xx deletion body says the deletion was put on hold rather than
 /// done (`pending: true` or `code: "change_pending"`). The server answers a hold
-/// with 202; this also catches one that reached the client as another 2xx.
+/// with 202 only; any other 2xx that says this is refused as unexpected, so it
+/// is never read as a deletion.
 pub fn deletion_body_says_pending(body: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return false;

@@ -16,8 +16,8 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { useShallow } from 'zustand/react/shallow';
 import { Gift, LogOut, Trash, Download, CreditCard } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
-import { BirdoCard, BirdoSectionHeader, BirdoNavRow } from '@/components/birdo';
-import { brand, status as statusTokens } from '@/lib/birdo-theme';
+import { BirdoButton, BirdoCard, BirdoDialog, BirdoSectionHeader, BirdoNavRow } from '@/components/birdo';
+import { brand, status as statusTokens, white } from '@/lib/birdo-theme';
 import { planRank } from '@/lib/plan';
 import { BILLING_URL } from '@/lib/links';
 import { displayableEmail, resolveAnonymousAccount } from '@/utils/helpers';
@@ -26,7 +26,7 @@ import { loadSubscription } from '@/session/session-data';
 import { signOut } from '@/session/session';
 import { AccountNumberCard, IdentityCard, SubscriptionCard } from './profile/ProfileCards';
 import { DeleteAccountDialog } from './profile/DeleteAccountDialog';
-import { PendingDeletionBanner, usePendingDeletion } from './profile/PendingDeletion';
+import { PendingDeletionBanner, SIGN_OUT_WITH_HOLD, usePendingDeletion } from './profile/PendingDeletion';
 import { ReplaceAccountNumberDialog } from './profile/ReplaceAccountNumberDialog';
 import { VoucherRedeemDialog } from './profile/VoucherRedeemDialog';
 
@@ -69,6 +69,9 @@ export function Profile() {
   const [showReplaceDialog, setShowReplaceDialog] = useState(false);
   const [exportState, setExportState] = useState<'idle' | 'working' | 'done' | 'error'>('idle');
   const pendingDeletion = usePendingDeletion();
+  // MR-2335: signing out cancels a held deletion on the server, so while one
+  // is listed the user is told before it happens.
+  const [confirmSignOut, setConfirmSignOut] = useState(false);
 
   // GDPR data export (Art. 20). The backend command returns the full JSON blob;
   // save it via a webview download so the user gets a file with no extra plugin.
@@ -182,7 +185,7 @@ export function Profile() {
               subtitle={isAnon ? 'Anonymous account' : (resolvedEmail ?? undefined)}
               leadingIcon={LogOut}
               leadingTint={statusTokens.red}
-              onClick={() => void signOut()}
+              onClick={() => (pendingDeletion.hold ? setConfirmSignOut(true) : void signOut())}
             />
           </BirdoCard>
         </div>
@@ -199,6 +202,30 @@ export function Profile() {
           hasPassword={account.hasPassword}
           onDismiss={() => setShowReplaceDialog(false)}
         />
+      )}
+      {confirmSignOut && (
+        <BirdoDialog open onClose={() => setConfirmSignOut(false)} title="Sign out?" icon={LogOut}>
+          <p className="text-[13px]" style={{ color: white.w80 }}>
+            {SIGN_OUT_WITH_HOLD}
+          </p>
+          <div className="flex gap-2.5">
+            <BirdoButton
+              text="Stay signed in"
+              variant="secondary"
+              fullWidth
+              onClick={() => setConfirmSignOut(false)}
+            />
+            <BirdoButton
+              text="Sign out"
+              variant="danger"
+              fullWidth
+              onClick={() => {
+                setConfirmSignOut(false);
+                void signOut();
+              }}
+            />
+          </div>
+        </BirdoDialog>
       )}
       {showDeleteDialog && (
         <DeleteAccountDialog

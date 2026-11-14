@@ -656,6 +656,12 @@ impl From<crate::api::types::DeletionHold> for DeletionHoldResult {
 fn hold_failure(error: &ApiError) -> IpcError {
     match error {
         ApiError::Unauthorized | ApiError::NotAuthenticated => IpcError::session_expired(),
+        // A 202 that could not be read, or any other 2xx: nothing is assumed.
+        ApiError::Parse(_) => IpcError::new(
+            IpcErrorCode::ServerError,
+            "The server's answer to the hold request was not the expected one. Nothing is \
+             assumed deleted.",
+        ),
         ApiError::Rejected { message, .. } => {
             IpcError::new(IpcError::from_api(error).code, message)
         }
@@ -2106,6 +2112,14 @@ mod account_boundary_tests {
         });
         assert_eq!(busy.code, IpcErrorCode::StepUpUnavailable);
         assert!(busy.retryable);
+        // An unexpected 2xx / unreadable 202: an error that assumes nothing.
+        let odd = super::hold_failure(&ApiError::Parse("x".into()));
+        assert_eq!(odd.code, IpcErrorCode::ServerError);
+        assert!(
+            odd.message.contains("Nothing is assumed deleted"),
+            "{}",
+            odd.message
+        );
         for e in [unavailable, capped, wrong, busy] {
             assert!(
                 !e.message.starts_with("Account deletion failed"),

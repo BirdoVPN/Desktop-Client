@@ -499,12 +499,21 @@ mod deletion_hold_tests {
         assert_eq!(hold.apply_after, APPLY_AFTER);
         assert_eq!(hold.message.as_deref(), Some(FILED));
         assert!(!hold.already_pending);
-        // The same body as another 2xx (a proxy that rewrote the status) is
-        // still a hold: `pending` / `code` say so.
-        held(classify(StatusCode::OK, &body));
+        // Only a 202 is a hold. The same body under any other 2xx is
+        // unexpected: an error, and above all not a deletion (no wipe).
         let mut by_code = body.clone();
         by_code.as_object_mut().unwrap().remove("pending");
-        held(classify(StatusCode::OK, &by_code));
+        for status in [StatusCode::OK, StatusCode::CREATED, StatusCode::NO_CONTENT] {
+            for unexpected in [&body, &by_code] {
+                assert!(
+                    matches!(
+                        classify(status, unexpected),
+                        GdprDeleteOutcome::Refused(ApiError::Parse(_))
+                    ),
+                    "{status}"
+                );
+            }
+        }
         // A deletion's own 200 is unchanged.
         assert!(matches!(
             classify(
@@ -680,9 +689,10 @@ mod deletion_hold_tests {
         ));
     }
 
-    /// The hold request's own reading of a classified answer: a hold is the
-    /// result, a deletion-shaped 2xx is NOT accepted as one (a server that
-    /// ignored `stepUpMethod`), and refusals pass through.
+    /// The hold request's own reading of a classified answer: a hold (a 202)
+    /// is the result; any other 2xx, even a deletion-shaped one, is
+    /// "unexpected, nothing assumed deleted", never a wipe and never a hold;
+    /// refusals pass through.
     #[test]
     fn the_hold_request_accepts_only_a_hold() {
         let hold = DeletionHold {

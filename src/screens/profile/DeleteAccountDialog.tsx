@@ -59,7 +59,8 @@ import {
   TWO_FACTOR_PLACEHOLDER,
 } from '@/lib/two-factor';
 import { useAppStore } from '@/store/app-store';
-import { cancelErrorText, holdWhen } from './PendingDeletion';
+import { command } from '@/session/command';
+import { cancelErrorText, holdWhen, SIGN_OUT_CANCELS_HOLD } from './PendingDeletion';
 
 /** Shape returned by the Rust `delete_account` command. */
 export interface DeleteAccountResult {
@@ -104,7 +105,11 @@ export const HOLD_OFFER_CODE = "Delete in 24 hours (I can't get the code)";
 export const HOLD_OFFER_OTHER = 'Delete in 24 hours instead';
 export const HOLD_EXPLAINED =
   'Your account will be deleted 24 hours from now unless you cancel it first, here or on the ' +
-  'website. Signing out of this app also cancels it. Any e-mail address on the account is alerted.';
+  `website. ${SIGN_OUT_CANCELS_HOLD} Any e-mail address on the account is alerted.`;
+/** A 202 that could not be read, or any other 2xx, to a hold request. */
+export const HOLD_UNEXPECTED =
+  "The server's answer wasn't the expected one, so nothing is assumed: your account was not " +
+  'deleted from this app. Check your Profile for a pending deletion, or try again.';
 
 /** A usable hold from what `request_deletion_hold` returned, or null. */
 function holdOf(result: unknown): DeletionHold | null {
@@ -189,6 +194,7 @@ function deletionErrorText(e: unknown): string {
 function holdErrorText(e: unknown): string {
   const err = toIpcError(e);
   if (err.code === 'rate_limited' && err.message.trim()) return err.message.trim();
+  if (err.code === 'server_error') return HOLD_UNEXPECTED;
   return DELETION_CODES.has(err.code)
     ? errorCopy(err, 'password_confirm').message
     : "Couldn't put the deletion on hold. Nothing was deleted. Please try again.";
@@ -305,7 +311,8 @@ export function DeleteAccountDialog({
     setError(null);
     setCodeError(null);
     try {
-      const result = await invoke<unknown>('request_deletion_hold', {
+      // `command`: an ended session takes the ordinary session-expired path.
+      const result = await command<unknown>('request_deletion_hold', {
         request: {
           password: hasPassword ? password : confirmText.trim(),
           ...(askingTwoFactor ? { two_factor_code: twoFactorCode } : {}),
@@ -314,7 +321,7 @@ export function DeleteAccountDialog({
       // NOT a deletion: nothing is signed out or disconnected here.
       const filed = holdOf(result);
       if (filed) setHold(filed);
-      else setError("Couldn't put the deletion on hold. Nothing was deleted. Please try again.");
+      else setError(HOLD_UNEXPECTED);
     } catch (e: unknown) {
       const err = toIpcError(e);
       if (err.code === 'two_factor_required') {
@@ -338,9 +345,10 @@ export function DeleteAccountDialog({
     setCancellingHold(true);
     setHoldCancelError(null);
     try {
-      const result = await invoke<{ cancelled?: boolean; alreadyGone?: boolean } | null>('cancel_pending_change', {
-        id: hold.pendingChangeId,
-      });
+      const result = await command<{ cancelled?: boolean; alreadyGone?: boolean } | null>(
+        'cancel_pending_change',
+        { id: hold.pendingChangeId },
+      );
       setHold(null);
       setHoldEnded(
         result?.alreadyGone
@@ -664,8 +672,8 @@ function HeldNotice({
       </p>
       <p className="text-[12px]" style={{ color: white.w80 }}>
         {hold.alreadyPending ? 'This deletion was already waiting; nothing new was filed. ' : ''}
-        Until then your account works as usual. Cancel it here or on the website to keep your account;
-        signing out of this app also cancels it.
+        Until then your account works as usual. Cancel it here or on the website to keep your account.{' '}
+        {SIGN_OUT_CANCELS_HOLD}
       </p>
       {cancelError && (
         <p className="text-[12px]" style={{ color: statusTokens.red }}>

@@ -718,15 +718,17 @@ impl BirdoApi {
         Self::deletion_hold_from(outcome)
     }
 
-    /// What a hold request's classified answer is for the caller. A `Deleted`
-    /// here (a 2xx that is neither 202 nor marked pending) would be a server
-    /// that ignored `stepUpMethod`; it is reported as unreadable, never as a
-    /// hold the user can cancel.
+    /// What a hold request's classified answer is for the caller. Only a 202
+    /// is a hold. A `Deleted` here (any other 2xx) is unexpected for a hold
+    /// request: nothing is assumed deleted, nothing is wiped, and it is not
+    /// shown as a hold the user could cancel. The session stays; if the
+    /// account really is gone, the next request says so the ordinary way
+    /// (session expired).
     pub(crate) fn deletion_hold_from(outcome: GdprDeleteOutcome) -> Result<DeletionHold, ApiError> {
         match outcome {
             GdprDeleteOutcome::Held(hold) => Ok(hold),
             GdprDeleteOutcome::Deleted(_) => Err(ApiError::Parse(
-                "the server did not answer the hold request with a hold".into(),
+                "an unexpected answer to the hold request; nothing is assumed deleted".into(),
             )),
             GdprDeleteOutcome::Refused(error) => Err(error),
             GdprDeleteOutcome::SessionExpired => Err(ApiError::Unauthorized),
@@ -880,20 +882,25 @@ impl BirdoApi {
         body: &str,
         retry_after: Option<u64>,
     ) -> GdprDeleteOutcome {
-        // MR-2335: a 202 (or any 2xx that says `pending`) put the deletion on
-        // hold. It is checked BEFORE the 2xx rule below, which reads any body
-        // as a deletion: a hold read that way signed the user out of an
-        // account that still exists. A hold body that cannot be read is an
-        // error, never a deletion and never a hold.
-        if status == StatusCode::ACCEPTED
-            || (status.is_success() && deletion_body_says_pending(body))
-        {
+        // MR-2335: a 202 put the deletion on hold. It is checked BEFORE the
+        // 2xx rule below, which reads any body as a deletion: a hold read that
+        // way signed the user out of an account that still exists. A hold body
+        // that cannot be read is an error, never a deletion and never a hold.
+        if status == StatusCode::ACCEPTED {
             return match DeletionHold::from_body(body, false) {
                 Some(hold) => GdprDeleteOutcome::Held(hold),
                 None => GdprDeleteOutcome::Refused(ApiError::Parse(
                     "a deletion hold the client could not read".into(),
                 )),
             };
+        }
+        // Any OTHER 2xx that says `pending` / `change_pending` is not the
+        // contract's answer to anything: unexpected, and nothing is assumed.
+        // Not a deletion (no wipe), and not a hold either (only a 202 is).
+        if status.is_success() && deletion_body_says_pending(body) {
+            return GdprDeleteOutcome::Refused(ApiError::Parse(
+                "an unexpected answer to the deletion; nothing is assumed deleted".into(),
+            ));
         }
         if status.is_success() {
             let parsed = serde_json::from_str::<DeleteAccountResponse>(body).unwrap_or_default();

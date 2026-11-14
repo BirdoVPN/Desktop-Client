@@ -11,19 +11,32 @@
  * - Profile shows a banner while an `account_delete` hold is listed, with
  *   Cancel; the list is read on open and on window focus, and a hold that is
  *   gone is simply not shown.
+ * - Signing out cancels the hold on the server: the dialog, the banner and a
+ *   sign-out confirmation (only while a hold is listed) say so.
+ * - Nothing ever concludes "account deleted": an ended session takes the
+ *   ordinary session-expired path, and an unexpected answer assumes nothing.
  *
  * Run: npx vitest run src/__tests__/DeletionHold.test.tsx
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { HOLD_OFFER_CODE, HOLD_OFFER_NUMBER, Profile } from '@/screens/Profile';
-import { heldDeletionOf, holdTimeText } from '@/screens/profile/PendingDeletion';
+import { HOLD_UNEXPECTED } from '@/screens/profile/DeleteAccountDialog';
+import {
+  heldDeletionOf,
+  holdTimeText,
+  SIGN_OUT_CANCELS_HOLD,
+  SIGN_OUT_WITH_HOLD,
+} from '@/screens/profile/PendingDeletion';
+import { expireSession, signOut } from '@/session/session';
 import type { ConnectionState } from '@/store/app-store';
 
 vi.mock('@tauri-apps/api/core');
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn().mockResolvedValue(undefined) }));
+// The two ways a session ends, as spies: the tests assert WHICH one ran.
+vi.mock('@/session/session', () => ({ signOut: vi.fn(), expireSession: vi.fn(), endSession: vi.fn() }));
 
 function stripMotion(props: Record<string, unknown>) {
   const {
@@ -110,6 +123,8 @@ const refusal = (code: string, message = 'x') => ({ code, message, retryable: fa
 
 beforeEach(() => {
   mockedInvoke.mockReset();
+  vi.mocked(signOut).mockReset();
+  vi.mocked(expireSession).mockReset();
   logout.mockReset();
   setConnectionState.mockReset();
   setCurrentServer.mockReset();
@@ -138,6 +153,7 @@ function nobodySignedOut() {
   expect(calls('delete_account')).toHaveLength(0);
   expect(calls('logout')).toHaveLength(0);
   expect(logout).not.toHaveBeenCalled();
+  expect(signOut).not.toHaveBeenCalled();
   expect(setConnectionState).not.toHaveBeenCalled();
   expect(setCurrentServer).not.toHaveBeenCalled();
 }
@@ -183,6 +199,8 @@ describe('asking for the hold', () => {
     // The number field is gone: the hold stands in for it.
     expect(screen.queryByLabelText('Account number')).not.toBeInTheDocument();
     expect(screen.getByText(/24 hours from now unless you cancel it first/)).toBeInTheDocument();
+    // Before asking: signing out (here or everywhere) cancels it.
+    expect(screen.getByText(new RegExp(SIGN_OUT_CANCELS_HOLD))).toBeInTheDocument();
     const submit = screen.getByRole('button', { name: 'Delete in 24 hours' });
     expect(submit).toBeDisabled();
     await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
@@ -191,6 +209,8 @@ describe('asking for the hold', () => {
     expect(await screen.findByText(`Your account will be deleted on ${holdTimeText(APPLY_AFTER)}.`)).toBeInTheDocument();
     expect(calls('request_deletion_hold')[0][1]).toStrictEqual({ request: { password: 'DELETE' } });
     expect(screen.getByRole('button', { name: 'Cancel deletion' })).toBeInTheDocument();
+    // And once it is pending.
+    expect(screen.getByText(new RegExp(SIGN_OUT_CANCELS_HOLD))).toBeInTheDocument();
     // A 202 is not a deletion: nobody is signed out, nothing disconnected.
     nobodySignedOut();
     // The Profile banner reads the list again.
@@ -254,6 +274,8 @@ describe('asking for the hold', () => {
       'You have asked for a delayed deletion too many times today. Please try again tomorrow.',
     ],
     [refusal('step_up_unavailable'), "We couldn't check this request just now. Nothing was deleted. Please try again in a minute."],
+    // An unreadable 202 or any other 2xx (Rust: server_error): nothing is assumed.
+    [refusal('server_error', 'Nothing is assumed deleted.'), HOLD_UNEXPECTED],
     [refusal('invalid_credentials', 'Incorrect password'), 'Incorrect password. Please try again.'],
   ])('a refused hold (%o) shows why and signs nobody out', async (rejection, shown) => {
     holdResult = () => Promise.reject(rejection);
@@ -272,7 +294,21 @@ describe('asking for the hold', () => {
     await userEvent.click(await screen.findByRole('button', { name: HOLD_OFFER_NUMBER }));
     await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
     await userEvent.click(screen.getByRole('button', { name: 'Delete in 24 hours' }));
-    expect(await screen.findByText(/Couldn't put the deletion on hold/)).toBeInTheDocument();
+    expect(await screen.findByText(HOLD_UNEXPECTED)).toBeInTheDocument();
+    expect(HOLD_UNEXPECTED).toMatch(/nothing is assumed/);
+    expect(HOLD_UNEXPECTED).toMatch(/was not deleted/);
+    expect(screen.queryByRole('button', { name: 'Cancel deletion' })).not.toBeInTheDocument();
+    nobodySignedOut();
+  });
+
+  it('a hold request that meets an ended session takes the session-expired path, not "deleted"', async () => {
+    holdResult = () => Promise.reject(refusal('session_expired', 'Your session has expired. Sign in again.'));
+    await openDialog();
+    await userEvent.click(await screen.findByRole('button', { name: HOLD_OFFER_NUMBER }));
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await userEvent.click(screen.getByRole('button', { name: 'Delete in 24 hours' }));
+    await waitFor(() => expect(expireSession).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/has been deleted/i)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Cancel deletion' })).not.toBeInTheDocument();
     nobodySignedOut();
   });
@@ -283,6 +319,45 @@ describe('asking for the hold', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Back' }));
     expect(screen.getByLabelText('Account number')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /delete my account/i })).toBeInTheDocument();
+  });
+});
+
+describe('signing out while a deletion is on hold', () => {
+  const listed = [{ id: HOLD_ID, action: 'account_delete', applyAfter: APPLY_AFTER }];
+
+  it('asks first, saying that signing out cancels the deletion; Stay keeps both', async () => {
+    listResult = () => Promise.resolve(listed);
+    render(<Profile />);
+    await screen.findByRole('button', { name: 'Cancel deletion' });
+    await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
+    expect(await screen.findByText(SIGN_OUT_WITH_HOLD)).toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Sign out?' })).toBeInTheDocument();
+    expect(SIGN_OUT_WITH_HOLD).toMatch(/Signing out cancels that deletion/);
+    expect(SIGN_OUT_WITH_HOLD).toMatch(/will NOT be deleted/);
+    expect(signOut).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Stay signed in' }));
+    expect(screen.queryByText(SIGN_OUT_WITH_HOLD)).not.toBeInTheDocument();
+    expect(signOut).not.toHaveBeenCalled();
+    expect(calls('cancel_pending_change')).toHaveLength(0);
+  });
+
+  it('confirming signs out the ordinary way (the server cancels the hold)', async () => {
+    listResult = () => Promise.resolve(listed);
+    render(<Profile />);
+    await screen.findByRole('button', { name: 'Cancel deletion' });
+    await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
+    await screen.findByText(SIGN_OUT_WITH_HOLD);
+    await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Sign out' }));
+    expect(signOut).toHaveBeenCalledTimes(1);
+    expect(calls('delete_account')).toHaveLength(0);
+  });
+
+  it('without a hold, Sign out signs out at once, as before', async () => {
+    render(<Profile />);
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
+    await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
+    expect(signOut).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(SIGN_OUT_WITH_HOLD)).not.toBeInTheDocument();
   });
 });
 
@@ -297,6 +372,7 @@ describe('the Profile banner', () => {
     listResult = () => (answers.shift() ?? (() => Promise.resolve([])))();
     render(<Profile />);
     expect(await screen.findByText(`Your account will be deleted on ${holdTimeText(APPLY_AFTER)}.`)).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(SIGN_OUT_CANCELS_HOLD))).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Cancel deletion' }));
     await waitFor(() =>
       expect(screen.queryByText(/Your account will be deleted on/)).not.toBeInTheDocument(),
@@ -347,6 +423,25 @@ describe('the Profile banner', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Cancel deletion' }));
     expect(await screen.findByText(/No internet connection/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Cancel deletion' })).toBeInTheDocument();
+  });
+
+  it('a remembered hold plus a dead session is NOT "account deleted": the session-expired path runs', async () => {
+    const answers = [
+      () => Promise.resolve(listed),
+      () => Promise.reject(refusal('session_expired', 'Your session has expired. Sign in again.')),
+    ];
+    listResult = () => answers.shift()!();
+    render(<Profile />);
+    await screen.findByRole('button', { name: 'Cancel deletion' });
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+    // The ordinary path for an ended session, once. Nothing here decides the
+    // account is gone: no deletion sign-out, no "deleted" wording.
+    await waitFor(() => expect(expireSession).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/has been deleted/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/account (was|is) deleted/i)).not.toBeInTheDocument();
+    nobodySignedOut();
   });
 
   it('heldDeletionOf reads only a usable account_delete row', () => {
