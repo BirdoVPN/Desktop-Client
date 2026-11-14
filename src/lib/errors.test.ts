@@ -21,6 +21,7 @@ import {
   EMAIL_NOT_VERIFIED_COPY,
   quotaGraceMessage,
   REVOKED_COPY,
+  EVICTED_COPY,
   SESSION_EXPIRED_COPY,
   STEALTH_FAILED_COPY,
   UPDATE_REQUIRED_COPY,
@@ -42,6 +43,7 @@ const ALL: IpcErrorCode[] = [
   'server_unavailable',
   'session_expired',
   'revoked',
+  'evicted',
   'quota_exceeded',
   'device_limit',
   'subscription_required',
@@ -147,6 +149,10 @@ describe('errorCopy', () => {
     expect(errorCopy(err('pq_failed'))).toEqual({ message: PQ_FAILED_COPY, action: 'open_settings' });
     expect(errorCopy(err('stealth_failed')).message).toBe(STEALTH_FAILED_COPY);
     expect(errorCopy(err('revoked'))).toEqual({ message: REVOKED_COPY, action: 'connect' });
+    // MR-2333: an eviction says another device took over, never 'revoked'.
+    expect(errorCopy(err('evicted'))).toEqual({ message: EVICTED_COPY, action: 'connect' });
+    expect(EVICTED_COPY).toMatch(/another device on your account took over/i);
+    expect(EVICTED_COPY).not.toMatch(/revoked/i);
     expect(errorCopy(err('quota_exceeded'))).toEqual({ message: QUOTA_EXCEEDED_COPY, action: 'view_plans' });
     expect(QUOTA_EXCEEDED_COPY).toBe(
       "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.",
@@ -226,6 +232,7 @@ describe('vpnErrorCopy', () => {
 describe('reconnect give-up (P1-parity-020)', () => {
   it('picks the iOS kind from the final error code', () => {
     expect(giveUpKind(err('revoked'))).toBe('revoked');
+    expect(giveUpKind(err('evicted'))).toBe('revoked');
     expect(giveUpKind(err('server_unreachable'))).toBe('never_established');
     expect(giveUpKind(err('adapter_failed'))).toBe('died_after_handshake');
     expect(giveUpKind(null)).toBe('died_after_handshake');

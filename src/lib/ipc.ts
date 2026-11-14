@@ -25,6 +25,7 @@ export type IpcErrorCode =
   | 'server_unavailable'
   | 'session_expired'
   | 'revoked'
+  | 'evicted'
   | 'quota_exceeded'
   | 'device_limit'
   | 'subscription_required'
@@ -60,6 +61,7 @@ const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
   'server_unavailable',
   'session_expired',
   'revoked',
+  'evicted',
   'quota_exceeded',
   'device_limit',
   'subscription_required',

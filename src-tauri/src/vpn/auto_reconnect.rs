@@ -2863,7 +2863,7 @@ mod tests {
         .await;
         let (ending, said) = probe_verdict(&reply, false);
         assert_eq!(said, "evicted");
-        assert_eq!(ending.map(|e| e.code), Some(IpcErrorCode::Revoked));
+        assert_eq!(ending.map(|e| e.code), Some(IpcErrorCode::Evicted));
     }
 
     /// The grace warning goes out once per session, not on every 30 s
