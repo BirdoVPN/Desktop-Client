@@ -35,6 +35,15 @@
  *  - a password account keeps the password (+ 2FA code), as before.
  * A wrong number / code says so under its own field. A server that predates
  * this sends no factors, and nothing new is asked or sent.
+ *
+ * MR-2335 (MR-179 hold fallback, birdo-web #883): while the preflight says
+ * `stepUpHoldAvailable` (`holdAvailable === true`, its own switch,
+ * independent of `enforced`), a user who cannot present the number or the
+ * e-mailed code can instead ask for "Delete in 24 hours". The password and
+ * 2FA are still asked for. The answer is a HOLD, not a deletion: nothing is
+ * signed out, cleared or disconnected (Rust `request_deletion_hold` touches no
+ * local state), and the dialog shows when it applies with a Cancel button. A
+ * hold already waiting (409 `change_already_pending`) is shown the same way.
  */
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -50,6 +59,7 @@ import {
   TWO_FACTOR_PLACEHOLDER,
 } from '@/lib/two-factor';
 import { useAppStore } from '@/store/app-store';
+import { cancelErrorText, holdWhen } from './PendingDeletion';
 
 /** Shape returned by the Rust `delete_account` command. */
 export interface DeleteAccountResult {
@@ -72,6 +82,42 @@ export interface DeletionPreflight {
   stepUpFactors?: string[];
   /** MR-179: the server refuses a deletion without them; until then they are optional. */
   stepUpEnforced?: boolean;
+  /** MR-2335: the server takes a 24-hour hold instead of the number / code. */
+  stepUpHoldAvailable?: boolean;
+}
+
+/** Shape returned by the Rust `request_deletion_hold` command (MR-2335). */
+export interface DeletionHold {
+  /** For `cancel_pending_change`. */
+  pendingChangeId: string;
+  /** ISO-8601; shown in local time. */
+  applyAfter: string;
+  /** The server's sentence, when it sent one. */
+  message?: string | null;
+  /** Filed before this request (409 `change_already_pending`). */
+  alreadyPending?: boolean;
+}
+
+/** MR-2335: the hold offer, worded by what the user cannot present. */
+export const HOLD_OFFER_NUMBER = 'Delete in 24 hours (I lost my account number)';
+export const HOLD_OFFER_CODE = "Delete in 24 hours (I can't get the code)";
+export const HOLD_OFFER_OTHER = 'Delete in 24 hours instead';
+export const HOLD_EXPLAINED =
+  'Your account will be deleted 24 hours from now unless you cancel it first, here or on the ' +
+  'website. Signing out of this app also cancels it. Any e-mail address on the account is alerted.';
+
+/** A usable hold from what `request_deletion_hold` returned, or null. */
+function holdOf(result: unknown): DeletionHold | null {
+  if (typeof result !== 'object' || result === null) return null;
+  const r = result as Record<string, unknown>;
+  if (typeof r.pendingChangeId !== 'string' || !r.pendingChangeId) return null;
+  if (typeof r.applyAfter !== 'string' || !r.applyAfter) return null;
+  return {
+    pendingChangeId: r.pendingChangeId,
+    applyAfter: r.applyAfter,
+    message: typeof r.message === 'string' ? r.message : null,
+    alreadyPending: r.alreadyPending === true,
+  };
 }
 
 /** Shape returned by the Rust `send_deletion_code` command (MR-179). */
@@ -112,6 +158,9 @@ const DELETION_CODES: ReadonlySet<string> = new Set([
   'email_code_required',
   'email_code_invalid',
   'apple_reauth_required',
+  'hold_unavailable',
+  'step_up_no_factor',
+  'step_up_unavailable',
   'rate_limited',
   'session_expired',
   'network_offline',
@@ -132,16 +181,32 @@ function deletionErrorText(e: unknown): string {
     : "Couldn't delete your account. Please try again.";
 }
 
+/**
+ * A refused hold, in words (MR-2335). A 429 carries the server's own sentence
+ * from Rust: it alone says whether to wait 15 minutes (the 2FA lockout) or
+ * until tomorrow (the daily cap on holds); `hold_unavailable` says why too.
+ */
+function holdErrorText(e: unknown): string {
+  const err = toIpcError(e);
+  if (err.code === 'rate_limited' && err.message.trim()) return err.message.trim();
+  return DELETION_CODES.has(err.code)
+    ? errorCopy(err, 'password_confirm').message
+    : "Couldn't put the deletion on hold. Nothing was deleted. Please try again.";
+}
+
 export function DeleteAccountDialog({
   open,
   hasPassword,
   onDismiss,
   onDeleted,
+  onHoldChanged,
 }: {
   open: boolean;
   hasPassword: boolean;
   onDismiss: () => void;
   onDeleted: () => void;
+  /** MR-2335: a hold was filed, cancelled, or may exist: read the list again. */
+  onHoldChanged?: () => void;
 }) {
   const [password, setPassword] = useState('');
   const [confirmText, setConfirmText] = useState('');
@@ -177,6 +242,13 @@ export function DeleteAccountDialog({
   // Second-pass #9: what the server says a deletion would leave billing, asked
   // for when the dialog opens. Null while loading or after a failure.
   const [preflight, setPreflight] = useState<DeletionPreflight | null>(null);
+  // MR-2335: the user chose "Delete in 24 hours"; then the hold the server
+  // filed (or the one already waiting), and its cancel.
+  const [holdMode, setHoldMode] = useState(false);
+  const [hold, setHold] = useState<DeletionHold | null>(null);
+  const [cancellingHold, setCancellingHold] = useState(false);
+  const [holdCancelError, setHoldCancelError] = useState<string | null>(null);
+  const [holdEnded, setHoldEnded] = useState<string | null>(null);
   // Once the account is gone, every way out of the dialog must finish the
   // sign-out; merely closing it would leave the UI on a deleted account.
   const dismiss = stillBilling ? onDeleted : onDismiss;
@@ -201,6 +273,13 @@ export function DeleteAccountDialog({
     };
   }, [open]);
   const namedStores = preflight?.storeSubscriptionsStillBilling ?? [];
+  // MR-2335: offered only while the server says the hold is available, and
+  // only to an account with a factor the hold stands in for.
+  const factors = preflight?.stepUpFactors ?? [];
+  const holdOffered =
+    preflight?.stepUpHoldAvailable === true &&
+    (askingNumber || askingEmailCode || factors.includes('apple_reauth'));
+  const holdOfferText = askingNumber ? HOLD_OFFER_NUMBER : askingEmailCode ? HOLD_OFFER_CODE : HOLD_OFFER_OTHER;
 
   const canSubmit =
     !deleting &&
@@ -212,6 +291,69 @@ export function DeleteAccountDialog({
     (!askingEmailCode ||
       digitsOnly(emailCode).length === EMAIL_CODE_LENGTH ||
       (!stepUpEnforced && digitsOnly(emailCode).length === 0));
+
+  // The hold needs what the server still checks: the password (or DELETE) and
+  // the 2FA code once asked for. Never the number or the e-mailed code.
+  const canSubmitHold =
+    !deleting &&
+    (hasPassword ? password.length > 0 : confirmText.trim().toUpperCase() === 'DELETE') &&
+    (!askingTwoFactor || isTwoFactorCode(twoFactorCode));
+
+  const handleHold = async () => {
+    if (!canSubmitHold) return;
+    setDeleting(true);
+    setError(null);
+    setCodeError(null);
+    try {
+      const result = await invoke<unknown>('request_deletion_hold', {
+        request: {
+          password: hasPassword ? password : confirmText.trim(),
+          ...(askingTwoFactor ? { two_factor_code: twoFactorCode } : {}),
+        },
+      });
+      // NOT a deletion: nothing is signed out or disconnected here.
+      const filed = holdOf(result);
+      if (filed) setHold(filed);
+      else setError("Couldn't put the deletion on hold. Nothing was deleted. Please try again.");
+    } catch (e: unknown) {
+      const err = toIpcError(e);
+      if (err.code === 'two_factor_required') {
+        if (askingTwoFactor) setCodeError(holdErrorText(err));
+        setAskingTwoFactor(true);
+      } else if (err.code === 'two_factor_invalid') {
+        setAskingTwoFactor(true);
+        setCodeError(holdErrorText(err));
+      } else {
+        setError(holdErrorText(err));
+      }
+    } finally {
+      setDeleting(false);
+      // Filed, already waiting, or refused: the Profile banner reads the list again.
+      onHoldChanged?.();
+    }
+  };
+
+  const handleCancelHold = async () => {
+    if (!hold || cancellingHold) return;
+    setCancellingHold(true);
+    setHoldCancelError(null);
+    try {
+      const result = await invoke<{ cancelled?: boolean; alreadyGone?: boolean } | null>('cancel_pending_change', {
+        id: hold.pendingChangeId,
+      });
+      setHold(null);
+      setHoldEnded(
+        result?.alreadyGone
+          ? 'This deletion is no longer waiting, so there was nothing to cancel.'
+          : 'The deletion is cancelled. Your account stays as it is.',
+      );
+      onHoldChanged?.();
+    } catch (e: unknown) {
+      setHoldCancelError(cancelErrorText(e));
+    } finally {
+      setCancellingHold(false);
+    }
+  };
 
   const handleSendCode = async () => {
     if (sendingCode || deleting) return;
@@ -304,6 +446,21 @@ export function DeleteAccountDialog({
     >
       {stillBilling ? (
         <StillBillingNotice stores={stillBilling} onDone={onDeleted} />
+      ) : holdEnded ? (
+        <>
+          <p className="text-[13px]" style={{ color: white.w80 }}>
+            {holdEnded}
+          </p>
+          <BirdoButton text="OK" variant="primary" fullWidth onClick={onDismiss} />
+        </>
+      ) : hold ? (
+        <HeldNotice
+          hold={hold}
+          cancelling={cancellingHold}
+          cancelError={holdCancelError}
+          onCancelHold={() => void handleCancelHold()}
+          onClose={onDismiss}
+        />
       ) : (
         <>
           <p className="text-[13px]" style={{ color: white.w60 }}>
@@ -311,6 +468,11 @@ export function DeleteAccountDialog({
             days; payment records are kept, anonymised, for 7 years for tax. This cannot be undone.
             {hasPassword ? ' Enter your password to confirm.' : ' Type DELETE below to confirm.'}
           </p>
+          {holdMode && (
+            <p className="rounded-birdo-sm px-3 py-2 text-[12px]" style={{ backgroundColor: white.w05, color: white.w80 }}>
+              {HOLD_EXPLAINED}
+            </p>
+          )}
           {/* The stores the preflight names, before the confirm button; the
               static warning when it has not answered, failed, or named none. */}
           <p
@@ -356,7 +518,7 @@ export function DeleteAccountDialog({
               autoComplete="current-password"
             />
           )}
-          {askingNumber && (
+          {askingNumber && !holdMode && (
             <BirdoTextField
               value={accountNumber}
               onChange={(v) => {
@@ -372,7 +534,7 @@ export function DeleteAccountDialog({
               autoComplete="off"
             />
           )}
-          {askingEmailCode && (
+          {askingEmailCode && !holdMode && (
             <>
               <p className="text-[12px]" style={{ color: white.w80 }}>
                 {emailCodeSent
@@ -422,20 +584,106 @@ export function DeleteAccountDialog({
               disabled={deleting}
             />
           )}
-          <div className="flex gap-2.5">
-            <BirdoButton text="Cancel" variant="secondary" fullWidth disabled={deleting} onClick={onDismiss} />
-            <BirdoButton
-              text={deleting ? 'Deleting…' : 'Delete My Account'}
-              variant="danger"
-              fullWidth
-              isLoading={deleting}
-              disabled={!canSubmit}
-              onClick={handleConfirm}
-            />
-          </div>
+          {holdMode ? (
+            <div className="flex gap-2.5">
+              <BirdoButton
+                text="Back"
+                variant="secondary"
+                fullWidth
+                disabled={deleting}
+                onClick={() => {
+                  setHoldMode(false);
+                  setError(null);
+                }}
+              />
+              <BirdoButton
+                text={deleting ? 'Sending\u2026' : 'Delete in 24 hours'}
+                variant="danger"
+                fullWidth
+                isLoading={deleting}
+                disabled={!canSubmitHold}
+                onClick={handleHold}
+              />
+            </div>
+          ) : (
+            <>
+              <div className="flex gap-2.5">
+                <BirdoButton text="Cancel" variant="secondary" fullWidth disabled={deleting} onClick={onDismiss} />
+                <BirdoButton
+                  text={deleting ? 'Deleting…' : 'Delete My Account'}
+                  variant="danger"
+                  fullWidth
+                  isLoading={deleting}
+                  disabled={!canSubmit}
+                  onClick={handleConfirm}
+                />
+              </div>
+              {holdOffered && (
+                <BirdoButton
+                  text={holdOfferText}
+                  variant="ghost"
+                  fullWidth
+                  disabled={deleting}
+                  onClick={() => {
+                    setHoldMode(true);
+                    setError(null);
+                    setNumberError(null);
+                    setEmailCodeError(null);
+                  }}
+                />
+              )}
+            </>
+          )}
         </>
       )}
     </BirdoDialog>
+  );
+}
+
+/**
+ * MR-2335: the deletion is ON HOLD, not done. The account and this sign-in
+ * stay until the time shown; Cancel keeps the account.
+ */
+function HeldNotice({
+  hold,
+  cancelling,
+  cancelError,
+  onCancelHold,
+  onClose,
+}: {
+  hold: DeletionHold;
+  cancelling: boolean;
+  cancelError: string | null;
+  onCancelHold: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <>
+      <p className="text-[13px] font-semibold" style={{ color: white.w100 }}>
+        {`Your account will be deleted ${holdWhen(hold.applyAfter)}.`}
+      </p>
+      <p className="text-[12px]" style={{ color: white.w80 }}>
+        {hold.alreadyPending ? 'This deletion was already waiting; nothing new was filed. ' : ''}
+        Until then your account works as usual. Cancel it here or on the website to keep your account;
+        signing out of this app also cancels it.
+      </p>
+      {cancelError && (
+        <p className="text-[12px]" style={{ color: statusTokens.red }}>
+          {cancelError}
+        </p>
+      )}
+      <div className="flex gap-2.5">
+        <BirdoButton
+          text="Cancel deletion"
+          variant="secondary"
+          fullWidth
+          isLoading={cancelling}
+          disabled={cancelling}
+          onClick={onCancelHold}
+        />
+        <BirdoButton text="Close" variant="primary" fullWidth disabled={cancelling} onClick={onClose} />
+      </div>
+    </>
   );
 }
 

@@ -378,6 +378,10 @@ const FRONTEND_COMMANDS = [
   'delete_account',
   'deletion_preflight',
   'send_deletion_code',
+  // MR-2335: the 24-hour deletion hold, and the pending-change list + cancel
+  'request_deletion_hold',
+  'list_pending_changes',
+  'cancel_pending_change',
   'export_user_data',
   // A command answered session_expired: Rust ends the session too (REVIEW-WIN-012)
   'end_expired_session',

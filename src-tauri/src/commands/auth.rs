@@ -537,6 +537,10 @@ pub struct DeletionPreflightResult {
     /// number / code is optional, so a user whose code e-mail fails can still
     /// delete, as before.
     pub step_up_enforced: bool,
+    /// MR-2335: the server takes a 24-hour hold instead of the number / code
+    /// (`stepUp.holdAvailable === true`; its own switch, independent of
+    /// `enforced`). False from an older backend.
+    pub step_up_hold_available: bool,
 }
 
 /// What `send_deletion_code` returns: the masked address the code went to.
@@ -593,7 +597,205 @@ fn deletion_preflight_result(
             .as_ref()
             .map(|s| s.enforced)
             .unwrap_or(false),
+        step_up_hold_available: response
+            .step_up
+            .as_ref()
+            .is_some_and(|s| s.hold_available()),
     }
+}
+
+/// MR-2335: what the hold dialog sends. The password (or, for an account
+/// without one, the typed confirmation, exactly as `delete_account`) and the
+/// 2FA code once asked for. No number and no e-mailed code: the hold stands in
+/// for them.
+// No `Debug`: it carries the password and the 2FA code.
+#[derive(Deserialize)]
+pub struct DeletionHoldRequest {
+    pub password: String,
+    #[serde(default)]
+    pub two_factor_code: Option<String>,
+}
+
+impl Drop for DeletionHoldRequest {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        if let Some(code) = self.two_factor_code.as_mut() {
+            code.zeroize();
+        }
+    }
+}
+
+/// A deletion on hold, for the dialog and the Profile banner.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionHoldResult {
+    /// For `cancel_pending_change`.
+    pub pending_change_id: String,
+    /// ISO-8601 server time it applies at; the UI shows it in local time.
+    pub apply_after: String,
+    /// The server's sentence about the hold, when it sent one.
+    pub message: Option<String>,
+    /// It was filed before this request (409 `change_already_pending`).
+    pub already_pending: bool,
+}
+
+impl From<crate::api::types::DeletionHold> for DeletionHoldResult {
+    fn from(hold: crate::api::types::DeletionHold) -> Self {
+        Self {
+            pending_change_id: hold.pending_change_id,
+            apply_after: hold.apply_after,
+            message: hold.message,
+            already_pending: hold.already_pending,
+        }
+    }
+}
+
+/// A refused hold, by code. The server's own sentence where it is the
+/// explanation (`hold_unavailable`, and a 429 whose wait only the sentence
+/// names), never "Account deletion failed: ...": nothing was deleted.
+fn hold_failure(error: &ApiError) -> IpcError {
+    match error {
+        ApiError::Unauthorized | ApiError::NotAuthenticated => IpcError::session_expired(),
+        ApiError::Rejected { message, .. } => {
+            IpcError::new(IpcError::from_api(error).code, message)
+        }
+        other => IpcError::from_api(other),
+    }
+}
+
+/// MR-2335 (MR-179 hold fallback, birdo-web #883): ask for the account to be
+/// deleted in 24 hours, for a user who cannot present the account number or
+/// the e-mailed code. Offered only when the preflight said
+/// `holdAvailable: true`.
+///
+/// NOT a deletion: unlike `delete_account`, nothing local is touched on ANY
+/// answer. No sign-out, no token wipe, no tunnel teardown, no device-id
+/// rotation: the account still exists, the user can cancel, and the server
+/// drops the hold when this app's session signs out.
+///
+/// A 409 `change_already_pending` whose body does not name the hold (the
+/// server's error filter keeps only `details`) is answered from
+/// `GET /auth/pending-changes`; only if that cannot say either is it a
+/// `hold_unavailable` with the server's sentence.
+#[tauri::command]
+pub async fn request_deletion_hold(
+    request: DeletionHoldRequest,
+    api: State<'_, BirdoApi>,
+) -> Result<DeletionHoldResult, IpcError> {
+    tracing::info!("Account deletion hold requested (GDPR)");
+    let two_factor_code = request
+        .two_factor_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    match api
+        .request_deletion_hold(&request.password, two_factor_code)
+        .await
+    {
+        Ok(hold) => Ok(hold.into()),
+        Err(ApiError::DeletionAlreadyOnHold(message)) => {
+            match api
+                .list_pending_changes()
+                .await
+                .ok()
+                .and_then(|rows| held_deletion_in(&rows, message.trim()))
+            {
+                Some(hold) => Ok(hold.into()),
+                None => Err(hold_failure(&ApiError::DeletionAlreadyOnHold(message))),
+            }
+        }
+        Err(e) => Err(hold_failure(&e)),
+    }
+}
+
+/// The account's held deletion among the pending changes, if one is listed
+/// with a usable time.
+fn held_deletion_in(
+    rows: &[crate::api::types::PendingChange],
+    message: &str,
+) -> Option<crate::api::types::DeletionHold> {
+    rows.iter()
+        .find(|row| row.action == "account_delete" && row.apply_after.is_some())
+        .map(|row| crate::api::types::DeletionHold {
+            pending_change_id: row.id.clone(),
+            apply_after: row.apply_after.clone().unwrap_or_default(),
+            message: (!message.is_empty()).then(|| message.to_string()),
+            already_pending: true,
+        })
+}
+
+/// One pending change, for the Profile banner (MR-2335). The UI acts on
+/// `action: "account_delete"` only.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingChangeItem {
+    pub id: String,
+    pub action: String,
+    pub description: Option<String>,
+    pub apply_after: Option<String>,
+    pub created_at: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// MR-2335: `GET /auth/pending-changes`, read on opening Profile and on window
+/// focus. A hold can vanish between two reads (the server cancels it on a
+/// sign-out elsewhere, a number rotation, a password or 2FA change), so an
+/// empty list is an answer, not an error.
+#[tauri::command]
+pub async fn list_pending_changes(
+    api: State<'_, BirdoApi>,
+) -> Result<Vec<PendingChangeItem>, IpcError> {
+    let rows = api.list_pending_changes().await.map_err(IpcError::from)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| PendingChangeItem {
+            id: row.id,
+            action: row.action,
+            description: row.description,
+            apply_after: row.apply_after,
+            created_at: row.created_at,
+            detail: row.detail,
+        })
+        .collect())
+}
+
+/// What `cancel_pending_change` did.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelPendingChangeResult {
+    /// Cancelled by this request.
+    pub cancelled: bool,
+    /// It was gone already (404 `pending_change_not_found`): nothing to do but
+    /// read the list again.
+    pub already_gone: bool,
+}
+
+/// MR-2335: `POST /auth/pending-changes/:id/cancel`. Cancelling a held
+/// deletion keeps the account; nothing local changes either way.
+#[tauri::command]
+pub async fn cancel_pending_change(
+    id: String,
+    api: State<'_, BirdoApi>,
+) -> Result<CancelPendingChangeResult, IpcError> {
+    if !crate::api::types::pending_change_id_ok(&id) {
+        return Err(IpcError::unknown("That change could not be found."));
+    }
+    let cancelled = api
+        .cancel_pending_change(&id)
+        .await
+        .map_err(IpcError::from)?;
+    tracing::info!(
+        "Pending change {}",
+        if cancelled {
+            "cancelled"
+        } else {
+            "was already gone"
+        }
+    );
+    Ok(CancelPendingChangeResult {
+        cancelled,
+        already_gone: !cancelled,
+    })
 }
 
 /// GDPR: Export all user data (Right to Data Portability, Art. 20).
@@ -1729,18 +1931,188 @@ mod account_boundary_tests {
                 step_up: Some(crate::api::types::DeletionStepUp {
                     factors: vec!["account_number".into()],
                     enforced: false,
+                    hold_available: Some(serde_json::json!(true)),
                 }),
             });
         assert_eq!(named.store_subscriptions_still_billing, vec!["Google Play"]);
         assert!(named.web_subscription_will_be_cancelled);
         assert_eq!(named.step_up_factors, vec!["account_number"]);
         assert!(!named.step_up_enforced);
+        // MR-2335: independent of `enforced`.
+        assert!(named.step_up_hold_available);
 
         let nothing = super::deletion_preflight_result(&Default::default());
         assert!(nothing.store_subscriptions_still_billing.is_empty());
         assert!(!nothing.web_subscription_will_be_cancelled);
         assert!(nothing.step_up_factors.is_empty());
         assert!(!nothing.step_up_enforced);
+        assert!(!nothing.step_up_hold_available);
+    }
+
+    /// MR-2335: only a JSON `true` offers the hold; a string, a number, null
+    /// or no key at all do not, and none of them fails the preflight.
+    #[test]
+    fn the_hold_is_offered_only_for_hold_available_true() {
+        for (raw, want) in [
+            (
+                r#"{"factors":["account_number"],"enforced":true,"holdAvailable":true}"#,
+                true,
+            ),
+            (
+                r#"{"factors":["account_number"],"enforced":false,"holdAvailable":true}"#,
+                true,
+            ),
+            (
+                r#"{"factors":["account_number"],"enforced":true,"holdAvailable":false}"#,
+                false,
+            ),
+            (
+                r#"{"factors":["account_number"],"enforced":true,"holdAvailable":"true"}"#,
+                false,
+            ),
+            (
+                r#"{"factors":["account_number"],"enforced":true,"holdAvailable":1}"#,
+                false,
+            ),
+            (
+                r#"{"factors":["account_number"],"enforced":true,"holdAvailable":null}"#,
+                false,
+            ),
+            (r#"{"factors":["account_number"],"enforced":true}"#, false),
+        ] {
+            let preflight: crate::api::types::DeletionPreflightResponse =
+                serde_json::from_str(&format!(r#"{{"success":true,"stepUp":{raw}}}"#))
+                    .unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert_eq!(
+                super::deletion_preflight_result(&preflight).step_up_hold_available,
+                want,
+                "{raw}"
+            );
+        }
+    }
+
+    /// MR-2335: a hold is NOT a deletion. Its command touches nothing local on
+    /// any answer: no session end, no token wipe, no device-id rotation, no
+    /// settings reset, no PQ purge. (`delete_account` does all of these, after
+    /// a 2xx.)
+    #[test]
+    fn a_deletion_hold_never_signs_out_or_tears_down() {
+        let hold = body("request_deletion_hold");
+        for forbidden in [
+            "end_session",
+            "clear_tokens",
+            "clear_account_choices",
+            "device_id::rotate",
+            "purge_legacy_keypair_files",
+            "record_disabled",
+            "logout",
+            "around_the_tunnel",
+        ] {
+            assert!(
+                !hold.contains(forbidden),
+                "request_deletion_hold: {forbidden}"
+            );
+        }
+        let del = body("delete_account");
+        assert!(del.contains("end_session(&app, EndReason::AccountDeleted)"));
+        assert!(del.contains("credentials.clear_tokens()"));
+        // Neither the listing nor the cancel touches local state either.
+        for name in ["list_pending_changes", "cancel_pending_change"] {
+            let b = body(name);
+            assert!(
+                !b.contains("end_session") && !b.contains("clear_tokens"),
+                "{name}"
+            );
+        }
+    }
+
+    /// MR-2335: the hold's request carries the password and the 2FA code, so it
+    /// is wiped on drop and never printable.
+    #[test]
+    fn the_hold_request_is_wiped_and_not_debug() {
+        let source = include_str!("auth.rs");
+        let at = source
+            .find("pub struct DeletionHoldRequest")
+            .expect("DeletionHoldRequest");
+        let derive = &source[source[..at].rfind("#[derive(").unwrap()..at];
+        assert_eq!(derive.trim_end(), "#[derive(Deserialize)]");
+        assert!(source.contains("impl Drop for DeletionHoldRequest"));
+    }
+
+    /// MR-2335: a 409 `change_already_pending` the body did not name is read
+    /// from the pending-change list; a list without a held deletion is not
+    /// mistaken for one.
+    #[test]
+    fn an_unnamed_existing_hold_is_found_in_the_pending_list() {
+        use crate::api::types::PendingChange;
+        let row = |id: &str, action: &str, at: Option<&str>| PendingChange {
+            id: id.into(),
+            action: action.into(),
+            description: None,
+            apply_after: at.map(str::to_string),
+            created_at: None,
+            detail: None,
+        };
+        let rows = [
+            row("pc_pw", "password_set", Some("2026-11-15T09:00:00.000Z")),
+            row("pc_del", "account_delete", Some("2026-11-15T10:00:00.000Z")),
+        ];
+        let hold = super::held_deletion_in(&rows, "A deletion is already on hold.").unwrap();
+        assert_eq!(hold.pending_change_id, "pc_del");
+        assert_eq!(hold.apply_after, "2026-11-15T10:00:00.000Z");
+        assert!(hold.already_pending);
+        assert_eq!(
+            hold.message.as_deref(),
+            Some("A deletion is already on hold.")
+        );
+        assert!(super::held_deletion_in(&rows[..1], "").is_none());
+        assert!(super::held_deletion_in(&[row("pc_x", "account_delete", None)], "").is_none());
+    }
+
+    /// MR-2335: a refused hold reaches the dialog by code, with the server's
+    /// sentence where it is the explanation, and never reads "Account deletion
+    /// failed".
+    #[test]
+    fn a_refused_hold_keeps_its_code_and_sentence() {
+        use crate::api::error::{ApiError, StepUpKind};
+        use crate::commands::ipc_error::IpcErrorCode;
+        let unavailable = super::hold_failure(&ApiError::StepUp {
+            kind: StepUpKind::HoldUnavailable,
+            message: "A delayed deletion is not available. Nothing was deleted.".into(),
+        });
+        assert_eq!(unavailable.code, IpcErrorCode::HoldUnavailable);
+        assert_eq!(
+            unavailable.message,
+            "A delayed deletion is not available. Nothing was deleted."
+        );
+        let capped = super::hold_failure(&ApiError::Rejected {
+            status: 429,
+            message: "You have asked for a delayed deletion too many times today. Please try again tomorrow.".into(),
+        });
+        assert_eq!(capped.code, IpcErrorCode::RateLimited);
+        assert!(capped.message.contains("tomorrow"), "{}", capped.message);
+        let wrong = super::hold_failure(&ApiError::Rejected {
+            status: 401,
+            message: "Incorrect password".into(),
+        });
+        assert_eq!(wrong.code, IpcErrorCode::InvalidCredentials);
+        assert_eq!(
+            super::hold_failure(&ApiError::Unauthorized).code,
+            IpcErrorCode::SessionExpired
+        );
+        let busy = super::hold_failure(&ApiError::StepUp {
+            kind: StepUpKind::Unavailable,
+            message: "We could not check your code just now.".into(),
+        });
+        assert_eq!(busy.code, IpcErrorCode::StepUpUnavailable);
+        assert!(busy.retryable);
+        for e in [unavailable, capped, wrong, busy] {
+            assert!(
+                !e.message.starts_with("Account deletion failed"),
+                "{}",
+                e.message
+            );
+        }
     }
 
     /// MR-179: the proof rides the deletion call (number as digits, code

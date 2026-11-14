@@ -6,6 +6,9 @@
  * redeem voucher, export data, delete account and sign out. Managing a paid
  * subscription and the legal links live on the web (dashboard.birdo.app).
  * Usage moved to the Limit tab (P1-parity-009).
+ *
+ * MR-2335: an account deletion waiting out its 24-hour hold shows as a banner
+ * at the top, with Cancel (`PendingDeletion.tsx`), read on open and on focus.
  */
 import { useCallback, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -23,6 +26,7 @@ import { loadSubscription } from '@/session/session-data';
 import { signOut } from '@/session/session';
 import { AccountNumberCard, IdentityCard, SubscriptionCard } from './profile/ProfileCards';
 import { DeleteAccountDialog } from './profile/DeleteAccountDialog';
+import { PendingDeletionBanner, usePendingDeletion } from './profile/PendingDeletion';
 import { ReplaceAccountNumberDialog } from './profile/ReplaceAccountNumberDialog';
 import { VoucherRedeemDialog } from './profile/VoucherRedeemDialog';
 
@@ -32,6 +36,9 @@ export {
   preflightStoreWarning,
   type DeleteAccountResult,
   type DeletionPreflight,
+  type DeletionHold,
+  HOLD_OFFER_NUMBER,
+  HOLD_OFFER_CODE,
 } from './profile/DeleteAccountDialog';
 
 export function Profile() {
@@ -61,6 +68,7 @@ export function Profile() {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [showReplaceDialog, setShowReplaceDialog] = useState(false);
   const [exportState, setExportState] = useState<'idle' | 'working' | 'done' | 'error'>('idle');
+  const pendingDeletion = usePendingDeletion();
 
   // GDPR data export (Art. 20). The backend command returns the full JSON blob;
   // save it via a webview download so the user gets a file with no extra plugin.
@@ -96,6 +104,10 @@ export function Profile() {
       </div>
 
       <div className="flex flex-col gap-3 px-5 pb-12 pt-2">
+        {pendingDeletion.hold && (
+          <PendingDeletionBanner hold={pendingDeletion.hold} onChanged={pendingDeletion.refresh} />
+        )}
+
         <IdentityCard email={resolvedEmail} plan={account.plan} isAnon={isAnon} />
 
         {isAnon && (
@@ -196,6 +208,7 @@ export function Profile() {
           // still has one, and the backend will demand it.
           hasPassword={account.hasPassword}
           onDismiss={() => setShowDeleteDialog(false)}
+          onHoldChanged={pendingDeletion.refresh}
           onDeleted={async () => {
             try {
               await invoke('logout');

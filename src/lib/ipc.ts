@@ -38,6 +38,9 @@ export type IpcErrorCode =
   | 'email_code_required'
   | 'email_code_invalid'
   | 'apple_reauth_required'
+  | 'hold_unavailable'
+  | 'step_up_no_factor'
+  | 'step_up_unavailable'
   | 'cert_pin_failed'
   | 'stealth_failed'
   | 'pq_failed'
@@ -73,6 +76,9 @@ const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
   'email_code_required',
   'email_code_invalid',
   'apple_reauth_required',
+  'hold_unavailable',
+  'step_up_no_factor',
+  'step_up_unavailable',
   'cert_pin_failed',
   'stealth_failed',
   'pq_failed',

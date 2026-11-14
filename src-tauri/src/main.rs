@@ -216,6 +216,9 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::auth::delete_account, // GDPR account deletion
         commands::auth::deletion_preflight, // what a deletion leaves billing
         commands::auth::send_deletion_code, // MR-179: e-mail the deletion code (SSO)
+        commands::auth::request_deletion_hold, // MR-2335: delete in 24 h (cancellable)
+        commands::auth::list_pending_changes, // MR-2335: the held deletion, for Profile
+        commands::auth::cancel_pending_change, // MR-2335: cancel a held change
         commands::auth::export_user_data, // GDPR data export
         commands::session::end_expired_session, // a command answered session_expired
         // VPN operations

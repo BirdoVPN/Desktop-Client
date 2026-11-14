@@ -35,6 +35,9 @@ const APP_COMMANDS: &[&str] = &[
     "delete_account",
     "deletion_preflight",
     "send_deletion_code",
+    "request_deletion_hold",
+    "list_pending_changes",
+    "cancel_pending_change",
     "export_user_data",
     "end_expired_session",
     // VPN operations

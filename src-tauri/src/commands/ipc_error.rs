@@ -52,6 +52,17 @@ pub enum IpcErrorCode {
     /// An Apple account with no e-mail address must re-sign in with Apple,
     /// which only the iOS app does. Not retryable here.
     AppleReauthRequired,
+    /// MR-2335: the 24-hour deletion hold was refused (409 `hold_unavailable`:
+    /// switched off, or not tied to this session), or one is already waiting
+    /// and the answer did not say which. Nothing was deleted. The UI shows the
+    /// server's sentence, which says which.
+    HoldUnavailable,
+    /// MR-2335: 403 `step_up_no_factor`: this account cannot be verified for an
+    /// in-app deletion; support can delete it. Not retryable.
+    StepUpNoFactor,
+    /// MR-2335: 503 `step_up_unavailable`: the check could not run just now and
+    /// nothing was deleted or put on hold. Retryable.
+    StepUpUnavailable,
     CertPinFailed,
     StealthFailed,
     PqFailed,
@@ -111,6 +122,8 @@ impl IpcErrorCode {
                 | IpcErrorCode::AccountRestricted
                 | IpcErrorCode::RegistrationNotAllowed
                 | IpcErrorCode::AppleReauthRequired
+                | IpcErrorCode::HoldUnavailable
+                | IpcErrorCode::StepUpNoFactor
                 | IpcErrorCode::EmailNotVerified
         )
     }
@@ -365,8 +378,27 @@ impl IpcError {
                     StepUpKind::EmailCodeRequired => IpcErrorCode::EmailCodeRequired,
                     StepUpKind::EmailCodeInvalid => IpcErrorCode::EmailCodeInvalid,
                     StepUpKind::AppleReauth => IpcErrorCode::AppleReauthRequired,
+                    StepUpKind::HoldUnavailable => IpcErrorCode::HoldUnavailable,
+                    StepUpKind::NoFactor => IpcErrorCode::StepUpNoFactor,
+                    StepUpKind::Unavailable => IpcErrorCode::StepUpUnavailable,
                 },
                 message,
+            ),
+            // MR-2335: `request_deletion_hold` reads the waiting hold from the
+            // pending-change list; this is only what is left when it cannot.
+            // The server's sentence ("A deletion is already on hold. Cancel it
+            // first ...") is the explanation.
+            ApiError::DeletionAlreadyOnHold(message) if !message.is_empty() => {
+                Self::new(IpcErrorCode::HoldUnavailable, message)
+            }
+            ApiError::DeletionAlreadyOnHold(_) => Self::new(
+                IpcErrorCode::HoldUnavailable,
+                "A deletion is already on hold for this account.",
+            ),
+            // `cancel_pending_change` answers this itself (already gone).
+            ApiError::PendingChangeNotFound => Self::new(
+                IpcErrorCode::Unknown,
+                "That change is no longer pending.",
             ),
             // Retryable by nature: the check is down, the account was not refused.
             ApiError::QuotaCheckUnavailable { retry_after_secs } => Self::transient(
@@ -635,6 +667,9 @@ mod tests {
             (IpcErrorCode::EmailCodeRequired, "email_code_required"),
             (IpcErrorCode::EmailCodeInvalid, "email_code_invalid"),
             (IpcErrorCode::AppleReauthRequired, "apple_reauth_required"),
+            (IpcErrorCode::HoldUnavailable, "hold_unavailable"),
+            (IpcErrorCode::StepUpNoFactor, "step_up_no_factor"),
+            (IpcErrorCode::StepUpUnavailable, "step_up_unavailable"),
             (IpcErrorCode::CertPinFailed, "cert_pin_failed"),
             (IpcErrorCode::StealthFailed, "stealth_failed"),
             (IpcErrorCode::PqFailed, "pq_failed"),
@@ -767,6 +802,36 @@ mod tests {
                 IpcErrorCode::AppleReauthRequired,
             ),
             (
+                ApiError::StepUp {
+                    kind: StepUpKind::HoldUnavailable,
+                    message: "x".into(),
+                },
+                IpcErrorCode::HoldUnavailable,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::NoFactor,
+                    message: "x".into(),
+                },
+                IpcErrorCode::StepUpNoFactor,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::Unavailable,
+                    message: "x".into(),
+                },
+                IpcErrorCode::StepUpUnavailable,
+            ),
+            (
+                ApiError::DeletionAlreadyOnHold("x".into()),
+                IpcErrorCode::HoldUnavailable,
+            ),
+            (
+                ApiError::DeletionAlreadyOnHold(String::new()),
+                IpcErrorCode::HoldUnavailable,
+            ),
+            (ApiError::PendingChangeNotFound, IpcErrorCode::Unknown),
+            (
                 ApiError::QuotaCheckUnavailable {
                     retry_after_secs: Some(30),
                 },
@@ -790,6 +855,32 @@ mod tests {
         for (i, (api, code)) in cases.iter().enumerate() {
             assert_eq!(IpcError::from_api(api).code, *code, "case {i}");
         }
+    }
+
+    /// MR-2335: a hold that is switched off, or an account the app cannot
+    /// verify, is refused the same way every time; a check that could not run
+    /// is worth asking again. None of them is about a connection.
+    #[test]
+    fn deletion_hold_codes_say_whether_a_retry_can_help() {
+        assert!(!IpcErrorCode::HoldUnavailable.retryable());
+        assert!(!IpcErrorCode::StepUpNoFactor.retryable());
+        assert!(IpcErrorCode::StepUpUnavailable.retryable());
+        for code in [
+            IpcErrorCode::HoldUnavailable,
+            IpcErrorCode::StepUpNoFactor,
+            IpcErrorCode::StepUpUnavailable,
+        ] {
+            assert!(!code.is_hard_refusal(), "{code:?}");
+        }
+        // The server's sentence is what the UI shows for a refused hold.
+        let held = IpcError::from_api(&ApiError::StepUp {
+            kind: StepUpKind::HoldUnavailable,
+            message: "A delayed deletion is not available. Nothing was deleted.".into(),
+        });
+        assert_eq!(
+            held.message,
+            "A delayed deletion is not available. Nothing was deleted."
+        );
     }
 
     #[test]

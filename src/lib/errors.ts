@@ -72,6 +72,7 @@ export const EMAIL_NOT_VERIFIED_COPY =
   'Please verify your email address first. Open birdo.app/verify-email to get a new link.';
 export const REGISTRATION_NOT_ALLOWED_COPY =
   "BirdoVPN can't create new accounts from your country right now.";
+export const HOLD_UNAVAILABLE_COPY = 'A delayed deletion is not available right now. Nothing was deleted.';
 
 /**
  * The link for an `account_restricted` refusal's review page, only if the path
@@ -147,6 +148,18 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   },
   email_code_invalid: {
     message: 'That code is not valid or has expired. Request a new code.',
+    action: null,
+  },
+  // MR-2335: the 24-hour deletion hold. `hold_unavailable` shows the server's
+  // own sentence when it sent one (see `errorCopy`): it says whether the hold
+  // is switched off, not tied to this session, or already waiting.
+  hold_unavailable: { message: HOLD_UNAVAILABLE_COPY, action: null },
+  step_up_no_factor: {
+    message: 'We cannot verify this account for an in-app deletion. Please contact support to delete it.',
+    action: null,
+  },
+  step_up_unavailable: {
+    message: "We couldn't check this request just now. Nothing was deleted. Please try again in a minute.",
     action: null,
   },
   // Kept apart from every connectivity message on purpose: a pin failure can
@@ -226,10 +239,13 @@ export function errorCopy(error: IpcError, context: ErrorContext = 'general'): E
       action: null,
     };
   }
-  // The server's own sentence says why, and for these two nothing else does.
+  // The server's own sentence says why, and for these nothing else does.
   // Keyed on the code, never on the wording; the sentence is shown, not read.
   if (error.code === 'registration_not_allowed') {
     return { message: error.message.trim() || REGISTRATION_NOT_ALLOWED_COPY, action: null };
+  }
+  if (error.code === 'hold_unavailable') {
+    return { message: error.message.trim() || HOLD_UNAVAILABLE_COPY, action: null };
   }
   if (error.code === 'account_restricted') {
     const until = untilText(error.restriction?.until);
