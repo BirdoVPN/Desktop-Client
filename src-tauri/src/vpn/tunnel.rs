@@ -1204,7 +1204,7 @@ impl WintunTunnel {
 
         // LOCKDOWN: publish the tunnel interface LUID to the kill switch so
         // always-on mode can permit tunneled traffic by interface. Best-effort —
-        // only lockdown mode (off by default) depends on it.
+        // only lockdown mode (ON by default on Windows, switchable in Settings) depends on it.
         #[cfg(windows)]
         {
             let mut luid_published = false;

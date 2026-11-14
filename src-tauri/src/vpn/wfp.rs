@@ -672,8 +672,8 @@ fn filter_record(spec: &FilterSpec, name: &[u16], provider_key: &mut GUID) -> FW
 
 /// The kernel calls one policy change makes, in the order [`commit_policy`]
 /// makes them. [`Kernel`] is the FWPM API; the tests use a fake that can fail
-/// any of them, so the rules are tested without an elevated WFP session (CI
-/// runners are not elevated).
+/// any of them, so the rules are tested without touching a live WFP session (a dev
+/// machine's unelevated test run has none; CI runs elevated).
 trait FilterKernel {
     fn begin(&mut self) -> Result<(), String>;
     fn commit(&mut self) -> Result<(), String>;
@@ -1089,7 +1089,7 @@ pub async fn deactivate_blocking() -> Result<(), String> {
 }
 
 /// Ownership rules for the standalone IPv6 block, kept engine-free so they can
-/// be unit-tested without an elevated WFP session (CI runners are not elevated).
+/// be unit-tested without an elevated WFP session (an unelevated dev run has none; CI itself is elevated).
 /// Every public IPv6 entry point below routes its decision through here.
 mod v6_state {
     use super::{IPV6_BLOCK_HELD, IPV6_BLOCK_WANTED, IPV6_ONLY_ACTIVE, IS_BLOCKING};
@@ -1672,7 +1672,7 @@ mod tests {
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Mirrors what the WFP engine holds, so a full reactive kill-switch cycle can
-    /// be walked without an elevated WFP session (CI runners are not elevated).
+    /// be walked without an elevated WFP session (an unelevated dev run has none; CI itself is elevated).
     /// Each method performs exactly the state transitions its real counterpart
     /// does — the decisions all come from `v6_state`, which is the code under test.
     #[derive(Default)]

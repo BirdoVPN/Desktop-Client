@@ -64,11 +64,22 @@ pub struct ApiErrorBody {
 /// `twoFactorCode` (Account API contract item 85): the TOTP or backup code an
 /// account with 2FA must add, sent only once the server has asked for it — so
 /// a backend that predates the field never sees it.
-#[derive(Debug, Serialize)]
+// No `Debug`: it carries the password, the 2FA code, the account number and the
+// e-mailed code, and a derived one would print them.
+#[derive(Serialize)]
 pub struct DeleteAccountBody<'a> {
     pub password: &'a str,
     #[serde(rename = "twoFactorCode", skip_serializing_if = "Option::is_none")]
     pub two_factor_code: Option<&'a str>,
+    /// MR-179 (owner 2026-11-13): the 24-digit number an anonymous account
+    /// re-enters. Sent only once the server asked for it, or the preflight said
+    /// to, so a backend that predates it never sees the key.
+    #[serde(rename = "accountNumber", skip_serializing_if = "Option::is_none")]
+    pub account_number: Option<&'a str>,
+    /// MR-179: the 6-digit code `POST /api/v1/gdpr/delete/code` e-mailed to an
+    /// SSO account with no 2FA.
+    #[serde(rename = "emailCode", skip_serializing_if = "Option::is_none")]
+    pub email_code: Option<&'a str>,
 }
 
 /// Success body of `DELETE /api/v1/gdpr/delete`.
@@ -100,6 +111,32 @@ pub struct DeletionPreflightResponse {
     pub store_subscriptions_still_billing: Option<serde_json::Value>,
     #[serde(default)]
     pub web_subscription_will_be_cancelled: Option<bool>,
+    /// MR-179: what this account is asked for before a deletion. Absent from a
+    /// backend older than birdo-web #766.
+    #[serde(default)]
+    pub step_up: Option<DeletionStepUp>,
+}
+
+/// `stepUp` of the deletion preflight: the server's factor tokens (`password`,
+/// `account_number`, `email_code`, `apple_reauth`, `two_factor`) and whether it
+/// refuses a deletion that lacks them.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DeletionStepUp {
+    #[serde(default)]
+    pub factors: Vec<String>,
+    #[serde(default)]
+    pub enforced: bool,
+}
+
+/// Body of `POST /api/v1/gdpr/delete/code`: the e-mailed deletion code went to
+/// `sentTo`, a masked address ("j***@example.com").
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionCodeResponse {
+    #[serde(default)]
+    pub sent_to: Option<String>,
+    #[serde(default)]
+    pub expires_in_minutes: Option<u64>,
 }
 
 /// Turn `storeSubscriptionsStillBilling` into user-facing store names,

@@ -33,6 +33,11 @@ export type IpcErrorCode =
   | 'invalid_credentials'
   | 'two_factor_required'
   | 'two_factor_invalid'
+  | 'account_number_required'
+  | 'account_number_invalid'
+  | 'email_code_required'
+  | 'email_code_invalid'
+  | 'apple_reauth_required'
   | 'cert_pin_failed'
   | 'stealth_failed'
   | 'pq_failed'
@@ -63,6 +68,11 @@ const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
   'invalid_credentials',
   'two_factor_required',
   'two_factor_invalid',
+  'account_number_required',
+  'account_number_invalid',
+  'email_code_required',
+  'email_code_invalid',
+  'apple_reauth_required',
   'cert_pin_failed',
   'stealth_failed',
   'pq_failed',

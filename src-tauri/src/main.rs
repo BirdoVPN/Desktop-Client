@@ -215,6 +215,7 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::auth::verify_2fa,     // FIX C-2: 2FA TOTP verification
         commands::auth::delete_account, // GDPR account deletion
         commands::auth::deletion_preflight, // what a deletion leaves billing
+        commands::auth::send_deletion_code, // MR-179: e-mail the deletion code (SSO)
         commands::auth::export_user_data, // GDPR data export
         commands::session::end_expired_session, // a command answered session_expired
         // VPN operations
