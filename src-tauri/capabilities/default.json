@@ -15,6 +15,7 @@
     "allow-verify-2fa",
     "allow-delete-account",
     "allow-deletion-preflight",
+    "allow-send-deletion-code",
     "allow-export-user-data",
     "allow-end-expired-session",
     "allow-connect-vpn",

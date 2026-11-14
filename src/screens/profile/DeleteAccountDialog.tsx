@@ -24,6 +24,17 @@
  * then sends it with the retry. `two_factor_invalid` says the code was wrong
  * and lets the user try again; a 429 gets the rate-limit copy. A server that
  * predates the contract never asks, and never sees a code.
+ *
+ * MR-179 (owner 2026-11-13): a fresh re-auth before deletion, like the
+ * website. The preflight's `stepUpFactors` (or a refusal by code:
+ * `account_number_required` / `email_code_required`) makes the dialog ask for
+ * what the server expects:
+ *  - an anonymous account re-enters its 24-digit number;
+ *  - an SSO account with no 2FA taps "Email me a code" (`send_deletion_code`)
+ *    and types the 6-digit code it receives;
+ *  - a password account keeps the password (+ 2FA code), as before.
+ * A wrong number / code says so under its own field. A server that predates
+ * this sends no factors, and nothing new is asked or sent.
  */
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -57,7 +68,24 @@ export interface DeletionPreflight {
   storeSubscriptionsStillBilling: string[];
   /** A web (Polar) subscription is billing and the deletion will cancel it. */
   webSubscriptionWillBeCancelled: boolean;
+  /** MR-179: the server's step-up factor tokens; absent from an older backend. */
+  stepUpFactors?: string[];
+  /** MR-179: the server refuses a deletion without them; until then they are optional. */
+  stepUpEnforced?: boolean;
 }
+
+/** Shape returned by the Rust `send_deletion_code` command (MR-179). */
+export interface DeletionCodeResult {
+  /** The masked address the code went to, e.g. "j***@example.com". */
+  sentTo: string | null;
+  /** How long the code works, in minutes, when the server says. */
+  expiresInMinutes?: number | null;
+}
+
+/** An anonymous account number is 24 digits; the e-mailed deletion code is 6. */
+export const ACCOUNT_NUMBER_LENGTH = 24;
+export const EMAIL_CODE_LENGTH = 6;
+const digitsOnly = (v: string) => v.replace(/\D/g, '');
 
 /** Shown in place of STORE_BILLING_WARNING when the preflight names stores. */
 export function preflightStoreWarning(stores: string[]): string {
@@ -79,6 +107,11 @@ const DELETION_CODES: ReadonlySet<string> = new Set([
   'invalid_credentials',
   'two_factor_required',
   'two_factor_invalid',
+  'account_number_required',
+  'account_number_invalid',
+  'email_code_required',
+  'email_code_invalid',
+  'apple_reauth_required',
   'rate_limited',
   'session_expired',
   'network_offline',
@@ -115,6 +148,22 @@ export function DeleteAccountDialog({
   // Set once the server answered `two_factor_required`.
   const [askingTwoFactor, setAskingTwoFactor] = useState(false);
   const [twoFactorCode, setTwoFactorCode] = useState('');
+  // MR-179: set from the preflight's factors, or once the server answered
+  // `account_number_required` / `email_code_required`.
+  const [askingNumber, setAskingNumber] = useState(false);
+  const [accountNumber, setAccountNumber] = useState('');
+  const [numberError, setNumberError] = useState<string | null>(null);
+  const [askingEmailCode, setAskingEmailCode] = useState(false);
+  const [emailCode, setEmailCode] = useState('');
+  const [emailCodeError, setEmailCodeError] = useState<string | null>(null);
+  const [emailCodeSent, setEmailCodeSent] = useState(false);
+  const [emailCodeSentTo, setEmailCodeSentTo] = useState<string | null>(null);
+  const [sendingCode, setSendingCode] = useState(false);
+  const [emailCodeMinutes, setEmailCodeMinutes] = useState<number | null>(null);
+  // MR-179: the number / code is OPTIONAL until the server enforces it (the
+  // preflight's `enforced`, or it already answered `*_required`), so a user
+  // whose code e-mail fails can still delete, as before.
+  const [stepUpEnforced, setStepUpEnforced] = useState(false);
   const [deleting, setDeleting] = useState(false);
   // A refusal of the password / DELETE confirmation, under that field.
   const [error, setError] = useState<string | null>(null);
@@ -137,7 +186,12 @@ export function DeleteAccountDialog({
     let cancelled = false;
     invoke<DeletionPreflight | null>('deletion_preflight')
       .then((result) => {
-        if (!cancelled && result) setPreflight(result);
+        if (cancelled || !result) return;
+        setPreflight(result);
+        if (result.stepUpEnforced) setStepUpEnforced(true);
+        const factors = result.stepUpFactors ?? [];
+        if (factors.includes('account_number')) setAskingNumber(true);
+        if (factors.includes('email_code')) setAskingEmailCode(true);
       })
       .catch(() => {
         /* best effort: the static warning stays */
@@ -151,13 +205,37 @@ export function DeleteAccountDialog({
   const canSubmit =
     !deleting &&
     (hasPassword ? password.length > 0 : confirmText.trim().toUpperCase() === 'DELETE') &&
-    (!askingTwoFactor || isTwoFactorCode(twoFactorCode));
+    (!askingTwoFactor || isTwoFactorCode(twoFactorCode)) &&
+    (!askingNumber ||
+      digitsOnly(accountNumber).length === ACCOUNT_NUMBER_LENGTH ||
+      (!stepUpEnforced && digitsOnly(accountNumber).length === 0)) &&
+    (!askingEmailCode ||
+      digitsOnly(emailCode).length === EMAIL_CODE_LENGTH ||
+      (!stepUpEnforced && digitsOnly(emailCode).length === 0));
+
+  const handleSendCode = async () => {
+    if (sendingCode || deleting) return;
+    setSendingCode(true);
+    setEmailCodeError(null);
+    try {
+      const sent = await invoke<DeletionCodeResult | null>('send_deletion_code');
+      setEmailCodeSent(true);
+      setEmailCodeSentTo(sent?.sentTo ?? null);
+      setEmailCodeMinutes(sent?.expiresInMinutes ?? null);
+    } catch (e: unknown) {
+      setEmailCodeError(deletionErrorText(e));
+    } finally {
+      setSendingCode(false);
+    }
+  };
 
   const handleConfirm = async () => {
     if (!canSubmit) return;
     setDeleting(true);
     setError(null);
     setCodeError(null);
+    setNumberError(null);
+    setEmailCodeError(null);
     try {
       // Password-less accounts send the typed confirmation token: the server
       // skips the password check for them, and the command's request type is
@@ -166,6 +244,8 @@ export function DeleteAccountDialog({
         request: {
           password: hasPassword ? password : confirmText.trim(),
           ...(askingTwoFactor ? { two_factor_code: twoFactorCode } : {}),
+          ...(askingNumber && digitsOnly(accountNumber) ? { account_number: digitsOnly(accountNumber) } : {}),
+          ...(askingEmailCode && digitsOnly(emailCode) ? { email_code: digitsOnly(emailCode) } : {}),
         },
       });
       // Confirmed: Rust has already taken the tunnel down. Mirror that now
@@ -191,6 +271,20 @@ export function DeleteAccountDialog({
       } else if (err.code === 'two_factor_invalid' || (askingTwoFactor && err.code === 'rate_limited')) {
         setAskingTwoFactor(true);
         setCodeError(deletionErrorText(err));
+      } else if (err.code === 'account_number_required' || err.code === 'account_number_invalid') {
+        // MR-179: asked for, not an error the user made, unless a number was
+        // already sent: then it is the answer.
+        if (askingNumber || err.code === 'account_number_invalid') setNumberError(deletionErrorText(err));
+        setAskingNumber(true);
+        setStepUpEnforced(true);
+      } else if (err.code === 'email_code_required' || err.code === 'email_code_invalid') {
+        if (askingEmailCode || err.code === 'email_code_invalid') setEmailCodeError(deletionErrorText(err));
+        setAskingEmailCode(true);
+        setStepUpEnforced(true);
+      } else if (askingNumber && err.code === 'rate_limited') {
+        setNumberError(deletionErrorText(err));
+      } else if (askingEmailCode && err.code === 'rate_limited') {
+        setEmailCodeError(deletionErrorText(err));
       } else {
         setError(deletionErrorText(err));
       }
@@ -261,6 +355,61 @@ export function DeleteAccountDialog({
               disabled={deleting}
               autoComplete="current-password"
             />
+          )}
+          {askingNumber && (
+            <BirdoTextField
+              value={accountNumber}
+              onChange={(v) => {
+                setAccountNumber(digitsOnly(v).slice(0, ACCOUNT_NUMBER_LENGTH));
+                if (numberError) setNumberError(null);
+              }}
+              label="Account number"
+              type="password"
+              placeholder="24 digits"
+              hint="Enter the 24-digit account number you signed up with"
+              errorText={numberError}
+              disabled={deleting}
+              autoComplete="off"
+            />
+          )}
+          {askingEmailCode && (
+            <>
+              <p className="text-[12px]" style={{ color: white.w80 }}>
+                {emailCodeSent
+                  ? emailCodeSentTo
+                    ? `We emailed a code to ${emailCodeSentTo}. It works once for ${emailCodeMinutes ?? 10} minutes.`
+                    : `We emailed a code to your account address. It works once for ${emailCodeMinutes ?? 10} minutes.`
+                  : 'Enter the code we emailed you to delete your account.'}
+              </p>
+              <BirdoButton
+                text={emailCodeSent ? 'Send a new code' : 'Email me a code'}
+                variant="secondary"
+                fullWidth
+                isLoading={sendingCode}
+                disabled={sendingCode || deleting}
+                onClick={handleSendCode}
+              />
+              {emailCodeSent && (
+                <BirdoTextField
+                  value={emailCode}
+                  onChange={(v) => {
+                    setEmailCode(digitsOnly(v).slice(0, EMAIL_CODE_LENGTH));
+                    if (emailCodeError) setEmailCodeError(null);
+                  }}
+                  label="Emailed code"
+                  type="text"
+                  placeholder="123456"
+                  errorText={emailCodeError}
+                  disabled={deleting}
+                  autoComplete="one-time-code"
+                />
+              )}
+              {!emailCodeSent && emailCodeError && (
+                <p className="text-[12px]" style={{ color: statusTokens.red }}>
+                  {emailCodeError}
+                </p>
+              )}
+            </>
           )}
           {askingTwoFactor && (
             <TwoFactorField

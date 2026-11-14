@@ -377,6 +377,7 @@ const FRONTEND_COMMANDS = [
   'verify_2fa',
   'delete_account',
   'deletion_preflight',
+  'send_deletion_code',
   'export_user_data',
   // A command answered session_expired: Rust ends the session too (REVIEW-WIN-012)
   'end_expired_session',
