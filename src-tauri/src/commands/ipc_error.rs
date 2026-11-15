@@ -31,6 +31,12 @@ pub enum IpcErrorCode {
     ServerUnavailable,
     SessionExpired,
     Revoked,
+    /// MR-2333: the heartbeat said `evicted`: a newer connection on the
+    /// account (another device) took this session's slot. Like `revoked` the
+    /// session is over and is NEVER re-dialled automatically (that would evict
+    /// the other device back); its own code so the UI can say what happened
+    /// instead of "Connection has been revoked".
+    Evicted,
     /// The Free plan's monthly allowance is used up and the server ended the
     /// session (heartbeat `reason: "quota_exceeded"`, birdo-web #590).
     QuotaExceeded,
@@ -99,6 +105,7 @@ impl IpcErrorCode {
             self,
             IpcErrorCode::SessionExpired
                 | IpcErrorCode::Revoked
+                | IpcErrorCode::Evicted
                 | IpcErrorCode::QuotaExceeded
                 | IpcErrorCode::DeviceLimit
                 | IpcErrorCode::SubscriptionRequired
@@ -123,6 +130,7 @@ impl IpcErrorCode {
             self,
             IpcErrorCode::SessionExpired
                 | IpcErrorCode::Revoked
+                | IpcErrorCode::Evicted
                 | IpcErrorCode::QuotaExceeded
                 | IpcErrorCode::DeviceLimit
                 | IpcErrorCode::SubscriptionRequired
@@ -619,6 +627,7 @@ mod tests {
             (IpcErrorCode::ServerUnavailable, "server_unavailable"),
             (IpcErrorCode::SessionExpired, "session_expired"),
             (IpcErrorCode::Revoked, "revoked"),
+            (IpcErrorCode::Evicted, "evicted"),
             (IpcErrorCode::QuotaExceeded, "quota_exceeded"),
             (IpcErrorCode::DeviceLimit, "device_limit"),
             (IpcErrorCode::SubscriptionRequired, "subscription_required"),
@@ -889,6 +898,7 @@ mod tests {
         for code in [
             IpcErrorCode::SessionExpired,
             IpcErrorCode::Revoked,
+            IpcErrorCode::Evicted,
             IpcErrorCode::QuotaExceeded,
             IpcErrorCode::DeviceLimit,
             IpcErrorCode::SubscriptionRequired,
