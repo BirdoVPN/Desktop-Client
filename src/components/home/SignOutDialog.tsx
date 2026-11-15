@@ -12,12 +12,18 @@
  * Profile is known here at once, and the list is read again each time the
  * dialog opens (a hold filed before the app was restarted). Sign out waits for
  * that one read, so the warning cannot be skipped by a fast click.
+ *
+ * The server's sign-out is best effort (Rust's `logout` ignores a failed
+ * `/auth/logout`), so offline it may never void a hold filed here. Confirming
+ * Sign out while one is known therefore cancels it FIRST; if that cancel
+ * fails, nobody is signed out: the dialog says the deletion is still
+ * scheduled and offers Try again, or Sign out anyway.
  */
 import { useEffect, useState } from 'react';
 import { TriangleAlert } from 'lucide-react';
 import { BirdoButton, BirdoDialog } from '@/components/birdo';
 import { status, white } from '@/lib/birdo-theme';
-import { signOutWithHoldText, useHeldDeletion } from '@/lib/held-deletion';
+import { signOutCancelFailedText, signOutWithHoldText, useHeldDeletion } from '@/lib/held-deletion';
 import { cancelErrorText, cancelHeldDeletion, refreshHeldDeletion } from '@/session/held-deletion';
 import { signOut } from '@/session/session';
 
@@ -64,6 +70,8 @@ function SignOutConfirm({
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [cancelled, setCancelled] = useState(false);
+  // Sign out tried to cancel a hold filed here first, and that failed.
+  const [signOutBlocked, setSignOutBlocked] = useState<{ reason: string; applyAfter: string } | null>(null);
   useEffect(() => {
     let current = true;
     void refreshHeldDeletion().finally(() => {
@@ -88,6 +96,34 @@ function SignOutConfirm({
     }
   };
 
+  const signOutNow = async () => {
+    setBusy(true);
+    try {
+      await signOut();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Sign out. A hold this session filed is cancelled first: the server's
+  // sign-out may never arrive, and the user was told signing out cancels it.
+  const confirmSignOut = async () => {
+    if (busy) return;
+    setSignOutBlocked(null);
+    if (hold?.filedHere) {
+      setBusy(true);
+      try {
+        await cancelHeldDeletion(hold.id);
+      } catch (e: unknown) {
+        setSignOutBlocked({ reason: cancelErrorText(e), applyAfter: hold.applyAfter });
+        return;
+      } finally {
+        setBusy(false);
+      }
+    }
+    await signOutNow();
+  };
+
   return (
     <>
       <p className="text-[13px]" style={{ color: white.w60 }}>
@@ -109,7 +145,7 @@ function SignOutConfirm({
           The deletion is cancelled. Your account stays as it is.
         </p>
       )}
-      {hold && (
+      {hold && !signOutBlocked && (
         <BirdoButton
           text="Cancel deletion"
           variant="secondary"
@@ -125,6 +161,30 @@ function SignOutConfirm({
           {cancelError}
         </p>
       )}
+      {signOutBlocked && (
+        <>
+          <p role="alert" className="text-[12px]" style={{ color: status.red }}>
+            {signOutCancelFailedText(signOutBlocked.reason, signOutBlocked)}
+          </p>
+          <div className="flex gap-2.5">
+            <BirdoButton
+              text="Retry"
+              variant="secondary"
+              fullWidth
+              isLoading={busy}
+              disabled={busy}
+              onClick={() => void confirmSignOut()}
+            />
+            <BirdoButton
+              text="Sign out anyway"
+              variant="danger"
+              fullWidth
+              disabled={busy}
+              onClick={() => void signOutNow()}
+            />
+          </div>
+        </>
+      )}
       <div className="flex gap-2.5">
         <BirdoButton
           text={hold ? 'Stay signed in' : 'Cancel'}
@@ -133,21 +193,16 @@ function SignOutConfirm({
           disabled={busy}
           onClick={onClose}
         />
-        <BirdoButton
-          text="Sign out"
-          variant="danger"
-          fullWidth
-          isLoading={busy}
-          disabled={(checking && !hold) || cancelling}
-          onClick={async () => {
-            setBusy(true);
-            try {
-              await signOut();
-            } finally {
-              setBusy(false);
-            }
-          }}
-        />
+        {!signOutBlocked && (
+          <BirdoButton
+            text="Sign out"
+            variant="danger"
+            fullWidth
+            isLoading={busy}
+            disabled={(checking && !hold) || cancelling}
+            onClick={() => void confirmSignOut()}
+          />
+        )}
       </div>
     </>
   );

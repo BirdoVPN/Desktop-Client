@@ -459,7 +459,9 @@ describe('the Home sign-out dialog (SignOutDialog, opened from the Connect scree
     render(<SignOutDialog open stillConnected onClose={() => {}} />);
     // No waiting on the read: the warning is in the first paint.
     expect(screen.getByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_HERE);
-    expect(SIGN_OUT_FILED_HERE).toMatch(/Signing out cancels that deletion/);
+    expect(SIGN_OUT_FILED_HERE).toMatch(/Signing out of this app cancels that deletion/);
+    // M1: nothing absolute; the server's sign-out is best effort.
+    expect(SIGN_OUT_FILED_HERE).not.toMatch(/will NOT be deleted/);
     expect(screen.getByRole('button', { name: 'Cancel deletion' })).toBeInTheDocument();
     await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
     expect(screen.getByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_HERE);
@@ -502,6 +504,59 @@ describe('the Home sign-out dialog (SignOutDialog, opened from the Connect scree
     expect(screen.getByText('Are you sure you want to sign out?')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
     expect(signOut).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('signing out with a hold filed here: the app cancels it first (M1)', () => {
+  const listed = [{ id: HOLD_ID, action: 'account_delete', applyAfter: APPLY_AFTER }];
+
+  /** A hold this session filed, still listed under the same id. */
+  async function openWithHoldFiledHere() {
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true });
+    listResult = () => Promise.resolve(listed);
+    render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
+    expect(getHeldDeletion()?.filedHere).toBe(true);
+  }
+
+  it('confirming cancels the deletion by its id BEFORE signing out', async () => {
+    await openWithHoldFiledHere();
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await waitFor(() => expect(signOut).toHaveBeenCalledTimes(1));
+    expect(calls('cancel_pending_change')).toEqual([['cancel_pending_change', { id: HOLD_ID }]]);
+    const cancelAt = mockedInvoke.mock.invocationCallOrder[
+      mockedInvoke.mock.calls.findIndex(([c]) => c === 'cancel_pending_change')
+    ];
+    expect(cancelAt).toBeLessThan(vi.mocked(signOut).mock.invocationCallOrder[0]);
+  });
+
+  it('a cancel that fails signs nobody out: the deletion is still scheduled; Retry cancels, then signs out', async () => {
+    const answers = [
+      () => Promise.reject(refusal('network_offline')),
+      () => Promise.resolve({ cancelled: true, alreadyGone: false }),
+    ];
+    cancelResult = () => answers.shift()!();
+    await openWithHoldFiledHere();
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    const failure = await screen.findByText(/The deletion is still scheduled/);
+    expect(failure).toHaveTextContent(`still scheduled on ${holdTimeText(APPLY_AFTER)}`);
+    expect(failure).toHaveTextContent('Retry, or sign out anyway: the deletion may then still go ahead.');
+    expect(signOut).not.toHaveBeenCalled();
+    expect(getHeldDeletion()).toEqual({ id: HOLD_ID, applyAfter: APPLY_AFTER, filedHere: true });
+    expect(screen.queryByRole('button', { name: 'Sign out' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(signOut).toHaveBeenCalledTimes(1));
+    expect(calls('cancel_pending_change')).toHaveLength(2);
+  });
+
+  it('Sign out anyway signs out without cancelling again, leaving the deletion as it is', async () => {
+    cancelResult = () => Promise.reject(refusal('network_offline'));
+    await openWithHoldFiledHere();
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await screen.findByText(/The deletion is still scheduled/);
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out anyway' }));
+    await waitFor(() => expect(signOut).toHaveBeenCalledTimes(1));
+    expect(calls('cancel_pending_change')).toHaveLength(1);
   });
 });
 

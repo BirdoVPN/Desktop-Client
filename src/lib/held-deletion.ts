@@ -147,20 +147,29 @@ export function signOutHoldNote(hold: Pick<HeldDeletion, 'filedHere'>): string {
  * The sign-out confirmations (Profile and Home) while a hold is known. The
  * server voids a hold when the app session that filed it signs out (or on a
  * sign-out everywhere); a hold filed on the website or by another device
- * stays, whatever this app does.
+ * stays, whatever this app does. Nothing absolute ("will NOT be deleted"):
+ * the server's sign-out is best effort, so for a hold filed here the app
+ * cancels it itself before signing out, and says so if that fails.
  */
 export function signOutWithHoldText(hold: HeldDeletion): string {
   const waiting = `Your account is waiting to be deleted ${holdWhen(hold.applyAfter)}.`;
   return hold.filedHere
-    ? `${waiting} Signing out cancels that deletion, so your account will NOT be deleted. ` +
-        'To delete it, stay signed in until then.'
+    ? `${waiting} Signing out of this app cancels that deletion. To delete it, stay signed in until then.`
     : `${waiting} ${SIGN_OUT_KEEPS_HOLD} To keep your account, cancel the deletion.`;
+}
+
+/** Signing out cancels a hold filed here first; that cancel failed. */
+export function signOutCancelFailedText(reason: string, hold: Pick<HeldDeletion, 'applyAfter'>): string {
+  return (
+    `${reason} The deletion is still scheduled ${holdWhen(hold.applyAfter)}. Retry, or sign out ` +
+    'anyway: the deletion may then still go ahead.'
+  );
 }
 
 /** The number-replacement dialog while a hold is known. */
 export function rotationWithHoldText(applyAfter: string): string {
   return (
     `Your account is waiting to be deleted ${holdWhen(applyAfter)}. Replacing the account number ` +
-    'cancels that deletion, so your account will NOT be deleted.'
+    'cancels that deletion.'
   );
 }
