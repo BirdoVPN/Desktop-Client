@@ -68,6 +68,8 @@ export const SETTINGS_UNVERIFIED_COPY =
 
 export const ACCOUNT_RESTRICTED_COPY =
   'New connections on this account are paused for now. If this is a mistake, ask for a review.';
+export const EMAIL_NOT_VERIFIED_COPY =
+  'Please verify your email address first. Open birdo.app/verify-email to get a new link.';
 export const REGISTRATION_NOT_ALLOWED_COPY =
   "BirdoVPN can't create new accounts from your country right now.";
 
@@ -121,6 +123,32 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
     message: 'That verification code is invalid or has expired. Please try again.',
     action: null,
   },
+  // MR-179 (owner 2026-11-13): the deletion step-up. Same words as the server's
+  // own refusals (birdo-web deletion-step-up.ts), minus the "update the app"
+  // hint an app that cannot ask would need.
+  account_number_required: {
+    message: 'Enter your 24-digit account number to delete your account.',
+    action: null,
+  },
+  account_number_invalid: {
+    message: 'That account number is not the number of this account.',
+    action: null,
+  },
+  email_code_required: {
+    message: 'Enter the code we emailed you to delete your account.',
+    action: null,
+  },
+  // An Apple account with no e-mail address re-signs in with Apple, which only
+  // the iOS app can do; the website refuses it too, so say where to go.
+  apple_reauth_required: {
+    message:
+      'This account signs in with Apple. To delete it, open the BirdoVPN app on your iPhone or iPad and delete it there.',
+    action: null,
+  },
+  email_code_invalid: {
+    message: 'That code is not valid or has expired. Request a new code.',
+    action: null,
+  },
   // Kept apart from every connectivity message on purpose: a pin failure can
   // mean the connection is being intercepted, and "check your internet" would
   // tell the user to keep trying on exactly that network.
@@ -162,6 +190,7 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   // these are the fallbacks for an answer that carried none.
   account_restricted: { message: ACCOUNT_RESTRICTED_COPY, action: null },
   registration_not_allowed: { message: REGISTRATION_NOT_ALLOWED_COPY, action: null },
+  email_not_verified: { message: EMAIL_NOT_VERIFIED_COPY, action: null },
   unknown: { message: 'Something went wrong. Please try again.', action: 'retry' },
 };
 

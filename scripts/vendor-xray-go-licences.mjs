@@ -166,15 +166,25 @@ if (!/Copyright .* The Go Authors/.test(goLicense.toString('utf8'))) die(`the ${
 const releases = JSON.parse((await download('https://go.dev/dl/?mode=json&include=all')).toString('utf8'));
 const srcFile = (releases.find((r) => r.version === goVersion)?.files || []).find((f) => f.kind === 'source');
 if (!srcFile || !/^[0-9a-f]{64}$/.test(srcFile.sha256 || '')) die(`go.dev/dl lists no source archive for ${goVersion}`);
+// What reaches the table file is not copied from that network JSON (CodeQL
+// js/http-to-file-access, MR-2132): the file name is built from the Go version
+// read out of the binaries, and the digest is the one this run computes from
+// the archive itself, which must equal the one go.dev publishes.
+const srcArchive = `${goVersion}.src.tar.gz`;
+if (srcFile.filename !== srcArchive) die(`go.dev/dl lists '${srcFile.filename}' as the source archive, expected '${srcArchive}'`);
+const srcSha256 = createHash('sha256')
+  .update(await download(`https://go.dev/dl/${srcArchive}`))
+  .digest('hex');
+if (srcSha256 !== srcFile.sha256) die(`${srcArchive}: downloaded SHA-256 ${srcSha256} is not the ${srcFile.sha256} go.dev publishes`);
 const toolchain = {
   version: goVersion,
   license: 'BSD-3-Clause',
   source: 'https://go.googlesource.com/go',
   texts: vendor('go', goVersion, { LICENSE: goLicense }),
-  srcArchive: srcFile.filename,
-  srcSha256: srcFile.sha256,
+  srcArchive,
+  srcSha256,
 };
-console.log(`Go toolchain ${goVersion}: LICENSE; ${srcFile.filename} ${srcFile.sha256}`);
+console.log(`Go toolchain ${goVersion}: LICENSE; ${srcArchive} ${srcSha256}`);
 
 const sorted = Object.fromEntries(Object.entries(modules).sort(([a], [b]) => (a < b ? -1 : 1)));
 fs.writeFileSync(tablePath, `${JSON.stringify({ _comment: table._comment, toolchain, modules: sorted }, null, 2)}\n`);

@@ -11,6 +11,13 @@ pub mod auth {
     /// fresh 24-digit ID and returns tokens (signed in immediately). Requires the
     /// X-Desktop-Client header (sent on all POSTs).
     pub const REGISTER_ANONYMOUS: &str = "/auth/register/anonymous";
+    /// Two-phase replacement of an anonymous account number (MR-1707): prepare
+    /// holds a new number pending, confirm swaps it in. Both answer 403
+    /// `anon_number_rotation_disabled` while the server's switch is off.
+    pub const ROTATE_NUMBER_PREPARE: &str = "/auth/anonymous/rotate-number/prepare";
+    pub const ROTATE_NUMBER_CONFIRM: &str = "/auth/anonymous/rotate-number/confirm";
+    /// Sign-up proof-of-work challenge (`{ "op": "signup" }`); see `api::pow`.
+    pub const POW_CHALLENGE: &str = "/auth/pow/challenge";
     /// Native SSO handoff exchange: swap the web broker's single-use PKCE-bound
     /// code (delivered to our loopback redirect) for real tokens.
     pub const NATIVE_EXCHANGE: &str = "/auth/native/exchange";
@@ -34,6 +41,9 @@ pub mod auth {
     /// `@Get('delete/preflight')` on the same controller). Read by the
     /// deletion dialog before the user confirms.
     pub const GDPR_DELETE_PREFLIGHT: &str = "/api/v1/gdpr/delete/preflight";
+    /// MR-179: e-mail the one-time deletion code to an SSO account, `POST`
+    /// (`@Post('delete/code')` on the same controller). No body.
+    pub const GDPR_DELETE_CODE: &str = "/api/v1/gdpr/delete/code";
 }
 
 /// User endpoints — FIX C-3: route through /auth/me instead of phantom /users/subscription

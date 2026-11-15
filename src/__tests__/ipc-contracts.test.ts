@@ -367,12 +367,17 @@ const FRONTEND_COMMANDS = [
   'login',
   'login_anonymous',
   'register_anonymous',
+  // MR-1707: the two-phase replacement of an anonymous account number
+  'rotate_anonymous_number_prepare',
+  'rotate_anonymous_number_confirm',
+  'cancel_signup_proof',
   'native_oauth_login',
   'logout',
   'get_auth_state',
   'verify_2fa',
   'delete_account',
   'deletion_preflight',
+  'send_deletion_code',
   'export_user_data',
   // A command answered session_expired: Rust ends the session too (REVIEW-WIN-012)
   'end_expired_session',
@@ -411,6 +416,9 @@ const FRONTEND_COMMANDS = [
   'get_required_update',
   // The session an update ended, resumed once (MR-1861)
   'take_update_resume',
+  // A-M50: the Linux new-version notice (GitHub Releases), and its release-page opener
+  'check_linux_release',
+  'open_linux_release_page',
   // Settings › About › Licences: the bundled third-party notices (MR-1685)
   'get_third_party_notices',
   // Account data

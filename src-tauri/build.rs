@@ -25,12 +25,16 @@ const APP_COMMANDS: &[&str] = &[
     "login",
     "login_anonymous",
     "register_anonymous",
+    "rotate_anonymous_number_prepare",
+    "rotate_anonymous_number_confirm",
+    "cancel_signup_proof",
     "native_oauth_login",
     "logout",
     "get_auth_state",
     "verify_2fa",
     "delete_account",
     "deletion_preflight",
+    "send_deletion_code",
     "export_user_data",
     "end_expired_session",
     // VPN operations
@@ -63,6 +67,9 @@ const APP_COMMANDS: &[&str] = &[
     "install_update",
     "get_required_update",
     "take_update_resume",
+    // A-M50: Linux new-version notice
+    "check_linux_release",
+    "open_linux_release_page",
     // Settings › About › Licences
     "get_third_party_notices",
     // Extended VPN info

@@ -243,7 +243,7 @@ describe('Profile', () => {
         email: 'me@example.com',
         plan: 'SOVEREIGN',
         status: 'active',
-        expiresAt: '2026-11-03',
+        expiresAt: '2099-11-03',
         maxDevices: 10,
         bandwidthLimit: 0,
       },
@@ -251,12 +251,27 @@ describe('Profile', () => {
     render(<Profile />);
     expect(screen.getByText('Protected')).toBeInTheDocument();
     expect(screen.getByText('Connected · Frankfurt #1')).toBeInTheDocument();
-    expect(screen.getByText('Renews Nov 3, 2026')).toBeInTheDocument();
+    expect(screen.getByText('Renews Nov 3, 2099')).toBeInTheDocument();
     for (const chip of ['10 devices', 'Unlimited data', 'Premium servers']) {
       expect(screen.getByText(chip)).toBeInTheDocument();
     }
     expect(screen.getByText('Manage Subscription')).toBeInTheDocument();
     expect(screen.getByText('Delete Account')).toBeInTheDocument();
+  });
+
+  // MR-2260: a free account's period end is a monthly metering window, not a
+  // renewal, and a past date is never a renewal either.
+  it.each([
+    ['RECON', 'active', '2099-01-01T00:00:00.000Z'],
+    ['RECON', 'active', '2026-08-01T00:00:00.000Z'],
+    ['OPERATIVE', 'active', '2026-08-01T00:00:00.000Z'],
+  ])('shows no renewal line for %s/%s with expiresAt %s', (plan, status, expiresAt) => {
+    useAppStore.setState({
+      planStatus: 'ready',
+      account: { ...useAppStore.getState().account, plan, status: status as 'active', expiresAt, maxDevices: 1, bandwidthLimit: 0 },
+    });
+    render(<Profile />);
+    expect(document.body.textContent).not.toMatch(/Renews|Access until/);
   });
 
   // Owner 2026-10-21: the free plan read "53687091200 GB / month". `/auth/me`

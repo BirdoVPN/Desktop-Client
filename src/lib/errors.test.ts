@@ -18,6 +18,7 @@ import {
   PQ_FAILED_COPY,
   QUOTA_EXCEEDED_COPY,
   REGISTRATION_NOT_ALLOWED_COPY,
+  EMAIL_NOT_VERIFIED_COPY,
   quotaGraceMessage,
   REVOKED_COPY,
   SESSION_EXPIRED_COPY,
@@ -49,6 +50,11 @@ const ALL: IpcErrorCode[] = [
   'invalid_credentials',
   'two_factor_required',
   'two_factor_invalid',
+  'account_number_required',
+  'account_number_invalid',
+  'email_code_required',
+  'email_code_invalid',
+  'apple_reauth_required',
   'cert_pin_failed',
   'stealth_failed',
   'pq_failed',
@@ -60,6 +66,7 @@ const ALL: IpcErrorCode[] = [
   'settings_unverified',
   'client_attestation_required',
   'consent_required',
+  'email_not_verified',
   'unknown',
 ];
 
@@ -110,6 +117,14 @@ describe('account_restricted and registration_not_allowed', () => {
     expect(errorCopy(err('registration_not_allowed', { message: '' })).message).toBe(REGISTRATION_NOT_ALLOWED_COPY);
     // Other 403s are unchanged.
     expect(errorCopy(err('subscription_required'), 'general').message).toMatch(/Upgrade to unlock/);
+  });
+});
+
+describe('email_not_verified (MR-2210)', () => {
+  it('shows the verify-your-email copy, never the upgrade copy', () => {
+    const copy = errorCopy(err('email_not_verified', { message: 'RAW RUST TEXT' }), 'sign_in');
+    expect(copy).toEqual({ message: EMAIL_NOT_VERIFIED_COPY, action: null });
+    expect(copy.message).not.toMatch(/upgrade/i);
   });
 });
 

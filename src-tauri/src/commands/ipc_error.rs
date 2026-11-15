@@ -14,6 +14,7 @@
 
 use serde::Serialize;
 
+use crate::api::error::StepUpKind;
 use crate::api::ApiError;
 
 /// Stable, snake_case error codes. Extend only by ADDING codes: the UI keys
@@ -40,6 +41,17 @@ pub enum IpcErrorCode {
     InvalidCredentials,
     TwoFactorRequired,
     TwoFactorInvalid,
+    /// MR-179: the deletion step-up (owner 2026-11-13). The dialog asks for the
+    /// anonymous account's 24-digit number / the e-mailed code, or says the one
+    /// typed was wrong. Not hard refusals: the next attempt, with the proof,
+    /// can succeed.
+    AccountNumberRequired,
+    AccountNumberInvalid,
+    EmailCodeRequired,
+    EmailCodeInvalid,
+    /// An Apple account with no e-mail address must re-sign in with Apple,
+    /// which only the iOS app does. Not retryable here.
+    AppleReauthRequired,
     CertPinFailed,
     StealthFailed,
     PqFailed,
@@ -72,6 +84,9 @@ pub enum IpcErrorCode {
     /// (403 `details.code: "registration_country_not_allowed"`). The UI shows
     /// the server's sentence; "upgrade your plan" and "try again" cannot help.
     RegistrationNotAllowed,
+    /// Sign-in refused because the e-mail address was never verified (403
+    /// `details.code: "email_not_verified"`, MR-2210). Retrying cannot help.
+    EmailNotVerified,
     Unknown,
 }
 
@@ -95,6 +110,8 @@ impl IpcErrorCode {
                 | IpcErrorCode::ConsentRequired
                 | IpcErrorCode::AccountRestricted
                 | IpcErrorCode::RegistrationNotAllowed
+                | IpcErrorCode::AppleReauthRequired
+                | IpcErrorCode::EmailNotVerified
         )
     }
 
@@ -324,9 +341,16 @@ impl IpcError {
                 IpcErrorCode::RegistrationNotAllowed,
                 "BirdoVPN cannot create new accounts from your country right now.",
             ),
+            ApiError::EmailNotVerified => Self::new(
+                IpcErrorCode::EmailNotVerified,
+                "Please verify your email address first. Open birdo.app/verify-email to get a new link.",
+            ),
             ApiError::CertificatePinningFailed(_) => {
                 Self::new(IpcErrorCode::CertPinFailed, error.to_string())
             }
+            // A sign-up proof of work the server refused twice: its sentence
+            // ("The security check expired. Please try again.") is the advice.
+            ApiError::PowRefused { message, .. } => Self::new(IpcErrorCode::ServerError, message),
             ApiError::Rejected { status, message } => Self::from_rejection(*status, message),
             ApiError::TwoFactorRequired(message) => {
                 Self::new(IpcErrorCode::TwoFactorRequired, message)
@@ -334,6 +358,16 @@ impl IpcError {
             ApiError::TwoFactorInvalid(message) => {
                 Self::new(IpcErrorCode::TwoFactorInvalid, message)
             }
+            ApiError::StepUp { kind, message } => Self::new(
+                match kind {
+                    StepUpKind::AccountNumberRequired => IpcErrorCode::AccountNumberRequired,
+                    StepUpKind::AccountNumberInvalid => IpcErrorCode::AccountNumberInvalid,
+                    StepUpKind::EmailCodeRequired => IpcErrorCode::EmailCodeRequired,
+                    StepUpKind::EmailCodeInvalid => IpcErrorCode::EmailCodeInvalid,
+                    StepUpKind::AppleReauth => IpcErrorCode::AppleReauthRequired,
+                },
+                message,
+            ),
             // Retryable by nature: the check is down, the account was not refused.
             ApiError::QuotaCheckUnavailable { retry_after_secs } => Self::transient(
                 "BirdoVPN couldn't check your plan's data allowance just now. Please try again \
@@ -359,6 +393,12 @@ impl IpcError {
                 "BirdoVPN couldn't assign your connection an address on this server just now. \
                  Please try again in a moment.",
                 *retry_after_secs,
+            ),
+            // MR-1707: the number-replacement commands read the code
+            // themselves; this is only the generic fallback.
+            ApiError::AnonNumberRefused(_) => Self::new(
+                IpcErrorCode::ServerError,
+                "The account number could not be replaced right now.",
             ),
             ApiError::Unknown(message) => Self::unknown(message),
         }
@@ -587,6 +627,14 @@ mod tests {
             (IpcErrorCode::InvalidCredentials, "invalid_credentials"),
             (IpcErrorCode::TwoFactorRequired, "two_factor_required"),
             (IpcErrorCode::TwoFactorInvalid, "two_factor_invalid"),
+            (
+                IpcErrorCode::AccountNumberRequired,
+                "account_number_required",
+            ),
+            (IpcErrorCode::AccountNumberInvalid, "account_number_invalid"),
+            (IpcErrorCode::EmailCodeRequired, "email_code_required"),
+            (IpcErrorCode::EmailCodeInvalid, "email_code_invalid"),
+            (IpcErrorCode::AppleReauthRequired, "apple_reauth_required"),
             (IpcErrorCode::CertPinFailed, "cert_pin_failed"),
             (IpcErrorCode::StealthFailed, "stealth_failed"),
             (IpcErrorCode::PqFailed, "pq_failed"),
@@ -606,6 +654,7 @@ mod tests {
                 IpcErrorCode::RegistrationNotAllowed,
                 "registration_not_allowed",
             ),
+            (IpcErrorCode::EmailNotVerified, "email_not_verified"),
             (IpcErrorCode::Unknown, "unknown"),
         ];
         for (code, wire) in pairs {
@@ -681,6 +730,41 @@ mod tests {
             (
                 ApiError::TwoFactorInvalid("x".into()),
                 IpcErrorCode::TwoFactorInvalid,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::AccountNumberRequired,
+                    message: "x".into(),
+                },
+                IpcErrorCode::AccountNumberRequired,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::AccountNumberInvalid,
+                    message: "x".into(),
+                },
+                IpcErrorCode::AccountNumberInvalid,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::EmailCodeRequired,
+                    message: "x".into(),
+                },
+                IpcErrorCode::EmailCodeRequired,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::EmailCodeInvalid,
+                    message: "x".into(),
+                },
+                IpcErrorCode::EmailCodeInvalid,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::AppleReauth,
+                    message: "x".into(),
+                },
+                IpcErrorCode::AppleReauthRequired,
             ),
             (
                 ApiError::QuotaCheckUnavailable {

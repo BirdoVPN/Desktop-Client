@@ -330,19 +330,12 @@ pub async fn install_update(app: AppHandle) -> Result<bool, UpdateFailure> {
     // guard resets the flag on every return; a successful Windows install
     // exits the process before it would, which is correct.
     static INSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if INSTALLING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    let Some(_install_guard) = InstallGuard::take(&INSTALLING) else {
         return Err(UpdateFailure::before_install(
             "install_failed",
             "An update install is already in progress".to_string(),
         ));
-    }
-    struct InstallGuard;
-    impl Drop for InstallGuard {
-        fn drop(&mut self) {
-            INSTALLING.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-    let _install_guard = InstallGuard;
+    };
 
     let tunnel_connected = app
         .state::<crate::vpn::VpnManager>()
@@ -428,26 +421,36 @@ pub async fn install_update(app: AppHandle) -> Result<bool, UpdateFailure> {
     // actually going ahead (the installer folder is ready), so an earlier
     // failure never leaves a stale record behind. Windows exits inside
     // `install` below; the new version resumes at its first start.
-    if let Some(target) = &resume {
-        crate::commands::update_resume::record(target);
-    }
-    end_session(&app, EndReason::Update).await;
-
-    let installed = {
-        // L1: redirect TMP/TEMP to the admin-only folder for the duration of
-        // `install` ONLY — not the teardown above or any child it spawned —
-        // and restore them deterministically when it returns. On Windows a
-        // successful `install` exits the process from inside, so the restore
-        // runs only on the failure path (and the single-flight guard above
-        // keeps a second call from restoring them mid-install).
-        #[cfg(windows)]
-        let _env = AdminOnlyTemp::to(&updates_dir);
-        // MR-2013: on Windows `install` exits the process from inside, past
-        // `RunEvent::Exit`: a copied account number still owed its clear
-        // would stay on the clipboard.
-        crate::commands::clipboard::clear_on_exit();
-        update.install(bundle)
-    };
+    let installed = end_session_then_install(
+        || {
+            if let Some(target) = &resume {
+                crate::commands::update_resume::record(target);
+            }
+        },
+        || end_session(&app, EndReason::Update),
+        || {
+            // L1: redirect TMP/TEMP to the admin-only folder for the duration of
+            // `install` ONLY — not the teardown above or any child it spawned —
+            // and restore them deterministically when it returns. On Windows a
+            // successful `install` exits the process from inside, so the restore
+            // runs only on the failure path (and the single-flight guard above
+            // keeps a second call from restoring them mid-install).
+            //
+            // MR-2013: on Windows `install` exits the process from inside, past
+            // `RunEvent::Exit`: a copied account number still owed its clear
+            // would stay on the clipboard.
+            #[cfg(windows)]
+            {
+                let env = AdminOnlyTemp::to(&updates_dir);
+                crate::commands::clipboard::clear_on_exit();
+                env
+            }
+            #[cfg(not(windows))]
+            crate::commands::clipboard::clear_on_exit()
+        },
+        || update.install(bundle),
+    )
+    .await;
     if let Err(e) = installed {
         tracing::warn!("Update install failed: {e}");
         // Still this version, still running: nothing for a next start to resume.
@@ -456,6 +459,49 @@ pub async fn install_update(app: AppHandle) -> Result<bool, UpdateFailure> {
     }
 
     Ok(true)
+}
+
+/// L4: the single-flight claim on an install. Taken from `flag`; dropping it
+/// gives the flag back on every return. Apart from `install_update` so a test
+/// can drive it on a flag of its own.
+struct InstallGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> InstallGuard<'a> {
+    /// `None` when an install already holds `flag`.
+    fn take(flag: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
+        if flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            None
+        } else {
+            Some(Self(flag))
+        }
+    }
+}
+
+impl Drop for InstallGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// W1-004 / MR-1861 / L1: what `install_update` does once the bundle is
+/// downloaded and verified, in its order, apart from the updater so a test
+/// can drive it with fakes: `record` the session to resume, `end` the session
+/// (the Windows install exits the process, so it must already be over), then
+/// `prepare` the install (the TMP/TEMP redirect and the clipboard clear; what
+/// it returns lives until `install` has returned), then `install`.
+async fn end_session_then_install<G, T, E, F>(
+    record: impl FnOnce(),
+    end: impl FnOnce() -> F,
+    prepare: impl FnOnce() -> G,
+    install: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E>
+where
+    F: std::future::Future<Output = ()>,
+{
+    record();
+    end().await;
+    let _prepared = prepare();
+    install()
 }
 
 /// MR-1722: this process's temporary directory, pointed at a fresh
@@ -514,55 +560,154 @@ impl Drop for AdminOnlyTemp {
 
 #[cfg(test)]
 mod tests {
-    /// W1-004: the session ends between the verified download and the install
-    /// (which exits the process on Windows); never a combined
-    /// download-and-install that skips it.
+    /// W1-004 / MR-1861 / L1 (MA-DESK-013): after the verified download, the
+    /// session to resume is recorded, the session is ended, the install is
+    /// prepared (TMP/TEMP redirect, clipboard clear) and only then installed,
+    /// and what the preparation holds is released after the install returns,
+    /// on its failure path too. Driven with fakes through the function
+    /// `install_update` calls; breaking the order or the scope fails it.
     #[test]
-    fn the_session_ends_between_download_and_install() {
+    fn the_session_ends_before_the_install_and_the_redirect_outlasts_it() {
+        use std::sync::{Arc, Mutex};
+
+        struct Restores(Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Restores {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("restore");
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let step = |name: &'static str| {
+            let log = Arc::clone(&log);
+            move || log.lock().unwrap().push(name)
+        };
+        let ended = {
+            let log = Arc::clone(&log);
+            move || async move {
+                // The session's end takes real time: nothing after it may
+                // start before it finishes.
+                tokio::task::yield_now().await;
+                log.lock().unwrap().push("end");
+            }
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        // A failed install: the error comes back, and the redirect is put
+        // back after the install attempt, not before it.
+        let installed: Result<(), &str> = runtime.block_on(super::end_session_then_install(
+            step("record"),
+            ended.clone(),
+            {
+                let log = Arc::clone(&log);
+                move || {
+                    log.lock().unwrap().push("prepare");
+                    Restores(log)
+                }
+            },
+            {
+                let install = step("install");
+                move || {
+                    install();
+                    Err("the installer is held")
+                }
+            },
+        ));
+        assert_eq!(installed, Err("the installer is held"));
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["record", "end", "prepare", "install", "restore"]
+        );
+
+        // A successful one returns what the install returned.
+        log.lock().unwrap().clear();
+        let installed: Result<u8, &str> = runtime.block_on(super::end_session_then_install(
+            step("record"),
+            ended,
+            step("prepare"),
+            || Ok(7),
+        ));
+        assert_eq!(installed, Ok(7));
+        assert_eq!(*log.lock().unwrap(), ["record", "end", "prepare"]);
+    }
+
+    /// W1-004 / MR-1722 / L6: what the behavioural test above cannot see is
+    /// which calls `install_update` hands that function, and what comes before
+    /// it: the download, then the admin-only installer folder, before the
+    /// session is recorded or ended; never a combined download-and-install.
+    #[test]
+    fn install_update_wires_the_real_steps_after_the_download_and_the_folder() {
         let source = include_str!("updater.rs");
         let body = &source[source.find("pub async fn install_update(").unwrap()..];
         let body = &body[..body.find("\n}").unwrap()];
         let download = body.find(".download(").expect("download");
-        let record = body
-            .find("update_resume::record(target)")
-            .expect("record the session");
-        let teardown = body
-            .find("end_session(&app, EndReason::Update)")
-            .expect("teardown");
-        let install = body.find("update.install(bundle)").expect("install");
-        assert!(download < teardown && teardown < install);
-        // MR-1722: the admin-only installer folder is made before the
-        // teardown; L6: the resume record is written only after it is ready.
         let folder = body
             .find("protected_dir::fresh_updates_dir()")
             .expect("fresh_updates_dir");
-        assert!(download < folder && folder < record && record < teardown);
-        // L1: TMP/TEMP are redirected ONLY around `install`, inside the block
-        // that holds the guard, after the teardown.
-        let env = body
-            .find("let _env = AdminOnlyTemp::to(&updates_dir);")
-            .expect("the env redirect scoped to install");
-        assert!(teardown < env && env < install);
+        let sequence = body
+            .find("end_session_then_install(")
+            .expect("the install sequence");
+        assert!(download < folder && folder < sequence);
+        let sequence = &body[sequence..];
+        for wired in [
+            "update_resume::record(target)",
+            "end_session(&app, EndReason::Update)",
+            "AdminOnlyTemp::to(&updates_dir)",
+            "clipboard::clear_on_exit()",
+            "update.install(bundle)",
+        ] {
+            assert!(sequence.contains(wired), "`{wired}` is not in the sequence");
+        }
         assert!(!body.contains(&["download", "_and_install"].concat()));
     }
 
-    /// L4: a second concurrent `install_update` is refused rather than racing
-    /// `fresh_updates_dir` / the TMP redirect of the first.
+    /// L4 (MA-DESK-013): a second concurrent install is refused while the
+    /// first holds the flag, whatever way the first returns frees it, and
+    /// the claim is not shared between flags.
     #[test]
     fn install_update_is_single_flight() {
+        use super::InstallGuard;
+        use std::sync::atomic::AtomicBool;
+
+        let flag = AtomicBool::new(false);
+        let first = InstallGuard::take(&flag).expect("the first install");
+        assert!(
+            InstallGuard::take(&flag).is_none(),
+            "a second install ran beside the first"
+        );
+        // The refused call must not free the first one's claim.
+        assert!(InstallGuard::take(&flag).is_none());
+        drop(first);
+        let again = InstallGuard::take(&flag);
+        assert!(again.is_some(), "the claim outlived its install");
+        drop(again);
+
+        // An early return (`?`, an error arm) drops the guard.
+        let attempt = |flag: &AtomicBool| -> Result<(), ()> {
+            let _guard = InstallGuard::take(flag).ok_or(())?;
+            Err(())
+        };
+        assert!(attempt(&flag).is_err());
+        assert!(InstallGuard::take(&flag).is_some());
+    }
+
+    /// L4: the flag is taken before the installer folder is made, which would
+    /// delete the first install's installer.
+    #[test]
+    fn the_single_flight_claim_comes_before_the_installer_folder() {
         let source = include_str!("updater.rs");
         let body = &source[source.find("pub async fn install_update(").unwrap()..];
         let body = &body[..body.find("\n}").unwrap()];
-        let swap = body
-            .find("INSTALLING.swap(true,")
-            .expect("the single-flight flag");
+        let claim = body
+            .find("InstallGuard::take(&INSTALLING)")
+            .expect("the single-flight claim");
         let folder = body.find("fresh_updates_dir()").expect("fresh_updates_dir");
         assert!(
-            swap < folder,
+            claim < folder,
             "the flag is taken before the installer folder"
         );
-        assert!(body.contains("struct InstallGuard"));
-        assert!(body.contains("INSTALLING.store(false,"));
     }
 
     /// MR-1722: what the plugin calls to place the installer

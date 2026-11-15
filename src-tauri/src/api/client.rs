@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
 use super::endpoints;
-use super::error::ApiError;
+use super::error::{ApiError, StepUpKind};
 use super::types::*;
 
 // H-1: erased_serde is used for the generic retry interceptor
@@ -95,6 +95,19 @@ pub(crate) enum GdprDeleteOutcome {
     SessionExpired,
     /// Anything else, carrying the error to show (the password check's 401
     /// message included).
+    Refused(ApiError),
+}
+
+/// What one proof-checked POST response means (MR-1707, the number
+/// replacement; see `BirdoApi::classify_proof_post_response_after`).
+#[derive(Debug)]
+pub(crate) enum ProofPostOutcome {
+    /// 2xx, with the body text.
+    Done(String),
+    /// A 401 from the JWT guard (bare "Unauthorized" or no message, and no
+    /// proof code): refresh the access token and send once more.
+    SessionExpired,
+    /// Anything else, a handler's own 401 included: the answer, never retried.
     Refused(ApiError),
 }
 
@@ -447,26 +460,44 @@ impl BirdoApi {
     /// Login with email and password (desktop endpoint)
     /// FIX C-2: Returns LoginResult which may be either Success (with tokens)
     /// or TwoFactorChallenge (requiring TOTP code submission).
-    pub async fn login(&self, email: &str, password: &str) -> Result<LoginResult, ApiError> {
+    ///
+    /// A-M77 / MR-2139: during a failed-sign-in spike the server may answer
+    /// 429 `pow_required` for the `login` operation; the request is then sent
+    /// once more with a proof (`pow::login_with_proof`). `Cancelled` when
+    /// `cancel` was set while the proof was being worked out.
+    pub async fn login(
+        &self,
+        email: &str,
+        password: &str,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        on_progress: Arc<dyn Fn(u32, u64) + Send + Sync>,
+    ) -> Result<super::pow::Registered<LoginResult>, ApiError> {
         // LoginRequest::new attaches this installation's stable deviceId (plus
         // the device descriptors). Without it the backend could never honour a
         // trusted-device 2FA skip, and its User-Agent-derived fallback id
         // changed on every app update, spawning a duplicate device row each
         // release. See the type's doc comment.
-        let payload = LoginRequest::new(email, password);
-
-        // Use desktop-specific endpoint that returns tokens in body
-        let result: LoginResult = self
-            .post(endpoints::auth::LOGIN_DESKTOP, &payload, false)
-            .await?;
+        let registered = super::pow::login_with_proof(
+            |proof| {
+                let payload = LoginRequest::new(email, password).with_pow(proof);
+                async move {
+                    // Use desktop-specific endpoint that returns tokens in body
+                    self.post::<_, LoginResult>(endpoints::auth::LOGIN_DESKTOP, &payload, false)
+                        .await
+                }
+            },
+            || self.fetch_login_challenge(),
+            |c| Self::solve_challenge(c, cancel, on_progress),
+        )
+        .await?;
 
         // Only store tokens if login succeeded (not 2FA challenge)
-        if let LoginResult::Success { ref tokens, .. } = result {
+        if let super::pow::Registered::Done(LoginResult::Success { ref tokens, .. }) = registered {
             self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
                 .await;
         }
 
-        Ok(result)
+        Ok(registered)
     }
 
     /// Native SSO handoff exchange. Swaps the web broker's single-use, PKCE-bound
@@ -593,11 +624,15 @@ impl BirdoApi {
         &self,
         password: &str,
         two_factor_code: Option<&str>,
+        account_number: Option<&str>,
+        email_code: Option<&str>,
         around_the_tunnel: Option<std::net::IpAddr>,
     ) -> Result<DeleteAccountResponse, ApiError> {
         let body = DeleteAccountBody {
             password,
             two_factor_code,
+            account_number,
+            email_code,
         };
         let token_before = self.access_token_value().await;
         let outcome = match self.send_gdpr_delete(&body, around_the_tunnel).await? {
@@ -774,6 +809,167 @@ impl BirdoApi {
     /// Read-only; the ordinary GET path with the usual refresh-and-retry.
     pub async fn deletion_preflight(&self) -> Result<DeletionPreflightResponse, ApiError> {
         self.get(endpoints::auth::GDPR_DELETE_PREFLIGHT, true).await
+    }
+
+    /// MR-179: e-mail the one-time deletion code to an SSO account (no
+    /// password, no 2FA). The ordinary bearer POST with the usual
+    /// refresh-and-retry; no body. 400 `email_code_not_used`, 429
+    /// `too_many_attempts` past 3 an hour and 503 `email_code_not_sent` map
+    /// like any other refusal.
+    pub async fn send_deletion_code(&self) -> Result<DeletionCodeResponse, ApiError> {
+        self.post(
+            endpoints::auth::GDPR_DELETE_CODE,
+            &serde_json::json!({}),
+            true,
+        )
+        .await
+    }
+
+    /// MR-1707: step 1 of replacing an anonymous account number. Changes
+    /// nothing on the account: the server holds the new number pending for
+    /// ten minutes and returns it once. Sent through
+    /// [`Self::post_proof_checked`]: a wrong proof is a 401 from the handler
+    /// and must be sent ONCE (each one counts against the server's 5 per 15
+    /// minutes), never refreshed and re-sent.
+    pub async fn rotate_number_prepare(
+        &self,
+        body: &RotatePrepareBody,
+    ) -> Result<RotatePrepareResponse, ApiError> {
+        let text = self
+            .post_proof_checked(endpoints::auth::ROTATE_NUMBER_PREPARE, body)
+            .await?;
+        serde_json::from_str(&text).map_err(|e| ApiError::Parse(e.to_string()))
+    }
+
+    /// A bearer POST whose handler can itself answer 401 (a wrong proof), like
+    /// `delete_account`'s: only the JWT guard's bare "Unauthorized" (or an
+    /// empty message, and no machine code) means the access token expired and
+    /// is refreshed and retried once. Any other 401 is the answer and is
+    /// surfaced with no refresh and no second request.
+    async fn post_proof_checked<B: Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<String, ApiError> {
+        let token_before = self.access_token_value().await;
+        let mut outcome = self.send_proof_post(path, body).await?;
+        if matches!(outcome, ProofPostOutcome::SessionExpired) {
+            {
+                // Same serialisation as request_with_retry: only refresh if
+                // nobody else already did while we waited for the lock.
+                let lock = Arc::clone(&self.refresh_lock).lock_owned().await;
+                if self.access_token_value().await == token_before {
+                    self.refresh_detached(lock)
+                        .await
+                        .map_err(super::session_gate::error_after_failed_refresh)?;
+                }
+            }
+            outcome = self.send_proof_post(path, body).await?;
+        }
+        match outcome {
+            ProofPostOutcome::Done(text) => Ok(text),
+            ProofPostOutcome::Refused(error) => Err(error),
+            ProofPostOutcome::SessionExpired => Err(ApiError::Unauthorized),
+        }
+    }
+
+    async fn send_proof_post<B: Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<ProofPostOutcome, ApiError> {
+        let token = self
+            .access_token
+            .read()
+            .await
+            .clone()
+            .ok_or(ApiError::NotAuthenticated)?;
+        let response = self
+            .client
+            .post(format!("{}{}", API_BASE_URL, path))
+            .header("X-Desktop-Client", DESKTOP_CLIENT_HEADER)
+            .bearer_auth(token.as_str())
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+        let status = response.status();
+        let retry_after = retry_after_of(&response);
+        let text = response.text().await.unwrap_or_default();
+        let outcome = Self::classify_proof_post_response_after(status, &text, retry_after);
+        if let ProofPostOutcome::Refused(ApiError::UpgradeRequired(info)) = &outcome {
+            super::upgrade_gate::latch_from(
+                super::upgrade_gate::Origin::ControlPlane,
+                info.clone(),
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// Decide what one proof-checked POST response means, from status and
+    /// body alone. A 401 carrying a machine `error` code (the backend sends
+    /// `rotation_proof_invalid` for a wrong proof) is the handler's answer;
+    /// failing that, a 401 whose message is anything but passport's bare
+    /// "Unauthorized" is too. Only the bare one means "refresh and retry".
+    pub(crate) fn classify_proof_post_response_after(
+        status: StatusCode,
+        body: &str,
+        retry_after: Option<u64>,
+    ) -> ProofPostOutcome {
+        if status.is_success() {
+            return ProofPostOutcome::Done(body.to_string());
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            let parsed = serde_json::from_str::<ApiErrorBody>(body).ok();
+            let message = parsed
+                .as_ref()
+                .and_then(|b| b.message.as_deref())
+                .map(str::trim)
+                .filter(|m| !m.is_empty());
+            let code = parsed
+                .as_ref()
+                .and_then(|b| b.error.as_deref())
+                .map(str::trim)
+                .filter(|c| !c.is_empty());
+            let refused = |m: &str| {
+                ProofPostOutcome::Refused(ApiError::Rejected {
+                    status: StatusCode::UNAUTHORIZED.as_u16(),
+                    message: m.to_string(),
+                })
+            };
+            return match (code, message) {
+                // A code the handler set wins, whatever the wording.
+                (Some(c), m) if !c.eq_ignore_ascii_case("unauthorized") => {
+                    refused(m.unwrap_or("The proof was not accepted"))
+                }
+                (_, Some(m)) if !m.eq_ignore_ascii_case("unauthorized") => refused(m),
+                _ => ProofPostOutcome::SessionExpired,
+            };
+        }
+        ProofPostOutcome::Refused(Self::classify_error_response_after(
+            status,
+            body,
+            retry_after,
+        ))
+    }
+
+    /// MR-1707: step 2. On success the old number is dead, every other
+    /// session is signed out, and the answer carries this session's fresh
+    /// tokens, which are adopted here (the caller persists them).
+    pub async fn rotate_number_confirm(
+        &self,
+        body: &RotateConfirmBody,
+    ) -> Result<RotateConfirmResponse, ApiError> {
+        let text = self
+            .post_proof_checked(endpoints::auth::ROTATE_NUMBER_CONFIRM, body)
+            .await?;
+        let response: RotateConfirmResponse =
+            serde_json::from_str(&text).map_err(|e| ApiError::Parse(e.to_string()))?;
+        if let Some(ref tokens) = response.tokens {
+            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
+        }
+        Ok(response)
     }
 
     // ========================================================================
@@ -984,59 +1180,152 @@ impl BirdoApi {
 
     /// Login to an EXISTING anonymous account by its 24-digit ID (+ optional
     /// password set on the website). The endpoint never creates accounts.
+    ///
+    /// A-M77 / MR-2139: like `login`, a 429 `pow_required` for the `login`
+    /// operation gets one retry with a solved proof.
     pub async fn login_anonymous(
         &self,
         anonymous_id: &str,
         password: Option<String>,
         device_id: &str,
-    ) -> Result<AnonymousLoginResult, ApiError> {
-        let payload = AnonymousLoginRequest {
-            anonymous_id: anonymous_id.to_string(),
-            password,
-            device_id: device_id.to_string(),
-        };
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        on_progress: Arc<dyn Fn(u32, u64) + Send + Sync>,
+    ) -> Result<super::pow::Registered<AnonymousLoginResult>, ApiError> {
+        let registered = super::pow::login_with_proof(
+            |proof| {
+                let payload = AnonymousLoginRequest {
+                    anonymous_id: anonymous_id.to_string(),
+                    password: password.clone(),
+                    device_id: device_id.to_string(),
+                    pow: proof,
+                };
+                async move {
+                    self.post::<_, AnonymousLoginResult>(
+                        endpoints::auth::LOGIN_ANONYMOUS,
+                        &payload,
+                        false,
+                    )
+                    .await
+                }
+            },
+            || self.fetch_login_challenge(),
+            |c| Self::solve_challenge(c, cancel, on_progress),
+        )
+        .await?;
 
-        let result: AnonymousLoginResult = self
-            .post(endpoints::auth::LOGIN_ANONYMOUS, &payload, false)
-            .await?;
-
-        if let Some(ref tokens) = result.tokens {
-            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
-                .await;
+        if let super::pow::Registered::Done(ref result) = registered {
+            if let Some(ref tokens) = result.tokens {
+                self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                    .await;
+            }
         }
 
-        Ok(result)
+        Ok(registered)
     }
 
     /// Create a BRAND-NEW anonymous account in-app (native clients). The server
     /// mints the 24-digit ID and returns tokens, so the app is signed in
     /// immediately — the no-email privacy path without a website round-trip.
     /// Requires the X-Desktop-Client header, which `do_request` adds to all POSTs.
+    ///
+    /// MR-2152: the server issues and checks a sign-up proof of work; without
+    /// one the account lands on its stricter "legacy" tier. The proof is
+    /// fetched, solved off the async threads and attached here (`api::pow`);
+    /// `Registered::Cancelled` when `cancel` was set meanwhile.
     pub async fn register_anonymous(
         &self,
         device_id: &str,
         device_name: Option<String>,
-    ) -> Result<AnonymousLoginResult, ApiError> {
-        let payload = crate::api::types::AnonymousRegisterRequest {
-            device_id: device_id.to_string(),
-            device_name,
-            device_type: "DESKTOP".to_string(),
-            // Shared with the login body via utils::device_platform so the two
-            // payloads can never label the same machine differently.
-            platform: crate::utils::device_platform().to_string(),
-            app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        };
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        on_progress: Arc<dyn Fn(u32, u64) + Send + Sync>,
+    ) -> Result<super::pow::Registered<AnonymousLoginResult>, ApiError> {
+        use super::pow;
+        let registered = pow::register_with_proof(
+            || self.fetch_signup_challenge(),
+            |c: pow::Challenge| {
+                Self::solve_challenge(c, Arc::clone(&cancel), Arc::clone(&on_progress))
+            },
+            |proof| {
+                let payload = crate::api::types::AnonymousRegisterRequest {
+                    device_id: device_id.to_string(),
+                    device_name: device_name.clone(),
+                    device_type: "DESKTOP".to_string(),
+                    // Shared with the login body via utils::device_platform so the two
+                    // payloads can never label the same machine differently.
+                    platform: crate::utils::device_platform().to_string(),
+                    app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    pow: proof,
+                };
+                async move {
+                    self.post::<_, AnonymousLoginResult>(
+                        endpoints::auth::REGISTER_ANONYMOUS,
+                        &payload,
+                        false,
+                    )
+                    .await
+                }
+            },
+        )
+        .await?;
 
-        let result: AnonymousLoginResult = self
-            .post(endpoints::auth::REGISTER_ANONYMOUS, &payload, false)
-            .await?;
-
-        if let Some(ref tokens) = result.tokens {
-            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
-                .await;
+        if let pow::Registered::Done(ref result) = registered {
+            if let Some(ref tokens) = result.tokens {
+                self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                    .await;
+            }
         }
 
-        Ok(result)
+        Ok(registered)
+    }
+
+    /// `POST /auth/pow/challenge` for a sign-up. `None` for ANY failure (the
+    /// endpoint is down, rate limited, answered something else): the sign-up
+    /// then goes out without a proof and the server decides, as before.
+    async fn fetch_signup_challenge(&self) -> Option<super::pow::Challenge> {
+        self.fetch_challenge("signup").await
+    }
+
+    /// `POST /auth/pow/challenge` for a sign-in (A-M77 / MR-2139), asked for
+    /// only after a 429 `pow_required` naming the `login` operation. The
+    /// endpoint is the fixed one: a path from a response body is not followed.
+    async fn fetch_login_challenge(&self) -> Option<super::pow::Challenge> {
+        self.fetch_challenge(super::pow::LOGIN_OP).await
+    }
+
+    async fn fetch_challenge(&self, op: &str) -> Option<super::pow::Challenge> {
+        self.post::<_, super::pow::Challenge>(
+            endpoints::auth::POW_CHALLENGE,
+            &serde_json::json!({ "op": op }),
+            false,
+        )
+        .await
+        .inspect_err(|e| tracing::info!("{op} challenge not available ({e}); no proof sent"))
+        .ok()
+    }
+
+    /// Work a challenge out off the async threads, reporting progress and
+    /// honouring `cancel` (`None` is a cancel). One solver for every operation.
+    async fn solve_challenge(
+        c: super::pow::Challenge,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        on_progress: Arc<dyn Fn(u32, u64) + Send + Sync>,
+    ) -> Option<super::pow::PowSolution> {
+        use super::pow;
+        on_progress(c.difficulty, 0);
+        let token = c.challenge.clone();
+        let bits = c.difficulty;
+        let nonce = tokio::task::spawn_blocking(move || {
+            pow::solve(&token, bits, pow::default_threads(), &cancel, |h| {
+                on_progress(bits, h)
+            })
+        })
+        .await
+        .ok()?
+        .ok()?;
+        Some(pow::PowSolution {
+            challenge: c.challenge,
+            nonce,
+        })
     }
 
     // ========================================================================
@@ -1495,9 +1784,36 @@ impl BirdoApi {
         {
             return ApiError::RegistrationNotAllowed(message().trim().to_string());
         }
+        if status == StatusCode::FORBIDDEN
+            && body
+                .as_ref()
+                .and_then(|b| b.details.as_ref())
+                .and_then(|d| d.get("code"))
+                .and_then(|c| c.as_str())
+                == Some("email_not_verified")
+        {
+            return ApiError::EmailNotVerified;
+        }
         match body.as_ref().and_then(|b| b.error.as_deref()) {
             Some("two_factor_required") => return ApiError::TwoFactorRequired(message()),
             Some("two_factor_invalid") => return ApiError::TwoFactorInvalid(message()),
+            // MR-179: the deletion step-up refusals (birdo-web
+            // deletion-step-up.ts), by `error`, never by the sentence. A 429
+            // `too_many_attempts` is not one of these: it stays a rate limit.
+            Some(code) if StepUpKind::from_code(code).is_some() => {
+                return ApiError::StepUp {
+                    kind: StepUpKind::from_code(code).expect("checked above"),
+                    message: message(),
+                };
+            }
+            // MR-1707: the anonymous-number replacement's own refusals. The
+            // two 409s share a status, and a bare 403 would read as a plan
+            // refusal.
+            Some(
+                code @ ("anon_number_rotation_disabled"
+                | "rotation_not_pending"
+                | "rotation_account_changed"),
+            ) => return ApiError::AnonNumberRefused(code.to_string()),
             // MR-1944: the attestation policy refused this build. A bare 403
             // reads as `subscription_required`, whose "upgrade your plan" is
             // wrong advice here.
@@ -1538,6 +1854,28 @@ impl BirdoApi {
         }
 
         // MR-1808: the waits the server names, by status — see the doc above.
+        // The sign-up proof of work (`details.code`, birdo-web
+        // `SignupPowService`): 400 invalid/expired, 409 replayed, 428 raised
+        // or required. `pow_rate_limited` is a 429 and stays RateLimited.
+        if let Some(code) = body
+            .as_ref()
+            .and_then(|b| b.details.as_ref())
+            .and_then(|d| d.get("code"))
+            .and_then(|c| c.as_str())
+            .filter(|c| super::pow::is_retryable_code(c) || *c == "pow_required")
+        {
+            return ApiError::PowRefused {
+                code: code.to_string(),
+                message: message().trim().to_string(),
+                pow_op: body
+                    .as_ref()
+                    .and_then(|b| b.details.as_ref())
+                    .and_then(|d| d.get("pow"))
+                    .and_then(|p| p.get("op"))
+                    .and_then(|o| o.as_str())
+                    .map(str::to_string),
+            };
+        }
         if status == StatusCode::TOO_MANY_REQUESTS {
             return ApiError::RateLimited {
                 retry_after_secs: retry_after,

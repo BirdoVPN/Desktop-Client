@@ -31,6 +31,7 @@ use crate::commands::vpn::{
 };
 use crate::storage::CredentialStore;
 use crate::vpn::auto_reconnect::ReconnectInfo;
+use crate::vpn::birdo_pq::PqSession;
 use crate::vpn::manager::{
     ConnectPhase, ConnectionState, MultiHopStatus, SessionLabel, VpnManager,
 };
@@ -394,20 +395,15 @@ async fn attempt(
     ctx.stealth_mode = settings.stealth_mode;
 
     // AUDIT-C1: with PQ requested, attach our ML-KEM-1024 public key so the
-    // server can encapsulate against it.
-    let pq_pk = if settings.quantum_protection {
-        Some(
-            crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
-                IpcError::new(
-                    IpcErrorCode::PqFailed,
-                    "Post-quantum engine unavailable. Connection aborted because quantum \
-                     protection is enabled.",
-                )
-            })?,
-        )
-    } else {
-        None
-    };
+    // server can encapsulate against it. MR-703 / MR-1742: the keypair is made
+    // HERE, once per attempt, and its secret lives only in this `PqSession`:
+    // held across the retryable-refusal retry below (the same key is re-sent,
+    // so the server's ciphertext still fits), moved into `prepare_tunnel` to
+    // decapsulate, and wiped on every other exit (an error, a cancel, a drop).
+    // A later attempt (the Adaptive Transport retry) and every re-dial call
+    // `begin()` again: no pair is ever reused across attempts.
+    let pq_session = settings.quantum_protection.then(PqSession::begin);
+    let pq_pk = pq_session.as_ref().map(PqSession::public_key_b64);
 
     vm.set_phase(ConnectPhase::Authenticating);
     // MR-1639: a refusal the server marks retryable with a wait
@@ -522,6 +518,7 @@ async fn attempt(
             server_id: dialled_id,
             stealth_mode: settings.stealth_mode,
             quantum_protection: settings.quantum_protection,
+            pq_session,
             fallback_reason,
             custom_dns: settings.custom_dns.clone(),
             custom_mtu: settings.custom_mtu,
@@ -895,6 +892,9 @@ pub(crate) struct TunnelRequest<'a> {
     pub server_id: &'a str,
     pub stealth_mode: bool,
     pub quantum_protection: bool,
+    /// The keypair this request's `pqClientPublicKey` came from (MR-703).
+    /// Consumed by the decapsulation; `None` when quantum protection is off.
+    pub pq_session: Option<PqSession>,
     pub fallback_reason: Option<&'a str>,
     pub custom_dns: Option<Vec<String>>,
     pub custom_mtu: u16,
@@ -925,7 +925,7 @@ pub(crate) async fn prepare_tunnel(
     vm: &VpnManager,
     epoch: u64,
     response: ConnectResponse,
-    request: TunnelRequest<'_>,
+    mut request: TunnelRequest<'_>,
 ) -> Result<PreparedTunnel, IpcError> {
     enforce_requested_protection(&response, request.stealth_mode, request.quantum_protection)?;
 
@@ -960,8 +960,8 @@ pub(crate) async fn prepare_tunnel(
     };
 
     vm.set_phase(ConnectPhase::NegotiatingPq);
-    let quantum_psk =
-        derive_quantum_psk(&response).map_err(|m| IpcError::new(IpcErrorCode::PqFailed, m))?;
+    let quantum_psk = derive_quantum_psk(&response, request.pq_session.take())
+        .map_err(|m| IpcError::new(IpcErrorCode::PqFailed, m))?;
 
     let (mut config, server_name) = build_vpn_config(
         response,
@@ -1494,15 +1494,18 @@ mod lifecycle_tests {
         }
     }
 
-    /// MR-1934: macOS's Cmd+Q, the Dock's Quit and logout reach the end of
-    /// the run (`RunEvent::Exit`) with no exit request before it, and the
-    /// teardown that request runs was skipped: pf's block and the session's
-    /// DNS outlived the app. There, off Windows and unless a restart was let
-    /// through, the same teardown now runs, capped, before the process ends.
-    /// What the helper does is driven in
+    /// MR-1934 / MA-DESK-013: macOS's Cmd+Q, the Dock's Quit and logout reach
+    /// the end of the run (`RunEvent::Exit`) with no exit request before it.
+    /// What the end of the run does, and in which order (record, teardown,
+    /// clear; not on Windows, not after a restart, not twice), is driven with
+    /// fakes in `utils::tests::the_end_of_the_run_records_then_tears_down_then_clears`
+    /// and what the teardown helper does in
     /// `utils::tests::an_exit_that_never_asked_first_runs_the_teardown_once`.
+    /// Kept, because only the source can say it: `main.rs` hands that function
+    /// the real flags and the real teardown, and a restart says so before it
+    /// returns.
     #[test]
-    fn an_exit_with_no_exit_request_still_tears_down_off_windows() {
+    fn the_exit_arm_hands_the_end_of_the_run_the_real_flags_and_teardown() {
         let main_rs = include_str!("../main.rs").replace('\r', "");
         let exit = &main_rs[main_rs
             .find("if matches!(event, RunEvent::Exit) {")
@@ -1513,15 +1516,14 @@ mod lifecycle_tests {
         order(
             exit,
             &[
-                "record_if_exit_kept_the_session(",
-                "#[cfg(not(target_os = \"windows\"))]",
-                "if !EXIT_RESTARTING.load(",
-                "utils::tear_down_unless_started(",
+                "utils::end_of_run(",
                 "&EXIT_TEARDOWN_STARTED,",
+                "&EXIT_RESTARTING,",
+                "cfg!(not(target_os = \"windows\")),",
                 "EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN,",
-                "tauri::async_runtime::block_on(",
+                "record_if_exit_kept_the_session(",
                 "teardown_for_exit(&app)",
-                "clear_on_exit();",
+                "commands::clipboard::clear_on_exit,",
             ],
         );
         // A restart is let through without the teardown, and says so before
@@ -1701,7 +1703,7 @@ mod lifecycle_tests {
             attempt,
             &[
                 "let settings = apply_vpn_settings(app).await;",
-                "let pq_pk = if settings.quantum_protection {",
+                "let pq_session = settings.quantum_protection.then(PqSession::begin);",
                 "let mut retried = false;",
                 "loop {",
                 "generate_wireguard_keypair()",
@@ -1718,7 +1720,7 @@ mod lifecycle_tests {
         );
         for once in [
             "apply_vpn_settings(",
-            "get_client_public_key_b64()",
+            "PqSession::begin",
             "generate_wireguard_keypair()",
         ] {
             assert_eq!(attempt.matches(once).count(), 1, "{once}");

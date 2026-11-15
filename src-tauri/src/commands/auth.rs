@@ -4,14 +4,19 @@
 
 use crate::api::error::ApiError;
 use crate::api::session_gate::{self, RefreshOutcome, StoredSession};
-use crate::api::types::{AccountNumber, LoginResult, UserProfile};
+use crate::api::types::{
+    AccountNumber, LoginResult, RotateConfirmBody, RotatePrepareBody, UserProfile,
+};
 use crate::api::BirdoApi;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use crate::commands::session::{end_session, EndReason};
 use crate::storage::CredentialStore;
 use crate::utils::redact_email;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, State};
 use zeroize::Zeroize;
 
 // FIX-2-5: Client-side rate limiting for login IPC command
@@ -161,6 +166,7 @@ pub struct UserInfo {
 /// Login with email and password
 #[tauri::command]
 pub async fn login(
+    app: AppHandle,
     request: LoginRequest,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
@@ -208,8 +214,16 @@ pub async fn login(
 
     tracing::info!("Login attempt for: {}", redact_email(&request.email));
 
-    match api.login(&request.email, &request.password).await {
-        Ok(result) => match result {
+    // A-M77 / MR-2139: during a failed-sign-in spike the server may ask for a
+    // proof of work, solved once and sent once (`api::pow::login_with_proof`).
+    let (cancel, on_progress) = begin_proof(&app);
+    let outcome = api
+        .login(&request.email, &request.password, cancel, on_progress)
+        .await;
+    end_proof();
+    match outcome {
+        Ok(crate::api::pow::Registered::Cancelled) => Ok(cancelled_response()),
+        Ok(crate::api::pow::Registered::Done(result)) => match result {
             LoginResult::Success { tokens, .. } => {
                 // Store tokens in Windows Credential Manager for persistence
                 if let Err(e) =
@@ -303,15 +317,12 @@ pub async fn logout(
         ))
     })?;
 
-    // Logout hygiene (documented contract of the persistent ML-KEM identity):
-    // the keypair is a globally-unique, machine-stable linkage primitive, so it
-    // must not survive an account boundary. Best-effort — a delete failure must
-    // not block the logout itself. Deliberately NOT called on the
-    // rejected-refresh auto-sign-out path (get_auth_state): that is a session
-    // expiry on the same account, not the user leaving it.
-    if let Err(e) = crate::vpn::birdo_pq::reset_persisted_keypair() {
-        tracing::warn!("Failed to reset BirdoPQ keypair on logout: {}", e);
-    }
+    // Logout hygiene: since MR-703 / MR-1742 no ML-KEM key outlives a connect,
+    // so there is no identity to reset. This only deletes any key file an older
+    // build left (startup already does; this covers one written since by a
+    // downgrade). Best-effort and idempotent.
+    crate::vpn::birdo_pq::purge_legacy_keypair_files();
+    crate::vpn::birdo_pq::record_disabled();
 
     // The device identifier is deliberately NOT rotated here (second-pass
     // #14), matching iOS and Android: it rotates on account DELETION only.
@@ -327,7 +338,9 @@ pub async fn logout(
 /// GDPR: Permanently delete account and all associated data.
 /// Requires password confirmation to prevent accidental deletion from a
 /// compromised webview (defense-in-depth).
-#[derive(Debug, Deserialize)]
+// No `Debug`: it carries the password, the 2FA code, the account number and the
+// e-mailed code, and a derived one would print them.
+#[derive(Deserialize)]
 pub struct DeleteAccountRequest {
     pub password: String,
     /// The TOTP or backup code, once the server has asked for it
@@ -335,12 +348,25 @@ pub struct DeleteAccountRequest {
     /// first attempt and for accounts without 2FA.
     #[serde(default)]
     pub two_factor_code: Option<String>,
+    /// MR-179: the anonymous account's 24-digit number, once the server (or the
+    /// preflight) asked for it. Absent otherwise.
+    #[serde(default)]
+    pub account_number: Option<String>,
+    /// MR-179: the code e-mailed by `send_deletion_code` to an SSO account.
+    #[serde(default)]
+    pub email_code: Option<String>,
 }
 
 impl Drop for DeleteAccountRequest {
     fn drop(&mut self) {
         self.password.zeroize();
         if let Some(code) = self.two_factor_code.as_mut() {
+            code.zeroize();
+        }
+        if let Some(number) = self.account_number.as_mut() {
+            number.zeroize();
+        }
+        if let Some(code) = self.email_code.as_mut() {
             code.zeroize();
         }
     }
@@ -364,7 +390,9 @@ pub struct DeleteAccountResult {
 fn delete_failure_message(error: &ApiError) -> IpcError {
     let (code, reason) = match error {
         // The dialog asks for the code / says it was wrong, by code alone.
-        ApiError::TwoFactorRequired(_) | ApiError::TwoFactorInvalid(_) => {
+        ApiError::TwoFactorRequired(_)
+        | ApiError::TwoFactorInvalid(_)
+        | ApiError::StepUp { .. } => {
             return IpcError::from_api(error);
         }
         ApiError::Rejected { message, .. } | ApiError::Unknown(message) => {
@@ -432,9 +460,30 @@ pub async fn delete_account(
     // the app fell to Login with "your session expired". Keeping the tunnel
     // until the server confirms is still the rule; only the request's path
     // changes.
+    // MR-179: digits only for the number (the server ignores grouping, and a
+    // pasted "1234 5678 ..." must not fail a length check there), the code as
+    // typed; blank means not sent.
+    let account_number: Option<zeroize::Zeroizing<String>> = request
+        .account_number
+        .as_deref()
+        .map(|n| {
+            zeroize::Zeroizing::new(n.chars().filter(char::is_ascii_digit).collect::<String>())
+        })
+        .filter(|n| !n.is_empty());
+    let email_code = request
+        .email_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
     let around_the_tunnel = around_the_tunnel(&app).await;
     let response = api
-        .delete_account(&request.password, two_factor_code, around_the_tunnel)
+        .delete_account(
+            &request.password,
+            two_factor_code,
+            account_number.as_ref().map(|n| n.as_str()),
+            email_code,
+            around_the_tunnel,
+        )
         .await
         .map_err(|e| delete_failure_message(&e))?;
 
@@ -451,12 +500,11 @@ pub async fn delete_account(
     crate::commands::settings::clear_account_choices(&app).await;
 
     // Clear all local credentials after successful server-side deletion,
-    // including the persistent ML-KEM identity (same hygiene as logout —
+    // including any key file an older build left (same hygiene as logout —
     // doubly so for a GDPR deletion) and the device identifier (C-8).
     let _ = credentials.clear_tokens();
-    if let Err(e) = crate::vpn::birdo_pq::reset_persisted_keypair() {
-        tracing::warn!("Failed to reset BirdoPQ keypair on account deletion: {}", e);
-    }
+    crate::vpn::birdo_pq::purge_legacy_keypair_files();
+    crate::vpn::birdo_pq::record_disabled();
     crate::utils::device_id::rotate();
 
     let store_subscriptions_still_billing = response
@@ -480,6 +528,36 @@ pub struct DeletionPreflightResult {
     pub store_subscriptions_still_billing: Vec<String>,
     /// A web (Polar) subscription is billing and the deletion will cancel it.
     pub web_subscription_will_be_cancelled: bool,
+    /// MR-179: the server's step-up factor tokens for this account
+    /// (`password`, `account_number`, `email_code`, `apple_reauth`,
+    /// `two_factor`). Empty from a backend older than birdo-web #766, or when
+    /// the preflight said nothing.
+    pub step_up_factors: Vec<String>,
+    /// MR-179: the server refuses a deletion without them. Until then the
+    /// number / code is optional, so a user whose code e-mail fails can still
+    /// delete, as before.
+    pub step_up_enforced: bool,
+}
+
+/// What `send_deletion_code` returns: the masked address the code went to.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionCodeResult {
+    pub sent_to: Option<String>,
+    /// How long the code works, in minutes, when the server says.
+    pub expires_in_minutes: Option<u64>,
+}
+
+/// MR-179: e-mail the one-time deletion code to an SSO account (no password,
+/// no 2FA). Errors reach the dialog by code: `rate_limited` past 3 an hour,
+/// `server_unavailable` when the mail could not be sent.
+#[tauri::command]
+pub async fn send_deletion_code(api: State<'_, BirdoApi>) -> Result<DeletionCodeResult, IpcError> {
+    let response = api.send_deletion_code().await.map_err(IpcError::from)?;
+    Ok(DeletionCodeResult {
+        sent_to: response.sent_to,
+        expires_in_minutes: response.expires_in_minutes,
+    })
 }
 
 /// `GET /api/v1/gdpr/delete/preflight`: read-only, nothing local changes.
@@ -504,6 +582,16 @@ fn deletion_preflight_result(
             .unwrap_or_default(),
         web_subscription_will_be_cancelled: response
             .web_subscription_will_be_cancelled
+            .unwrap_or(false),
+        step_up_factors: response
+            .step_up
+            .as_ref()
+            .map(|s| s.factors.clone())
+            .unwrap_or_default(),
+        step_up_enforced: response
+            .step_up
+            .as_ref()
+            .map(|s| s.enforced)
             .unwrap_or(false),
     }
 }
@@ -812,6 +900,69 @@ impl Drop for AnonymousLoginCommandRequest {
     }
 }
 
+/// Event the proof of work reports its progress on: a percentage (0-99) while
+/// this device works a challenge out. Sign-up (MR-2152) and, during a
+/// failed-sign-in spike, sign-in (A-M77 / MR-2139) share it, and so share
+/// `cancel_signup_proof`: only one of them runs at a time.
+const SIGNUP_PROOF_EVENT: &str = "signup-proof-progress";
+
+/// The running sign-up's cancel flag, for `cancel_signup_proof`.
+static SIGNUP_CANCEL: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
+/// Stop the device check of a sign-up in progress; the sign-up then ends as
+/// cancelled and sends nothing.
+#[tauri::command]
+pub fn cancel_signup_proof() {
+    if let Some(flag) = SIGNUP_CANCEL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        flag.store(true, Ordering::Release);
+    }
+}
+
+/// Progress reporter of a proof of work: (difficulty bits, hashes done).
+type ProofProgress = Arc<dyn Fn(u32, u64) + Send + Sync>;
+
+/// The cancel flag and the progress reporter of one proof of work. The flag is
+/// registered for `cancel_signup_proof`; call `end_proof` when the request ends.
+fn begin_proof(app: &AppHandle) -> (Arc<AtomicBool>, ProofProgress) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    *SIGNUP_CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cancel));
+    let on_progress: ProofProgress = {
+        let app = app.clone();
+        let throttle = Mutex::new(crate::api::pow::Throttle::new(Duration::from_millis(250)));
+        Arc::new(move |bits, hashes| {
+            let first = hashes == 0;
+            if first || throttle.lock().unwrap_or_else(|e| e.into_inner()).ready() {
+                // Expected work is 2^bits hashes; 99 until the nonce is found.
+                let expected = 2f64.powi(bits as i32);
+                let percent = ((hashes as f64 / expected) * 100.0).min(99.0) as u32;
+                let _ = app.emit(SIGNUP_PROOF_EVENT, percent);
+            }
+        })
+    };
+    (cancel, on_progress)
+}
+
+fn end_proof() {
+    *SIGNUP_CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// The answer to a sign-in or sign-up the user cancelled while the proof of
+/// work ran: nothing was sent after the cancel.
+fn cancelled_response() -> LoginResponse {
+    LoginResponse {
+        success: false,
+        message: Some("Cancelled".to_string()),
+        user: None,
+        requires_two_factor: false,
+        challenge_token: None,
+        code: Some(IpcErrorCode::Cancelled),
+    }
+}
+
 /// Create a BRAND-NEW anonymous account in-app and sign in.
 ///
 /// Desktop could previously only LOG IN to an existing 24-digit anonymous ID;
@@ -822,6 +973,7 @@ impl Drop for AnonymousLoginCommandRequest {
 /// surface it prominently ("save this") before proceeding.
 #[tauri::command]
 pub async fn register_anonymous(
+    app: AppHandle,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
 ) -> Result<LoginResponse, IpcError> {
@@ -851,11 +1003,21 @@ pub async fn register_anonymous(
     let device_id = crate::utils::get_device_id();
     tracing::info!("Anonymous account creation requested");
 
-    match api
-        .register_anonymous(&device_id, Some(crate::commands::vpn::get_device_name()))
-        .await
-    {
-        Ok(result) if result.ok => {
+    // MR-2152: the sign-up proof of work. `cancel_signup_proof` sets this.
+    let (cancel, on_progress) = begin_proof(&app);
+    let outcome = api
+        .register_anonymous(
+            &device_id,
+            Some(crate::commands::vpn::get_device_name()),
+            cancel,
+            on_progress,
+        )
+        .await;
+    end_proof();
+
+    match outcome {
+        Ok(crate::api::pow::Registered::Cancelled) => Ok(cancelled_response()),
+        Ok(crate::api::pow::Registered::Done(result)) if result.ok => {
             if let Some(ref tokens) = result.tokens {
                 if let Err(e) =
                     credentials.store_tokens(&tokens.access_token, &tokens.refresh_token)
@@ -879,7 +1041,7 @@ pub async fn register_anonymous(
                 code: None,
             })
         }
-        Ok(_) => Ok(LoginResponse {
+        Ok(crate::api::pow::Registered::Done(_)) => Ok(LoginResponse {
             success: false,
             message: Some("Could not create an anonymous account. Please try again.".to_string()),
             user: None,
@@ -901,9 +1063,207 @@ pub async fn register_anonymous(
     }
 }
 
+/// What a number-replacement step answers (MR-1707). A refusal the user can
+/// act on is an `Ok` with `refusal` set, so the UI words each one; anything
+/// else (offline, a server error) is an `Err(IpcError)` as everywhere.
+/// `refusal`: `disabled`, `unauthorized`, `not_pending`, `account_changed`,
+/// `mismatch`, `bad_number`, `rate_limited`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotationStep {
+    pub refusal: Option<&'static str>,
+    /// `prepare` only: the NEW number, shown once. A credential: never
+    /// logged, redacted in `Debug`, and not kept here after the answer.
+    pub new_number: Option<String>,
+    pub expires_in_seconds: Option<u64>,
+    pub retry_after_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for RotationStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotationStep")
+            .field("refusal", &self.refusal)
+            .field(
+                "new_number",
+                &self.new_number.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for RotationStep {
+    fn drop(&mut self) {
+        self.new_number.zeroize();
+    }
+}
+
+impl RotationStep {
+    fn refused(refusal: &'static str) -> Self {
+        Self {
+            refusal: Some(refusal),
+            new_number: None,
+            expires_in_seconds: None,
+            retry_after_secs: None,
+        }
+    }
+}
+
+/// The refusals of the two rotation calls the UI words itself, by what
+/// the server said. `None`: not one of them, so it is a plain `IpcError`.
+fn rotation_refusal(error: &ApiError, wrong_number_is_400: bool) -> Option<RotationStep> {
+    match error {
+        ApiError::AnonNumberRefused(code) => Some(RotationStep::refused(match code.as_str() {
+            "rotation_not_pending" => "not_pending",
+            "rotation_account_changed" => "account_changed",
+            _ => "disabled",
+        })),
+        ApiError::Unauthorized | ApiError::Rejected { status: 401, .. } => {
+            Some(RotationStep::refused("unauthorized"))
+        }
+        ApiError::RateLimited { retry_after_secs } => Some(RotationStep {
+            refusal: Some("rate_limited"),
+            new_number: None,
+            expires_in_seconds: None,
+            retry_after_secs: *retry_after_secs,
+        }),
+        ApiError::Rejected { status: 400, .. } if wrong_number_is_400 => {
+            Some(RotationStep::refused("mismatch"))
+        }
+        ApiError::Rejected { status: 400, .. } => Some(RotationStep::refused("bad_number")),
+        _ => None,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotatePrepareCommandRequest {
+    pub current_number: String,
+    pub password: Option<String>,
+    pub two_factor_code: Option<String>,
+}
+
+impl Drop for RotatePrepareCommandRequest {
+    fn drop(&mut self) {
+        self.current_number.zeroize();
+        self.password.zeroize();
+        self.two_factor_code.zeroize();
+    }
+}
+
+fn digits_only(raw: &str) -> String {
+    raw.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+/// MR-1707 step 1: prove the CURRENT number (and the password / 2FA code the
+/// account has) and get a replacement held pending for ten minutes. Nothing
+/// on the account changes; the old number keeps working until `confirm`.
+/// The numbers are credentials: not logged, and nothing is stored here.
+#[tauri::command]
+pub async fn rotate_anonymous_number_prepare(
+    request: RotatePrepareCommandRequest,
+    api: State<'_, BirdoApi>,
+    credentials: State<'_, CredentialStore>,
+) -> Result<RotationStep, IpcError> {
+    let current = digits_only(&request.current_number);
+    if current.len() != 24 {
+        return Ok(RotationStep::refused("bad_number"));
+    }
+    if let Ok(tokens) = credentials.get_tokens() {
+        api.restore_tokens_if_absent(tokens.access_token.clone(), tokens.refresh_token.clone())
+            .await;
+    }
+    tracing::info!("Account number replacement: prepare requested");
+    let non_empty = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let body = RotatePrepareBody {
+        current_number: current,
+        password: request.password.clone().filter(|p| !p.is_empty()),
+        two_factor_code: non_empty(&request.two_factor_code),
+    };
+    match api.rotate_number_prepare(&body).await {
+        Ok(response) => Ok(RotationStep {
+            refusal: None,
+            new_number: Some(response.new_number.clone()),
+            expires_in_seconds: response.expires_in_seconds,
+            retry_after_secs: None,
+        }),
+        Err(e) => {
+            tracing::warn!("Account number replacement: prepare refused ({})", e);
+            match rotation_refusal(&e, false) {
+                Some(step) => Ok(step),
+                None => Err(IpcError::from_api(&e)),
+            }
+        }
+    }
+}
+
+/// MR-1707 step 2: the user re-typed the whole new number. On success the
+/// old number is dead, every other session is signed out, and this one
+/// continues on the fresh tokens, stored exactly as a sign-in stores them.
+#[tauri::command]
+pub async fn rotate_anonymous_number_confirm(
+    new_number: String,
+    api: State<'_, BirdoApi>,
+    credentials: State<'_, CredentialStore>,
+) -> Result<RotationStep, IpcError> {
+    let mut new_number = new_number;
+    let digits = digits_only(&new_number);
+    new_number.zeroize();
+    if digits.len() != 24 {
+        return Ok(RotationStep::refused("mismatch"));
+    }
+    if let Ok(tokens) = credentials.get_tokens() {
+        api.restore_tokens_if_absent(tokens.access_token.clone(), tokens.refresh_token.clone())
+            .await;
+    }
+    tracing::info!("Account number replacement: confirm requested");
+    let body = RotateConfirmBody {
+        new_number: digits,
+        device_id: crate::utils::get_device_id(),
+        device_name: Some(crate::commands::vpn::get_device_name()),
+        platform: crate::utils::device_platform().to_string(),
+    };
+    match api.rotate_number_confirm(&body).await {
+        Ok(response) if response.ok => {
+            if let Some(ref tokens) = response.tokens {
+                if let Err(e) =
+                    credentials.store_tokens(&tokens.access_token, &tokens.refresh_token)
+                {
+                    tracing::warn!(
+                        "Failed to persist the credentials after a replacement: {}",
+                        e
+                    );
+                }
+            }
+            tracing::info!("Account number replaced; this session continues");
+            Ok(RotationStep {
+                refusal: None,
+                new_number: None,
+                expires_in_seconds: None,
+                retry_after_secs: None,
+            })
+        }
+        Ok(_) => Err(IpcError::from_api(&ApiError::Parse(
+            "unexpected confirm answer".to_string(),
+        ))),
+        Err(e) => {
+            tracing::warn!("Account number replacement: confirm refused ({})", e);
+            match rotation_refusal(&e, true) {
+                Some(step) => Ok(step),
+                None => Err(IpcError::from_api(&e)),
+            }
+        }
+    }
+}
+
 /// Login to an existing anonymous account with its 24-digit ID
 #[tauri::command]
 pub async fn login_anonymous(
+    app: AppHandle,
     request: AnonymousLoginCommandRequest,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
@@ -952,11 +1312,21 @@ pub async fn login_anonymous(
     let device_id = crate::utils::get_device_id();
     tracing::info!("Anonymous login attempt");
 
-    match api
-        .login_anonymous(&anonymous_id, request.password.clone(), &device_id)
-        .await
-    {
-        Ok(result) => {
+    // A-M77 / MR-2139: the spike-time proof of work, as in `login`.
+    let (cancel, on_progress) = begin_proof(&app);
+    let outcome = api
+        .login_anonymous(
+            &anonymous_id,
+            request.password.clone(),
+            &device_id,
+            cancel,
+            on_progress,
+        )
+        .await;
+    end_proof();
+    match outcome {
+        Ok(crate::api::pow::Registered::Cancelled) => Ok(cancelled_response()),
+        Ok(crate::api::pow::Registered::Done(result)) => {
             if result.requires_two_factor {
                 tracing::info!("Anonymous login requires 2FA");
                 return Ok(LoginResponse {
@@ -1067,9 +1437,7 @@ mod account_boundary_tests {
         let around = del
             .find("let around_the_tunnel = around_the_tunnel(&app).await;")
             .expect("the path around the tunnel");
-        let confirmed = del
-            .find(".delete_account(&request.password, two_factor_code, around_the_tunnel)")
-            .expect("the server call");
+        let confirmed = del.find(".delete_account(").expect("the server call");
         assert!(around < confirmed);
         let path = body_of("async fn around_the_tunnel(");
         assert!(
@@ -1358,12 +1726,66 @@ mod account_boundary_tests {
                     { "store": "GOOGLE_PLAY", "productId": "birdo_operative", "expiresAt": null }
                 ])),
                 web_subscription_will_be_cancelled: Some(true),
+                step_up: Some(crate::api::types::DeletionStepUp {
+                    factors: vec!["account_number".into()],
+                    enforced: false,
+                }),
             });
         assert_eq!(named.store_subscriptions_still_billing, vec!["Google Play"]);
         assert!(named.web_subscription_will_be_cancelled);
+        assert_eq!(named.step_up_factors, vec!["account_number"]);
+        assert!(!named.step_up_enforced);
 
         let nothing = super::deletion_preflight_result(&Default::default());
         assert!(nothing.store_subscriptions_still_billing.is_empty());
         assert!(!nothing.web_subscription_will_be_cancelled);
+        assert!(nothing.step_up_factors.is_empty());
+        assert!(!nothing.step_up_enforced);
+    }
+
+    /// MR-179: the proof rides the deletion call (number as digits, code
+    /// trimmed), is wiped on drop, and a step-up refusal reaches the dialog by
+    /// code, not as "Account deletion failed: ...".
+    #[test]
+    fn deletion_forwards_the_step_up_proof_and_keeps_refusal_codes() {
+        let del = body("delete_account");
+        assert!(
+            del.contains("request\n        .account_number") || del.contains(".account_number")
+        );
+        assert!(del.contains("account_number.as_ref()"));
+        assert!(del.contains("email_code,"));
+        let request_drop = include_str!("auth.rs");
+        assert!(request_drop.contains("number.zeroize()"));
+
+        use crate::api::error::StepUpKind;
+        for (kind, code) in [
+            (
+                StepUpKind::AccountNumberRequired,
+                crate::commands::ipc_error::IpcErrorCode::AccountNumberRequired,
+            ),
+            (
+                StepUpKind::AccountNumberInvalid,
+                crate::commands::ipc_error::IpcErrorCode::AccountNumberInvalid,
+            ),
+            (
+                StepUpKind::EmailCodeRequired,
+                crate::commands::ipc_error::IpcErrorCode::EmailCodeRequired,
+            ),
+            (
+                StepUpKind::EmailCodeInvalid,
+                crate::commands::ipc_error::IpcErrorCode::EmailCodeInvalid,
+            ),
+        ] {
+            let err = super::delete_failure_message(&crate::api::error::ApiError::StepUp {
+                kind,
+                message: "Enter your 24-digit account number to delete your account.".into(),
+            });
+            assert_eq!(err.code, code);
+            assert!(
+                !err.message.starts_with("Account deletion failed"),
+                "{}",
+                err.message
+            );
+        }
     }
 }

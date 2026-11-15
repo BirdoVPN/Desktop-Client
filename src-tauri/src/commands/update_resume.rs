@@ -1176,11 +1176,12 @@ mod tests {
         let recorded = run
             .find("commands::update_resume::record_if_exit_kept_the_session(")
             .expect("record at exit");
-        let flag = run[recorded..]
-            .find("EXIT_TEARDOWN_STARTED.load(")
-            .expect("the teardown flag");
+        // What the record is told (the teardown flag as it stood BEFORE the
+        // end of the run's own teardown claims it) is driven in
+        // `utils::tests::the_end_of_the_run_records_then_tears_down_then_clears`.
+        let end_of_run = run.find("utils::end_of_run(").expect("the end of the run");
         let requested = run.find("RunEvent::ExitRequested").expect("ExitRequested");
-        assert!(exit < recorded && recorded < requested && flag < 200);
+        assert!(exit < end_of_run && end_of_run < recorded && recorded < requested);
     }
 
     /// Review of #276, M1: the exit path records on Windows only. On macOS a

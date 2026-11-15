@@ -64,11 +64,22 @@ pub struct ApiErrorBody {
 /// `twoFactorCode` (Account API contract item 85): the TOTP or backup code an
 /// account with 2FA must add, sent only once the server has asked for it — so
 /// a backend that predates the field never sees it.
-#[derive(Debug, Serialize)]
+// No `Debug`: it carries the password, the 2FA code, the account number and the
+// e-mailed code, and a derived one would print them.
+#[derive(Serialize)]
 pub struct DeleteAccountBody<'a> {
     pub password: &'a str,
     #[serde(rename = "twoFactorCode", skip_serializing_if = "Option::is_none")]
     pub two_factor_code: Option<&'a str>,
+    /// MR-179 (owner 2026-11-13): the 24-digit number an anonymous account
+    /// re-enters. Sent only once the server asked for it, or the preflight said
+    /// to, so a backend that predates it never sees the key.
+    #[serde(rename = "accountNumber", skip_serializing_if = "Option::is_none")]
+    pub account_number: Option<&'a str>,
+    /// MR-179: the 6-digit code `POST /api/v1/gdpr/delete/code` e-mailed to an
+    /// SSO account with no 2FA.
+    #[serde(rename = "emailCode", skip_serializing_if = "Option::is_none")]
+    pub email_code: Option<&'a str>,
 }
 
 /// Success body of `DELETE /api/v1/gdpr/delete`.
@@ -100,6 +111,32 @@ pub struct DeletionPreflightResponse {
     pub store_subscriptions_still_billing: Option<serde_json::Value>,
     #[serde(default)]
     pub web_subscription_will_be_cancelled: Option<bool>,
+    /// MR-179: what this account is asked for before a deletion. Absent from a
+    /// backend older than birdo-web #766.
+    #[serde(default)]
+    pub step_up: Option<DeletionStepUp>,
+}
+
+/// `stepUp` of the deletion preflight: the server's factor tokens (`password`,
+/// `account_number`, `email_code`, `apple_reauth`, `two_factor`) and whether it
+/// refuses a deletion that lacks them.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DeletionStepUp {
+    #[serde(default)]
+    pub factors: Vec<String>,
+    #[serde(default)]
+    pub enforced: bool,
+}
+
+/// Body of `POST /api/v1/gdpr/delete/code`: the e-mailed deletion code went to
+/// `sentTo`, a masked address ("j***@example.com").
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionCodeResponse {
+    #[serde(default)]
+    pub sent_to: Option<String>,
+    #[serde(default)]
+    pub expires_in_minutes: Option<u64>,
 }
 
 /// Turn `storeSubscriptionsStillBilling` into user-facing store names,
@@ -377,6 +414,10 @@ pub struct LoginRequest {
     platform: String,
     #[serde(rename = "appVersion")]
     app_version: String,
+    /// A solved `login` challenge (`api::pow`), only on the one retry the
+    /// server asked for with 429 `pow_required` (A-M77 / MR-2139).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pow: Option<super::pow::PowSolution>,
 }
 
 /// Clamp a device label to what DeviceInfoSchema accepts: 1..=`max` characters.
@@ -409,7 +450,15 @@ impl LoginRequest {
             device_type: "DESKTOP".to_string(),
             platform: crate::utils::device_platform().to_string(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
+            pow: None,
         }
+    }
+
+    /// Attach the solved `login` challenge of the one retry a 429
+    /// `pow_required` asked for (A-M77 / MR-2139).
+    pub fn with_pow(mut self, pow: Option<super::pow::PowSolution>) -> Self {
+        self.pow = pow;
+        self
     }
 }
 
@@ -519,6 +568,9 @@ pub struct AnonymousLoginRequest {
     pub password: Option<String>,
     #[serde(rename = "deviceId")]
     pub device_id: String,
+    /// A solved `login` challenge, only on the retry a 429 `pow_required` asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow: Option<super::pow::PowSolution>,
 }
 
 /// Per-user monthly bandwidth usage + cap (backend GET /vpn/stats), for the
@@ -545,6 +597,97 @@ pub struct UsageStats {
 /// the server generates the 24-digit ID (matches backend DeviceInfoSchema — all
 /// fields optional). Reuses `AnonymousLoginResult` for the response shape
 /// ({ ok, anonymousId, tokens }).
+/// `POST /auth/anonymous/rotate-number/prepare` (MR-1707, birdo-web #850):
+/// the step-up proof for a replacement number. The current number is the
+/// account's only credential, so it is wiped on drop and never logged.
+#[derive(Serialize)]
+pub struct RotatePrepareBody {
+    #[serde(rename = "currentNumber")]
+    pub current_number: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(rename = "twoFactorCode", skip_serializing_if = "Option::is_none")]
+    pub two_factor_code: Option<String>,
+}
+
+impl Drop for RotatePrepareBody {
+    fn drop(&mut self) {
+        self.current_number.zeroize();
+        self.password.zeroize();
+        self.two_factor_code.zeroize();
+    }
+}
+
+impl std::fmt::Debug for RotatePrepareBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RotatePrepareBody(<redacted>)")
+    }
+}
+
+/// The prepare answer: the NEW number, shown once. Redacted in `Debug`.
+#[derive(Deserialize)]
+pub struct RotatePrepareResponse {
+    #[serde(rename = "newNumber")]
+    pub new_number: String,
+    #[serde(default, rename = "expiresInSeconds")]
+    pub expires_in_seconds: Option<u64>,
+}
+
+impl Drop for RotatePrepareResponse {
+    fn drop(&mut self) {
+        self.new_number.zeroize();
+    }
+}
+
+impl std::fmt::Debug for RotatePrepareResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RotatePrepareResponse(<redacted>)")
+    }
+}
+
+/// `POST /auth/anonymous/rotate-number/confirm`: the user re-types the whole
+/// new number; device fields are optional, as at login.
+#[derive(Serialize)]
+pub struct RotateConfirmBody {
+    #[serde(rename = "newNumber")]
+    pub new_number: String,
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
+    #[serde(rename = "deviceName", skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    pub platform: String,
+}
+
+impl Drop for RotateConfirmBody {
+    fn drop(&mut self) {
+        self.new_number.zeroize();
+    }
+}
+
+impl std::fmt::Debug for RotateConfirmBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RotateConfirmBody(<redacted>)")
+    }
+}
+
+/// The confirm answer: the caller's fresh session, minted after every other
+/// session was ended.
+#[derive(Deserialize)]
+pub struct RotateConfirmResponse {
+    #[serde(default)]
+    pub ok: bool,
+    pub tokens: Option<TokenPair>,
+}
+
+/// Manual: `TokenPair`'s derived `Debug` would print the tokens.
+impl std::fmt::Debug for RotateConfirmResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotateConfirmResponse")
+            .field("ok", &self.ok)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AnonymousRegisterRequest {
     #[serde(rename = "deviceId")]
@@ -556,6 +699,10 @@ pub struct AnonymousRegisterRequest {
     pub platform: String,
     #[serde(rename = "appVersion", skip_serializing_if = "Option::is_none")]
     pub app_version: Option<String>,
+    /// A solved `signup` challenge (`api::pow`). Absent when none could be
+    /// had: the server then judges the request on its fallback tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pow: Option<super::pow::PowSolution>,
 }
 
 /// Anonymous login response. Success = { ok, anonymousId, tokens }; accounts
@@ -693,9 +840,19 @@ impl UserProfile {
 pub struct AccountNumber(String);
 
 impl AccountNumber {
-    /// Only the documented shape (`/^\d{24}$/`) is accepted.
+    /// Only the documented shape (`/^\d{24}$/`) is accepted, or the server's
+    /// mask of it (MR-1707, birdo-web #850, `ANON_NUMBER_MASKING`): 24
+    /// characters, stars then the last digits (`********************1234`).
+    /// A mask is not a credential; the UI shows it and offers no copy.
     pub fn parse(raw: &str) -> Option<Self> {
-        (raw.len() == 24 && raw.bytes().all(|b| b.is_ascii_digit())).then(|| Self(raw.to_string()))
+        (raw.len() == 24 && (raw.bytes().all(|b| b.is_ascii_digit()) || Self::is_mask(raw)))
+            .then(|| Self(raw.to_string()))
+    }
+
+    /// Stars, then digits only: `*` first, no digit before a star.
+    fn is_mask(raw: &str) -> bool {
+        let stars = raw.bytes().take_while(|b| *b == b'*').count();
+        stars > 0 && raw.bytes().skip(stars).all(|b| b.is_ascii_digit())
     }
 }
 

@@ -630,10 +630,11 @@ pub(crate) async fn start_stealth_tunnel(
 ///
 /// Order of preference:
 ///   1. BirdoPQ v1 ML-KEM-1024 — decapsulate the server-supplied ciphertext
-///      with our persistent client secret key. Post-quantum on the app-to-API
-///      leg only, not a complete "record now, decrypt later" defence: the key
-///      is long-lived, the relay leg is classical TLS and multi-hop's middle
-///      leg has no PQ PSK (`vpn::birdo_pq` module docs).
+///      with the secret of THIS connect's `PqSession` (one keypair per
+///      connect request, consumed here, never stored). Post-quantum on the
+///      app-to-API leg only, not a complete "record now, decrypt later"
+///      defence: the relay leg is classical TLS and multi-hop's middle leg
+///      has no PQ PSK (`vpn::birdo_pq` module docs).
 ///   2. If the server enabled quantum mode but decapsulation fails, abort.
 ///   3. Server-provided classical PSK (TLS-delivered random; not HNDL-safe).
 ///   4. None — connection runs without PSK.
@@ -642,10 +643,11 @@ pub(crate) async fn start_stealth_tunnel(
 /// real protection level instead of a no-op toggle indicator.
 pub(crate) fn derive_quantum_psk(
     response: &ConnectResponse,
+    pq_session: Option<crate::vpn::birdo_pq::PqSession>,
 ) -> Result<Option<Zeroizing<String>>, String> {
     // 1) True bilateral PQ — only succeeds when server returned a ciphertext
     //    AND we have a local keypair AND decapsulation produced a PSK.
-    if let Some(psk) = crate::vpn::birdo_pq::try_decapsulate(response) {
+    if let Some(psk) = crate::vpn::birdo_pq::try_decapsulate(response, pq_session) {
         return Ok(Some(psk));
     }
 
@@ -2028,7 +2030,7 @@ mod tests {
     #[test]
     fn derive_quantum_psk_fails_closed_when_psk_withheld() {
         let resp = withheld_psk_response(Some(true));
-        let r = derive_quantum_psk(&resp);
+        let r = derive_quantum_psk(&resp, Some(crate::vpn::birdo_pq::PqSession::begin()));
         assert!(r.is_err(), "expected fail-closed Err, got {r:?}");
         assert!(r.unwrap_err().contains("silent downgrade"));
     }
@@ -2039,12 +2041,24 @@ mod tests {
     #[test]
     fn derive_quantum_psk_allows_no_psk_when_quantum_off() {
         let resp = withheld_psk_response(Some(false));
-        assert_eq!(derive_quantum_psk(&resp), Ok(None));
+        assert_eq!(derive_quantum_psk(&resp, None), Ok(None));
+    }
+
+    /// MR-703: quantum on, but this connect made no keypair (a bug upstream,
+    /// never a user state). It aborts, and does so even though the server
+    /// offers a classical PSK: no session, no decapsulation, no demotion.
+    #[test]
+    fn quantum_on_without_a_session_aborts() {
+        let mut resp = withheld_psk_response(Some(true));
+        resp.preshared_key = Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".into());
+        let r = derive_quantum_psk(&resp, None);
+        assert!(r.is_err(), "expected fail-closed Err, got {r:?}");
+        assert!(r.unwrap_err().contains("silent downgrade"));
     }
 
     /// The consequence of a BirdoPQ decapsulation that cannot happen — an
-    /// unusable persisted `birdo_pq_v1.bin`, a malformed ciphertext, a missing
-    /// nonce — is an ABORTED connect, never a demotion to the server's
+    /// malformed ciphertext, a missing nonce, a connect with no keypair — is
+    /// an ABORTED connect, never a demotion to the server's
     /// classical PSK. Three comments in `vpn::birdo_pq` once justified
     /// discarding the user's long-lived ML-KEM identity key with the opposite
     /// claim: a permanent, silent demotion for the life of the install. It
@@ -2057,7 +2071,7 @@ mod tests {
     fn undecapsulatable_pq_aborts_even_when_a_server_psk_is_offered() {
         let mut resp = withheld_psk_response(Some(true));
         resp.preshared_key = Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".into());
-        let r = derive_quantum_psk(&resp);
+        let r = derive_quantum_psk(&resp, Some(crate::vpn::birdo_pq::PqSession::begin()));
         assert!(
             r.is_err(),
             "a failed PQ decapsulation must abort, not take the offered classical PSK; got {r:?}"
@@ -2066,17 +2080,16 @@ mod tests {
     }
 
     /// The other direction of the same correction: with `quantum_enabled` off,
-    /// `try_decapsulate` returns at its first line and the PQ key file is never
-    /// opened, so the state of that file cannot affect the classical path at
-    /// all — there is no install-lifetime fallback for an unusable key to
-    /// cause. The server PSK is taken. (The `PqMode` latch is process-global
+    /// `try_decapsulate` returns at its first line and no keypair is touched,
+    /// so nothing about the PQ engine can affect the classical path at all.
+    /// The server PSK is taken. (The `PqMode` latch is process-global
     /// and other tests move it, so asserting on it here would race.)
     #[test]
-    fn quantum_off_takes_the_server_psk_regardless_of_the_pq_key_file() {
+    fn quantum_off_takes_the_server_psk_regardless_of_the_pq_engine() {
         let mut resp = withheld_psk_response(Some(false));
         resp.preshared_key = Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".into());
         assert_eq!(
-            derive_quantum_psk(&resp),
+            derive_quantum_psk(&resp, None),
             Ok(Some(Zeroizing::new(
                 "c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".to_string()
             )))

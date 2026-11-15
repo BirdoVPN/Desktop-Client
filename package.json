@@ -1,8 +1,8 @@
 {
   "name": "birdo-vpn-desktop",
-  "version": "1.4.52",
+  "version": "1.4.54",
   "type": "module",
-  "description": "Birdo VPN Desktop Client (Windows & macOS)",
+  "description": "Birdo VPN Desktop Client (Windows, macOS & Linux)",
   "private": true,
   "scripts": {
     "dev": "vite",
@@ -58,5 +58,13 @@
     "typescript": "^5.6.3",
     "vite": "^8.3.5",
     "vitest": "^5.0.3"
+  },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": {
+        ".": "11.0.3",
+        "@isaacs/nonrecursive-glob-match": "1.0.3"
+      }
+    }
   }
 }

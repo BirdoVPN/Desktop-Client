@@ -3,6 +3,33 @@
 use super::upgrade_gate::RequiredUpdate;
 use std::fmt;
 
+/// MR-179: which deletion step-up a refusal is about. The server's `error`
+/// codes, one to one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepUpKind {
+    AccountNumberRequired,
+    AccountNumberInvalid,
+    EmailCodeRequired,
+    EmailCodeInvalid,
+    /// `apple_reauth_required|invalid`: an Apple account with no e-mail address
+    /// re-signs in with Apple, which only the iOS app can do.
+    AppleReauth,
+}
+
+impl StepUpKind {
+    /// `error` of a deletion refusal, or None for any other code.
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "account_number_required" => Some(Self::AccountNumberRequired),
+            "account_number_invalid" => Some(Self::AccountNumberInvalid),
+            "email_code_required" => Some(Self::EmailCodeRequired),
+            "email_code_invalid" => Some(Self::EmailCodeInvalid),
+            "apple_reauth_required" | "apple_reauth_invalid" => Some(Self::AppleReauth),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ApiError {
     /// Network error (no connection, timeout, etc.)
@@ -51,12 +78,21 @@ pub enum ApiError {
     /// does not create new accounts from this country. Carries the backend's
     /// own sentence, which is the only explanation there is.
     RegistrationNotAllowed(String),
+    /// 403 with `details.code: "email_not_verified"` (MR-2210): the password was
+    /// right but the e-mail address was never confirmed. A bare 403 would read
+    /// as "your plan does not include this".
+    EmailNotVerified,
     /// The action needs the account's two-factor code (`error:
     /// "two_factor_required"`, Account API contract item 85). Carries the
     /// backend's sentence.
     TwoFactorRequired(String),
     /// The two-factor code sent was wrong (`error: "two_factor_invalid"`).
     TwoFactorInvalid(String),
+    /// MR-179: a deletion step-up refusal (`error: "account_number_required"`,
+    /// `"account_number_invalid"`, `"email_code_required"`,
+    /// `"email_code_invalid"`). Carries the backend's sentence; the dialog words
+    /// it by `kind`.
+    StepUp { kind: StepUpKind, message: String },
     /// 503 `error: "quota_check_unavailable"` (birdo-web #590): the server
     /// could not check a Free plan's allowance just now. Worth retrying, after
     /// `retry_after_secs` when the server says.
@@ -83,6 +119,23 @@ pub enum ApiError {
     /// variant so it is not read as a plan refusal (a bare 403 is
     /// `subscription_required`). Carries the backend's sentence.
     ClientAttestationRequired(String),
+    /// A proof of work (sign-up, or sign-in during a spike) the server did not accept (`details.code`
+    /// `pow_invalid`, `pow_expired`, `pow_replayed`, `pow_difficulty_raised`
+    /// or `pow_required`). `api::pow::register_with_proof` fetches a new
+    /// challenge on most of them; the sentence is the backend's.
+    PowRefused {
+        code: String,
+        message: String,
+        /// `details.pow.op` when the server names one (`login` or `signup`):
+        /// the operation a challenge must be fetched for. `None` when the
+        /// refusal carries no `pow` member (`pow_rate_limited`, old servers).
+        pow_op: Option<String>,
+    },
+    /// A refusal of the anonymous-number replacement, by the server's `error`
+    /// code (MR-1707): `anon_number_rotation_disabled` (403),
+    /// `rotation_not_pending` or `rotation_account_changed` (409). The status
+    /// alone cannot tell the two 409s apart.
+    AnonNumberRefused(String),
     /// Unknown error
     Unknown(String),
 }
@@ -199,8 +252,11 @@ impl fmt::Display for ApiError {
             ApiError::Rejected { message, .. }
             | ApiError::TwoFactorRequired(message)
             | ApiError::TwoFactorInvalid(message)
+            | ApiError::StepUp { message, .. }
             | ApiError::RegistrationNotAllowed(message)
+            | ApiError::PowRefused { message, .. }
             | ApiError::ClientAttestationRequired(message) => write!(f, "{}", message),
+            ApiError::EmailNotVerified => write!(f, "Please verify your email address before signing in"),
             ApiError::QuotaCheckUnavailable { .. } => {
                 write!(f, "The data allowance check is unavailable right now")
             }
@@ -215,6 +271,9 @@ impl fmt::Display for ApiError {
                     f,
                     "A connection address on this server could not be assigned right now"
                 )
+            }
+            ApiError::AnonNumberRefused(code) => {
+                write!(f, "The account number replacement was refused ({code})")
             }
             ApiError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
         }

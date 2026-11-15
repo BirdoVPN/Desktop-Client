@@ -1,5 +1,6 @@
 import { useState, useRef, useId, useEffect, type FormEvent, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
@@ -82,6 +83,10 @@ export function Login() {
   // "Creating…" during an ordinary sign-in because both shared one flag.
   const [signingIn, setSigningIn] = useState(false);
   const [creating, setCreating] = useState(false);
+  // MR-2152: while an account is created this device does a short sum the
+  // server asks for (sign-up proof of work); Rust reports 0-99 and can stop it.
+  // A-M77: the same during a sign-in spike, when the server asks for one there.
+  const [deviceCheck, setDeviceCheck] = useState<number | null>(null);
 
   // 2FA challenge state
   const [twoFactorRequired, setTwoFactorRequired] = useState(false);
@@ -177,6 +182,7 @@ export function Login() {
       setError(signInError(err));
     } finally {
       setSigningIn(false);
+      setDeviceCheck(null);
     }
   };
 
@@ -216,11 +222,36 @@ export function Login() {
       setError(signInError(err, 'anonymous_sign_in'));
     } finally {
       setSigningIn(false);
+      setDeviceCheck(null);
     }
   };
 
   // Create a brand-new anonymous account in-app. The backend mints the
   // 24-digit number and stores tokens; we show the number to save first.
+  useEffect(() => {
+    if (!creating && !signingIn) return;
+    let off: (() => void) | undefined;
+    let stopped = false;
+    try {
+      listen<number>('signup-proof-progress', (e) => setDeviceCheck(e.payload))
+        .then((un) => (stopped ? un() : (off = un)))
+        .catch(() => {});
+    } catch {
+      /* no event channel (tests, browser preview): the button just says Creating */
+    }
+    return () => {
+      stopped = true;
+      off?.();
+    };
+  }, [creating, signingIn]);
+
+  // "Signing in…", or the device check when the server asked for one (A-M77).
+  const signingInLabel = deviceCheck === null ? 'Signing in…' : `Checking this device… ${deviceCheck}%`;
+
+  const cancelDeviceCheck = () => {
+    invoke('cancel_signup_proof').catch(() => {});
+  };
+
   const handleCreateAnonymous = async () => {
     setError(null);
     setCreating(true);
@@ -235,6 +266,7 @@ export function Login() {
       setError(signInError(err, 'general'));
     } finally {
       setCreating(false);
+      setDeviceCheck(null);
     }
   };
 
@@ -618,7 +650,7 @@ export function Login() {
 
                         <BirdoButton
                           type="submit"
-                          text={signingIn ? 'Signing in…' : 'Sign in'}
+                          text={signingIn ? signingInLabel : 'Sign in'}
                           onClick={() => {}}
                           variant="brand"
                           size="large"
@@ -627,6 +659,16 @@ export function Login() {
                           disabled={!emailValid || password.length === 0}
                           className="mt-1"
                         />
+                        {signingIn && deviceCheck !== null && (
+                          <button
+                            type="button"
+                            onClick={cancelDeviceCheck}
+                            className="self-center text-xs underline transition hover:text-w100"
+                            style={{ color: white.w60 }}
+                          >
+                            Cancel
+                          </button>
+                        )}
                       </motion.form>
                     )}
 
@@ -656,8 +698,22 @@ export function Login() {
                               aria-hidden
                             />
                           )}
-                          {creating ? 'Creating…' : 'Create a new anonymous account'}
+                          {creating
+                            ? deviceCheck === null
+                              ? 'Creating…'
+                              : `Checking this device… ${deviceCheck}%`
+                            : 'Create a new anonymous account'}
                         </button>
+                        {creating && deviceCheck !== null && (
+                          <button
+                            type="button"
+                            onClick={cancelDeviceCheck}
+                            className="self-center text-xs underline transition hover:text-w100"
+                            style={{ color: white.w60 }}
+                          >
+                            Cancel
+                          </button>
+                        )}
                         <p className="text-center text-xs" style={{ color: white.w60 }}>
                           No email needed. You get an account number to sign in with.
                         </p>
@@ -694,7 +750,7 @@ export function Login() {
 
                           <BirdoButton
                             type="submit"
-                            text={signingIn ? 'Signing in…' : 'Sign in'}
+                            text={signingIn ? signingInLabel : 'Sign in'}
                             onClick={() => {}}
                             variant="secondary"
                             size="large"
@@ -702,6 +758,16 @@ export function Login() {
                             isLoading={signingIn}
                             disabled={creating}
                           />
+                          {signingIn && deviceCheck !== null && (
+                            <button
+                              type="button"
+                              onClick={cancelDeviceCheck}
+                              className="self-center text-xs underline transition hover:text-w100"
+                              style={{ color: white.w60 }}
+                            >
+                              Cancel
+                            </button>
+                          )}
                         </form>
                       </motion.div>
                     )}

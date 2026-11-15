@@ -18,10 +18,12 @@ import { brand, status as statusTokens } from '@/lib/birdo-theme';
 import { planRank } from '@/lib/plan';
 import { BILLING_URL } from '@/lib/links';
 import { displayableEmail, resolveAnonymousAccount } from '@/utils/helpers';
+import { anonNumberRotationEnabled } from '@/lib/features';
 import { loadSubscription } from '@/session/session-data';
 import { signOut } from '@/session/session';
 import { AccountNumberCard, IdentityCard, SubscriptionCard } from './profile/ProfileCards';
 import { DeleteAccountDialog } from './profile/DeleteAccountDialog';
+import { ReplaceAccountNumberDialog } from './profile/ReplaceAccountNumberDialog';
 import { VoucherRedeemDialog } from './profile/VoucherRedeemDialog';
 
 export {
@@ -57,6 +59,7 @@ export function Profile() {
 
   const [showVoucherDialog, setShowVoucherDialog] = useState(false);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [showReplaceDialog, setShowReplaceDialog] = useState(false);
   const [exportState, setExportState] = useState<'idle' | 'working' | 'done' | 'error'>('idle');
 
   // GDPR data export (Art. 20). The backend command returns the full JSON blob;
@@ -95,7 +98,12 @@ export function Profile() {
       <div className="flex flex-col gap-3 px-5 pb-12 pt-2">
         <IdentityCard email={resolvedEmail} plan={account.plan} isAnon={isAnon} />
 
-        {isAnon && <AccountNumberCard accountNumber={accountNumber} />}
+        {isAnon && (
+          <AccountNumberCard
+            accountNumber={accountNumber}
+            onReplace={anonNumberRotationEnabled() ? () => setShowReplaceDialog(true) : undefined}
+          />
+        )}
 
         <SubscriptionCard
           plan={account.plan}
@@ -173,6 +181,13 @@ export function Profile() {
         onDismiss={() => setShowVoucherDialog(false)}
         onRedeemed={() => void loadSubscription(true)}
       />
+      {showReplaceDialog && (
+        <ReplaceAccountNumberDialog
+          open
+          hasPassword={account.hasPassword}
+          onDismiss={() => setShowReplaceDialog(false)}
+        />
+      )}
       {showDeleteDialog && (
         <DeleteAccountDialog
           open

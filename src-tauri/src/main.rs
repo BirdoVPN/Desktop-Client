@@ -206,12 +206,16 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::auth::login,
         commands::auth::login_anonymous,
         commands::auth::register_anonymous,
+        commands::auth::rotate_anonymous_number_prepare, // MR-1707
+        commands::auth::rotate_anonymous_number_confirm, // MR-1707
+        commands::auth::cancel_signup_proof,
         commands::oauth::native_oauth_login, // native Google/GitHub SSO
         commands::auth::logout,
         commands::auth::get_auth_state,
         commands::auth::verify_2fa,     // FIX C-2: 2FA TOTP verification
         commands::auth::delete_account, // GDPR account deletion
         commands::auth::deletion_preflight, // what a deletion leaves billing
+        commands::auth::send_deletion_code, // MR-179: e-mail the deletion code (SSO)
         commands::auth::export_user_data, // GDPR data export
         commands::session::end_expired_session, // a command answered session_expired
         // VPN operations
@@ -246,6 +250,9 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::updater::install_update,
         commands::updater::get_required_update,
         commands::update_resume::take_update_resume, // MR-1861: the session an update ended
+        // A-M50: Linux new-version notice (no updater endpoint, no apt repo)
+        commands::linux_release::check_linux_release,
+        commands::linux_release::open_linux_release_page,
         // Settings › About › Licences (MR-1685)
         commands::licences::get_third_party_notices,
         // Extended VPN info
@@ -600,6 +607,13 @@ fn main() {
             #[cfg(windows)]
             crate::utils::protected_dir::remove_updates_at_start();
 
+            // MR-703 / MR-1742: no ML-KEM key is stored any more (one keypair
+            // per connect, in memory). Delete the file an older build left,
+            // once per start; the first start after the upgrade finds it.
+            // Off the setup path: it is only a few file deletions, but setup
+            // must not wait on a slow disk.
+            std::thread::spawn(crate::vpn::birdo_pq::purge_legacy_keypair_files);
+
             // R1 / D6c LOW: consume the legacy-upgrade marker now — the PRIMARY
             // instance (only it reaches setup; the single-instance plugin turns
             // a second one away), after the settings migration above. Gated on
@@ -896,10 +910,6 @@ fn main() {
             // for the next version to resume. Not on macOS, where Cmd+Q and
             // the Dock's Quit come this way too (commands::update_resume).
             if matches!(event, RunEvent::Exit) {
-                commands::update_resume::record_if_exit_kept_the_session(
-                    app_handle,
-                    EXIT_TEARDOWN_STARTED.load(std::sync::atomic::Ordering::SeqCst),
-                );
                 // MR-1934: macOS's Cmd+Q, the Dock's Quit and logout come
                 // here with no ExitRequested before them (tao's
                 // applicationWillTerminate), so the teardown below never ran
@@ -912,33 +922,42 @@ fn main() {
                 // shutdown, whose live session the next version resumes
                 // (MR-1861), and the WFP block goes with the process anyway.
                 // Not after a restart was let through (no teardown, by design).
-                #[cfg(not(target_os = "windows"))]
-                if !EXIT_RESTARTING.load(std::sync::atomic::Ordering::SeqCst) {
-                    let app = app_handle.clone();
-                    let ran = utils::tear_down_unless_started(
-                        &EXIT_TEARDOWN_STARTED,
-                        EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN,
-                        move || {
-                            tauri::async_runtime::block_on(async move {
-                                if tokio::time::timeout(EXIT_TEARDOWN_CAP, teardown_for_exit(&app))
-                                    .await
-                                    .is_err()
-                                {
-                                    error!("Exit teardown timed out — exiting anyway");
-                                }
-                            });
-                        },
+                //
+                // The order (record, teardown, clear) and the three
+                // conditions are `utils::end_of_run`, driven in
+                // `utils::tests::the_end_of_the_run_records_then_tears_down_then_clears`.
+                let app = app_handle.clone();
+                let ran = utils::end_of_run(
+                    &EXIT_TEARDOWN_STARTED,
+                    &EXIT_RESTARTING,
+                    cfg!(not(target_os = "windows")),
+                    EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN,
+                    |started| {
+                        commands::update_resume::record_if_exit_kept_the_session(
+                            app_handle, started,
+                        )
+                    },
+                    move || {
+                        tauri::async_runtime::block_on(async move {
+                            if tokio::time::timeout(EXIT_TEARDOWN_CAP, teardown_for_exit(&app))
+                                .await
+                                .is_err()
+                            {
+                                error!("Exit teardown timed out — exiting anyway");
+                            }
+                        });
+                    },
+                    // MR-2013: a copied account number whose one-minute clear
+                    // has not run yet would outlive the process on the
+                    // clipboard.
+                    commands::clipboard::clear_on_exit,
+                );
+                if let Some(finished) = ran {
+                    info!(
+                        "Exit with no exit request — the teardown ran first (finished: {})",
+                        finished
                     );
-                    if let Some(finished) = ran {
-                        info!(
-                            "Exit with no exit request — the teardown ran first (finished: {})",
-                            finished
-                        );
-                    }
                 }
-                // MR-2013: a copied account number whose one-minute clear has
-                // not run yet would outlive the process on the clipboard.
-                commands::clipboard::clear_on_exit();
             }
             if let RunEvent::ExitRequested { code, api, .. } = &event {
                 // A restart (`plugin-process` relaunch: the frontend's
