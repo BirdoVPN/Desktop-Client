@@ -26,8 +26,8 @@ import { displayableEmail, resolveAnonymousAccount } from '@/utils/helpers';
 import { anonNumberRotationEnabled } from '@/lib/features';
 import { loadSubscription } from '@/session/session-data';
 import { signOut } from '@/session/session';
-import { usePendingDeletion } from '@/session/held-deletion';
-import { clearHeldDeletion } from '@/lib/held-deletion';
+import { refreshHeldDeletion, usePendingDeletion } from '@/session/held-deletion';
+import { clearHeldDeletion, getHeldDeletion } from '@/lib/held-deletion';
 import { AccountNumberCard, IdentityCard, SubscriptionCard } from './profile/ProfileCards';
 import { DeleteAccountDialog } from './profile/DeleteAccountDialog';
 import { PendingDeletionBanner } from './profile/PendingDeletion';
@@ -78,6 +78,23 @@ export function Profile() {
   // `SignOutDialog`): it says what signing out does to that hold, by where the
   // hold came from, and offers Cancel deletion.
   const [confirmSignOut, setConfirmSignOut] = useState(false);
+  // With no hold known yet (Profile's own opening read may still be out),
+  // Sign out reads the list before deciding, so a fast click cannot skip
+  // the warning. The row is disabled meanwhile.
+  const [checkingHold, setCheckingHold] = useState(false);
+  const handleSignOut = async () => {
+    if (checkingHold) return;
+    if (!getHeldDeletion()) {
+      setCheckingHold(true);
+      try {
+        await refreshHeldDeletion();
+      } finally {
+        setCheckingHold(false);
+      }
+    }
+    if (getHeldDeletion()) setConfirmSignOut(true);
+    else void signOut();
+  };
 
   // GDPR data export (Art. 20). The backend command returns the full JSON blob;
   // save it via a webview download so the user gets a file with no extra plugin.
@@ -189,7 +206,8 @@ export function Profile() {
               subtitle={isAnon ? 'Anonymous account' : (resolvedEmail ?? undefined)}
               leadingIcon={LogOut}
               leadingTint={statusTokens.red}
-              onClick={() => (pendingDeletion.hold ? setConfirmSignOut(true) : void signOut())}
+              enabled={!checkingHold}
+              onClick={() => void handleSignOut()}
             />
           </BirdoCard>
         </div>

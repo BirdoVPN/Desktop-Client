@@ -415,12 +415,34 @@ describe('signing out while a deletion is on hold', () => {
     nobodySignedOut();
   });
 
-  it('without a hold, Sign out signs out at once, as before', async () => {
+  it('M2: a click before the opening read answers waits for the read; no hold: signs out, no dialog', async () => {
+    const read = deferred<unknown>();
+    listResult = () => read.promise;
     render(<Profile />);
-    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
+    // Clicked at once: Profile's own opening read is still out.
     await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
-    expect(signOut).toHaveBeenCalledTimes(1);
+    expect(signOut).not.toHaveBeenCalled();
+    // The row is disabled while the read is out.
+    expect(screen.queryByRole('button', { name: /^sign out/i })).not.toBeInTheDocument();
+    await act(async () => {
+      read.resolve([]);
+    });
+    await waitFor(() => expect(signOut).toHaveBeenCalledTimes(1));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('M2: a click before the opening read answers, and the read finds a hold: it asks first', async () => {
+    const read = deferred<unknown>();
+    listResult = () => read.promise;
+    render(<Profile />);
+    await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
+    expect(signOut).not.toHaveBeenCalled();
+    await act(async () => {
+      read.resolve(listed);
+    });
+    const dialog = await screen.findByRole('dialog', { name: 'Sign out?' });
+    expect(within(dialog).getByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_ELSEWHERE);
+    expect(signOut).not.toHaveBeenCalled();
   });
 });
 
