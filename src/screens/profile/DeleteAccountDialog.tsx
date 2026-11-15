@@ -62,7 +62,7 @@ import { useAppStore } from '@/store/app-store';
 import { holdWhen, noteHeldDeletion, SIGN_OUT_CANCELS_HOLD } from '@/lib/held-deletion';
 import { command } from '@/session/command';
 import { refreshHeldDeletion } from '@/session/held-deletion';
-import { cancelErrorText } from './PendingDeletion';
+import { cancelErrorText, cancelHeldDeletion } from './PendingDeletion';
 
 /** Shape returned by the Rust `delete_account` command. */
 export interface DeleteAccountResult {
@@ -351,17 +351,14 @@ export function DeleteAccountDialog({
     setCancellingHold(true);
     setHoldCancelError(null);
     try {
-      const result = await command<{ cancelled?: boolean; alreadyGone?: boolean } | null>(
-        'cancel_pending_change',
-        { id: hold.pendingChangeId },
-      );
+      // Clears the shared state at once (cancelled, or gone already), then re-reads.
+      const { alreadyGone } = await cancelHeldDeletion(hold.pendingChangeId);
       setHold(null);
       setHoldEnded(
-        result?.alreadyGone
+        alreadyGone
           ? 'This deletion is no longer waiting, so there was nothing to cancel.'
           : 'The deletion is cancelled. Your account stays as it is.',
       );
-      void refreshHeldDeletion();
     } catch (e: unknown) {
       setHoldCancelError(cancelErrorText(e));
     } finally {

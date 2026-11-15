@@ -16,7 +16,8 @@
  * - Nothing ever concludes "account deleted": an ended session takes the
  *   ordinary session-expired path, and an unexpected answer assumes nothing.
  * - The hold is ONE shared state (`@/lib/held-deletion`): the Home sign-out
- *   dialog warns too, and the hold the 202 named is known without a list read.
+ *   dialog warns too, the hold the 202 named is known without a list read, and
+ *   a cancel clears it at once.
  *
  * Run: npx vitest run src/__tests__/DeletionHold.test.tsx
  */
@@ -456,6 +457,28 @@ describe('the hold as shared state', () => {
     await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
     expect(await screen.findByText(SIGN_OUT_WITH_HOLD)).toBeInTheDocument();
     expect(signOut).not.toHaveBeenCalled();
+  });
+
+  it('a successful cancel clears the banner at once, even when the re-read fails', async () => {
+    const answers = [() => Promise.resolve(listed)];
+    listResult = () => (answers.shift() ?? (() => Promise.reject(refusal('network_offline'))))();
+    render(<Profile />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Cancel deletion' }));
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+    expect(calls('cancel_pending_change')[0][1]).toStrictEqual({ id: HOLD_ID });
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(2));
+    expect(getHeldDeletion()).toBeNull();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('a cancel answered "already gone" (404) clears it too', async () => {
+    const answers = [() => Promise.resolve(listed)];
+    listResult = () => (answers.shift() ?? (() => Promise.reject(refusal('network_offline'))))();
+    cancelResult = () => Promise.resolve({ cancelled: false, alreadyGone: true });
+    render(<Profile />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Cancel deletion' }));
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+    expect(getHeldDeletion()).toBeNull();
   });
 });
 

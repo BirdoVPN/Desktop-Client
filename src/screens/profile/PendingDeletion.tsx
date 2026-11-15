@@ -25,7 +25,7 @@ import { CalendarClock } from 'lucide-react';
 import { BirdoButton } from '@/components/birdo';
 import { status as statusTokens, white } from '@/lib/birdo-theme';
 import { errorCopy } from '@/lib/errors';
-import { holdWhen, SIGN_OUT_CANCELS_HOLD, type HeldDeletion } from '@/lib/held-deletion';
+import { clearHeldDeletion, holdWhen, SIGN_OUT_CANCELS_HOLD, type HeldDeletion } from '@/lib/held-deletion';
 import { toIpcError } from '@/lib/ipc';
 import { command } from '@/session/command';
 import { refreshHeldDeletion } from '@/session/held-deletion';
@@ -38,6 +38,23 @@ export function cancelErrorText(e: unknown): string {
     : errorCopy(err).message;
 }
 
+/**
+ * Cancel a held deletion. Cancelled now (200) or gone already (404
+ * `pending_change_not_found`): either way nothing is held any more, so the
+ * shared state is cleared AT ONCE, and the list is then read again. The
+ * banner and the sign-out warnings must not linger on a re-read that fails
+ * or is slow. Rejects (and changes nothing) when the cancel itself failed.
+ */
+export async function cancelHeldDeletion(id: string): Promise<{ alreadyGone: boolean }> {
+  const result = await command<{ cancelled?: boolean; alreadyGone?: boolean } | null>(
+    'cancel_pending_change',
+    { id },
+  );
+  clearHeldDeletion();
+  void refreshHeldDeletion();
+  return { alreadyGone: result?.alreadyGone === true };
+}
+
 /** The Profile banner: when the deletion applies, and Cancel. */
 export function PendingDeletionBanner({ hold }: { hold: HeldDeletion }) {
   const [cancelling, setCancelling] = useState(false);
@@ -48,10 +65,7 @@ export function PendingDeletionBanner({ hold }: { hold: HeldDeletion }) {
     setCancelling(true);
     setError(null);
     try {
-      // Cancelled now, or gone already (404 pending_change_not_found): either
-      // way the list is read again and says what is left.
-      await command('cancel_pending_change', { id: hold.id });
-      void refreshHeldDeletion();
+      await cancelHeldDeletion(hold.id);
     } catch (e: unknown) {
       setError(cancelErrorText(e));
     } finally {
