@@ -59,10 +59,15 @@ import {
   TWO_FACTOR_PLACEHOLDER,
 } from '@/lib/two-factor';
 import { useAppStore } from '@/store/app-store';
-import { holdWhen, noteHeldDeletion, SIGN_OUT_CANCELS_HOLD } from '@/lib/held-deletion';
+import {
+  holdWhen,
+  noteHeldDeletion,
+  SIGN_OUT_CANCELS_HOLD,
+  signOutHoldNote,
+  useHeldDeletion,
+} from '@/lib/held-deletion';
 import { command } from '@/session/command';
-import { refreshHeldDeletion } from '@/session/held-deletion';
-import { cancelErrorText, cancelHeldDeletion } from './PendingDeletion';
+import { cancelErrorText, cancelHeldDeletion, refreshHeldDeletion } from '@/session/held-deletion';
 
 /** Shape returned by the Rust `delete_account` command. */
 export interface DeleteAccountResult {
@@ -254,6 +259,12 @@ export function DeleteAccountDialog({
   const [cancellingHold, setCancellingHold] = useState(false);
   const [holdCancelError, setHoldCancelError] = useState<string | null>(null);
   const [holdEnded, setHoldEnded] = useState<string | null>(null);
+  // Where the hold came from, as the shared state knows it: a 409 for the
+  // hold this session filed earlier is still "filed here".
+  const sharedHold = useHeldDeletion();
+  const holdFiledHere =
+    hold !== null &&
+    (sharedHold?.id === hold.pendingChangeId ? sharedHold.filedHere : !hold.alreadyPending);
   // Once the account is gone, every way out of the dialog must finish the
   // sign-out; merely closing it would leave the UI on a deleted account.
   const dismiss = stillBilling ? onDeleted : onDismiss;
@@ -322,8 +333,13 @@ export function DeleteAccountDialog({
       if (filed) {
         setHold(filed);
         // Straight into the shared state: the banner and both sign-out
-        // warnings know it now, whatever the list read below does.
-        noteHeldDeletion({ id: filed.pendingChangeId, applyAfter: filed.applyAfter });
+        // warnings know it now, whatever the list read below does. Filed
+        // HERE only when this request filed it (the 202); a 409 names a hold
+        // that may have come from the website or another device.
+        noteHeldDeletion(
+          { id: filed.pendingChangeId, applyAfter: filed.applyAfter },
+          { filedHere: !filed.alreadyPending },
+        );
       } else {
         setError(HOLD_UNEXPECTED);
       }
@@ -467,6 +483,7 @@ export function DeleteAccountDialog({
       ) : hold ? (
         <HeldNotice
           hold={hold}
+          filedHere={holdFiledHere}
           cancelling={cancellingHold}
           cancelError={holdCancelError}
           onCancelHold={() => void handleCancelHold()}
@@ -657,12 +674,15 @@ export function DeleteAccountDialog({
  */
 function HeldNotice({
   hold,
+  filedHere,
   cancelling,
   cancelError,
   onCancelHold,
   onClose,
 }: {
   hold: DeletionHold;
+  /** This session filed it: signing out of this app voids it. */
+  filedHere: boolean;
   cancelling: boolean;
   cancelError: string | null;
   onCancelHold: () => void;
@@ -676,7 +696,7 @@ function HeldNotice({
       <p className="text-[12px]" style={{ color: white.w80 }}>
         {hold.alreadyPending ? 'This deletion was already waiting; nothing new was filed. ' : ''}
         Until then your account works as usual. Cancel it here or on the website to keep your account.{' '}
-        {SIGN_OUT_CANCELS_HOLD}
+        {signOutHoldNote({ filedHere })}
       </p>
       {cancelError && (
         <p className="text-[12px]" style={{ color: statusTokens.red }}>

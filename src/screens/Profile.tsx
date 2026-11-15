@@ -16,8 +16,10 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { useShallow } from 'zustand/react/shallow';
 import { Gift, LogOut, Trash, Download, CreditCard } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
-import { BirdoButton, BirdoCard, BirdoDialog, BirdoSectionHeader, BirdoNavRow } from '@/components/birdo';
-import { brand, status as statusTokens, white } from '@/lib/birdo-theme';
+import { selectTunnelActive } from '@/store/selectors';
+import { BirdoCard, BirdoSectionHeader, BirdoNavRow } from '@/components/birdo';
+import { SignOutDialog } from '@/components/home/SignOutDialog';
+import { brand, status as statusTokens } from '@/lib/birdo-theme';
 import { planRank } from '@/lib/plan';
 import { BILLING_URL } from '@/lib/links';
 import { displayableEmail, resolveAnonymousAccount } from '@/utils/helpers';
@@ -25,7 +27,7 @@ import { anonNumberRotationEnabled } from '@/lib/features';
 import { loadSubscription } from '@/session/session-data';
 import { signOut } from '@/session/session';
 import { usePendingDeletion } from '@/session/held-deletion';
-import { clearHeldDeletion, signOutWithHoldText } from '@/lib/held-deletion';
+import { clearHeldDeletion } from '@/lib/held-deletion';
 import { AccountNumberCard, IdentityCard, SubscriptionCard } from './profile/ProfileCards';
 import { DeleteAccountDialog } from './profile/DeleteAccountDialog';
 import { PendingDeletionBanner } from './profile/PendingDeletion';
@@ -44,13 +46,14 @@ export {
 } from './profile/DeleteAccountDialog';
 
 export function Profile() {
-  const { account, planStatus, userEmail, logout, pushRoute } = useAppStore(
+  const { account, planStatus, userEmail, logout, pushRoute, tunnelActive } = useAppStore(
     useShallow((s) => ({
       account: s.account,
       planStatus: s.planStatus,
       userEmail: s.userEmail,
       logout: s.logout,
       pushRoute: s.pushRoute,
+      tunnelActive: selectTunnelActive(s),
     })),
   );
   // Unknown (null) is not free: offer "View plans" only when the plan is KNOWN
@@ -71,8 +74,9 @@ export function Profile() {
   const [showReplaceDialog, setShowReplaceDialog] = useState(false);
   const [exportState, setExportState] = useState<'idle' | 'working' | 'done' | 'error'>('idle');
   const pendingDeletion = usePendingDeletion();
-  // MR-2335: signing out cancels a held deletion on the server, so while one
-  // is listed the user is told before it happens.
+  // MR-2335: while a deletion is on hold, Sign out asks first (the shared
+  // `SignOutDialog`): it says what signing out does to that hold, by where the
+  // hold came from, and offers Cancel deletion.
   const [confirmSignOut, setConfirmSignOut] = useState(false);
 
   // GDPR data export (Art. 20). The backend command returns the full JSON blob;
@@ -203,30 +207,11 @@ export function Profile() {
           onDismiss={() => setShowReplaceDialog(false)}
         />
       )}
-      {confirmSignOut && pendingDeletion.hold && (
-        <BirdoDialog open onClose={() => setConfirmSignOut(false)} title="Sign out?" icon={LogOut}>
-          <p className="text-[13px]" style={{ color: white.w80 }}>
-            {signOutWithHoldText(pendingDeletion.hold.applyAfter)}
-          </p>
-          <div className="flex gap-2.5">
-            <BirdoButton
-              text="Stay signed in"
-              variant="secondary"
-              fullWidth
-              onClick={() => setConfirmSignOut(false)}
-            />
-            <BirdoButton
-              text="Sign out"
-              variant="danger"
-              fullWidth
-              onClick={() => {
-                setConfirmSignOut(false);
-                void signOut();
-              }}
-            />
-          </div>
-        </BirdoDialog>
-      )}
+      <SignOutDialog
+        open={confirmSignOut}
+        stillConnected={tunnelActive}
+        onClose={() => setConfirmSignOut(false)}
+      />
       {showDeleteDialog && (
         <DeleteAccountDialog
           open

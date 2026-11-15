@@ -11,8 +11,11 @@
  * - Profile shows a banner while an `account_delete` hold is listed, with
  *   Cancel; the list is read on open and on window focus, and a hold that is
  *   gone is simply not shown.
- * - Signing out cancels the hold on the server: the dialog, the banner and a
- *   sign-out confirmation (only while a hold is listed) say so.
+ * - Signing out of this app voids only a hold THIS session filed (its 202);
+ *   one listed, or named by a 409, may come from the website or another
+ *   device and stays (birdo-web #883). The dialog, the banner and both
+ *   sign-out confirmations say which, and both confirmations offer Cancel
+ *   deletion.
  * - Nothing ever concludes "account deleted": an ended session takes the
  *   ordinary session-expired path, and an unexpected answer assumes nothing.
  * - The hold is ONE shared state (`@/lib/held-deletion`): the Home sign-out
@@ -38,6 +41,7 @@ import {
   noteHeldDeletion,
   rotationWithHoldText,
   SIGN_OUT_CANCELS_HOLD,
+  SIGN_OUT_KEEPS_HOLD,
   signOutWithHoldText,
 } from '@/lib/held-deletion';
 import { expireSession, signOut } from '@/session/session';
@@ -114,8 +118,9 @@ const calls = (cmd: string) => mockedInvoke.mock.calls.filter(([c]) => c === cmd
 const APPLY_AFTER = '2026-11-15T12:00:00.000Z';
 const HOLD_ID = 'cmhold0000000000000000001';
 const HELD = { pendingChangeId: HOLD_ID, applyAfter: APPLY_AFTER, message: null, alreadyPending: false };
-/** The sign-out warning while that hold is known (Profile and Home alike). */
-const SIGN_OUT_WITH_HOLD = signOutWithHoldText(APPLY_AFTER);
+/** The sign-out warnings while that hold is known (Profile and Home alike), by origin. */
+const SIGN_OUT_FILED_HERE = signOutWithHoldText({ id: HOLD_ID, applyAfter: APPLY_AFTER, filedHere: true });
+const SIGN_OUT_FILED_ELSEWHERE = signOutWithHoldText({ id: HOLD_ID, applyAfter: APPLY_AFTER, filedHere: false });
 
 let preflightResult: () => Promise<unknown>;
 let holdResult: () => Promise<unknown>;
@@ -256,7 +261,30 @@ describe('asking for the hold', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Delete in 24 hours' }));
     expect(await screen.findByText(/already waiting; nothing new was filed/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Cancel deletion' })).toBeInTheDocument();
+    // H1: it may have been asked for on the website or another device, so
+    // this app's sign-out is NOT said to cancel it.
+    expect(screen.getByText(new RegExp(SIGN_OUT_KEEPS_HOLD))).toBeInTheDocument();
+    expect(screen.queryByText(new RegExp(SIGN_OUT_CANCELS_HOLD))).not.toBeInTheDocument();
+    expect(getHeldDeletion()).toBeNull(); // the follow-up read listed nothing
     nobodySignedOut();
+  });
+
+  it('the 202 marks the hold "filed here"; a later 409 for the same hold keeps it, another hold does not', async () => {
+    listResult = () => new Promise(() => {}); // no list read answers
+    await openDialog();
+    await userEvent.click(await screen.findByRole('button', { name: HOLD_OFFER_NUMBER }));
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await userEvent.click(screen.getByRole('button', { name: 'Delete in 24 hours' }));
+    await screen.findByRole('button', { name: 'Close' });
+    expect(getHeldDeletion()).toEqual({ id: HOLD_ID, applyAfter: APPLY_AFTER, filedHere: true });
+    // The dialog's notice and the Profile banner behind it.
+    expect(screen.getAllByText(new RegExp(SIGN_OUT_CANCELS_HOLD))).toHaveLength(2);
+    expect(screen.queryByText(new RegExp(SIGN_OUT_KEEPS_HOLD))).not.toBeInTheDocument();
+    // What the dialog notes for a 409 (`filedHere: false`).
+    act(() => noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: false }));
+    expect(getHeldDeletion()?.filedHere).toBe(true);
+    act(() => noteHeldDeletion({ id: 'cmother', applyAfter: APPLY_AFTER }, { filedHere: false }));
+    expect(getHeldDeletion()?.filedHere).toBe(false);
   });
 
   it('Cancel cancels the hold by its id and says the account stays', async () => {
@@ -338,32 +366,53 @@ describe('asking for the hold', () => {
 describe('signing out while a deletion is on hold', () => {
   const listed = [{ id: HOLD_ID, action: 'account_delete', applyAfter: APPLY_AFTER }];
 
-  it('asks first, saying that signing out cancels the deletion; Stay keeps both', async () => {
+  it('a listed hold (maybe filed on the website): asks first, says signing out does NOT cancel it; Stay keeps both', async () => {
     listResult = () => Promise.resolve(listed);
     render(<Profile />);
     await screen.findByRole('button', { name: 'Cancel deletion' });
     await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
-    expect(await screen.findByText(SIGN_OUT_WITH_HOLD)).toBeInTheDocument();
-    expect(screen.getByRole('dialog', { name: 'Sign out?' })).toBeInTheDocument();
-    expect(SIGN_OUT_WITH_HOLD).toMatch(/Signing out cancels that deletion/);
-    expect(SIGN_OUT_WITH_HOLD).toContain(`on ${holdTimeText(APPLY_AFTER)}`);
-    expect(SIGN_OUT_WITH_HOLD).toMatch(/will NOT be deleted/);
+    const dialog = await screen.findByRole('dialog', { name: 'Sign out?' });
+    expect(within(dialog).getByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_ELSEWHERE);
+    expect(SIGN_OUT_FILED_ELSEWHERE).toContain(`on ${holdTimeText(APPLY_AFTER)}`);
+    expect(SIGN_OUT_FILED_ELSEWHERE).toContain(
+      'Signing out of this app does not cancel a deletion asked for on the website or another device. ' +
+        'To keep your account, cancel the deletion.',
+    );
+    expect(SIGN_OUT_FILED_ELSEWHERE).not.toMatch(/Signing out cancels/);
+    expect(within(dialog).getByRole('button', { name: 'Cancel deletion' })).toBeInTheDocument();
     expect(signOut).not.toHaveBeenCalled();
-    await userEvent.click(screen.getByRole('button', { name: 'Stay signed in' }));
-    expect(screen.queryByText(SIGN_OUT_WITH_HOLD)).not.toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Stay signed in' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     expect(signOut).not.toHaveBeenCalled();
     expect(calls('cancel_pending_change')).toHaveLength(0);
   });
 
-  it('confirming signs out the ordinary way (the server cancels the hold)', async () => {
+  it('confirming signs out the ordinary way; a hold not filed here is not cancelled by the app', async () => {
     listResult = () => Promise.resolve(listed);
     render(<Profile />);
     await screen.findByRole('button', { name: 'Cancel deletion' });
     await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
-    await screen.findByText(SIGN_OUT_WITH_HOLD);
-    await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Sign out' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Sign out?' });
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Sign out' })).toBeEnabled());
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Sign out' }));
     expect(signOut).toHaveBeenCalledTimes(1);
+    expect(calls('cancel_pending_change')).toHaveLength(0);
     expect(calls('delete_account')).toHaveLength(0);
+  });
+
+  it('Cancel deletion in the sign-out confirmation cancels the hold and keeps the user signed in', async () => {
+    const answers = [() => Promise.resolve(listed), () => Promise.resolve(listed)];
+    listResult = () => (answers.shift() ?? (() => Promise.resolve([])))();
+    render(<Profile />);
+    await screen.findByRole('button', { name: 'Cancel deletion' });
+    await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
+    const dialog = await screen.findByRole('dialog', { name: 'Sign out?' });
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel deletion' }));
+    expect(await within(dialog).findByText('The deletion is cancelled. Your account stays as it is.')).toBeInTheDocument();
+    expect(calls('cancel_pending_change')).toEqual([['cancel_pending_change', { id: HOLD_ID }]]);
+    expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
+    expect(getHeldDeletion()).toBeNull();
+    nobodySignedOut();
   });
 
   it('without a hold, Sign out signs out at once, as before', async () => {
@@ -371,7 +420,7 @@ describe('signing out while a deletion is on hold', () => {
     await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
     await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
     expect(signOut).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText(SIGN_OUT_WITH_HOLD)).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 });
 
@@ -389,26 +438,46 @@ function deferred<V>() {
 describe('the Home sign-out dialog (SignOutDialog, opened from the Connect screen)', () => {
   const listed = [{ id: HOLD_ID, action: 'account_delete', applyAfter: APPLY_AFTER }];
 
-  it('reads the list on opening and warns, with the date, that signing out cancels the deletion', async () => {
+  it('reads the list on opening; a listed hold: the date, "does not cancel", and Cancel deletion', async () => {
     listResult = () => Promise.resolve(listed);
     render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
-    expect(await screen.findByRole('alert')).toHaveTextContent(SIGN_OUT_WITH_HOLD);
-    expect(SIGN_OUT_WITH_HOLD).toContain(`on ${holdTimeText(APPLY_AFTER)}`);
+    expect(await screen.findByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_ELSEWHERE);
+    expect(SIGN_OUT_FILED_ELSEWHERE).toContain(`on ${holdTimeText(APPLY_AFTER)}`);
+    expect(screen.getByRole('button', { name: 'Cancel deletion' })).toBeInTheDocument();
     expect(calls('list_pending_changes')).toHaveLength(1);
     expect(signOut).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
     expect(signOut).toHaveBeenCalledTimes(1);
+    // Not filed here: the app does not cancel it on the way out.
+    expect(calls('cancel_pending_change')).toHaveLength(0);
   });
 
-  it('a hold filed in Profile is known here at once, even when the list read fails', async () => {
+  it('a hold filed in Profile is known here at once, even when the list read fails, and "cancels" is said', async () => {
     // What the dialog does with the 202: straight into the shared state.
-    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER });
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true });
     listResult = () => Promise.reject(refusal('network_offline'));
     render(<SignOutDialog open stillConnected onClose={() => {}} />);
     // No waiting on the read: the warning is in the first paint.
-    expect(screen.getByRole('alert')).toHaveTextContent(SIGN_OUT_WITH_HOLD);
+    expect(screen.getByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_HERE);
+    expect(SIGN_OUT_FILED_HERE).toMatch(/Signing out cancels that deletion/);
+    expect(screen.getByRole('button', { name: 'Cancel deletion' })).toBeInTheDocument();
     await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
-    expect(screen.getByRole('alert')).toHaveTextContent(SIGN_OUT_WITH_HOLD);
+    expect(screen.getByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_HERE);
+  });
+
+  it('a listed hold keeps "filed here" only while it is the same hold', async () => {
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true });
+    const answers = [() => Promise.resolve(listed), () => Promise.resolve([{ ...listed[0], id: 'cmother' }])];
+    listResult = () => answers.shift()!();
+    const { unmount } = render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
+    expect(getHeldDeletion()).toEqual({ id: HOLD_ID, applyAfter: APPLY_AFTER, filedHere: true });
+    expect(screen.getByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_HERE);
+    unmount();
+    render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
+    await waitFor(() => expect(getHeldDeletion()?.id).toBe('cmother'));
+    expect(getHeldDeletion()?.filedHere).toBe(false);
+    expect(screen.getByRole('alert')).toHaveTextContent(SIGN_OUT_KEEPS_HOLD);
   });
 
   it('Sign out waits for the opening read, so the warning cannot be skipped by a fast click', async () => {
@@ -420,7 +489,7 @@ describe('the Home sign-out dialog (SignOutDialog, opened from the Connect scree
     await act(async () => {
       read.resolve(listed);
     });
-    expect(await screen.findByRole('alert')).toHaveTextContent(SIGN_OUT_WITH_HOLD);
+    expect(await screen.findByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_ELSEWHERE);
     expect(button).toBeEnabled();
     expect(signOut).not.toHaveBeenCalled();
   });
@@ -450,15 +519,16 @@ describe('the hold as shared state', () => {
     await screen.findByRole('button', { name: 'Close' });
     // The follow-up read was made, and failed.
     await waitFor(() => expect(calls('list_pending_changes').length).toBeGreaterThanOrEqual(2));
-    expect(getHeldDeletion()).toEqual({ id: HOLD_ID, applyAfter: APPLY_AFTER });
+    expect(getHeldDeletion()).toEqual({ id: HOLD_ID, applyAfter: APPLY_AFTER, filedHere: true });
     await userEvent.click(screen.getByRole('button', { name: 'Close' }));
-    // The banner, from the 202 alone.
+    // The banner, from the 202 alone; filed here, so this app's sign-out cancels it.
     expect(screen.getByRole('status')).toHaveTextContent(
       `Your account will be deleted on ${holdTimeText(APPLY_AFTER)}.`,
     );
+    expect(screen.getByRole('status')).toHaveTextContent(SIGN_OUT_CANCELS_HOLD);
     // And the Profile sign-out asks first.
     await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
-    expect(await screen.findByText(SIGN_OUT_WITH_HOLD)).toBeInTheDocument();
+    expect(await screen.findByText(SIGN_OUT_FILED_HERE)).toBeInTheDocument();
     expect(signOut).not.toHaveBeenCalled();
   });
 
@@ -512,17 +582,17 @@ describe('the hold as shared state', () => {
 
   it('an older list read that resolves after a 202 does not hide the new hold', async () => {
     const stale = deferred<unknown>();
-    noteHeldDeletion({ id: 'cmold', applyAfter: APPLY_AFTER });
+    noteHeldDeletion({ id: 'cmold', applyAfter: APPLY_AFTER }, { filedHere: true });
     clearHeldDeletion();
     const answers = [() => stale.promise];
     listResult = () => (answers.shift() ?? (() => Promise.reject(refusal('network_offline'))))();
     render(<Profile />); // its opening read is still out
     await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
-    act(() => noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }));
+    act(() => noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true }));
     await act(async () => {
       stale.resolve([]); // it saw no hold, before the 202
     });
-    expect(getHeldDeletion()).toEqual({ id: HOLD_ID, applyAfter: APPLY_AFTER });
+    expect(getHeldDeletion()).toEqual({ id: HOLD_ID, applyAfter: APPLY_AFTER, filedHere: true });
     expect(screen.getByRole('status')).toBeInTheDocument();
   });
 
@@ -530,7 +600,8 @@ describe('the hold as shared state', () => {
     const { unmount } = render(<ReplaceAccountNumberDialog open hasPassword={false} onDismiss={() => {}} />);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     unmount();
-    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER });
+    // Any origin: a new number cancels every held deletion.
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: false });
     render(<ReplaceAccountNumberDialog open hasPassword={false} onDismiss={() => {}} />);
     expect(screen.getByRole('alert')).toHaveTextContent(rotationWithHoldText(APPLY_AFTER));
     expect(rotationWithHoldText(APPLY_AFTER)).toMatch(/Replacing the account number cancels that deletion/);
@@ -549,7 +620,9 @@ describe('the Profile banner', () => {
     listResult = () => (answers.shift() ?? (() => Promise.resolve([])))();
     render(<Profile />);
     expect(await screen.findByText(`Your account will be deleted on ${holdTimeText(APPLY_AFTER)}.`)).toBeInTheDocument();
-    expect(screen.getByText(new RegExp(SIGN_OUT_CANCELS_HOLD))).toBeInTheDocument();
+    // Listed, so not known to be filed here: this app's sign-out does not cancel it.
+    expect(screen.getByText(new RegExp(SIGN_OUT_KEEPS_HOLD))).toBeInTheDocument();
+    expect(screen.queryByText(new RegExp(SIGN_OUT_CANCELS_HOLD))).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Cancel deletion' }));
     await waitFor(() =>
       expect(screen.queryByText(/Your account will be deleted on/)).not.toBeInTheDocument(),
@@ -622,7 +695,8 @@ describe('the Profile banner', () => {
   });
 
   it('heldDeletionOf reads only a usable account_delete row', () => {
-    expect(heldDeletionOf(listed)).toEqual({ id: HOLD_ID, applyAfter: APPLY_AFTER });
+    // The list does not say which session filed it: never "filed here" by itself.
+    expect(heldDeletionOf(listed)).toEqual({ id: HOLD_ID, applyAfter: APPLY_AFTER, filedHere: false });
     for (const bad of [undefined, null, {}, 'x', [{ action: 'account_delete' }], [{ id: 'a', action: 'account_delete' }], [null]]) {
       expect(heldDeletionOf(bad)).toBeNull();
     }

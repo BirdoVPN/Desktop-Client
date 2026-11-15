@@ -17,6 +17,13 @@
  *    server's answer replaces what is known, unless anything was written
  *    after the read STARTED. A read that fails changes nothing.
  *
+ * Where the hold came from decides what signing out does to it (birdo-web
+ * #883, `heldDeletionVoided`): the server drops a hold when the session that
+ * filed it is gone, and never one filed without a session (the website) or
+ * by another device's session. So `filedHere` is set only by THIS session's
+ * 202, and a list read keeps it only while the id is the same. Everything
+ * else is "not known to be filed here".
+ *
  * In memory only, never persisted: nothing ever concludes from it that the
  * account was deleted.
  */
@@ -26,6 +33,8 @@ import { useSyncExternalStore } from 'react';
 export interface HeldDeletion {
   id: string;
   applyAfter: string;
+  /** This app session's own 202 filed it: signing out of this app voids it. */
+  filedHere: boolean;
 }
 
 let held: HeldDeletion | null = null;
@@ -34,9 +43,16 @@ let version = 0;
 const listeners = new Set<() => void>();
 
 function publish(next: HeldDeletion | null) {
-  if (held?.id === next?.id && held?.applyAfter === next?.applyAfter) return;
+  if (held?.id === next?.id && held?.applyAfter === next?.applyAfter && held?.filedHere === next?.filedHere) {
+    return;
+  }
   held = next;
   listeners.forEach((listener) => listener());
+}
+
+/** `filedHere` survives only while it is the same hold. */
+function filedHereStill(id: string): boolean {
+  return held?.id === id && held.filedHere;
 }
 
 function subscribe(listener: () => void): () => void {
@@ -53,10 +69,18 @@ export function useHeldDeletion(): HeldDeletion | null {
   return useSyncExternalStore(subscribe, getHeldDeletion, getHeldDeletion);
 }
 
-/** The server named the hold (202 / 409): it is known from now. */
-export function noteHeldDeletion(hold: HeldDeletion): void {
+/**
+ * The server named the hold: it is known from now. `filedHere` only for this
+ * session's 202; a 409 for a hold already waiting may name one filed on the
+ * website or another device (it stays `filedHere` if it is the same hold this
+ * session filed).
+ */
+export function noteHeldDeletion(
+  hold: Pick<HeldDeletion, 'id' | 'applyAfter'>,
+  { filedHere }: { filedHere: boolean },
+): void {
   version += 1;
-  publish(hold);
+  publish({ id: hold.id, applyAfter: hold.applyAfter, filedHere: filedHere || filedHereStill(hold.id) });
 }
 
 /** Cancelled, gone already, or the session ended: nothing is held. */
@@ -73,10 +97,15 @@ export function startHeldDeletionRead(): number {
 
 /** The read's answer, dropped if anything was written or read since it started. */
 export function finishHeldDeletionRead(token: number, items: unknown): void {
-  if (token === version) publish(heldDeletionOf(items));
+  if (token !== version) return;
+  const listed = heldDeletionOf(items);
+  publish(listed && { ...listed, filedHere: filedHereStill(listed.id) });
 }
 
-/** The account's held deletion in what `list_pending_changes` returned, if any. */
+/**
+ * The account's held deletion in what `list_pending_changes` returned, if any.
+ * The list does not say which session filed it: never `filedHere` by itself.
+ */
 export function heldDeletionOf(items: unknown): HeldDeletion | null {
   if (!Array.isArray(items)) return null;
   for (const item of items) {
@@ -85,7 +114,7 @@ export function heldDeletionOf(items: unknown): HeldDeletion | null {
     if (row.action !== 'account_delete') continue;
     if (typeof row.id !== 'string' || !row.id) continue;
     if (typeof row.applyAfter !== 'string' || !row.applyAfter) continue;
-    return { id: row.id, applyAfter: row.applyAfter };
+    return { id: row.id, applyAfter: row.applyAfter, filedHere: false };
   }
   return null;
 }
@@ -102,19 +131,30 @@ export function holdWhen(applyAfter: string): string {
   return at ? `on ${at}` : 'within 24 hours';
 }
 
-/** What ends a hold besides Cancel: said wherever a hold is shown. */
+/** What ends a hold this app session filed, besides Cancel. */
 export const SIGN_OUT_CANCELS_HOLD = 'Signing out of this app, or signing out everywhere, also cancels it.';
+
+/** A hold not known to be filed here: this app's sign-out leaves it in place. */
+export const SIGN_OUT_KEEPS_HOLD =
+  'Signing out of this app does not cancel a deletion asked for on the website or another device.';
+
+/** The sentence about signing out that fits where the hold came from. */
+export function signOutHoldNote(hold: Pick<HeldDeletion, 'filedHere'>): string {
+  return hold.filedHere ? SIGN_OUT_CANCELS_HOLD : SIGN_OUT_KEEPS_HOLD;
+}
 
 /**
  * The sign-out confirmations (Profile and Home) while a hold is known. The
- * server cancels a hold when the app session that asked for it signs out, or
- * on a sign-out everywhere.
+ * server voids a hold when the app session that filed it signs out (or on a
+ * sign-out everywhere); a hold filed on the website or by another device
+ * stays, whatever this app does.
  */
-export function signOutWithHoldText(applyAfter: string): string {
-  return (
-    `Your account is waiting to be deleted ${holdWhen(applyAfter)}. Signing out cancels that ` +
-    'deletion, so your account will NOT be deleted. To delete it, stay signed in until then.'
-  );
+export function signOutWithHoldText(hold: HeldDeletion): string {
+  const waiting = `Your account is waiting to be deleted ${holdWhen(hold.applyAfter)}.`;
+  return hold.filedHere
+    ? `${waiting} Signing out cancels that deletion, so your account will NOT be deleted. ` +
+        'To delete it, stay signed in until then.'
+    : `${waiting} ${SIGN_OUT_KEEPS_HOLD} To keep your account, cancel the deletion.`;
 }
 
 /** The number-replacement dialog while a hold is known. */

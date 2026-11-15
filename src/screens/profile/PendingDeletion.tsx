@@ -7,53 +7,26 @@
  * whenever the window regains focus (`usePendingDeletion`), and the Home
  * sign-out dialog and the number-replacement dialog read the same state. A
  * hold can vanish between two reads: the server cancels it on a sign-out
- * elsewhere, a number rotation, a password or 2FA change, and drops it when
- * this app's session ends. So a hold that is gone is simply not shown; it is
- * never an error. A read that FAILS keeps what was shown: an outage is not
- * "no hold".
+ * everywhere, a number rotation, a password or 2FA change, and voids one this
+ * app's session filed when that session ends. So a hold that is gone is
+ * simply not shown; it is never an error. A read that FAILS keeps what was
+ * shown: an outage is not "no hold".
  *
  * Nothing here ever concludes that the account WAS deleted. The hold is not
  * persisted, and a session that has ended (a read answered `session_expired`)
  * takes the ordinary session-expired path (`command()` → `expireSession`):
  * the sign-in screen, never "account deleted".
  *
- * Signing out of this app, or signing out everywhere, CANCELS the hold on the
- * server. The dialog, this banner and both sign-out confirmations say so.
+ * Signing out of this app voids only a hold THIS session filed (birdo-web
+ * #883); one filed on the website or by another device stays. The dialog,
+ * this banner and both sign-out confirmations say which (`filedHere`).
  */
 import { useState } from 'react';
 import { CalendarClock } from 'lucide-react';
 import { BirdoButton } from '@/components/birdo';
 import { status as statusTokens, white } from '@/lib/birdo-theme';
-import { errorCopy } from '@/lib/errors';
-import { clearHeldDeletion, holdWhen, SIGN_OUT_CANCELS_HOLD, type HeldDeletion } from '@/lib/held-deletion';
-import { toIpcError } from '@/lib/ipc';
-import { command } from '@/session/command';
-import { refreshHeldDeletion } from '@/session/held-deletion';
-
-/** A failed cancel, in words. */
-export function cancelErrorText(e: unknown): string {
-  const err = toIpcError(e);
-  return err.code === 'unknown'
-    ? "Couldn't cancel the deletion. Please try again."
-    : errorCopy(err).message;
-}
-
-/**
- * Cancel a held deletion. Cancelled now (200) or gone already (404
- * `pending_change_not_found`): either way nothing is held any more, so the
- * shared state is cleared AT ONCE, and the list is then read again. The
- * banner and the sign-out warnings must not linger on a re-read that fails
- * or is slow. Rejects (and changes nothing) when the cancel itself failed.
- */
-export async function cancelHeldDeletion(id: string): Promise<{ alreadyGone: boolean }> {
-  const result = await command<{ cancelled?: boolean; alreadyGone?: boolean } | null>(
-    'cancel_pending_change',
-    { id },
-  );
-  clearHeldDeletion();
-  void refreshHeldDeletion();
-  return { alreadyGone: result?.alreadyGone === true };
-}
+import { holdWhen, signOutHoldNote, type HeldDeletion } from '@/lib/held-deletion';
+import { cancelErrorText, cancelHeldDeletion } from '@/session/held-deletion';
 
 /** The Profile banner: when the deletion applies, and Cancel. */
 export function PendingDeletionBanner({ hold }: { hold: HeldDeletion }) {
@@ -86,7 +59,7 @@ export function PendingDeletionBanner({ hold }: { hold: HeldDeletion }) {
             {`Your account will be deleted ${holdWhen(hold.applyAfter)}.`}
           </p>
           <p className="mt-1 text-[12px]" style={{ color: white.w80 }}>
-            Cancel it to keep your account. {SIGN_OUT_CANCELS_HOLD}
+            Cancel it to keep your account. {signOutHoldNote(hold)}
           </p>
         </div>
       </div>
