@@ -36,6 +36,7 @@ import { SignOutDialog } from '@/components/home/SignOutDialog';
 import {
   clearHeldDeletion,
   getHeldDeletion,
+  heldDeletionGeneration,
   heldDeletionOf,
   HOLD_UNCHECKED_CAUTION,
   holdTimeText,
@@ -283,9 +284,9 @@ describe('asking for the hold', () => {
     expect(screen.getAllByText(new RegExp(SIGN_OUT_CANCELS_HOLD))).toHaveLength(2);
     expect(screen.queryByText(new RegExp(SIGN_OUT_KEEPS_HOLD))).not.toBeInTheDocument();
     // What the dialog notes for a 409 (`filedHere: false`).
-    act(() => noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: false }));
+    act(() => noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: false, generation: heldDeletionGeneration() }));
     expect(getHeldDeletion()?.filedHere).toBe(true);
-    act(() => noteHeldDeletion({ id: 'cmother', applyAfter: APPLY_AFTER }, { filedHere: false }));
+    act(() => noteHeldDeletion({ id: 'cmother', applyAfter: APPLY_AFTER }, { filedHere: false, generation: heldDeletionGeneration() }));
     expect(getHeldDeletion()?.filedHere).toBe(false);
   });
 
@@ -501,7 +502,7 @@ describe('the Home sign-out dialog (SignOutDialog, opened from the Connect scree
 
   it('a hold filed in Profile is known here at once, even when the list read fails, and "cancels" is said', async () => {
     // What the dialog does with the 202: straight into the shared state.
-    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true });
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true, generation: heldDeletionGeneration() });
     listResult = () => Promise.reject(refusal('network_offline'));
     render(<SignOutDialog open stillConnected onClose={() => {}} />);
     // No waiting on the read: the warning is in the first paint.
@@ -515,7 +516,7 @@ describe('the Home sign-out dialog (SignOutDialog, opened from the Connect scree
   });
 
   it('a listed hold keeps "filed here" only while it is the same hold', async () => {
-    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true });
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true, generation: heldDeletionGeneration() });
     const answers = [() => Promise.resolve(listed), () => Promise.resolve([{ ...listed[0], id: 'cmother' }])];
     listResult = () => answers.shift()!();
     const { unmount } = render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
@@ -595,7 +596,7 @@ describe('signing out with a hold filed here: the app cancels it first (M1)', ()
 
   /** A hold this session filed, still listed under the same id. */
   async function openWithHoldFiledHere() {
-    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true });
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true, generation: heldDeletionGeneration() });
     listResult = () => Promise.resolve(listed);
     render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
     await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
@@ -720,13 +721,13 @@ describe('the hold as shared state', () => {
 
   it('an older list read that resolves after a 202 does not hide the new hold', async () => {
     const stale = deferred<unknown>();
-    noteHeldDeletion({ id: 'cmold', applyAfter: APPLY_AFTER }, { filedHere: true });
+    noteHeldDeletion({ id: 'cmold', applyAfter: APPLY_AFTER }, { filedHere: true, generation: heldDeletionGeneration() });
     clearHeldDeletion();
     const answers = [() => stale.promise];
     listResult = () => (answers.shift() ?? (() => Promise.reject(refusal('network_offline'))))();
     render(<Profile />); // its opening read is still out
     await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
-    act(() => noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true }));
+    act(() => noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true, generation: heldDeletionGeneration() }));
     await act(async () => {
       stale.resolve([]); // it saw no hold, before the 202
     });
@@ -734,12 +735,41 @@ describe('the hold as shared state', () => {
     expect(screen.getByRole('status')).toBeInTheDocument();
   });
 
+  it('L3: a 202 that arrives after the session ended does not put the old account\'s hold back', async () => {
+    const request = deferred<unknown>();
+    holdResult = () => request.promise;
+    await openDialog();
+    await userEvent.click(await screen.findByRole('button', { name: HOLD_OFFER_NUMBER }));
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await userEvent.click(screen.getByRole('button', { name: 'Delete in 24 hours' }));
+    await waitFor(() => expect(calls('request_deletion_hold')).toHaveLength(1));
+    const readsBefore = calls('list_pending_changes').length;
+    // The session ends while the request is out (`endSession` / `signOut` clear the shared hold).
+    act(() => clearHeldDeletion());
+    await act(async () => {
+      request.resolve(HELD);
+    });
+    expect(getHeldDeletion()).toBeNull();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument(); // no banner
+    // Nor a list read on behalf of the session that ended.
+    expect(calls('list_pending_changes')).toHaveLength(readsBefore);
+  });
+
+  it('L3: a note made before the last clear is dropped; one made after it is kept', () => {
+    const before = heldDeletionGeneration();
+    clearHeldDeletion();
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true, generation: before });
+    expect(getHeldDeletion()).toBeNull();
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true, generation: heldDeletionGeneration() });
+    expect(getHeldDeletion()).toEqual({ id: HOLD_ID, applyAfter: APPLY_AFTER, filedHere: true });
+  });
+
   it('the number-replacement dialog warns that a new number cancels the deletion, only while a hold is known', async () => {
     const { unmount } = render(<ReplaceAccountNumberDialog open hasPassword={false} onDismiss={() => {}} />);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     unmount();
     // Any origin: a new number cancels every held deletion.
-    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: false });
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: false, generation: heldDeletionGeneration() });
     render(<ReplaceAccountNumberDialog open hasPassword={false} onDismiss={() => {}} />);
     expect(screen.getByRole('alert')).toHaveTextContent(rotationWithHoldText(APPLY_AFTER));
     expect(rotationWithHoldText(APPLY_AFTER)).toMatch(/Replacing the account number cancels that deletion/);

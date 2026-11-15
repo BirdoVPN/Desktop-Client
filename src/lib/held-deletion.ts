@@ -40,6 +40,10 @@ export interface HeldDeletion {
 let held: HeldDeletion | null = null;
 // Bumped by every write and by every read that starts.
 let version = 0;
+// Bumped by every clear (a cancel, the end of a session). A note made for an
+// earlier generation is dropped: a 202 that arrives after the session ended
+// must not put the old account's hold back for the next one.
+let generation = 0;
 const listeners = new Set<() => void>();
 
 function publish(next: HeldDeletion | null) {
@@ -69,22 +73,31 @@ export function useHeldDeletion(): HeldDeletion | null {
   return useSyncExternalStore(subscribe, getHeldDeletion, getHeldDeletion);
 }
 
+/** Take it before sending a hold request; pass it to `noteHeldDeletion`. */
+export function heldDeletionGeneration(): number {
+  return generation;
+}
+
 /**
  * The server named the hold: it is known from now. `filedHere` only for this
  * session's 202; a 409 for a hold already waiting may name one filed on the
  * website or another device (it stays `filedHere` if it is the same hold this
- * session filed).
+ * session filed). `generation` is `heldDeletionGeneration()` from before the
+ * request: if anything was cleared since (the session ended), the answer
+ * belongs to what was cleared and is dropped.
  */
 export function noteHeldDeletion(
   hold: Pick<HeldDeletion, 'id' | 'applyAfter'>,
-  { filedHere }: { filedHere: boolean },
+  { filedHere, generation: asOf }: { filedHere: boolean; generation: number },
 ): void {
+  if (asOf !== generation) return;
   version += 1;
   publish({ id: hold.id, applyAfter: hold.applyAfter, filedHere: filedHere || filedHereStill(hold.id) });
 }
 
 /** Cancelled, gone already, or the session ended: nothing is held. */
 export function clearHeldDeletion(): void {
+  generation += 1;
   version += 1;
   publish(null);
 }

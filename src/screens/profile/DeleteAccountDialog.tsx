@@ -60,6 +60,7 @@ import {
 } from '@/lib/two-factor';
 import { useAppStore } from '@/store/app-store';
 import {
+  heldDeletionGeneration,
   holdWhen,
   noteHeldDeletion,
   SIGN_OUT_CANCELS_HOLD,
@@ -320,6 +321,8 @@ export function DeleteAccountDialog({
     setDeleting(true);
     setError(null);
     setCodeError(null);
+    // An answer that arrives after the session ended belongs to that session.
+    const generation = heldDeletionGeneration();
     try {
       // `command`: an ended session takes the ordinary session-expired path.
       const result = await command<unknown>('request_deletion_hold', {
@@ -338,7 +341,7 @@ export function DeleteAccountDialog({
         // that may have come from the website or another device.
         noteHeldDeletion(
           { id: filed.pendingChangeId, applyAfter: filed.applyAfter },
-          { filedHere: !filed.alreadyPending },
+          { filedHere: !filed.alreadyPending, generation },
         );
       } else {
         setError(HOLD_UNEXPECTED);
@@ -357,8 +360,8 @@ export function DeleteAccountDialog({
     } finally {
       setDeleting(false);
       // Filed, already waiting, or refused: read the list again. A read that
-      // fails keeps the hold just noted.
-      void refreshHeldDeletion();
+      // fails keeps the hold just noted. Not once the session has ended.
+      if (heldDeletionGeneration() === generation) void refreshHeldDeletion();
     }
   };
 
