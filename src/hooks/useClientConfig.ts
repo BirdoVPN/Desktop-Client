@@ -4,10 +4,12 @@
  * screen's price feed (`plans`).
  *
  * WHY THIS IS A HOOK AND NOT AN INLINE EFFECT (PR #162 review, must-fix 2):
- * the three guards below ARE the feature. "Unknown means available" is decided
- * here and nowhere else, and the failure it prevents is asymmetric — a wrongly
- * `false` value hides filtering the user chose and paid attention to, while a
- * wrongly-available one costs a greyed-out row appearing a moment late. While
+ * the three guards below ARE the feature. "Only an explicit boolean moves the
+ * gate" is decided here and nowhere else: a payload without the field, or a
+ * fetch that fails, leaves the last answer in place. (Since owner 2026-11-13
+ * the store STARTS unknown and unknown HIDES the row, so a client that never
+ * gets an answer shows no row; these guards keep one blip from flipping an
+ * answer it already has, in either direction.) While
  * this lived inline in a 1700-line Dashboard nothing could reach it: all three
  * guards could be inverted at once (`typeof … === 'boolean'` → `true`, the
  * setter → `!!cfg?.dnsFilteringAvailable`, the `.catch()` → `set(false)`) and
@@ -143,7 +145,7 @@ export const GATE_POLL_INTERVAL_MS = 60_000;
  * route, and `AppShell` renders Settings and Dashboard mutually exclusively,
  * so Dashboard is not on the path to this screen at all. A `birdo://settings`
  * cold launch sets `tab` to 'settings' before the shell first renders, which
- * left the gate at its `true` default for the entire session and showed
+ * left the gate at its then-`true` default for the entire session and showed
  * BirdoShield ON and switchable with `DNS_FILTERING_ENABLED` off. `AppShell`
  * is the component that is mounted for every authenticated session whatever
  * the tab, which is the property this fetch actually needs.
@@ -152,7 +154,8 @@ export const GATE_POLL_INTERVAL_MS = 60_000;
  * 200: the client sends no `If-None-Match` and reqwest keeps no HTTP cache, so
  * each one pulls the whole public payload. That is cheap (small, public route)
  * and it fails harmlessly — a 429 from the endpoint's 60 req/min bucket lands
- * in the catch below and leaves the gate at its "available" default.
+ * in the catch below and leaves the gate as it was (unknown, and the row
+ * hidden, if no fetch has answered yet).
  *
  * ── STALENESS: what actually bounds it ─────────────────────────────────────
  *
@@ -223,15 +226,17 @@ export const GATE_POLL_INTERVAL_MS = 60_000;
  * `src/__tests__/useClientConfig.test.tsx` fails if any of the three return
  * triggers, the visible poll, or the throttle is dropped.
  *
- * Which direction each error costs, unchanged:
+ * Which direction each error costs (owner 2026-11-13: the row is HIDDEN
+ * while the gate is off or unknown, and Rust sends the connect flag only
+ * while ITS copy of the gate, written by the same `get_client_config` call,
+ * is on):
  *
- *  - trailing a gate that has just been switched ON: the row reads OFF and
- *    disabled while the tunnel really is filtering. `settingsToRust` sends
- *    `dns_filtering: settings.dnsFiltering` regardless of the gate, so the
- *    user's stored preference is still honoured server-side — the screen
- *    understates what is happening, which is the safe direction.
+ *  - trailing a gate that has just been switched ON: no row yet, and no flag
+ *    on the wire until the next answer. The user's stored preference is kept
+ *    and applies from then on — the safe direction.
  *  - trailing a gate that has just been switched OFF: the row stays usable,
- *    which is the direction that lies, and the one the refetch above bounds.
+ *    and the flag is still sent, which is the direction that lies, and the one
+ *    the refetch above bounds.
  */
 export function useClientConfig(): void {
   const setDnsFilteringAvailable = useAppStore((s) => s.setDnsFilteringAvailable);
@@ -274,12 +279,12 @@ export function useClientConfig(): void {
           const gates = planGatesFrom(cfg);
           if (gates) setPlanGates(gates);
         })
-        // GUARD 2: the catch deliberately does NOTHING. The store default is
-        // `true`; an offline client, a 500, a 429 or a cold start must leave
-        // the row usable. Setting `false` here is precisely the bug this PR
-        // exists to prevent, one layer down.
+        // GUARD 2: the catch deliberately does NOTHING. An offline client, a
+        // 500 or a 429 must not overwrite an answer the server already gave:
+        // the last known value stands (unknown, hiding the row, until a fetch
+        // first answers).
         .catch(() => {
-          /* silent — the store default (available) stands */
+          /* silent — the last known value stands */
         });
     };
 
