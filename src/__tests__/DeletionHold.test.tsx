@@ -15,6 +15,8 @@
  *   sign-out confirmation (only while a hold is listed) say so.
  * - Nothing ever concludes "account deleted": an ended session takes the
  *   ordinary session-expired path, and an unexpected answer assumes nothing.
+ * - The hold is ONE shared state (`@/lib/held-deletion`): the Home sign-out
+ *   dialog warns too, and reads the list when it opens.
  *
  * Run: npx vitest run src/__tests__/DeletionHold.test.tsx
  */
@@ -24,12 +26,15 @@ import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { HOLD_OFFER_CODE, HOLD_OFFER_NUMBER, Profile } from '@/screens/Profile';
 import { HOLD_UNEXPECTED } from '@/screens/profile/DeleteAccountDialog';
+import { SignOutDialog } from '@/components/home/SignOutDialog';
 import {
+  clearHeldDeletion,
   heldDeletionOf,
   holdTimeText,
+  noteHeldDeletion,
   SIGN_OUT_CANCELS_HOLD,
-  SIGN_OUT_WITH_HOLD,
-} from '@/screens/profile/PendingDeletion';
+  signOutWithHoldText,
+} from '@/lib/held-deletion';
 import { expireSession, signOut } from '@/session/session';
 import type { ConnectionState } from '@/store/app-store';
 
@@ -104,6 +109,8 @@ const calls = (cmd: string) => mockedInvoke.mock.calls.filter(([c]) => c === cmd
 const APPLY_AFTER = '2026-11-15T12:00:00.000Z';
 const HOLD_ID = 'cmhold0000000000000000001';
 const HELD = { pendingChangeId: HOLD_ID, applyAfter: APPLY_AFTER, message: null, alreadyPending: false };
+/** The sign-out warning while that hold is known (Profile and Home alike). */
+const SIGN_OUT_WITH_HOLD = signOutWithHoldText(APPLY_AFTER);
 
 let preflightResult: () => Promise<unknown>;
 let holdResult: () => Promise<unknown>;
@@ -122,6 +129,7 @@ const preflight = (stepUpFactors: string[], stepUpHoldAvailable: unknown, stepUp
 const refusal = (code: string, message = 'x') => ({ code, message, retryable: false, retry_after_secs: null });
 
 beforeEach(() => {
+  clearHeldDeletion();
   mockedInvoke.mockReset();
   vi.mocked(signOut).mockReset();
   vi.mocked(expireSession).mockReset();
@@ -333,6 +341,7 @@ describe('signing out while a deletion is on hold', () => {
     expect(await screen.findByText(SIGN_OUT_WITH_HOLD)).toBeInTheDocument();
     expect(screen.getByRole('dialog', { name: 'Sign out?' })).toBeInTheDocument();
     expect(SIGN_OUT_WITH_HOLD).toMatch(/Signing out cancels that deletion/);
+    expect(SIGN_OUT_WITH_HOLD).toContain(`on ${holdTimeText(APPLY_AFTER)}`);
     expect(SIGN_OUT_WITH_HOLD).toMatch(/will NOT be deleted/);
     expect(signOut).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole('button', { name: 'Stay signed in' }));
@@ -358,6 +367,67 @@ describe('signing out while a deletion is on hold', () => {
     await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
     expect(signOut).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(SIGN_OUT_WITH_HOLD)).not.toBeInTheDocument();
+  });
+});
+
+/** A promise the test settles when it chooses. */
+function deferred<V>() {
+  let resolve!: (value: V) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<V>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+describe('the Home sign-out dialog (SignOutDialog, opened from the Connect screen)', () => {
+  const listed = [{ id: HOLD_ID, action: 'account_delete', applyAfter: APPLY_AFTER }];
+
+  it('reads the list on opening and warns, with the date, that signing out cancels the deletion', async () => {
+    listResult = () => Promise.resolve(listed);
+    render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
+    expect(await screen.findByRole('alert')).toHaveTextContent(SIGN_OUT_WITH_HOLD);
+    expect(SIGN_OUT_WITH_HOLD).toContain(`on ${holdTimeText(APPLY_AFTER)}`);
+    expect(calls('list_pending_changes')).toHaveLength(1);
+    expect(signOut).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    expect(signOut).toHaveBeenCalledTimes(1);
+  });
+
+  it('a hold filed in Profile is known here at once, even when the list read fails', async () => {
+    // What the dialog does with the 202: straight into the shared state.
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER });
+    listResult = () => Promise.reject(refusal('network_offline'));
+    render(<SignOutDialog open stillConnected onClose={() => {}} />);
+    // No waiting on the read: the warning is in the first paint.
+    expect(screen.getByRole('alert')).toHaveTextContent(SIGN_OUT_WITH_HOLD);
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
+    expect(screen.getByRole('alert')).toHaveTextContent(SIGN_OUT_WITH_HOLD);
+  });
+
+  it('Sign out waits for the opening read, so the warning cannot be skipped by a fast click', async () => {
+    const read = deferred<unknown>();
+    listResult = () => read.promise;
+    render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
+    const button = screen.getByRole('button', { name: 'Sign out' });
+    expect(button).toBeDisabled();
+    await act(async () => {
+      read.resolve(listed);
+    });
+    expect(await screen.findByRole('alert')).toHaveTextContent(SIGN_OUT_WITH_HOLD);
+    expect(button).toBeEnabled();
+    expect(signOut).not.toHaveBeenCalled();
+  });
+
+  it('without a hold it asks only the usual question, and a failed read does not block signing out', async () => {
+    listResult = () => Promise.reject(refusal('network_offline'));
+    render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Sign out' })).toBeEnabled());
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByText('Are you sure you want to sign out?')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    expect(signOut).toHaveBeenCalledTimes(1);
   });
 });
 

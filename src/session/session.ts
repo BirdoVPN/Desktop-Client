@@ -2,6 +2,7 @@
  * Ending a session, the two ways it happens.
  */
 import { invoke } from '@tauri-apps/api/core';
+import { clearHeldDeletion } from '@/lib/held-deletion';
 import { useAppStore } from '@/store/app-store';
 import { selectTunnelActive } from '@/store/selectors';
 
@@ -13,6 +14,8 @@ import { selectTunnelActive } from '@/store/selectors';
 export function endSession(reason: 'expired' | 'revoked'): void {
   const s = useAppStore.getState();
   if (!s.isAuthenticated) return;
+  // MR-2335: the next account must not inherit this one's held deletion.
+  clearHeldDeletion();
   s.logout();
   s.setSessionEndedReason(reason);
 }
@@ -58,5 +61,7 @@ export async function signOut(): Promise<void> {
   } catch {
     /* best effort — local state is cleared regardless */
   }
+  // MR-2335: signing out cancelled any held deletion on the server.
+  clearHeldDeletion();
   useAppStore.getState().logout();
 }

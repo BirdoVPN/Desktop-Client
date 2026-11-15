@@ -59,8 +59,10 @@ import {
   TWO_FACTOR_PLACEHOLDER,
 } from '@/lib/two-factor';
 import { useAppStore } from '@/store/app-store';
+import { holdWhen, SIGN_OUT_CANCELS_HOLD } from '@/lib/held-deletion';
 import { command } from '@/session/command';
-import { cancelErrorText, holdWhen, SIGN_OUT_CANCELS_HOLD } from './PendingDeletion';
+import { refreshHeldDeletion } from '@/session/held-deletion';
+import { cancelErrorText } from './PendingDeletion';
 
 /** Shape returned by the Rust `delete_account` command. */
 export interface DeleteAccountResult {
@@ -205,14 +207,11 @@ export function DeleteAccountDialog({
   hasPassword,
   onDismiss,
   onDeleted,
-  onHoldChanged,
 }: {
   open: boolean;
   hasPassword: boolean;
   onDismiss: () => void;
   onDeleted: () => void;
-  /** MR-2335: a hold was filed, cancelled, or may exist: read the list again. */
-  onHoldChanged?: () => void;
 }) {
   const [password, setPassword] = useState('');
   const [confirmText, setConfirmText] = useState('');
@@ -335,8 +334,9 @@ export function DeleteAccountDialog({
       }
     } finally {
       setDeleting(false);
-      // Filed, already waiting, or refused: the Profile banner reads the list again.
-      onHoldChanged?.();
+      // Filed, already waiting, or refused: the shared hold (the Profile
+      // banner, both sign-out warnings) reads the list again.
+      void refreshHeldDeletion();
     }
   };
 
@@ -355,7 +355,7 @@ export function DeleteAccountDialog({
           ? 'This deletion is no longer waiting, so there was nothing to cancel.'
           : 'The deletion is cancelled. Your account stays as it is.',
       );
-      onHoldChanged?.();
+      void refreshHeldDeletion();
     } catch (e: unknown) {
       setHoldCancelError(cancelErrorText(e));
     } finally {

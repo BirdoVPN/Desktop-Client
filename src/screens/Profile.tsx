@@ -24,9 +24,11 @@ import { displayableEmail, resolveAnonymousAccount } from '@/utils/helpers';
 import { anonNumberRotationEnabled } from '@/lib/features';
 import { loadSubscription } from '@/session/session-data';
 import { signOut } from '@/session/session';
+import { usePendingDeletion } from '@/session/held-deletion';
+import { clearHeldDeletion, signOutWithHoldText } from '@/lib/held-deletion';
 import { AccountNumberCard, IdentityCard, SubscriptionCard } from './profile/ProfileCards';
 import { DeleteAccountDialog } from './profile/DeleteAccountDialog';
-import { PendingDeletionBanner, SIGN_OUT_WITH_HOLD, usePendingDeletion } from './profile/PendingDeletion';
+import { PendingDeletionBanner } from './profile/PendingDeletion';
 import { ReplaceAccountNumberDialog } from './profile/ReplaceAccountNumberDialog';
 import { VoucherRedeemDialog } from './profile/VoucherRedeemDialog';
 
@@ -107,9 +109,7 @@ export function Profile() {
       </div>
 
       <div className="flex flex-col gap-3 px-5 pb-12 pt-2">
-        {pendingDeletion.hold && (
-          <PendingDeletionBanner hold={pendingDeletion.hold} onChanged={pendingDeletion.refresh} />
-        )}
+        {pendingDeletion.hold && <PendingDeletionBanner hold={pendingDeletion.hold} />}
 
         <IdentityCard email={resolvedEmail} plan={account.plan} isAnon={isAnon} />
 
@@ -203,10 +203,10 @@ export function Profile() {
           onDismiss={() => setShowReplaceDialog(false)}
         />
       )}
-      {confirmSignOut && (
+      {confirmSignOut && pendingDeletion.hold && (
         <BirdoDialog open onClose={() => setConfirmSignOut(false)} title="Sign out?" icon={LogOut}>
           <p className="text-[13px]" style={{ color: white.w80 }}>
-            {SIGN_OUT_WITH_HOLD}
+            {signOutWithHoldText(pendingDeletion.hold.applyAfter)}
           </p>
           <div className="flex gap-2.5">
             <BirdoButton
@@ -235,13 +235,13 @@ export function Profile() {
           // still has one, and the backend will demand it.
           hasPassword={account.hasPassword}
           onDismiss={() => setShowDeleteDialog(false)}
-          onHoldChanged={pendingDeletion.refresh}
           onDeleted={async () => {
             try {
               await invoke('logout');
             } catch {
               /* best effort — the account is already gone server-side */
             }
+            clearHeldDeletion();
             logout();
           }}
         />
