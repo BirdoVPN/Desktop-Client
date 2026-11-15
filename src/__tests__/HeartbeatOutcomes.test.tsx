@@ -9,7 +9,8 @@
  *  - inside the Free plan's grace window, a `quota-warning` event carrying
  *    the seconds left (`auto_reconnect.rs`, `QuotaWarning`);
  *  - when the server ended the session, an `error` status whose code is
- *    `revoked` or `quota_exceeded` (`end_by_server` → `give_up`, no `gaveUp`);
+ *    `revoked`, `evicted` (MR-2333) or `quota_exceeded` (`end_by_server` →
+ *    `give_up`, no `gaveUp`);
  *  - otherwise nothing (`Fine`, and `ServerGoingOffline`, which only logs).
  *
  * This file pins the other half, per reason: that outcome, as Rust emits it,
@@ -22,7 +23,7 @@
  *
  * The OUTCOMES below mirror `heartbeat_cases`' `live` column; keep the two in
  * step. The teardown probe's column (`after_teardown`) re-dials or ends with
- * the same two codes, so it reaches the UI as one of these same outcomes.
+ * the same codes, so it reaches the UI as one of these same outcomes.
  *
  * Run: npx vitest run src/__tests__/HeartbeatOutcomes.test.tsx
  */
@@ -35,7 +36,7 @@ import { VpnSessionController } from '@/session/controller';
 import { useAppStore, defaultSettings } from '@/store/app-store';
 import { resetSessionData } from '@/session/session-data';
 import { CONSENT_VERSION } from '@/lib/consent';
-import { QUOTA_EXCEEDED_COPY, REVOKED_COPY, quotaGraceMessage, vpnErrorCopy } from '@/lib/errors';
+import { EVICTED_COPY, QUOTA_EXCEEDED_COPY, REVOKED_COPY, quotaGraceMessage, vpnErrorCopy } from '@/lib/errors';
 
 vi.mock('@tauri-apps/api/core');
 
@@ -89,7 +90,7 @@ function quotaWarningWire(): { event: string; secondsKey: string } {
   return { event, secondsKey: camel(fields[0]) };
 }
 
-type EndCode = 'Revoked' | 'QuotaExceeded';
+type EndCode = 'Revoked' | 'Evicted' | 'QuotaExceeded';
 
 /** The wire name of an `IpcErrorCode` variant (`ipc_error.rs`, `rename_all = "snake_case"`). */
 function ipcCodeWire(variant: EndCode): string {
@@ -115,6 +116,8 @@ const HB_NOT_FOUND = 'Connection not found. Please reconnect.';
 const HB_REVOKED = 'Connection has been revoked. Please reconnect.';
 // reconnect_policy::quota_exceeded_error().
 const RUST_QUOTA_EXCEEDED = "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.";
+// reconnect_policy::EVICTED_MESSAGE (MR-2333): never the reply's not-found sentence.
+const RUST_EVICTED = 'Another device on your account took over this connection.';
 
 type Outcome =
   | { kind: 'nothing' }
@@ -132,6 +135,7 @@ const nothing: Outcome = { kind: 'nothing' };
 const grace = (secondsRemaining: number): Outcome => ({ kind: 'grace', secondsRemaining });
 const revoked = (message: string): Outcome => ({ kind: 'end', code: 'Revoked', message });
 const quotaEnded: Outcome = { kind: 'end', code: 'QuotaExceeded', message: RUST_QUOTA_EXCEEDED };
+const evicted: Outcome = { kind: 'end', code: 'Evicted', message: RUST_EVICTED };
 
 const CASES: ReasonCase[] = [
   { reason: 'ok', shape: 'live', outcome: nothing },
@@ -141,7 +145,7 @@ const CASES: ReasonCase[] = [
   { reason: 'server_offline', shape: 'invalid: the key went with a drained server', outcome: revoked(HB_NOT_FOUND) },
   { reason: 'revoked', shape: 'a deactivated row', outcome: revoked(HB_REVOKED) },
   { reason: 'revoked', shape: 'a removal record', outcome: revoked(HB_NOT_FOUND) },
-  { reason: 'evicted', shape: 'a removal record', outcome: revoked(HB_NOT_FOUND) },
+  { reason: 'evicted', shape: 'a removal record', outcome: evicted },
   { reason: 'reaped', shape: 'a removal record', outcome: revoked(HB_NOT_FOUND) },
   { reason: 'quota_exceeded', shape: 'ended at this check-in', outcome: quotaEnded },
   { reason: 'quota_exceeded', shape: 'a removal record', outcome: quotaEnded },
@@ -151,6 +155,7 @@ const CASES: ReasonCase[] = [
 /** What the UI shows for an ending: the copy by code, never by the server's sentence. */
 const END_UI: Record<EndCode, { message: string; action: string }> = {
   Revoked: { message: REVOKED_COPY, action: 'connect' },
+  Evicted: { message: EVICTED_COPY, action: 'connect' },
   QuotaExceeded: { message: QUOTA_EXCEEDED_COPY, action: 'view_plans' },
 };
 
@@ -222,9 +227,10 @@ describe('heartbeat reasons: what the UI does (MR-1638)', () => {
     expect([...new Set(CASES.map((c) => c.reason))].sort()).toEqual([...reasons].sort());
   });
 
-  it('the grace event and the two ending codes are the names the UI listens for', () => {
+  it('the grace event and the three ending codes are the names the UI listens for', () => {
     expect(quotaWarningWire()).toEqual({ event: 'quota-warning', secondsKey: 'secondsRemaining' });
     expect(ipcCodeWire('Revoked')).toBe('revoked');
+    expect(ipcCodeWire('Evicted')).toBe('evicted');
     expect(ipcCodeWire('QuotaExceeded')).toBe('quota_exceeded');
   });
 
