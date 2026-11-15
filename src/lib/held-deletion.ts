@@ -1,8 +1,8 @@
 /**
  * MR-2335: the account's deletion on its 24-hour hold, as ONE shared state.
  *
- * Every surface that must know about it reads this: the Profile banner and
- * the Profile and the Home sign-out confirmations.
+ * Every surface that must know about it reads this: the Profile banner, the
+ * Profile and the Home sign-out confirmations, the number-replacement dialog.
  * It used to be local to Profile, so a user who filed a hold there and signed
  * out from Home cancelled the deletion without being told.
  *
@@ -114,5 +114,13 @@ export function signOutWithHoldText(applyAfter: string): string {
   return (
     `Your account is waiting to be deleted ${holdWhen(applyAfter)}. Signing out cancels that ` +
     'deletion, so your account will NOT be deleted. To delete it, stay signed in until then.'
+  );
+}
+
+/** The number-replacement dialog while a hold is known. */
+export function rotationWithHoldText(applyAfter: string): string {
+  return (
+    `Your account is waiting to be deleted ${holdWhen(applyAfter)}. Replacing the account number ` +
+    'cancels that deletion, so your account will NOT be deleted.'
   );
 }

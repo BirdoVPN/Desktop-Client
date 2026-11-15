@@ -16,8 +16,8 @@
  * - Nothing ever concludes "account deleted": an ended session takes the
  *   ordinary session-expired path, and an unexpected answer assumes nothing.
  * - The hold is ONE shared state (`@/lib/held-deletion`): the Home sign-out
- *   dialog warns too, the hold the 202 named is known without a list read, and
- *   a cancel clears it at once.
+ *   dialog and the number-replacement dialog warn too, the hold the 202 named
+ *   is known without a list read, and a cancel clears it at once.
  *
  * Run: npx vitest run src/__tests__/DeletionHold.test.tsx
  */
@@ -27,6 +27,7 @@ import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { HOLD_OFFER_CODE, HOLD_OFFER_NUMBER, Profile } from '@/screens/Profile';
 import { HOLD_UNEXPECTED } from '@/screens/profile/DeleteAccountDialog';
+import { ReplaceAccountNumberDialog } from '@/screens/profile/ReplaceAccountNumberDialog';
 import { SignOutDialog } from '@/components/home/SignOutDialog';
 import {
   clearHeldDeletion,
@@ -34,6 +35,7 @@ import {
   heldDeletionOf,
   holdTimeText,
   noteHeldDeletion,
+  rotationWithHoldText,
   SIGN_OUT_CANCELS_HOLD,
   signOutWithHoldText,
 } from '@/lib/held-deletion';
@@ -479,6 +481,17 @@ describe('the hold as shared state', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Cancel deletion' }));
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
     expect(getHeldDeletion()).toBeNull();
+  });
+
+  it('the number-replacement dialog warns that a new number cancels the deletion, only while a hold is known', async () => {
+    const { unmount } = render(<ReplaceAccountNumberDialog open hasPassword={false} onDismiss={() => {}} />);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    unmount();
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER });
+    render(<ReplaceAccountNumberDialog open hasPassword={false} onDismiss={() => {}} />);
+    expect(screen.getByRole('alert')).toHaveTextContent(rotationWithHoldText(APPLY_AFTER));
+    expect(rotationWithHoldText(APPLY_AFTER)).toMatch(/Replacing the account number cancels that deletion/);
+    expect(rotationWithHoldText(APPLY_AFTER)).toContain(`on ${holdTimeText(APPLY_AFTER)}`);
   });
 });
 

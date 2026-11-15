@@ -30,6 +30,7 @@ import { BirdoButton, BirdoDialog, BirdoTextField } from '@/components/birdo';
 import { brand, hairline, status as statusTokens, white } from '@/lib/birdo-theme';
 import { copySensitive } from '@/lib/clipboard';
 import { errorCopy } from '@/lib/errors';
+import { clearHeldDeletion, rotationWithHoldText, useHeldDeletion } from '@/lib/held-deletion';
 import { toIpcError } from '@/lib/ipc';
 import {
   isTwoFactorCode,
@@ -37,6 +38,7 @@ import {
   TWO_FACTOR_HINT,
   TWO_FACTOR_PLACEHOLDER,
 } from '@/lib/two-factor';
+import { refreshHeldDeletion } from '@/session/held-deletion';
 import { signOut } from '@/session/session';
 import { useAppStore } from '@/store/app-store';
 import { formatAccountNumber, identityPatch, type AuthStateIdentity } from '@/utils/helpers';
@@ -104,6 +106,8 @@ export function ReplaceAccountNumberDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // MR-2335: a deletion on its 24-hour hold, which a new number cancels.
+  const heldDeletion = useHeldDeletion();
   // Set once a confirm has been SENT. If it committed on the server and its
   // answer was lost, the old tokens are revoked, so a later 401 or 409
   // `rotation_not_pending` means "probably done", not "start again".
@@ -202,6 +206,9 @@ export function ReplaceAccountNumberDialog({
         setNewNumber(null);
         setRetyped('');
         setPhase('done');
+        // MR-2335: the server cancelled any held deletion with the old number.
+        clearHeldDeletion();
+        void refreshHeldDeletion();
         // Rust now holds the fresh tokens; read the identity again (the number
         // shown on Profile is the new one, or its mask).
         try {
@@ -250,6 +257,12 @@ export function ReplaceAccountNumberDialog({
             You get a new number. The old one stops working and every other device is signed out,
             but only once you confirm the new one on the next steps.
           </p>
+          {/* MR-2335: the server cancels a held deletion when the number changes. */}
+          {heldDeletion && (
+            <p role="alert" className="text-[12px]" style={{ color: statusTokens.red }}>
+              {rotationWithHoldText(heldDeletion.applyAfter)}
+            </p>
+          )}
           <BirdoTextField
             value={currentNumber}
             onChange={(v) => {

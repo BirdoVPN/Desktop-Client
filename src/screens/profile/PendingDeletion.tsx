@@ -5,7 +5,7 @@
  * The hold itself is shared state (`@/lib/held-deletion`): the dialog writes
  * it the moment the server names it, Profile reads the list when it opens and
  * whenever the window regains focus (`usePendingDeletion`), and the Home
- * sign-out dialog reads the same state. A
+ * sign-out dialog and the number-replacement dialog read the same state. A
  * hold can vanish between two reads: the server cancels it on a sign-out
  * elsewhere, a number rotation, a password or 2FA change, and drops it when
  * this app's session ends. So a hold that is gone is simply not shown; it is
