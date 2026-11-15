@@ -16,7 +16,7 @@
  * - Nothing ever concludes "account deleted": an ended session takes the
  *   ordinary session-expired path, and an unexpected answer assumes nothing.
  * - The hold is ONE shared state (`@/lib/held-deletion`): the Home sign-out
- *   dialog warns too, and reads the list when it opens.
+ *   dialog warns too, and the hold the 202 named is known without a list read.
  *
  * Run: npx vitest run src/__tests__/DeletionHold.test.tsx
  */
@@ -29,6 +29,7 @@ import { HOLD_UNEXPECTED } from '@/screens/profile/DeleteAccountDialog';
 import { SignOutDialog } from '@/components/home/SignOutDialog';
 import {
   clearHeldDeletion,
+  getHeldDeletion,
   heldDeletionOf,
   holdTimeText,
   noteHeldDeletion,
@@ -428,6 +429,33 @@ describe('the Home sign-out dialog (SignOutDialog, opened from the Connect scree
     expect(screen.getByText('Are you sure you want to sign out?')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
     expect(signOut).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('the hold as shared state', () => {
+  const listed = [{ id: HOLD_ID, action: 'account_delete', applyAfter: APPLY_AFTER }];
+
+  it('the hold the 202 named is shown and warned about even though every later list read fails', async () => {
+    // Profile's opening read finds nothing; every read after it fails.
+    const answers = [() => Promise.resolve([])];
+    listResult = () => (answers.shift() ?? (() => Promise.reject(refusal('network_offline'))))();
+    await openDialog();
+    await userEvent.click(await screen.findByRole('button', { name: HOLD_OFFER_NUMBER }));
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await userEvent.click(screen.getByRole('button', { name: 'Delete in 24 hours' }));
+    await screen.findByRole('button', { name: 'Close' });
+    // The follow-up read was made, and failed.
+    await waitFor(() => expect(calls('list_pending_changes').length).toBeGreaterThanOrEqual(2));
+    expect(getHeldDeletion()).toEqual({ id: HOLD_ID, applyAfter: APPLY_AFTER });
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }));
+    // The banner, from the 202 alone.
+    expect(screen.getByRole('status')).toHaveTextContent(
+      `Your account will be deleted on ${holdTimeText(APPLY_AFTER)}.`,
+    );
+    // And the Profile sign-out asks first.
+    await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
+    expect(await screen.findByText(SIGN_OUT_WITH_HOLD)).toBeInTheDocument();
+    expect(signOut).not.toHaveBeenCalled();
   });
 });
 

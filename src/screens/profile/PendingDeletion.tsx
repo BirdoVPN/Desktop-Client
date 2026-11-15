@@ -2,10 +2,10 @@
  * MR-2335 (MR-179 hold fallback, birdo-web #883): an account deletion on its
  * 24-hour hold, shown on Profile with a way to cancel it.
  *
- * The hold itself is shared state (`@/lib/held-deletion`): Profile reads the
- * list when it opens and whenever the window regains focus
- * (`usePendingDeletion`) and again after the dialog or this banner files or
- * cancels one, and the Home sign-out dialog reads the same state. A
+ * The hold itself is shared state (`@/lib/held-deletion`): the dialog writes
+ * it the moment the server names it, Profile reads the list when it opens and
+ * whenever the window regains focus (`usePendingDeletion`), and the Home
+ * sign-out dialog reads the same state. A
  * hold can vanish between two reads: the server cancels it on a sign-out
  * elsewhere, a number rotation, a password or 2FA change, and drops it when
  * this app's session ends. So a hold that is gone is simply not shown; it is

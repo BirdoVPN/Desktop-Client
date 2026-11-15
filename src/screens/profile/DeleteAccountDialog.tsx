@@ -59,7 +59,7 @@ import {
   TWO_FACTOR_PLACEHOLDER,
 } from '@/lib/two-factor';
 import { useAppStore } from '@/store/app-store';
-import { holdWhen, SIGN_OUT_CANCELS_HOLD } from '@/lib/held-deletion';
+import { holdWhen, noteHeldDeletion, SIGN_OUT_CANCELS_HOLD } from '@/lib/held-deletion';
 import { command } from '@/session/command';
 import { refreshHeldDeletion } from '@/session/held-deletion';
 import { cancelErrorText } from './PendingDeletion';
@@ -319,8 +319,14 @@ export function DeleteAccountDialog({
       });
       // NOT a deletion: nothing is signed out or disconnected here.
       const filed = holdOf(result);
-      if (filed) setHold(filed);
-      else setError(HOLD_UNEXPECTED);
+      if (filed) {
+        setHold(filed);
+        // Straight into the shared state: the banner and both sign-out
+        // warnings know it now, whatever the list read below does.
+        noteHeldDeletion({ id: filed.pendingChangeId, applyAfter: filed.applyAfter });
+      } else {
+        setError(HOLD_UNEXPECTED);
+      }
     } catch (e: unknown) {
       const err = toIpcError(e);
       if (err.code === 'two_factor_required') {
@@ -334,8 +340,8 @@ export function DeleteAccountDialog({
       }
     } finally {
       setDeleting(false);
-      // Filed, already waiting, or refused: the shared hold (the Profile
-      // banner, both sign-out warnings) reads the list again.
+      // Filed, already waiting, or refused: read the list again. A read that
+      // fails keeps the hold just noted.
       void refreshHeldDeletion();
     }
   };
