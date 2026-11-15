@@ -11,7 +11,9 @@
  * (`filedHere`, `@/lib/held-deletion`). The hold is shared state: one filed in
  * Profile is known here at once, and the list is read again each time the
  * dialog opens (a hold filed before the app was restarted). Sign out waits for
- * that one read, so the warning cannot be skipped by a fast click.
+ * that one read, so the warning cannot be skipped by a fast click, but for at
+ * most `HOLD_READ_WAIT_MS`: a read that fails or is slower leaves no hold
+ * known, so the dialog says it could not check, and Sign out works.
  *
  * The server's sign-out is best effort (Rust's `logout` ignores a failed
  * `/auth/logout`), so offline it may never void a hold filed here. Confirming
@@ -23,8 +25,18 @@ import { useEffect, useState } from 'react';
 import { TriangleAlert } from 'lucide-react';
 import { BirdoButton, BirdoDialog } from '@/components/birdo';
 import { status, white } from '@/lib/birdo-theme';
-import { signOutCancelFailedText, signOutWithHoldText, useHeldDeletion } from '@/lib/held-deletion';
-import { cancelErrorText, cancelHeldDeletion, refreshHeldDeletion } from '@/session/held-deletion';
+import {
+  HOLD_UNCHECKED_CAUTION,
+  signOutCancelFailedText,
+  signOutWithHoldText,
+  useHeldDeletion,
+} from '@/lib/held-deletion';
+import {
+  cancelErrorText,
+  cancelHeldDeletion,
+  HOLD_READ_WAIT_MS,
+  refreshHeldDeletion,
+} from '@/session/held-deletion';
 import { signOut } from '@/session/session';
 
 export function SignOutDialog({
@@ -64,8 +76,10 @@ function SignOutConfirm({
   onClose: () => void;
 }) {
   const hold = useHeldDeletion();
-  // The read this opening started is still out.
-  const [checking, setChecking] = useState(true);
+  // The read this opening started: still out, answered, or failed / not
+  // answered within HOLD_READ_WAIT_MS ("unchecked": the caution, and Sign out
+  // goes ahead). A late answer still counts.
+  const [read, setRead] = useState<'pending' | 'answered' | 'unchecked'>('pending');
   // Cancel deletion, from this dialog.
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
@@ -74,11 +88,15 @@ function SignOutConfirm({
   const [signOutBlocked, setSignOutBlocked] = useState<{ reason: string; applyAfter: string } | null>(null);
   useEffect(() => {
     let current = true;
-    void refreshHeldDeletion().finally(() => {
-      if (current) setChecking(false);
+    const timer = setTimeout(() => {
+      if (current) setRead((now) => (now === 'pending' ? 'unchecked' : now));
+    }, HOLD_READ_WAIT_MS);
+    void refreshHeldDeletion().then((answered) => {
+      if (current) setRead(answered ? 'answered' : 'unchecked');
     });
     return () => {
       current = false;
+      clearTimeout(timer);
     };
   }, []);
 
@@ -140,6 +158,11 @@ function SignOutConfirm({
           {signOutWithHoldText(hold)}
         </p>
       )}
+      {!hold && !cancelled && read === 'unchecked' && (
+        <p role="note" className="text-[12px]" style={{ color: white.w80 }}>
+          {HOLD_UNCHECKED_CAUTION}
+        </p>
+      )}
       {cancelled && !hold && (
         <p role="status" className="text-[12px]" style={{ color: white.w80 }}>
           The deletion is cancelled. Your account stays as it is.
@@ -199,7 +222,7 @@ function SignOutConfirm({
             variant="danger"
             fullWidth
             isLoading={busy}
-            disabled={(checking && !hold) || cancelling}
+            disabled={(read === 'pending' && !hold) || cancelling}
             onClick={() => void confirmSignOut()}
           />
         )}

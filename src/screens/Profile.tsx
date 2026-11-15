@@ -26,7 +26,7 @@ import { displayableEmail, resolveAnonymousAccount } from '@/utils/helpers';
 import { anonNumberRotationEnabled } from '@/lib/features';
 import { loadSubscription } from '@/session/session-data';
 import { signOut } from '@/session/session';
-import { refreshHeldDeletion, usePendingDeletion } from '@/session/held-deletion';
+import { refreshHeldDeletionWithin, usePendingDeletion } from '@/session/held-deletion';
 import { clearHeldDeletion, getHeldDeletion } from '@/lib/held-deletion';
 import { AccountNumberCard, IdentityCard, SubscriptionCard } from './profile/ProfileCards';
 import { DeleteAccountDialog } from './profile/DeleteAccountDialog';
@@ -80,19 +80,22 @@ export function Profile() {
   const [confirmSignOut, setConfirmSignOut] = useState(false);
   // With no hold known yet (Profile's own opening read may still be out),
   // Sign out reads the list before deciding, so a fast click cannot skip
-  // the warning. The row is disabled meanwhile.
+  // the warning. The row is disabled meanwhile, for at most
+  // HOLD_READ_WAIT_MS: a read that fails or is slower opens the confirmation
+  // too, which says it could not check.
   const [checkingHold, setCheckingHold] = useState(false);
   const handleSignOut = async () => {
     if (checkingHold) return;
+    let answered = true;
     if (!getHeldDeletion()) {
       setCheckingHold(true);
       try {
-        await refreshHeldDeletion();
+        answered = await refreshHeldDeletionWithin();
       } finally {
         setCheckingHold(false);
       }
     }
-    if (getHeldDeletion()) setConfirmSignOut(true);
+    if (getHeldDeletion() || !answered) setConfirmSignOut(true);
     else void signOut();
   };
 

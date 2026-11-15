@@ -26,7 +26,7 @@
  * Run: npx vitest run src/__tests__/DeletionHold.test.tsx
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { HOLD_OFFER_CODE, HOLD_OFFER_NUMBER, Profile } from '@/screens/Profile';
@@ -37,6 +37,7 @@ import {
   clearHeldDeletion,
   getHeldDeletion,
   heldDeletionOf,
+  HOLD_UNCHECKED_CAUTION,
   holdTimeText,
   noteHeldDeletion,
   rotationWithHoldText,
@@ -44,6 +45,7 @@ import {
   SIGN_OUT_KEEPS_HOLD,
   signOutWithHoldText,
 } from '@/lib/held-deletion';
+import { HOLD_READ_WAIT_MS } from '@/session/held-deletion';
 import { expireSession, signOut } from '@/session/session';
 import type { ConnectionState } from '@/store/app-store';
 
@@ -431,6 +433,29 @@ describe('signing out while a deletion is on hold', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
+  it('L1: a read that does not answer within 3 s opens the confirmation, which says it could not check', async () => {
+    vi.useFakeTimers();
+    try {
+      listResult = () => new Promise(() => {});
+      render(<Profile />);
+      fireEvent.click(screen.getByRole('button', { name: /^sign out/i }));
+      expect(signOut).not.toHaveBeenCalled();
+      await act(async () => {
+        vi.advanceTimersByTime(HOLD_READ_WAIT_MS + 100);
+      });
+      const dialog = screen.getByRole('dialog', { name: 'Sign out?' });
+      // The dialog asks once more, for at most as long, then says it could not check.
+      await act(async () => {
+        vi.advanceTimersByTime(HOLD_READ_WAIT_MS + 100);
+      });
+      expect(within(dialog).getByText(HOLD_UNCHECKED_CAUTION)).toBeInTheDocument();
+      expect(within(dialog).getByRole('button', { name: 'Sign out' })).toBeEnabled();
+      expect(signOut).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('M2: a click before the opening read answers, and the read finds a hold: it asks first', async () => {
     const read = deferred<unknown>();
     listResult = () => read.promise;
@@ -518,14 +543,50 @@ describe('the Home sign-out dialog (SignOutDialog, opened from the Connect scree
     expect(signOut).not.toHaveBeenCalled();
   });
 
-  it('without a hold it asks only the usual question, and a failed read does not block signing out', async () => {
-    listResult = () => Promise.reject(refusal('network_offline'));
+  it('without a hold (the read answered) it asks only the usual question', async () => {
     render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
     await waitFor(() => expect(screen.getByRole('button', { name: 'Sign out' })).toBeEnabled());
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText(HOLD_UNCHECKED_CAUTION)).not.toBeInTheDocument();
     expect(screen.getByText('Are you sure you want to sign out?')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
     expect(signOut).toHaveBeenCalledTimes(1);
+  });
+
+  it('L1: a read that fails and no hold known: the generic caution, and signing out is not blocked', async () => {
+    listResult = () => Promise.reject(refusal('network_offline'));
+    render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Sign out' })).toBeEnabled());
+    expect(screen.getByRole('note')).toHaveTextContent(
+      "We couldn't check whether a deletion is waiting; if you asked for one in this app, signing out cancels it.",
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    expect(signOut).toHaveBeenCalledTimes(1);
+  });
+
+  it('L1: a read that does not answer: Sign out waits about 3 s, not 30, then works with the caution', async () => {
+    vi.useFakeTimers();
+    try {
+      listResult = () => new Promise(() => {});
+      render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
+      expect(screen.getByRole('button', { name: 'Sign out' })).toBeDisabled();
+      await act(async () => {
+        vi.advanceTimersByTime(HOLD_READ_WAIT_MS - 100);
+      });
+      expect(screen.getByRole('button', { name: 'Sign out' })).toBeDisabled();
+      expect(screen.queryByText(HOLD_UNCHECKED_CAUTION)).not.toBeInTheDocument();
+      await act(async () => {
+        vi.advanceTimersByTime(200);
+      });
+      expect(HOLD_READ_WAIT_MS).toBe(3000);
+      expect(screen.getByRole('button', { name: 'Sign out' })).toBeEnabled();
+      expect(screen.getByText(HOLD_UNCHECKED_CAUTION)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+      expect(signOut).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

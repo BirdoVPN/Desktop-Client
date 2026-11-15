@@ -158,6 +158,10 @@ export function signOutWithHoldText(hold: HeldDeletion): string {
     : `${waiting} ${SIGN_OUT_KEEPS_HOLD} To keep your account, cancel the deletion.`;
 }
 
+/** The sign-out confirmation when the list could not be read and no hold is known. */
+export const HOLD_UNCHECKED_CAUTION =
+  "We couldn't check whether a deletion is waiting; if you asked for one in this app, signing out cancels it.";
+
 /** Signing out cancels a hold filed here first; that cancel failed. */
 export function signOutCancelFailedText(reason: string, hold: Pick<HeldDeletion, 'applyAfter'>): string {
   return (

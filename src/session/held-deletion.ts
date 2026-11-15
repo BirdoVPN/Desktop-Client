@@ -18,18 +18,41 @@ import { toIpcError } from '@/lib/ipc';
 import { command } from '@/session/command';
 
 /**
- * Read `GET /auth/pending-changes` now. A hold that vanished (the server
- * cancels it on a sign-out elsewhere, a number rotation, a password or 2FA
- * change) is simply gone; a read that FAILS keeps what is known, because an
- * outage is not "no hold". Never rejects.
+ * How long a sign-out waits for the list before it goes ahead without it.
+ * The request itself may take reqwest's 30 s; nobody waits that long to sign
+ * out.
  */
-export function refreshHeldDeletion(): Promise<void> {
+export const HOLD_READ_WAIT_MS = 3000;
+
+/**
+ * Read `GET /auth/pending-changes` now. A hold that vanished (the server
+ * cancels it on a sign-out everywhere, a number rotation, a password or 2FA
+ * change) is simply gone; a read that FAILS keeps what is known, because an
+ * outage is not "no hold". Never rejects: true once the server answered,
+ * false when the read failed.
+ */
+export function refreshHeldDeletion(): Promise<boolean> {
   const token = startHeldDeletionRead();
   return command<unknown>('list_pending_changes')
-    .then((items) => finishHeldDeletionRead(token, items))
-    .catch(() => {
-      /* keep what is known */
+    .then((items) => {
+      finishHeldDeletionRead(token, items);
+      return true;
+    })
+    .catch(() => false);
+}
+
+/**
+ * `refreshHeldDeletion`, waited for at most `ms`: false when the read failed
+ * or is still out by then (it carries on, and still updates the state).
+ */
+export function refreshHeldDeletionWithin(ms: number = HOLD_READ_WAIT_MS): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    void refreshHeldDeletion().then((answered) => {
+      clearTimeout(timer);
+      resolve(answered);
     });
+  });
 }
 
 /** The held deletion, read when the caller mounts and on every window focus. */
