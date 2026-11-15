@@ -122,6 +122,8 @@ mod gdpr_request_tests {
                 &DeleteAccountBody {
                     password: "pw",
                     two_factor_code: None,
+                    account_number: None,
+                    email_code: None,
                 },
             )
             .build()
@@ -167,6 +169,8 @@ mod gdpr_request_tests {
                     &DeleteAccountBody {
                         password: "pw",
                         two_factor_code: code,
+                        account_number: None,
+                        email_code: None,
                     },
                 )
                 .build()
@@ -178,6 +182,87 @@ mod gdpr_request_tests {
             body_of(Some("123456")),
             json!({ "password": "pw", "twoFactorCode": "123456" })
         );
+    }
+
+    /// MR-179: the account number and the e-mailed code ride only when there is
+    /// one, so a backend older than the step-up never sees either key.
+    #[test]
+    fn the_step_up_proof_rides_only_when_there_is_one() {
+        let api = BirdoApi::new();
+        let body_of = |number: Option<&str>, mailed: Option<&str>| -> serde_json::Value {
+            let request = api
+                .gdpr_delete_request(
+                    "tok",
+                    &DeleteAccountBody {
+                        password: "pw",
+                        two_factor_code: None,
+                        account_number: number,
+                        email_code: mailed,
+                    },
+                )
+                .build()
+                .unwrap();
+            serde_json::from_slice(request.body().and_then(|b| b.as_bytes()).unwrap()).unwrap()
+        };
+        assert_eq!(body_of(None, None), json!({ "password": "pw" }));
+        assert_eq!(
+            body_of(Some("123456789012345678901234"), None),
+            json!({ "password": "pw", "accountNumber": "123456789012345678901234" })
+        );
+        assert_eq!(
+            body_of(None, Some("654321")),
+            json!({ "password": "pw", "emailCode": "654321" })
+        );
+    }
+
+    /// MR-179: the step-up refusals are told apart by `error`, never by the
+    /// sentence, and a 429 `too_many_attempts` stays a rate limit.
+    #[test]
+    fn deletion_step_up_refusals_map_by_error() {
+        use super::super::error::StepUpKind;
+        for (code, want) in [
+            ("account_number_required", StepUpKind::AccountNumberRequired),
+            ("account_number_invalid", StepUpKind::AccountNumberInvalid),
+            ("email_code_required", StepUpKind::EmailCodeRequired),
+            ("email_code_invalid", StepUpKind::EmailCodeInvalid),
+        ] {
+            let body = format!(
+                r#"{{"statusCode":403,"error":"{code}","message":"Anything at all. If your app cannot ask for this, update the app, or delete your account on the website.","stepUp":["account_number"]}}"#
+            );
+            match BirdoApi::classify_gdpr_delete_response(StatusCode::FORBIDDEN, &body) {
+                GdprDeleteOutcome::Refused(ApiError::StepUp { kind, message }) => {
+                    assert_eq!(kind, want, "{code}");
+                    assert!(message.contains("update the app"), "{message}");
+                }
+                _ => panic!("{code} was not a StepUp refusal"),
+            }
+        }
+        let locked = r#"{"statusCode":429,"error":"too_many_attempts","message":"Too many attempts. Please wait 15 minutes and try again."}"#;
+        assert!(matches!(
+            BirdoApi::classify_gdpr_delete_response(StatusCode::TOO_MANY_REQUESTS, locked),
+            GdprDeleteOutcome::Refused(ApiError::RateLimited { .. })
+        ));
+    }
+
+    /// MR-179: the preflight's `stepUp` and the code reply decode, and an older
+    /// backend's preflight (no `stepUp`) still does.
+    #[test]
+    fn the_step_up_preflight_and_code_reply_decode() {
+        use super::super::types::{DeletionCodeResponse, DeletionPreflightResponse};
+        let with: DeletionPreflightResponse = serde_json::from_str(
+            r#"{"success":true,"storeSubscriptionsStillBilling":[],"stepUp":{"factors":["email_code"],"enforced":true}}"#,
+        )
+        .unwrap();
+        let step_up = with.step_up.unwrap();
+        assert_eq!(step_up.factors, vec!["email_code"]);
+        assert!(step_up.enforced);
+        let old: DeletionPreflightResponse = serde_json::from_str(r#"{"success":true}"#).unwrap();
+        assert!(old.step_up.is_none());
+        let sent: DeletionCodeResponse = serde_json::from_str(
+            r#"{"success":true,"sentTo":"o***@example.com","expiresInMinutes":10}"#,
+        )
+        .unwrap();
+        assert_eq!(sent.sent_to.as_deref(), Some("o***@example.com"));
     }
 
     /// Item 85: the server's 403s are told apart by `error`, never by the
