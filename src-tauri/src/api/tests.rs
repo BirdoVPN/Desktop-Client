@@ -715,30 +715,71 @@ mod deletion_hold_tests {
         ));
     }
 
-    /// No sign-out on a hold: neither the hold request nor `delete_account`'s
-    /// `Held` arm clears a token. `delete_account` clears them in its
-    /// `Deleted` arm only.
-    #[test]
-    fn a_hold_never_clears_the_tokens() {
+    /// A session in memory, still exactly as `set_tokens` left it.
+    async fn still_signed_in(api: &BirdoApi) -> bool {
+        api.is_authenticated().await
+            && api.access_token_value().await.as_deref() == Some("access-1")
+    }
+
+    /// No sign-out on a hold, by behaviour: with a session in memory, the
+    /// server's real answers are classified and handed to the two functions
+    /// that end the requests. Every hold answer (202, the 409s, an unreadable
+    /// 202, an unexpected 2xx) leaves the access token and the session exactly
+    /// as they were, through the hold request AND through `delete_account`;
+    /// only a confirmed deletion (a plain 200) clears them.
+    #[tokio::test]
+    async fn a_hold_leaves_the_tokens_and_the_session_untouched() {
+        let api = BirdoApi::new();
+        api.set_tokens("access-1".into(), "refresh-1".into()).await;
+        assert!(still_signed_in(&api).await);
+        let filed = json!({ "success": true, "pending": true, "code": "change_pending", "message": FILED, "stepUp": step_up_object() });
+        let already = json!({ "statusCode": 409, "error": "change_already_pending", "message": ALREADY, "details": { "stepUp": step_up_object() } });
+        let unnamed =
+            json!({ "statusCode": 409, "error": "change_already_pending", "message": ALREADY });
+        let unavailable = json!({ "statusCode": 409, "error": "hold_unavailable", "message": "x", "details": { "stepUp": ["account_number"] } });
+        let unreadable = json!({ "success": true, "pending": true, "stepUp": ["account_number"] });
+        for (status, body) in [
+            (StatusCode::ACCEPTED, &filed),
+            (StatusCode::CONFLICT, &already),
+            (StatusCode::CONFLICT, &unnamed),
+            (StatusCode::CONFLICT, &unavailable),
+            (StatusCode::ACCEPTED, &unreadable),
+            // Not the contract's answer to anything: nothing is assumed.
+            (StatusCode::OK, &filed),
+        ] {
+            // The hold request's ending.
+            let _ = BirdoApi::deletion_hold_from(classify(status, body));
+            assert!(still_signed_in(&api).await, "hold request: {status} {body}");
+            // `delete_account`'s ending, given the same answer.
+            assert!(
+                api.finish_gdpr_delete(classify(status, body))
+                    .await
+                    .is_err(),
+                "{status} {body} was accepted as a deletion"
+            );
+            assert!(
+                still_signed_in(&api).await,
+                "delete_account: {status} {body}"
+            );
+        }
+        // A deletion-shaped 200 to a HOLD request: unexpected, nothing wiped.
+        let deleted = json!({ "success": true, "message": "Your data has been deleted." });
+        assert!(BirdoApi::deletion_hold_from(classify(StatusCode::OK, &deleted)).is_err());
+        assert!(still_signed_in(&api).await);
+        // The one answer that ends the session: a confirmed deletion.
+        assert!(api
+            .finish_gdpr_delete(classify(StatusCode::OK, &deleted))
+            .await
+            .is_ok());
+        assert!(!api.is_authenticated().await);
+        // And the hold request is wired to the ending that cannot clear.
         const SOURCE: &str = include_str!("client.rs");
-        let fn_body = |signature: &str| {
-            let start = SOURCE.find(signature).expect(signature);
-            let rest = &SOURCE[start..];
-            &rest[..rest.find("\n    }").expect("end of fn")]
-        };
-        let hold = fn_body("pub async fn request_deletion_hold(");
-        assert!(!hold.contains("clear_tokens"));
+        let start = SOURCE.find("pub async fn request_deletion_hold(").unwrap();
+        let hold = &SOURCE[start..];
+        let hold = &hold[..hold.find("\n    }").unwrap()];
+        assert!(hold.contains("Self::deletion_hold_from(outcome)"));
         assert!(hold.contains("step_up_method: Some(\"hold\")"));
-        let hold_from = fn_body("pub(crate) fn deletion_hold_from(");
-        assert!(!hold_from.contains("clear_tokens"));
-        let delete = fn_body("pub async fn delete_account(");
-        assert_eq!(delete.matches("clear_tokens").count(), 1);
-        let deleted_arm = &delete[delete
-            .find("GdprDeleteOutcome::Deleted(response) => {")
-            .unwrap()..];
-        let deleted_arm = &deleted_arm[..deleted_arm.find("GdprDeleteOutcome::Held").unwrap()];
-        assert!(deleted_arm.contains("self.clear_tokens().await"));
-        assert!(delete.contains("step_up_method: None"));
+        assert!(!hold.contains("finish_gdpr_delete") && !hold.contains("clear_tokens"));
     }
 
     /// `GET /auth/pending-changes`, row by row; a row it cannot use is

@@ -17,7 +17,8 @@
  *   ordinary session-expired path, and an unexpected answer assumes nothing.
  * - The hold is ONE shared state (`@/lib/held-deletion`): the Home sign-out
  *   dialog and the number-replacement dialog warn too, the hold the 202 named
- *   is known without a list read, and a cancel clears it at once.
+ *   is known without a list read, a cancel clears it at once, and a slow old
+ *   read can never put it back.
  *
  * Run: npx vitest run src/__tests__/DeletionHold.test.tsx
  */
@@ -481,6 +482,48 @@ describe('the hold as shared state', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Cancel deletion' }));
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
     expect(getHeldDeletion()).toBeNull();
+  });
+
+  it('an older list read that resolves after a cancel does not put the hold back', async () => {
+    const stale = deferred<unknown>();
+    const answers = [
+      () => Promise.resolve(listed), // Profile opens: the hold is listed
+      () => stale.promise, // a focus read, still out when the user cancels
+      () => Promise.resolve([]), // the re-read after the cancel
+    ];
+    listResult = () => answers.shift()!();
+    render(<Profile />);
+    await screen.findByRole('button', { name: 'Cancel deletion' });
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(2));
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel deletion' }));
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(3));
+    // Now the old read answers with the hold it saw before the cancel.
+    await act(async () => {
+      stale.resolve(listed);
+    });
+    expect(getHeldDeletion()).toBeNull();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Cancel deletion' })).not.toBeInTheDocument();
+  });
+
+  it('an older list read that resolves after a 202 does not hide the new hold', async () => {
+    const stale = deferred<unknown>();
+    noteHeldDeletion({ id: 'cmold', applyAfter: APPLY_AFTER });
+    clearHeldDeletion();
+    const answers = [() => stale.promise];
+    listResult = () => (answers.shift() ?? (() => Promise.reject(refusal('network_offline'))))();
+    render(<Profile />); // its opening read is still out
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
+    act(() => noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }));
+    await act(async () => {
+      stale.resolve([]); // it saw no hold, before the 202
+    });
+    expect(getHeldDeletion()).toEqual({ id: HOLD_ID, applyAfter: APPLY_AFTER });
+    expect(screen.getByRole('status')).toBeInTheDocument();
   });
 
   it('the number-replacement dialog warns that a new number cancels the deletion, only while a hold is known', async () => {

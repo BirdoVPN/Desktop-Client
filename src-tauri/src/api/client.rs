@@ -657,6 +657,15 @@ impl BirdoApi {
             }
             other => other,
         };
+        self.finish_gdpr_delete(outcome).await
+    }
+
+    /// What `delete_account` does with its classified answer. The tokens are
+    /// cleared for a confirmed deletion and for nothing else.
+    pub(crate) async fn finish_gdpr_delete(
+        &self,
+        outcome: GdprDeleteOutcome,
+    ) -> Result<DeleteAccountResponse, ApiError> {
         match outcome {
             GdprDeleteOutcome::Deleted(response) => {
                 self.clear_tokens().await;
