@@ -215,6 +215,7 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::auth::verify_2fa,     // FIX C-2: 2FA TOTP verification
         commands::auth::delete_account, // GDPR account deletion
         commands::auth::deletion_preflight, // what a deletion leaves billing
+        commands::auth::send_deletion_code, // MR-179: e-mail the deletion code (SSO)
         commands::auth::export_user_data, // GDPR data export
         commands::session::end_expired_session, // a command answered session_expired
         // VPN operations
@@ -605,6 +606,13 @@ fn main() {
             // an installer that is still in use).
             #[cfg(windows)]
             crate::utils::protected_dir::remove_updates_at_start();
+
+            // MR-703 / MR-1742: no ML-KEM key is stored any more (one keypair
+            // per connect, in memory). Delete the file an older build left,
+            // once per start; the first start after the upgrade finds it.
+            // Off the setup path: it is only a few file deletions, but setup
+            // must not wait on a slow disk.
+            std::thread::spawn(crate::vpn::birdo_pq::purge_legacy_keypair_files);
 
             // R1 / D6c LOW: consume the legacy-upgrade marker now — the PRIMARY
             // instance (only it reaches setup; the single-instance plugin turns
