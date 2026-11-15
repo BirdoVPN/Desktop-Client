@@ -389,6 +389,10 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         lockdown_mode,
         ..
     } = settings;
+    // The PREFERENCE (after the Custom DNS rule). The fleet gate is applied
+    // where the flag goes on the wire (`session::attempt`, the auto-reconnect
+    // re-dial), so the session on record keeps the user's choice and each
+    // request reads the gate as it is then.
     let dns_filtering = effective_dns_filtering(dns_filtering, custom_dns.as_deref());
 
     // Mirror Local Network Sharing to the kill switch on every platform, so an
@@ -1764,6 +1768,50 @@ mod tests {
         // A single custom resolver is enough — same threshold as the tunnel builder.
         let one = vec!["1.1.1.1".to_string()];
         assert!(!effective_dns_filtering(true, Some(&one)));
+    }
+
+    /// Owner 2026-11-13: the connect flag needs the fleet gate known to be on,
+    /// whatever the preference says.
+    #[test]
+    fn dns_filtering_is_sent_only_while_the_fleet_gate_is_on() {
+        use crate::api::client::dns_filtering_with_gate as gated;
+        assert!(gated(true, true));
+        assert!(!gated(true, false));
+        assert!(!gated(false, true));
+        assert!(!gated(false, false));
+    }
+
+    /// A successful fetch sets the process-wide gate to
+    /// `dnsFilteringAvailable == Some(true)`: an explicit `false` and an absent
+    /// field both turn it off. The ONLY test that writes the process-wide gate
+    /// (nothing else in the suite reads it), so it cannot race another test.
+    #[test]
+    fn the_fleet_gate_is_on_only_for_an_explicit_true() {
+        use crate::api::client::{dns_filtering_gate_on, note_dns_filtering_gate};
+        note_dns_filtering_gate(Some(true));
+        assert!(dns_filtering_gate_on());
+        note_dns_filtering_gate(None);
+        assert!(!dns_filtering_gate_on(), "absent is not on");
+        note_dns_filtering_gate(Some(true));
+        note_dns_filtering_gate(Some(false));
+        assert!(!dns_filtering_gate_on());
+        note_dns_filtering_gate(None);
+        assert!(!dns_filtering_gate_on());
+    }
+
+    /// The gate is applied at the wire, not folded into the settings the
+    /// session records: `apply_vpn_settings` keeps the preference.
+    #[test]
+    fn apply_vpn_settings_keeps_the_preference_and_leaves_the_gate_to_the_wire() {
+        let source = include_str!("vpn.rs").replace('\r', "");
+        let body = &source[source
+            .find("pub(super) async fn apply_vpn_settings(")
+            .expect("apply_vpn_settings")..];
+        let body = &body[..body.find("\n}").expect("end of apply_vpn_settings")];
+        assert!(body.contains(
+            "let dns_filtering = effective_dns_filtering(dns_filtering, custom_dns.as_deref());"
+        ));
+        assert!(!body.contains("dns_filtering_gate_on("));
     }
 
     #[test]
