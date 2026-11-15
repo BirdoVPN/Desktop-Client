@@ -106,8 +106,14 @@ export function ReplaceAccountNumberDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // MR-2335: a deletion on its 24-hour hold, which a new number cancels.
+  // MR-2335: a deletion on its 24-hour hold, which a new number cancels
+  // (every hold, whoever filed it). Read when the dialog opens, so one filed
+  // on the website or before a restart is known too; said at the first step
+  // and again at the confirm step.
   const heldDeletion = useHeldDeletion();
+  useEffect(() => {
+    void refreshHeldDeletion();
+  }, []);
   // Set once a confirm has been SENT. If it committed on the server and its
   // answer was lost, the old tokens are revoked, so a later 401 or 409
   // `rotation_not_pending` means "probably done", not "start again".
@@ -380,6 +386,12 @@ export function ReplaceAccountNumberDialog({
             Type the new number again to confirm. When it matches, the old number stops working and
             every other device is signed out.
           </p>
+          {/* MR-2335: said again where the replacement is confirmed. */}
+          {heldDeletion && (
+            <p role="note" className="text-[12px]" style={{ color: statusTokens.red }}>
+              {rotationWithHoldText(heldDeletion.applyAfter)}
+            </p>
+          )}
           <BirdoTextField
             value={retyped}
             onChange={(v) => {

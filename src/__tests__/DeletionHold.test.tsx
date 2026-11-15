@@ -31,7 +31,7 @@ import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { HOLD_OFFER_CODE, HOLD_OFFER_NUMBER, Profile } from '@/screens/Profile';
 import { HOLD_UNEXPECTED } from '@/screens/profile/DeleteAccountDialog';
-import { ReplaceAccountNumberDialog } from '@/screens/profile/ReplaceAccountNumberDialog';
+import { ReplaceAccountNumberDialog, type RotationStep } from '@/screens/profile/ReplaceAccountNumberDialog';
 import { SignOutDialog } from '@/components/home/SignOutDialog';
 import {
   clearHeldDeletion,
@@ -125,10 +125,24 @@ const HELD = { pendingChangeId: HOLD_ID, applyAfter: APPLY_AFTER, message: null,
 const SIGN_OUT_FILED_HERE = signOutWithHoldText({ id: HOLD_ID, applyAfter: APPLY_AFTER, filedHere: true });
 const SIGN_OUT_FILED_ELSEWHERE = signOutWithHoldText({ id: HOLD_ID, applyAfter: APPLY_AFTER, filedHere: false });
 
+// The number replacement: fake numbers only.
+const CURRENT_NUMBER = '111122223333444455556666';
+const NEW_NUMBER = '777788889999000011112222';
+const rotationStep = (fields: Partial<RotationStep>): RotationStep => ({
+  refusal: null,
+  newNumber: null,
+  expiresInSeconds: null,
+  retryAfterSecs: null,
+  ...fields,
+});
+
 let preflightResult: () => Promise<unknown>;
 let holdResult: () => Promise<unknown>;
 let listResult: () => Promise<unknown>;
 let cancelResult: () => Promise<unknown>;
+// The number replacement (MR-1707): step 1 and step 2.
+let prepareResult: () => Promise<unknown>;
+let rotateResult: () => Promise<unknown>;
 
 const preflight = (stepUpFactors: string[], stepUpHoldAvailable: unknown, stepUpEnforced = true) => () =>
   Promise.resolve({
@@ -154,11 +168,15 @@ beforeEach(() => {
   holdResult = () => Promise.resolve(HELD);
   listResult = () => Promise.resolve([]);
   cancelResult = () => Promise.resolve({ cancelled: true, alreadyGone: false });
+  prepareResult = () => Promise.resolve(rotationStep({ newNumber: NEW_NUMBER }));
+  rotateResult = () => Promise.resolve(rotationStep({}));
   mockedInvoke.mockImplementation((cmd: string) => {
     if (cmd === 'deletion_preflight') return preflightResult();
     if (cmd === 'request_deletion_hold') return holdResult();
     if (cmd === 'list_pending_changes') return listResult();
     if (cmd === 'cancel_pending_change') return cancelResult();
+    if (cmd === 'rotate_anonymous_number_prepare') return prepareResult();
+    if (cmd === 'rotate_anonymous_number_confirm') return rotateResult();
     if (cmd === 'delete_account') return Promise.reject(new Error('delete_account must not be called'));
     return Promise.resolve(undefined);
   });
@@ -765,6 +783,7 @@ describe('the hold as shared state', () => {
   });
 
   it('the number-replacement dialog warns that a new number cancels the deletion, only while a hold is known', async () => {
+    listResult = () => new Promise(() => {}); // only what is already known
     const { unmount } = render(<ReplaceAccountNumberDialog open hasPassword={false} onDismiss={() => {}} />);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     unmount();
@@ -774,6 +793,26 @@ describe('the hold as shared state', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(rotationWithHoldText(APPLY_AFTER));
     expect(rotationWithHoldText(APPLY_AFTER)).toMatch(/Replacing the account number cancels that deletion/);
     expect(rotationWithHoldText(APPLY_AFTER)).toContain(`on ${holdTimeText(APPLY_AFTER)}`);
+    expect(rotationWithHoldText(APPLY_AFTER)).not.toMatch(/will NOT be deleted/);
+  });
+
+  /** The replacement dialog, from step 1 to the confirm step. */
+  async function toRotationConfirmStep() {
+    await userEvent.type(screen.getByLabelText('Current account number'), CURRENT_NUMBER);
+    await userEvent.click(screen.getByRole('button', { name: 'Get a new number' }));
+    await screen.findByTestId('new-account-number');
+    await userEvent.click(screen.getByRole('checkbox', { name: "I've saved it" }));
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await screen.findByLabelText('New account number');
+  }
+
+  it('L4: the replacement dialog reads the list when it opens, and warns again at the confirm step', async () => {
+    listResult = () => Promise.resolve(listed); // filed on the website, say: not known here before
+    render(<ReplaceAccountNumberDialog open hasPassword={false} onDismiss={() => {}} />);
+    expect(await screen.findByRole('alert')).toHaveTextContent(rotationWithHoldText(APPLY_AFTER));
+    expect(calls('list_pending_changes')).toHaveLength(1);
+    await toRotationConfirmStep();
+    expect(screen.getByRole('note')).toHaveTextContent(rotationWithHoldText(APPLY_AFTER));
   });
 });
 
