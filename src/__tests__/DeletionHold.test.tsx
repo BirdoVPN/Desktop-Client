@@ -814,6 +814,21 @@ describe('the hold as shared state', () => {
     await toRotationConfirmStep();
     expect(screen.getByRole('note')).toHaveTextContent(rotationWithHoldText(APPLY_AFTER));
   });
+
+  it('L2: a confirmed replacement clears the hold at once, then reads the list again', async () => {
+    // The opening read lists the hold; the read after the replacement never answers.
+    const answers = [() => Promise.resolve(listed)];
+    listResult = () => (answers.shift() ?? (() => new Promise(() => {})))();
+    render(<ReplaceAccountNumberDialog open hasPassword={false} onDismiss={() => {}} />);
+    await screen.findByRole('alert');
+    expect(getHeldDeletion()?.id).toBe(HOLD_ID);
+    await toRotationConfirmStep();
+    await userEvent.type(screen.getByLabelText('New account number'), NEW_NUMBER);
+    await userEvent.click(screen.getByRole('button', { name: 'Replace number' }));
+    await waitFor(() => expect(calls('rotate_anonymous_number_confirm')).toHaveLength(1));
+    await waitFor(() => expect(getHeldDeletion()).toBeNull());
+    expect(calls('list_pending_changes')).toHaveLength(2);
+  });
 });
 
 describe('the Profile banner', () => {

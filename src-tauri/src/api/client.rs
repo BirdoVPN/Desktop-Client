@@ -751,6 +751,17 @@ impl BirdoApi {
             }
             other => other,
         };
+        self.finish_deletion_hold(outcome).await
+    }
+
+    /// What `request_deletion_hold` does with its classified answer: it reads
+    /// it ([`Self::deletion_hold_from`]) and leaves the session alone, on every
+    /// answer. A method on the client, holding the session, so a test can drive
+    /// a signed-in client through it and see that nothing was cleared.
+    pub(crate) async fn finish_deletion_hold(
+        &self,
+        outcome: GdprDeleteOutcome,
+    ) -> Result<DeletionHold, ApiError> {
         Self::deletion_hold_from(outcome)
     }
 

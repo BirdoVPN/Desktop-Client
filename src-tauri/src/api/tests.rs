@@ -722,11 +722,13 @@ mod deletion_hold_tests {
     }
 
     /// No sign-out on a hold, by behaviour: with a session in memory, the
-    /// server's real answers are classified and handed to the two functions
-    /// that end the requests. Every hold answer (202, the 409s, an unreadable
-    /// 202, an unexpected 2xx) leaves the access token and the session exactly
-    /// as they were, through the hold request AND through `delete_account`;
-    /// only a confirmed deletion (a plain 200) clears them.
+    /// server's real answers are classified and handed to the two methods of
+    /// that signed-in client that end the requests (`finish_deletion_hold` for
+    /// the hold request, `finish_gdpr_delete` for `delete_account`). Every hold
+    /// answer (202, the 409s, an unreadable 202, an unexpected 2xx) leaves the
+    /// access token and the session exactly as they were, through both; only a
+    /// confirmed deletion (a plain 200) clears them. Either method clearing on
+    /// a hold fails this test.
     #[tokio::test]
     async fn a_hold_leaves_the_tokens_and_the_session_untouched() {
         let api = BirdoApi::new();
@@ -747,8 +749,8 @@ mod deletion_hold_tests {
             // Not the contract's answer to anything: nothing is assumed.
             (StatusCode::OK, &filed),
         ] {
-            // The hold request's ending.
-            let _ = BirdoApi::deletion_hold_from(classify(status, body));
+            // The hold request's ending, on the signed-in client.
+            let _ = api.finish_deletion_hold(classify(status, body)).await;
             assert!(still_signed_in(&api).await, "hold request: {status} {body}");
             // `delete_account`'s ending, given the same answer.
             assert!(
@@ -764,7 +766,10 @@ mod deletion_hold_tests {
         }
         // A deletion-shaped 200 to a HOLD request: unexpected, nothing wiped.
         let deleted = json!({ "success": true, "message": "Your data has been deleted." });
-        assert!(BirdoApi::deletion_hold_from(classify(StatusCode::OK, &deleted)).is_err());
+        assert!(api
+            .finish_deletion_hold(classify(StatusCode::OK, &deleted))
+            .await
+            .is_err());
         assert!(still_signed_in(&api).await);
         // The one answer that ends the session: a confirmed deletion.
         assert!(api
@@ -772,12 +777,13 @@ mod deletion_hold_tests {
             .await
             .is_ok());
         assert!(!api.is_authenticated().await);
-        // And the hold request is wired to the ending that cannot clear.
+        // And the hold request ends in the method driven above, never in
+        // `delete_account`'s.
         const SOURCE: &str = include_str!("client.rs");
         let start = SOURCE.find("pub async fn request_deletion_hold(").unwrap();
         let hold = &SOURCE[start..];
         let hold = &hold[..hold.find("\n    }").unwrap()];
-        assert!(hold.contains("Self::deletion_hold_from(outcome)"));
+        assert!(hold.contains("self.finish_deletion_hold(outcome).await"));
         assert!(hold.contains("step_up_method: Some(\"hold\")"));
         assert!(!hold.contains("finish_gdpr_delete") && !hold.contains("clear_tokens"));
     }
