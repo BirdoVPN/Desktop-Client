@@ -152,9 +152,15 @@ export function holdWhen(applyAfter: string): string {
 /** What ends a hold this app session filed, besides Cancel. */
 export const SIGN_OUT_CANCELS_HOLD = 'Signing out of this app, or signing out everywhere, also cancels it.';
 
-/** A hold not known to be filed here: this app's sign-out leaves it in place. */
+/**
+ * A hold not known to be filed here: listed, named by a 409, or this app's
+ * own hold after a restart (`filedHere` lives in memory). Signing out of this
+ * app voids it only if this session filed it; one filed on the website or by
+ * another device stays.
+ */
 export const SIGN_OUT_KEEPS_HOLD =
-  'Signing out of this app does not cancel a deletion asked for on the website or another device.';
+  'If you asked for it in this app, signing out may cancel it; a deletion asked for on the website or ' +
+  'another device stays.';
 
 /** The sentence about signing out that fits where the hold came from. */
 export function signOutHoldNote(hold: Pick<HeldDeletion, 'filedHere'>): string {

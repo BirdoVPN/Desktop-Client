@@ -387,7 +387,7 @@ describe('asking for the hold', () => {
 describe('signing out while a deletion is on hold', () => {
   const listed = [{ id: HOLD_ID, action: 'account_delete', applyAfter: APPLY_AFTER }];
 
-  it('a listed hold (maybe filed on the website): asks first, says signing out does NOT cancel it; Stay keeps both', async () => {
+  it('a listed hold (maybe filed on the website): asks first, says signing out may not cancel it; Stay keeps both', async () => {
     listResult = () => Promise.resolve(listed);
     render(<Profile />);
     await screen.findByRole('button', { name: 'Cancel deletion' });
@@ -396,7 +396,8 @@ describe('signing out while a deletion is on hold', () => {
     expect(within(dialog).getByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_ELSEWHERE);
     expect(SIGN_OUT_FILED_ELSEWHERE).toContain(`on ${holdTimeText(APPLY_AFTER)}`);
     expect(SIGN_OUT_FILED_ELSEWHERE).toContain(
-      'Signing out of this app does not cancel a deletion asked for on the website or another device. ' +
+      'If you asked for it in this app, signing out may cancel it; a deletion asked for on the website or ' +
+        'another device stays. ' +
         'To keep your account, cancel the deletion.',
     );
     expect(SIGN_OUT_FILED_ELSEWHERE).not.toMatch(/Signing out cancels/);
@@ -504,7 +505,7 @@ function deferred<V>() {
 describe('the Home sign-out dialog (SignOutDialog, opened from the Connect screen)', () => {
   const listed = [{ id: HOLD_ID, action: 'account_delete', applyAfter: APPLY_AFTER }];
 
-  it('reads the list on opening; a listed hold: the date, "does not cancel", and Cancel deletion', async () => {
+  it('reads the list on opening; a listed hold: the date, "may cancel ... stays", and Cancel deletion', async () => {
     listResult = () => Promise.resolve(listed);
     render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
     expect(await screen.findByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_ELSEWHERE);
