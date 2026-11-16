@@ -24,21 +24,33 @@ import { command } from '@/session/command';
  */
 export const HOLD_READ_WAIT_MS = 3000;
 
+// The newest read started: a read whose answer was dropped waits for it.
+let newestRead: { token: number; settled: Promise<boolean> } | null = null;
+
 /**
  * Read `GET /auth/pending-changes` now. A hold that vanished (the server
  * cancels it on a sign-out everywhere, a number rotation, a password or 2FA
  * change) is simply gone; a read that FAILS keeps what is known, because an
- * outage is not "no hold". Never rejects: true once the server answered,
- * false when the read failed.
+ * outage is not "no hold". Never rejects.
+ *
+ * True once an answer was APPLIED, false when the read failed. An answer
+ * dropped because a newer read started is not "answered": this waits for
+ * that newer read and settles with it. One dropped because the state was
+ * written since (a hold noted from a 202, a cancel) counts as answered: that
+ * write is newer than the answer.
  */
 export function refreshHeldDeletion(): Promise<boolean> {
   const token = startHeldDeletionRead();
-  return command<unknown>('list_pending_changes')
-    .then((items) => {
-      finishHeldDeletionRead(token, items);
-      return true;
-    })
-    .catch(() => false);
+  const settled = command<unknown>('list_pending_changes').then(
+    (items): boolean | Promise<boolean> => {
+      if (finishHeldDeletionRead(token, items)) return true;
+      const newer = newestRead;
+      return newer !== null && newer.token > token ? newer.settled : true;
+    },
+    () => false,
+  );
+  newestRead = { token, settled };
+  return settled;
 }
 
 /**

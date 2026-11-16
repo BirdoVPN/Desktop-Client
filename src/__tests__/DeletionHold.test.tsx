@@ -46,7 +46,7 @@ import {
   SIGN_OUT_KEEPS_HOLD,
   signOutWithHoldText,
 } from '@/lib/held-deletion';
-import { HOLD_READ_WAIT_MS } from '@/session/held-deletion';
+import { HOLD_READ_WAIT_MS, refreshHeldDeletion } from '@/session/held-deletion';
 import { expireSession, signOut } from '@/session/session';
 import type { ConnectionState } from '@/store/app-store';
 
@@ -925,5 +925,80 @@ describe('the Profile banner', () => {
     for (const bad of [undefined, null, {}, 'x', [{ action: 'account_delete' }], [{ id: 'a', action: 'account_delete' }], [null]]) {
       expect(heldDeletionOf(bad)).toBeNull();
     }
+  });
+});
+
+describe('overlapping list reads (LOW-2): a dropped answer is not "answered"', () => {
+  const listed = [{ id: HOLD_ID, action: 'account_delete', applyAfter: APPLY_AFTER }];
+
+  it('two overlapping reads: the first, answering after the second started, settles only with the second', async () => {
+    const first = deferred<unknown>();
+    const second = deferred<unknown>();
+    const answers = [() => first.promise, () => second.promise];
+    listResult = () => answers.shift()!();
+    let firstAnswered: boolean | undefined;
+    const firstRead = refreshHeldDeletion().then((answered) => {
+      firstAnswered = answered;
+    });
+    const secondRead = refreshHeldDeletion();
+    await act(async () => {
+      first.resolve([]); // dropped: a newer read is out
+    });
+    expect(firstAnswered).toBeUndefined();
+    expect(getHeldDeletion()).toBeNull();
+    await act(async () => {
+      second.resolve(listed);
+    });
+    await firstRead;
+    expect(firstAnswered).toBe(true);
+    expect(await secondRead).toBe(true);
+    expect(getHeldDeletion()?.id).toBe(HOLD_ID);
+  });
+
+  it("Profile's Sign out row, overtaken by a newer read, waits for it: then asks first", async () => {
+    const rowRead = deferred<unknown>();
+    const focusRead = deferred<unknown>();
+    const answers = [() => Promise.resolve([]), () => rowRead.promise, () => focusRead.promise];
+    listResult = () => (answers.shift() ?? (() => new Promise(() => {})))();
+    render(<Profile />);
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
+    await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(2));
+    act(() => {
+      window.dispatchEvent(new Event('focus')); // a newer read starts
+    });
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(3));
+    await act(async () => {
+      rowRead.resolve([]); // the row's own read answers, but it is dropped
+    });
+    expect(signOut).not.toHaveBeenCalled();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await act(async () => {
+      focusRead.resolve(listed);
+    });
+    expect(await screen.findByRole('dialog', { name: 'Sign out?' })).toBeInTheDocument();
+    expect(signOut).not.toHaveBeenCalled();
+  });
+
+  it('the sign-out dialog, its opening read overtaken by a newer one, keeps Sign out disabled until that answers', async () => {
+    const openingRead = deferred<unknown>();
+    const newerRead = deferred<unknown>();
+    const answers = [() => openingRead.promise, () => newerRead.promise];
+    listResult = () => (answers.shift() ?? (() => new Promise(() => {})))();
+    render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
+    act(() => {
+      void refreshHeldDeletion();
+    });
+    await act(async () => {
+      openingRead.resolve([]); // dropped
+    });
+    expect(screen.getByRole('button', { name: 'Sign out' })).toBeDisabled();
+    expect(screen.queryByRole('note')).not.toBeInTheDocument();
+    await act(async () => {
+      newerRead.resolve([]);
+    });
+    expect(screen.getByRole('button', { name: 'Sign out' })).toBeEnabled();
+    expect(screen.queryByRole('note')).not.toBeInTheDocument();
   });
 });

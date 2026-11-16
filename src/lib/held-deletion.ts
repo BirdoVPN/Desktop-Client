@@ -108,11 +108,16 @@ export function startHeldDeletionRead(): number {
   return version;
 }
 
-/** The read's answer, dropped if anything was written or read since it started. */
-export function finishHeldDeletionRead(token: number, items: unknown): void {
-  if (token !== version) return;
+/**
+ * The read's answer, dropped if anything was written or read since it
+ * started. Returns whether it was applied: a dropped answer says nothing
+ * about now (a newer read may still be out).
+ */
+export function finishHeldDeletionRead(token: number, items: unknown): boolean {
+  if (token !== version) return false;
   const listed = heldDeletionOf(items);
   publish(listed && { ...listed, filedHere: filedHereStill(listed.id) });
+  return true;
 }
 
 /**
