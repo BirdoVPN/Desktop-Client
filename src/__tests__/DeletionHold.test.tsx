@@ -577,8 +577,11 @@ describe('the Home sign-out dialog (SignOutDialog, opened from the Connect scree
     render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
     await waitFor(() => expect(screen.getByRole('button', { name: 'Sign out' })).toBeEnabled());
     expect(screen.getByRole('note')).toHaveTextContent(
-      "We couldn't check whether a deletion is waiting; if you asked for one in this app, signing out cancels it.",
+      "We couldn't check whether a deletion is waiting. If you asked for one, signing out may not cancel it. " +
+        'To keep your account, cancel the deletion in Profile or on the website.',
     );
+    // LOW-1: offline, the server sign-out fails too; nothing is promised.
+    expect(HOLD_UNCHECKED_CAUTION).not.toMatch(/signing out cancels it/);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
     expect(signOut).toHaveBeenCalledTimes(1);
