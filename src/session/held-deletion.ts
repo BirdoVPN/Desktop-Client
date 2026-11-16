@@ -85,14 +85,21 @@ export function usePendingDeletion(): { hold: HeldDeletion | null; refresh: () =
  * shared state is cleared AT ONCE, and the list is then read again. The
  * banner and the sign-out warnings must not linger on a re-read that fails
  * or is slow. Rejects (and changes nothing) when the cancel itself failed.
+ *
+ * `reread: false` when the session is about to end (the cancel before a
+ * sign-out): a read then could race the sign-out, come back 401 and turn a
+ * deliberate sign-out into "session expired".
  */
-export async function cancelHeldDeletion(id: string): Promise<{ alreadyGone: boolean }> {
+export async function cancelHeldDeletion(
+  id: string,
+  { reread = true }: { reread?: boolean } = {},
+): Promise<{ alreadyGone: boolean }> {
   const result = await command<{ cancelled?: boolean; alreadyGone?: boolean } | null>(
     'cancel_pending_change',
     { id },
   );
   clearHeldDeletion();
-  void refreshHeldDeletion();
+  if (reread) void refreshHeldDeletion();
   return { alreadyGone: result?.alreadyGone === true };
 }
 

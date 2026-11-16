@@ -131,7 +131,9 @@ function SignOutConfirm({
     if (hold?.filedHere) {
       setBusy(true);
       try {
-        await cancelHeldDeletion(hold.id);
+        // No list read after it: the session ends next (a read could race the
+        // sign-out and end it as "session expired").
+        await cancelHeldDeletion(hold.id, { reread: false });
       } catch (e: unknown) {
         setSignOutBlocked({ reason: cancelErrorText(e), applyAfter: hold.applyAfter });
         return;

@@ -633,6 +633,18 @@ describe('signing out with a hold filed here: the app cancels it first (M1)', ()
       mockedInvoke.mock.calls.findIndex(([c]) => c === 'cancel_pending_change')
     ];
     expect(cancelAt).toBeLessThan(vi.mocked(signOut).mock.invocationCallOrder[0]);
+    // LOW-3: no list read after the cancel (only the dialog's opening read):
+    // one could race the sign-out and end it as "session expired".
+    expect(calls('list_pending_changes')).toHaveLength(1);
+  });
+
+  it('LOW-3: Cancel deletion WITHOUT signing out still reads the list again', async () => {
+    await openWithHoldFiledHere();
+    listResult = () => Promise.resolve([]); // the server no longer lists it
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel deletion' }));
+    expect(await screen.findByText('The deletion is cancelled. Your account stays as it is.')).toBeInTheDocument();
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(2));
+    expect(signOut).not.toHaveBeenCalled();
   });
 
   it('a cancel that fails signs nobody out: the deletion is still scheduled; Retry cancels, then signs out', async () => {
@@ -652,6 +664,7 @@ describe('signing out with a hold filed here: the app cancels it first (M1)', ()
     await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
     await waitFor(() => expect(signOut).toHaveBeenCalledTimes(1));
     expect(calls('cancel_pending_change')).toHaveLength(2);
+    expect(calls('list_pending_changes')).toHaveLength(1); // LOW-3: no re-read on the way out
   });
 
   it('Sign out anyway signs out without cancelling again, leaving the deletion as it is', async () => {
