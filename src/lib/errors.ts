@@ -39,6 +39,13 @@ export const STEALTH_FAILED_COPY =
   "Stealth Mode couldn't start. Not connecting, so your traffic isn't sent unprotected. " +
   'Try again, or choose another location.';
 export const REVOKED_COPY = 'Connection has been revoked. Please reconnect.';
+/**
+ * MR-2333: the heartbeat said `evicted`: another device on the account took
+ * this connection's slot. BirdoVPN never re-dials it by itself (that would push
+ * the other device off in turn); Connect is the user's own choice.
+ */
+export const EVICTED_COPY =
+  'Another device on your account took over this connection. Click Connect to use BirdoVPN here instead.';
 export const QUOTA_EXCEEDED_COPY =
   "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.";
 export const SESSION_EXPIRED_COPY = 'Your session has expired. Sign in again.';
@@ -102,6 +109,7 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   },
   session_expired: { message: SESSION_EXPIRED_COPY, action: 'sign_in' },
   revoked: { message: REVOKED_COPY, action: 'connect' },
+  evicted: { message: EVICTED_COPY, action: 'connect' },
   // The server ended the session over the Free allowance (birdo-web #590):
   // reconnecting cannot help, a plan can.
   quota_exceeded: { message: QUOTA_EXCEEDED_COPY, action: 'view_plans' },
@@ -305,7 +313,7 @@ export function errorText(e: unknown, context: ErrorContext = 'general'): string
 export type GiveUpKind = 'revoked' | 'never_established' | 'died_after_handshake' | 'killswitch_failed';
 
 export function giveUpKind(error: IpcError | null | undefined): GiveUpKind {
-  if (error?.code === 'revoked') return 'revoked';
+  if (error?.code === 'revoked' || error?.code === 'evicted') return 'revoked';
   if (error?.code === 'server_unreachable') return 'never_established';
   if (error?.code === 'killswitch_failed') return 'killswitch_failed';
   return 'died_after_handshake';

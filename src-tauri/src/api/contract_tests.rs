@@ -1397,8 +1397,9 @@ fn in_grace(mut reply: Value, seconds: u64) -> Value {
 /// Every reason in `$defs/HeartbeatReason`, decided, in each shape the server
 /// sends it.
 fn heartbeat_cases() -> Vec<HeartbeatCase> {
-    use reconnect_policy::{quota_exceeded_error, revoked_error};
+    use reconnect_policy::{evicted_error, quota_exceeded_error, revoked_error};
     let revoked = Some(IpcErrorCode::Revoked);
+    let evicted = Some(IpcErrorCode::Evicted);
     let quota = Some(IpcErrorCode::QuotaExceeded);
     // On a live session every valid:false ends it, in the server's words.
     // For reaped and server_offline that answer is rare: the server removes
@@ -1480,12 +1481,14 @@ fn heartbeat_cases() -> Vec<HeartbeatCase> {
             probe_not_alive: revoked,
         },
         // A newer connection took the slot: a re-dial would evict it back.
+        // MR-2333: its own code and sentence (another device took over), not
+        // the reply's not-found one; it still ends the session on both paths.
         HeartbeatCase {
             reason: "evicted",
             body: key_gone("evicted"),
-            live: ended(HB_NOT_FOUND),
-            probe_alive: revoked,
-            probe_not_alive: revoked,
+            live: HeartbeatVerdict::End(evicted_error()),
+            probe_alive: evicted,
+            probe_not_alive: evicted,
         },
         // Housekeeping released it and nobody holds the slot: one re-dial.
         HeartbeatCase {
