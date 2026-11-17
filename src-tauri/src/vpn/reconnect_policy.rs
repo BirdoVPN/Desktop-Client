@@ -527,7 +527,8 @@ impl QuietRebuilds {
         self.run = None;
     }
 
-    /// Whether a healthy run is under way.
+    /// Whether a healthy run is under way (tests).
+    #[cfg(test)]
     pub fn in_healthy_run(&self) -> bool {
         self.run.is_some()
     }
