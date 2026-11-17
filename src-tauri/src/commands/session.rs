@@ -31,6 +31,7 @@ use crate::commands::vpn::{
 };
 use crate::storage::CredentialStore;
 use crate::vpn::auto_reconnect::ReconnectInfo;
+use crate::vpn::birdo_pq::PqSession;
 use crate::vpn::manager::{
     ConnectPhase, ConnectionState, MultiHopStatus, SessionLabel, VpnManager,
 };
@@ -392,22 +393,25 @@ async fn attempt(
     // What this attempt asks for, for the Adaptive Transport decision should
     // it fail (`fallback_reason_for`).
     ctx.stealth_mode = settings.stealth_mode;
+    // BirdoShield (D18): the preference goes on the wire only while the fleet
+    // gate is known to be on (owner 2026-11-13; `get_client_config` keeps the
+    // process-wide copy). Read once, so the retried request below asks for
+    // exactly what the first one did.
+    let dns_filtering = crate::api::client::dns_filtering_with_gate(
+        settings.dns_filtering,
+        crate::api::client::dns_filtering_gate_on(),
+    );
 
     // AUDIT-C1: with PQ requested, attach our ML-KEM-1024 public key so the
-    // server can encapsulate against it.
-    let pq_pk = if settings.quantum_protection {
-        Some(
-            crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
-                IpcError::new(
-                    IpcErrorCode::PqFailed,
-                    "Post-quantum engine unavailable. Connection aborted because quantum \
-                     protection is enabled.",
-                )
-            })?,
-        )
-    } else {
-        None
-    };
+    // server can encapsulate against it. MR-703 / MR-1742: the keypair is made
+    // HERE, once per attempt, and its secret lives only in this `PqSession`:
+    // held across the retryable-refusal retry below (the same key is re-sent,
+    // so the server's ciphertext still fits), moved into `prepare_tunnel` to
+    // decapsulate, and wiped on every other exit (an error, a cancel, a drop).
+    // A later attempt (the Adaptive Transport retry) and every re-dial call
+    // `begin()` again: no pair is ever reused across attempts.
+    let pq_session = settings.quantum_protection.then(PqSession::begin);
+    let pq_pk = pq_session.as_ref().map(PqSession::public_key_b64);
 
     vm.set_phase(ConnectPhase::Authenticating);
     // MR-1639: a refusal the server marks retryable with a wait
@@ -442,7 +446,7 @@ async fn attempt(
                                 fallback_reason,
                                 settings.quantum_protection.then_some(true),
                                 pq_pk.clone(),
-                                settings.dns_filtering,
+                                dns_filtering,
                             ),
                         )
                         .await?
@@ -465,7 +469,7 @@ async fn attempt(
                                 settings.stealth_mode,
                                 settings.quantum_protection,
                                 pq_pk.clone(),
-                                settings.dns_filtering,
+                                dns_filtering,
                             ),
                         )
                         .await?
@@ -522,6 +526,7 @@ async fn attempt(
             server_id: dialled_id,
             stealth_mode: settings.stealth_mode,
             quantum_protection: settings.quantum_protection,
+            pq_session,
             fallback_reason,
             custom_dns: settings.custom_dns.clone(),
             custom_mtu: settings.custom_mtu,
@@ -895,6 +900,9 @@ pub(crate) struct TunnelRequest<'a> {
     pub server_id: &'a str,
     pub stealth_mode: bool,
     pub quantum_protection: bool,
+    /// The keypair this request's `pqClientPublicKey` came from (MR-703).
+    /// Consumed by the decapsulation; `None` when quantum protection is off.
+    pub pq_session: Option<PqSession>,
     pub fallback_reason: Option<&'a str>,
     pub custom_dns: Option<Vec<String>>,
     pub custom_mtu: u16,
@@ -925,7 +933,7 @@ pub(crate) async fn prepare_tunnel(
     vm: &VpnManager,
     epoch: u64,
     response: ConnectResponse,
-    request: TunnelRequest<'_>,
+    mut request: TunnelRequest<'_>,
 ) -> Result<PreparedTunnel, IpcError> {
     enforce_requested_protection(&response, request.stealth_mode, request.quantum_protection)?;
 
@@ -960,8 +968,8 @@ pub(crate) async fn prepare_tunnel(
     };
 
     vm.set_phase(ConnectPhase::NegotiatingPq);
-    let quantum_psk =
-        derive_quantum_psk(&response).map_err(|m| IpcError::new(IpcErrorCode::PqFailed, m))?;
+    let quantum_psk = derive_quantum_psk(&response, request.pq_session.take())
+        .map_err(|m| IpcError::new(IpcErrorCode::PqFailed, m))?;
 
     let (mut config, server_name) = build_vpn_config(
         response,
@@ -1625,6 +1633,30 @@ mod lifecycle_tests {
         );
     }
 
+    /// Owner 2026-11-13: both dial paths send BirdoShield through the fleet
+    /// gate, and the session on record keeps the preference (the re-dial
+    /// gates it again when it sends, `redial_info_under_gate`).
+    #[test]
+    fn both_dial_paths_send_dns_filtering_through_the_fleet_gate() {
+        let attempt = body("async fn attempt(");
+        let gated = attempt
+            .find("let dns_filtering = crate::api::client::dns_filtering_with_gate(")
+            .expect("the attempt gates the flag");
+        assert!(attempt[gated..].contains("crate::api::client::dns_filtering_gate_on(),"));
+        let sent = &attempt[gated..];
+        assert_eq!(
+            sent.matches("                                dns_filtering,")
+                .count(),
+            2,
+            "connect_vpn and connect_multi_hop both pass the gated flag"
+        );
+        assert!(
+            !attempt.contains("                                settings.dns_filtering,"),
+            "no dial path passes the ungated preference"
+        );
+        assert!(attempt.contains("dns_filtering: settings.dns_filtering,"));
+    }
+
     /// Round 6 of the review of #222 (P3-1): the dial reads the kill switch
     /// intent's sequence before its state says Connecting/Switching, and its
     /// arm stores only if nothing wrote the intent since (killswitch tests
@@ -1703,7 +1735,7 @@ mod lifecycle_tests {
             attempt,
             &[
                 "let settings = apply_vpn_settings(app).await;",
-                "let pq_pk = if settings.quantum_protection {",
+                "let pq_session = settings.quantum_protection.then(PqSession::begin);",
                 "let mut retried = false;",
                 "loop {",
                 "generate_wireguard_keypair()",
@@ -1720,7 +1752,7 @@ mod lifecycle_tests {
         );
         for once in [
             "apply_vpn_settings(",
-            "get_client_public_key_b64()",
+            "PqSession::begin",
             "generate_wireguard_keypair()",
         ] {
             assert_eq!(attempt.matches(once).count(), 1, "{once}");

@@ -24,7 +24,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Dashboard } from '@/components/Dashboard';
 import { connectCta, serverSubtitle, serverTitle, statusPill } from '@/lib/vpn-display';
 import { parseVpnStatus, type VpnState } from '@/lib/ipc';
-import { PQ_FAILED_COPY, REVOKED_COPY } from '@/lib/errors';
+import { EVICTED_COPY, PQ_FAILED_COPY, REVOKED_COPY } from '@/lib/errors';
 import { defaultSettings, useAppStore, type Server } from '@/store/app-store';
 
 vi.mock('@tauri-apps/api/core');
@@ -169,6 +169,14 @@ describe('Dashboard: errors with a way forward', () => {
     setStatus({ state: 'error', error: { code: 'revoked', message: 'x' } });
     render(<Dashboard />);
     expect(screen.getByText(REVOKED_COPY)).toBeInTheDocument();
+    expect(screen.queryByText(/session expired/i)).not.toBeInTheDocument();
+  });
+
+  it('evicted says another device took over, never "revoked" (MR-2333)', () => {
+    setStatus({ state: 'error', error: { code: 'evicted', message: 'Another device on your account took over this connection.' } });
+    render(<Dashboard />);
+    expect(screen.getByText(EVICTED_COPY)).toBeInTheDocument();
+    expect(screen.queryByText(REVOKED_COPY)).not.toBeInTheDocument();
     expect(screen.queryByText(/session expired/i)).not.toBeInTheDocument();
   });
 

@@ -5,6 +5,7 @@ import { ConsentScreen } from '@/components/ConsentScreen';
 import { Login } from '@/components/Login';
 import { AppShell } from '@/components/AppShell';
 import { OfflineBanner } from '@/components/OfflineBanner';
+import { LinuxUpdateNotice } from '@/components/LinuxUpdateNotice';
 import { PixelCanvas } from '@/components/PixelCanvas';
 import { TitleBar } from '@/components/TitleBar';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
@@ -473,6 +474,8 @@ function App() {
             bottom navigation out of the window (W2-021). */}
         <div className="relative z-10 flex min-h-0 flex-1 flex-col overflow-hidden">
           <OfflineBanner />
+          {/* A-M50: Linux has no updater feed; Rust asks GitHub Releases. Not before consent. */}
+          {hasAcceptedConsent && !requiredUpdate && <LinuxUpdateNotice />}
           <div className="relative min-h-0 flex-1">
             {/* Dialogs portal here (BirdoDialog): over the screen, under the
                 title bar, never clipped by the card they are declared in. */}

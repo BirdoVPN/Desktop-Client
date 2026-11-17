@@ -12,14 +12,17 @@ import {
   errorCopy,
   errorText,
   giveUpKind,
+  HOLD_UNAVAILABLE_COPY,
   giveUpMessage,
   isSilentError,
   KILLSWITCH_HOLDING_COPY,
   PQ_FAILED_COPY,
   QUOTA_EXCEEDED_COPY,
   REGISTRATION_NOT_ALLOWED_COPY,
+  EMAIL_NOT_VERIFIED_COPY,
   quotaGraceMessage,
   REVOKED_COPY,
+  EVICTED_COPY,
   SESSION_EXPIRED_COPY,
   STEALTH_FAILED_COPY,
   UPDATE_REQUIRED_COPY,
@@ -41,6 +44,7 @@ const ALL: IpcErrorCode[] = [
   'server_unavailable',
   'session_expired',
   'revoked',
+  'evicted',
   'quota_exceeded',
   'device_limit',
   'subscription_required',
@@ -49,6 +53,14 @@ const ALL: IpcErrorCode[] = [
   'invalid_credentials',
   'two_factor_required',
   'two_factor_invalid',
+  'account_number_required',
+  'account_number_invalid',
+  'email_code_required',
+  'email_code_invalid',
+  'apple_reauth_required',
+  // 'hold_unavailable' shows the server's sentence: see its own test below.
+  'step_up_no_factor',
+  'step_up_unavailable',
   'cert_pin_failed',
   'stealth_failed',
   'pq_failed',
@@ -60,6 +72,7 @@ const ALL: IpcErrorCode[] = [
   'settings_unverified',
   'client_attestation_required',
   'consent_required',
+  'email_not_verified',
   'unknown',
 ];
 
@@ -113,6 +126,28 @@ describe('account_restricted and registration_not_allowed', () => {
   });
 });
 
+describe('email_not_verified (MR-2210)', () => {
+  it('shows the verify-your-email copy, never the upgrade copy', () => {
+    const copy = errorCopy(err('email_not_verified', { message: 'RAW RUST TEXT' }), 'sign_in');
+    expect(copy).toEqual({ message: EMAIL_NOT_VERIFIED_COPY, action: null });
+    expect(copy.message).not.toMatch(/upgrade/i);
+  });
+});
+
+/** MR-2335: a refused deletion hold says why in the server's own words. */
+describe('hold_unavailable', () => {
+  it('shows the server sentence, and its own copy without one', () => {
+    const sentence =
+      'We could not tie this request to your signed-in session. Sign in to the app again, then try again. Nothing was deleted.';
+    expect(errorCopy(err('hold_unavailable', { message: sentence, retryable: false }))).toEqual({
+      message: sentence,
+      action: null,
+    });
+    expect(errorCopy(err('hold_unavailable', { message: '  ' })).message).toBe(HOLD_UNAVAILABLE_COPY);
+    expect(HOLD_UNAVAILABLE_COPY).toMatch(/Nothing was deleted/);
+  });
+});
+
 describe('errorCopy', () => {
   it.each(ALL.filter((c) => c !== 'cancelled'))('%s has canonical copy and never echoes Rust\'s message', (code) => {
     const { message } = errorCopy(err(code));
@@ -132,6 +167,10 @@ describe('errorCopy', () => {
     expect(errorCopy(err('pq_failed'))).toEqual({ message: PQ_FAILED_COPY, action: 'open_settings' });
     expect(errorCopy(err('stealth_failed')).message).toBe(STEALTH_FAILED_COPY);
     expect(errorCopy(err('revoked'))).toEqual({ message: REVOKED_COPY, action: 'connect' });
+    // MR-2333: an eviction says another device took over, never 'revoked'.
+    expect(errorCopy(err('evicted'))).toEqual({ message: EVICTED_COPY, action: 'connect' });
+    expect(EVICTED_COPY).toMatch(/another device on your account took over/i);
+    expect(EVICTED_COPY).not.toMatch(/revoked/i);
     expect(errorCopy(err('quota_exceeded'))).toEqual({ message: QUOTA_EXCEEDED_COPY, action: 'view_plans' });
     expect(QUOTA_EXCEEDED_COPY).toBe(
       "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.",
@@ -211,6 +250,7 @@ describe('vpnErrorCopy', () => {
 describe('reconnect give-up (P1-parity-020)', () => {
   it('picks the iOS kind from the final error code', () => {
     expect(giveUpKind(err('revoked'))).toBe('revoked');
+    expect(giveUpKind(err('evicted'))).toBe('revoked');
     expect(giveUpKind(err('server_unreachable'))).toBe('never_established');
     expect(giveUpKind(err('adapter_failed'))).toBe('died_after_handshake');
     expect(giveUpKind(null)).toBe('died_after_handshake');

@@ -272,6 +272,14 @@ export function isMacPlatform(): boolean {
   return typeof navigator !== 'undefined' && navigator.userAgent.includes('Macintosh');
 }
 
+/**
+ * Platform gate for the Linux-only update notice (A-M50). WebKitGTK's UA
+ * carries "Linux"; Android's also does, but this app has no Android build.
+ */
+export function isLinuxPlatform(): boolean {
+  return typeof navigator !== 'undefined' && /Linux/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent);
+}
+
 /** Shape returned by the Rust `get_settings` command (snake_case). */
 export interface RustSettings {
   killswitch_enabled: boolean;
