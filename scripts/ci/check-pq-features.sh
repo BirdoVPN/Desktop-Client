@@ -146,8 +146,11 @@ fi
 # so a line-anchored grep walks straight past them.
 downgrade_claims=""
 while IFS= read -r f; do
-  if tr '\n' ' ' < "$f" | tr -s ' ' \
-    | grep -qiE 'fall(s|ing)? back to (the )?(server.provided )?classical|classical[ -]PSK (fallback|on every connect|for the rest)'; then
+  # A here-string, not `... | grep -q` (MR-2391): on a file larger than the
+  # pipe buffer, grep -q's exit at an early match SIGPIPEs tr, pipefail makes
+  # the pipeline fail, and the claim this check exists to catch is missed.
+  if grep -qiE 'fall(s|ing)? back to (the )?(server.provided )?classical|classical[ -]PSK (fallback|on every connect|for the rest)' \
+    <<<"$(tr '\n' ' ' < "$f" | tr -s ' ')"; then
     downgrade_claims="${downgrade_claims} ${f}"
   fi
 done < <(find src -name '*.rs')

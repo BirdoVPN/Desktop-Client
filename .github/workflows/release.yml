@@ -1569,7 +1569,7 @@ jobs:
             fi
             while read -r f; do
               local b; b="$(basename "$f")"
-              if ! printf '%s' "$b" | grep -qE "$arch_re"; then
+              if ! grep -qE -- "$arch_re" <<<"$b"; then
                 echo "::error::$b has no arch token matching $arch_re — updater cannot serve it"
                 fail=1
               fi
@@ -1679,7 +1679,7 @@ jobs:
           draft=false
           if [ "$type" = tag ]; then
             message=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .message)
-            if printf '%s' "$message" | grep -qxE 'release:[[:space:]]*draft[[:space:]]*'; then
+            if grep -qxE 'release:[[:space:]]*draft[[:space:]]*' <<<"$message"; then
               draft=true
             fi
           fi
@@ -1704,7 +1704,7 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+          if ! grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$TAG"; then
             echo "make_latest=false" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
             echo "::notice::$TAG is not plain vX.Y.Z - publishing it as a prerelease that does not take Latest"
