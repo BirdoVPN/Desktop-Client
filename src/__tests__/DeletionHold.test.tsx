@@ -387,7 +387,7 @@ describe('asking for the hold', () => {
 describe('signing out while a deletion is on hold', () => {
   const listed = [{ id: HOLD_ID, action: 'account_delete', applyAfter: APPLY_AFTER }];
 
-  it('a listed hold (maybe filed on the website): asks first, says signing out may not cancel it; Stay keeps both', async () => {
+  it('a listed hold (origin unknown): asks first, says signing out may not cancel it; Stay keeps both', async () => {
     listResult = () => Promise.resolve(listed);
     render(<Profile />);
     await screen.findByRole('button', { name: 'Cancel deletion' });
@@ -395,12 +395,12 @@ describe('signing out while a deletion is on hold', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Sign out?' });
     expect(within(dialog).getByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_ELSEWHERE);
     expect(SIGN_OUT_FILED_ELSEWHERE).toContain(`on ${holdTimeText(APPLY_AFTER)}`);
-    expect(SIGN_OUT_FILED_ELSEWHERE).toContain(
-      'If you asked for it in this app, signing out may cancel it; a deletion asked for on the website or ' +
-        'another device stays. ' +
-        'To keep your account, cancel the deletion.',
+    // The common wording (iOS #624, Android #623): nothing about where it came from.
+    expect(SIGN_OUT_FILED_ELSEWHERE).toBe(
+      `Your account will be deleted on ${holdTimeText(APPLY_AFTER)}. ` +
+        'Signing out of this app may not cancel this deletion. To keep your account, cancel the deletion.',
     );
-    expect(SIGN_OUT_FILED_ELSEWHERE).not.toMatch(/Signing out cancels/);
+    expect(SIGN_OUT_FILED_ELSEWHERE).not.toMatch(/website|another device|Signing out cancels/);
     expect(within(dialog).getByRole('button', { name: 'Cancel deletion' })).toBeInTheDocument();
     expect(signOut).not.toHaveBeenCalled();
     await userEvent.click(within(dialog).getByRole('button', { name: 'Stay signed in' }));
@@ -505,7 +505,7 @@ function deferred<V>() {
 describe('the Home sign-out dialog (SignOutDialog, opened from the Connect screen)', () => {
   const listed = [{ id: HOLD_ID, action: 'account_delete', applyAfter: APPLY_AFTER }];
 
-  it('reads the list on opening; a listed hold: the date, "may cancel ... stays", and Cancel deletion', async () => {
+  it('reads the list on opening; a listed hold: the date, "may not cancel", and Cancel deletion', async () => {
     listResult = () => Promise.resolve(listed);
     render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
     expect(await screen.findByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_ELSEWHERE);
@@ -526,7 +526,9 @@ describe('the Home sign-out dialog (SignOutDialog, opened from the Connect scree
     render(<SignOutDialog open stillConnected onClose={() => {}} />);
     // No waiting on the read: the warning is in the first paint.
     expect(screen.getByRole('alert')).toHaveTextContent(SIGN_OUT_FILED_HERE);
-    expect(SIGN_OUT_FILED_HERE).toMatch(/Signing out of this app cancels that deletion/);
+    expect(SIGN_OUT_FILED_HERE).toBe(
+      `Signing out cancels the deletion of your account that is scheduled for ${holdTimeText(APPLY_AFTER)}.`,
+    );
     // M1: nothing absolute; the server's sign-out is best effort.
     expect(SIGN_OUT_FILED_HERE).not.toMatch(/will NOT be deleted/);
     expect(screen.getByRole('button', { name: 'Cancel deletion' })).toBeInTheDocument();
@@ -569,6 +571,8 @@ describe('the Home sign-out dialog (SignOutDialog, opened from the Connect scree
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByText(HOLD_UNCHECKED_CAUTION)).not.toBeInTheDocument();
     expect(screen.getByText('Are you sure you want to sign out?')).toBeInTheDocument();
+    // No deletion text: the plain Cancel stays.
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
     expect(signOut).toHaveBeenCalledTimes(1);
   });
@@ -578,12 +582,15 @@ describe('the Home sign-out dialog (SignOutDialog, opened from the Connect scree
     render(<SignOutDialog open stillConnected={false} onClose={() => {}} />);
     await waitFor(() => expect(screen.getByRole('button', { name: 'Sign out' })).toBeEnabled());
     expect(screen.getByRole('note')).toHaveTextContent(
-      "We couldn't check whether a deletion is waiting. If you asked for one, signing out may not cancel it. " +
-        'To keep your account, cancel the deletion in Profile or on the website.',
+      "We couldn't check whether a deletion is waiting. Signing out may not cancel it. " +
+        "To keep your account, stay signed in and cancel it once you're online.",
     );
     // LOW-1: offline, the server sign-out fails too; nothing is promised.
-    expect(HOLD_UNCHECKED_CAUTION).not.toMatch(/signing out cancels it/);
+    expect(HOLD_UNCHECKED_CAUTION).not.toMatch(/signing out cancels it/i);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    // Next to text about a deletion, the dismiss button is not a bare "Cancel".
+    expect(screen.getByRole('button', { name: 'Stay signed in' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
     expect(signOut).toHaveBeenCalledTimes(1);
   });

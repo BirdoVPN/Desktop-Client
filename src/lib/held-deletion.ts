@@ -155,12 +155,11 @@ export const SIGN_OUT_CANCELS_HOLD = 'Signing out of this app, or signing out ev
 /**
  * A hold not known to be filed here: listed, named by a 409, or this app's
  * own hold after a restart (`filedHere` lives in memory). Signing out of this
- * app voids it only if this session filed it; one filed on the website or by
- * another device stays.
+ * app voids it only if this session filed it, which is not known here, so
+ * nothing is said about where it came from. The wording iOS (#624) and
+ * Android (#623) use.
  */
-export const SIGN_OUT_KEEPS_HOLD =
-  'If you asked for it in this app, signing out may cancel it; a deletion asked for on the website or ' +
-  'another device stays.';
+export const SIGN_OUT_KEEPS_HOLD = 'Signing out of this app may not cancel this deletion.';
 
 /** The sentence about signing out that fits where the hold came from. */
 export function signOutHoldNote(hold: Pick<HeldDeletion, 'filedHere'>): string {
@@ -168,28 +167,35 @@ export function signOutHoldNote(hold: Pick<HeldDeletion, 'filedHere'>): string {
 }
 
 /**
- * The sign-out confirmations (Profile and Home) while a hold is known. The
- * server voids a hold when the app session that filed it signs out (or on a
- * sign-out everywhere); a hold filed on the website or by another device
- * stays, whatever this app does. Nothing absolute ("will NOT be deleted"):
- * the server's sign-out is best effort, so for a hold filed here the app
- * cancels it itself before signing out, and says so if that fails.
+ * The sign-out confirmations (Profile and Home) while a hold is known, in the
+ * wording iOS (#624) and Android (#623) use. The server voids a hold when the
+ * app session that filed it signs out (or on a sign-out everywhere); one this
+ * app did not file, or cannot tell it filed, may stay whatever this app does.
+ * For a hold filed here the app also cancels it itself before signing out
+ * (the server's sign-out is best effort), and says so if that fails.
  */
 export function signOutWithHoldText(hold: HeldDeletion): string {
-  const waiting = `Your account is waiting to be deleted ${holdWhen(hold.applyAfter)}.`;
-  return hold.filedHere
-    ? `${waiting} Signing out of this app cancels that deletion. To delete it, stay signed in until then.`
-    : `${waiting} ${SIGN_OUT_KEEPS_HOLD} To keep your account, cancel the deletion.`;
+  if (hold.filedHere) {
+    const at = holdTimeText(hold.applyAfter);
+    return at
+      ? `Signing out cancels the deletion of your account that is scheduled for ${at}.`
+      : 'Signing out cancels the deletion of your account that is scheduled within 24 hours.';
+  }
+  return (
+    `Your account will be deleted ${holdWhen(hold.applyAfter)}. ${SIGN_OUT_KEEPS_HOLD} ` +
+    'To keep your account, cancel the deletion.'
+  );
 }
 
 /**
  * The sign-out confirmation when the list could not be read and no hold is
  * known. A failed read usually means offline, when the server's sign-out
- * fails too: nothing is promised about what signing out does.
+ * fails too: nothing is promised about what signing out does. The common
+ * wording (iOS #624, Android #623).
  */
 export const HOLD_UNCHECKED_CAUTION =
-  "We couldn't check whether a deletion is waiting. If you asked for one, signing out may not cancel it. " +
-  'To keep your account, cancel the deletion in Profile or on the website.';
+  "We couldn't check whether a deletion is waiting. Signing out may not cancel it. " +
+  "To keep your account, stay signed in and cancel it once you're online.";
 
 /** Signing out cancels a hold filed here first; that cancel failed. */
 export function signOutCancelFailedText(reason: string, hold: Pick<HeldDeletion, 'applyAfter'>): string {

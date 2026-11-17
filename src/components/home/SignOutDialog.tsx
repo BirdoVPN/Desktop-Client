@@ -144,6 +144,8 @@ function SignOutConfirm({
     await signOutNow();
   };
 
+  // The read could not tell whether a deletion is waiting.
+  const unchecked = !hold && !cancelled && read === 'unchecked';
   return (
     <>
       <p className="text-[13px]" style={{ color: white.w60 }}>
@@ -160,7 +162,7 @@ function SignOutConfirm({
           {signOutWithHoldText(hold)}
         </p>
       )}
-      {!hold && !cancelled && read === 'unchecked' && (
+      {unchecked && (
         <p role="note" className="text-[12px]" style={{ color: white.w80 }}>
           {HOLD_UNCHECKED_CAUTION}
         </p>
@@ -212,7 +214,9 @@ function SignOutConfirm({
       )}
       <div className="flex gap-2.5">
         <BirdoButton
-          text={hold ? 'Stay signed in' : 'Cancel'}
+          // Next to any text about a deletion, "Cancel" could read as "cancel
+          // the deletion": the dismiss button says what it does.
+          text={hold || unchecked || cancelled ? 'Stay signed in' : 'Cancel'}
           variant="secondary"
           fullWidth
           disabled={busy}
