@@ -1,7 +1,8 @@
 //! On-device speed test module
 //!
 //! Measures actual throughput through the VPN tunnel by downloading
-//! and uploading test data to a speed-test endpoint on the VPN server.
+//! and uploading test data to the speed-test endpoint on the Birdo API host (api.birdo.app, see
+//! `commands/speed_test.rs`).
 //!
 //! The speed test:
 //! - Downloads a fixed payload (e.g. 10MB) and measures throughput

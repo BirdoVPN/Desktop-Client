@@ -10,19 +10,23 @@ secrets are ever stored in GitHub**.
 ## Architecture
 
 ```
-Git tag push  →  GitHub Actions (build job)
-  → Tauri builds the NSIS .exe
-  → Sigstore: cosign sign-blob (provenance layer)
+Git tag push  →  GitHub Actions release.yml, job build-windows
+  → azure/login with the OIDC JWT (no client secret)
+  → installs Microsoft.Trusted.Signing.Client (Azure.CodeSigning.Dlib.dll)
+  → writes the signing metadata JSON the dlib reads
+  → smoke-tests signtool against a dummy binary
+  → signs xray.exe with signtool /dlib, then verifies it
+  → Tauri builds the NSIS .exe, signing each binary through the
+    bundle.windows.signCommand (signtool sign /dlib /dmdf) injected into the
+    build config at run time
   → artifacts uploaded
 
-  →  GitHub Actions (sign job)
-       → azure/login with OIDC JWT (no secrets)
-       → azure/trusted-signing-action signs the EXE
-       → signed artifacts uploaded
-
   →  GitHub Actions (release job)
-       → prefers signed; falls back to unsigned
-       → creates draft GitHub Release
+       → Sigstore: cosign sign-blob over SHA256SUMS.txt
+       → creates the draft GitHub Release
+
+Authenticode signing runs on tag builds only (or a workflow_dispatch with
+authenticode_dry_run); other builds are unsigned.
 ```
 
 ---
@@ -85,7 +89,7 @@ echo "Tenant ID: $(az account show --query tenantId --output tsv)"
 ## Step 3 — Add OIDC Federated Credentials
 
 ```bash
-# For tag-triggered signing (the sign job runs on tags only)
+# For tag-triggered signing (signing in build-windows runs on tags only)
 az ad app federated-credential create \
   --id "$APP_ID" \
   --parameters '{

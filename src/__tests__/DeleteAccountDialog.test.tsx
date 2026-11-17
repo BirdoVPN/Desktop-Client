@@ -12,7 +12,7 @@
  *
  * Run: npx vitest run src/__tests__/DeleteAccountDialog.test.tsx
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
@@ -356,5 +356,220 @@ describe('Delete account dialog: two-factor accounts', () => {
     await waitFor(() => expect(logout).toHaveBeenCalled());
     expect(screen.queryByLabelText('Two-factor code')).not.toBeInTheDocument();
     expect(deleteCalls()[0][1]).toStrictEqual({ request: { password: 'hunter2' } });
+  });
+});
+
+/**
+ * MR-179 (owner 2026-11-13): a fresh re-auth before deletion. The preflight's
+ * `stepUpFactors`, or a refusal by code, makes the dialog ask for the account
+ * number (anonymous) or the e-mailed code (SSO); the retry carries the proof.
+ */
+describe('Delete account dialog: step-up (MR-179)', () => {
+  const refusal = (code: string, extra: Record<string, unknown> = {}) => ({
+    code,
+    message: 'x',
+    retryable: true,
+    retry_after_secs: null,
+    ...extra,
+  });
+  const deleteCalls = () => mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'delete_account');
+  const NUMBER = '123456789012345678901234';
+  let sendResult: () => Promise<unknown>;
+
+  afterEach(() => {
+    mockStoreState.account.hasPassword = true;
+  });
+
+  beforeEach(() => {
+    sendResult = () => Promise.resolve({ sentTo: 'o***@example.com' });
+    mockedInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'delete_account') return deleteResult();
+      if (cmd === 'deletion_preflight') return preflightResult();
+      if (cmd === 'send_deletion_code') return sendResult();
+      return Promise.resolve(undefined);
+    });
+  });
+
+  const preflightWith = (stepUpFactors: string[], stepUpEnforced = true) => () =>
+    Promise.resolve({
+      storeSubscriptionsStillBilling: [],
+      webSubscriptionWillBeCancelled: false,
+      stepUpFactors,
+      stepUpEnforced,
+    });
+
+  const openDialog = async () => {
+    render(<Profile />);
+    await userEvent.click(screen.getByRole('button', { name: /delete account/i }));
+  };
+  const confirm = () => userEvent.click(screen.getByRole('button', { name: /delete my account/i }));
+
+  it('an anonymous account (preflight says account_number) types its number, which is sent as digits', async () => {
+    mockStoreState.account.hasPassword = false;
+    preflightResult = preflightWith(['account_number']);
+    await openDialog();
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    const field = await screen.findByLabelText('Account number');
+    // Not enough yet: the retry needs the whole number.
+    expect(screen.getByRole('button', { name: /delete my account/i })).toBeDisabled();
+    await userEvent.type(field, '1234 5678 9012 3456 7890 1234');
+    await confirm();
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(deleteCalls()[0][1]).toEqual({ request: { password: 'DELETE', account_number: NUMBER } });
+    mockStoreState.account.hasPassword = true;
+  });
+
+  it('a refusal for the number asks for it with no error line, then the retry sends it', async () => {
+    mockStoreState.account.hasPassword = false;
+    const answers = [
+      () => Promise.reject(refusal('account_number_required')),
+      () => Promise.resolve({ storeSubscriptionsStillBilling: [] }),
+    ];
+    deleteResult = () => answers.shift()!();
+    await openDialog();
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await confirm();
+    const field = await screen.findByLabelText('Account number');
+    expect(field).not.toHaveAccessibleDescription('Enter your 24-digit account number to delete your account.');
+    expect(logout).not.toHaveBeenCalled();
+    await userEvent.type(field, NUMBER);
+    await confirm();
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(deleteCalls()[1][1]).toEqual({ request: { password: 'DELETE', account_number: NUMBER } });
+    mockStoreState.account.hasPassword = true;
+  });
+
+  it('a wrong number says so under the number and lets the user try again', async () => {
+    mockStoreState.account.hasPassword = false;
+    preflightResult = preflightWith(['account_number']);
+    const answers = [
+      () => Promise.reject(refusal('account_number_invalid')),
+      () => Promise.resolve({ storeSubscriptionsStillBilling: [] }),
+    ];
+    deleteResult = () => answers.shift()!();
+    await openDialog();
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    const field = await screen.findByLabelText('Account number');
+    await userEvent.type(field, '999999999999999999999999');
+    await confirm();
+    await waitFor(() =>
+      expect(field).toHaveAccessibleDescription('That account number is not the number of this account.'),
+    );
+    expect(logout).not.toHaveBeenCalled();
+    await userEvent.clear(field);
+    await userEvent.type(field, NUMBER);
+    await confirm();
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    mockStoreState.account.hasPassword = true;
+  });
+
+  it('an SSO account (preflight says email_code) sends the code to its address, then deletes with it', async () => {
+    mockStoreState.account.hasPassword = false;
+    preflightResult = preflightWith(['email_code']);
+    await openDialog();
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await userEvent.click(await screen.findByRole('button', { name: 'Email me a code' }));
+    expect(mockedInvoke).toHaveBeenCalledWith('send_deletion_code');
+    expect(await screen.findByText(/We emailed a code to o\*\*\*@example\.com/)).toBeInTheDocument();
+    // The code field only appears once a code was sent; Delete waits for all 6 digits.
+    const field = await screen.findByLabelText('Emailed code');
+    expect(screen.getByRole('button', { name: /delete my account/i })).toBeDisabled();
+    await userEvent.type(field, '654321');
+    await confirm();
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(deleteCalls()[0][1]).toEqual({ request: { password: 'DELETE', email_code: '654321' } });
+    mockStoreState.account.hasPassword = true;
+  });
+
+  it('a wrong or expired e-mailed code says so, and a rate-limited send shows the rate-limit copy', async () => {
+    mockStoreState.account.hasPassword = false;
+    preflightResult = preflightWith(['email_code']);
+    deleteResult = () => Promise.reject(refusal('email_code_invalid'));
+    await openDialog();
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await userEvent.click(await screen.findByRole('button', { name: 'Email me a code' }));
+    const field = await screen.findByLabelText('Emailed code');
+    await userEvent.type(field, '111111');
+    await confirm();
+    await waitFor(() =>
+      expect(field).toHaveAccessibleDescription('That code is not valid or has expired. Request a new code.'),
+    );
+    expect(logout).not.toHaveBeenCalled();
+
+    sendResult = () => Promise.reject(refusal('rate_limited'));
+    await userEvent.click(screen.getByRole('button', { name: 'Send a new code' }));
+    await waitFor(() =>
+      expect(field).toHaveAccessibleDescription('Too many attempts. Please wait a moment.'),
+    );
+    mockStoreState.account.hasPassword = true;
+  });
+
+  it('a refusal for the e-mailed code asks for it without an error line', async () => {
+    mockStoreState.account.hasPassword = false;
+    deleteResult = () => Promise.reject(refusal('email_code_required'));
+    await openDialog();
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await confirm();
+    expect(await screen.findByRole('button', { name: 'Email me a code' })).toBeInTheDocument();
+    expect(screen.queryByText("Couldn't delete your account. Please try again.")).not.toBeInTheDocument();
+    mockStoreState.account.hasPassword = true;
+  });
+
+  it('before the server enforces it, an SSO user with no code still deletes', async () => {
+    mockStoreState.account.hasPassword = false;
+    preflightResult = preflightWith(['email_code'], false);
+    await openDialog();
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await screen.findByRole('button', { name: 'Email me a code' });
+    // Optional: Delete is enabled with no code, and none is sent.
+    await confirm();
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(deleteCalls()[0][1]).toEqual({ request: { password: 'DELETE' } });
+  });
+
+  it('when enforced, Delete waits for the whole number', async () => {
+    mockStoreState.account.hasPassword = false;
+    preflightResult = preflightWith(['account_number'], true);
+    await openDialog();
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await screen.findByLabelText('Account number');
+    expect(screen.getByRole('button', { name: /delete my account/i })).toBeDisabled();
+  });
+
+  it('an Apple account with no address is told to use the iOS app', async () => {
+    mockStoreState.account.hasPassword = false;
+    deleteResult = () => Promise.reject(refusal('apple_reauth_required'));
+    await openDialog();
+    await userEvent.type(screen.getByPlaceholderText('DELETE'), 'DELETE');
+    await confirm();
+    expect(await screen.findByText(/open the BirdoVPN app on your iPhone/i)).toBeInTheDocument();
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it('a server that predates the step-up asks for nothing new and sends nothing new', async () => {
+    // Default preflight: rejected, as an older backend answers.
+    render(<Profile />);
+    await userEvent.click(screen.getByRole('button', { name: /delete account/i }));
+    await userEvent.type(screen.getByPlaceholderText('\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022'), 'hunter2');
+    await confirm();
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(screen.queryByLabelText('Account number')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Emailed code')).not.toBeInTheDocument();
+    expect(deleteCalls()[0][1]).toStrictEqual({ request: { password: 'hunter2' } });
+  });
+
+  it('a password account keeps the password and the 2FA path, with no number or code asked', async () => {
+    preflightResult = preflightWith(['password', 'two_factor']);
+    const answers = [
+      () => Promise.reject(refusal('two_factor_required')),
+      () => Promise.resolve({ storeSubscriptionsStillBilling: [] }),
+    ];
+    deleteResult = () => answers.shift()!();
+    await openAndConfirm();
+    await userEvent.type(await screen.findByLabelText('Two-factor code'), '123456');
+    await confirm();
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(screen.queryByLabelText('Account number')).not.toBeInTheDocument();
+    expect(deleteCalls()[1][1]).toEqual({ request: { password: 'hunter2', two_factor_code: '123456' } });
   });
 });
