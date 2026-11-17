@@ -1402,12 +1402,13 @@ fn heartbeat_cases() -> Vec<HeartbeatCase> {
     let evicted = Some(IpcErrorCode::Evicted);
     let quota = Some(IpcErrorCode::QuotaExceeded);
     // On a live session a valid:false ends it, in the server's words, except
-    // reaped and server_offline: MR-2369 rebuilds those quietly, at most
-    // QUIET_REBUILDS_PER_EPISODE times per episode, then ends the session
-    // with that same revocation (`rebuilt`). The answer is rare live: the
-    // server removes the node's peer BEFORE it answers and the check-in
-    // rides the tunnel, so it mostly arrives as the teardown probe's, which
-    // re-dials as the contract allows.
+    // reaped: MR-2369 rebuilds it quietly, QUIET_REBUILDS_PER_EPISODE (one)
+    // time per episode, then ends the session with that same revocation
+    // (`rebuilt`). A drained server's server_offline still ends it: the
+    // contract says connect to a DIFFERENT server, and a re-dial goes to the
+    // same one. The answer is rare live: the server removes the node's peer
+    // BEFORE it answers and the check-in rides the tunnel, so it mostly
+    // arrives as the teardown probe's, which re-dials.
     let ended = |message: &str| HeartbeatVerdict::End(revoked_error(Some(message)));
     let rebuilt = |message: &str| HeartbeatVerdict::Rebuild {
         ending: revoked_error(Some(message)),
@@ -1461,7 +1462,7 @@ fn heartbeat_cases() -> Vec<HeartbeatCase> {
         HeartbeatCase {
             reason: "server_offline",
             body: key_gone("server_offline"),
-            live: rebuilt(HB_NOT_FOUND),
+            live: ended(HB_NOT_FOUND),
             probe_alive: None,
             probe_not_alive: None,
         },
@@ -1496,7 +1497,7 @@ fn heartbeat_cases() -> Vec<HeartbeatCase> {
             probe_not_alive: evicted,
         },
         // Housekeeping released it and nobody holds the slot: a quiet
-        // rebuild on both paths (live: capped, MR-2369).
+        // rebuild on both paths (live: once per episode, MR-2369).
         HeartbeatCase {
             reason: "reaped",
             body: key_gone("reaped"),

@@ -11,10 +11,11 @@
  *  - when the server ended the session, an `error` status whose code is
  *    `revoked`, `evicted` (MR-2333) or `quota_exceeded` (`end_by_server` →
  *    `give_up`, no `gaveUp`);
- *  - when the server released the key (`reaped`, a drained `server_offline`;
- *    `Rebuild`, MR-2369), a quiet re-dial: `reconnecting`, then `connected`
- *    again, up to `QUIET_REBUILDS_PER_EPISODE` times per episode, after which
- *    the next release ends the session like the rows above;
+ *  - when server housekeeping reaped the key (`reaped`; `Rebuild`, MR-2369),
+ *    a quiet re-dial: `reconnecting`, then `connected` again, up to
+ *    `QUIET_REBUILDS_PER_EPISODE` (one) time per episode, after which the
+ *    next reap ends the session like the rows above. A drained server's
+ *    `server_offline` is not rebuilt: it ends at once;
  *  - otherwise nothing (`Fine`, and `ServerGoingOffline`, which only logs).
  *
  * This file pins the other half, per reason: that outcome, as Rust emits it,
@@ -28,6 +29,13 @@
  * The OUTCOMES below mirror `heartbeat_cases`' `live` column; keep the two in
  * step. The teardown probe's column (`after_teardown`) re-dials or ends with
  * the same codes, so it reaches the UI as one of these same outcomes.
+ *
+ * UI-level only: this file emits what each row DECLARES and checks what the
+ * controller makes of it. It does not run Rust; that a `reaped` reply really
+ * rebuilds once and then ends is pinned in Rust (`heartbeat_cases`, and
+ * `auto_reconnect`'s `a_reaped_reply_is_rebuilt_once_then_ended`, which
+ * drives the loop with the real reply). Only the cap's value is read from
+ * the Rust source here.
  *
  * Run: npx vitest run src/__tests__/HeartbeatOutcomes.test.tsx
  */
@@ -152,7 +160,7 @@ const grace = (secondsRemaining: number): Outcome => ({ kind: 'grace', secondsRe
 const revoked = (message: string): Ending => ({ kind: 'end', code: 'Revoked', message });
 const quotaEnded: Ending = { kind: 'end', code: 'QuotaExceeded', message: RUST_QUOTA_EXCEEDED };
 const evicted: Ending = { kind: 'end', code: 'Evicted', message: RUST_EVICTED };
-// MR-2369: before it, both release rows were `revoked(HB_NOT_FOUND)` at once.
+// MR-2369: before it, the `reaped` row was `revoked(HB_NOT_FOUND)` at once.
 const rebuilt = (then: Ending): Outcome => ({ kind: 'rebuild', then });
 
 const CASES: ReasonCase[] = [
@@ -160,11 +168,7 @@ const CASES: ReasonCase[] = [
   { reason: 'ok', shape: 'live, inside the Free grace window (540 s)', outcome: grace(540) },
   { reason: 'server_offline', shape: 'valid: the key lives, its server is not ONLINE', outcome: nothing },
   { reason: 'server_offline', shape: 'valid, inside the Free grace window (60 s)', outcome: grace(60) },
-  {
-    reason: 'server_offline',
-    shape: 'invalid: the key went with a drained server',
-    outcome: rebuilt(revoked(HB_NOT_FOUND)),
-  },
+  { reason: 'server_offline', shape: 'invalid: the key went with a drained server', outcome: revoked(HB_NOT_FOUND) },
   { reason: 'revoked', shape: 'a deactivated row', outcome: revoked(HB_REVOKED) },
   { reason: 'revoked', shape: 'a removal record', outcome: revoked(HB_NOT_FOUND) },
   { reason: 'evicted', shape: 'a removal record', outcome: evicted },
