@@ -73,8 +73,9 @@ Get-Content SHA256SUMS.txt | ForEach-Object {
 | Tauri updater signature (`*.sig`, minisign) | each auto-update bundle | the in-app updater, against the public key built into the app |
 
 The updater `.sig` files are deliberately not listed in `SHA256SUMS.txt`: the updater
-verifies them itself. The macOS build is not Apple-signed or notarised (there is no
-Apple Developer account), so Gatekeeper warns on first launch; the checksum above is
+verifies them itself. The macOS build is not Apple-signed or notarised (the DMG
+is built unsigned, although BirdoVPN has an Apple Developer account for its iOS app and
+its Mac App Store app, not yet on sale), so Gatekeeper warns on first launch; the checksum above is
 how to confirm a DMG is genuine.
 
 ## What does this prove?

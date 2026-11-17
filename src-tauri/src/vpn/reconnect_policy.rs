@@ -303,7 +303,8 @@ pub fn needs_rebind<R: PartialEq>(pinned: Option<&R>, now: Option<&R>) -> bool {
 }
 
 /// Whether the SERVER ended the session: a revocation (owner default, iOS
-/// parity, P1-parity-021), a used-up Free allowance (birdo-web #590) or an
+/// parity, P1-parity-021), an eviction by another device (MR-2333), a used-up
+/// Free allowance (birdo-web #590) or an
 /// account restriction (`account_restricted`, which pauses new free-plan
 /// connections for up to 24 hours). No reconnect can bring any of them back,
 /// and holding the lockdown block over one would keep the machine offline
@@ -311,7 +312,10 @@ pub fn needs_rebind<R: PartialEq>(pinned: Option<&R>, now: Option<&R>) -> bool {
 pub fn server_ended(code: IpcErrorCode) -> bool {
     matches!(
         code,
-        IpcErrorCode::Revoked | IpcErrorCode::QuotaExceeded | IpcErrorCode::AccountRestricted
+        IpcErrorCode::Revoked
+            | IpcErrorCode::Evicted
+            | IpcErrorCode::QuotaExceeded
+            | IpcErrorCode::AccountRestricted
     )
 }
 
@@ -348,14 +352,17 @@ pub enum HeartbeatVerdict {
 }
 
 /// The heartbeat's answer, decided. `valid:false` ends the session: with the
-/// quota mark it is `quota_exceeded`, otherwise a revocation. `valid:true`
-/// with the quota mark is the grace window. An older server sends neither
-/// mark, and everything behaves as before.
+/// quota mark it is `quota_exceeded`, with `reason: "evicted"` it is
+/// `evicted` (another device took the slot, MR-2333), otherwise a revocation.
+/// `valid:true` with the quota mark is the grace window. An older server sends
+/// neither mark nor reason, and everything behaves as before.
 pub fn heartbeat_verdict(resp: &HeartbeatResponse) -> HeartbeatVerdict {
     let quota = resp.quota_exceeded || resp.reason.as_deref() == Some("quota_exceeded");
     if !resp.valid {
         return HeartbeatVerdict::End(if quota {
             quota_exceeded_error()
+        } else if resp.reason.as_deref() == Some("evicted") {
+            evicted_error()
         } else {
             revoked_error(resp.message.as_deref())
         });
@@ -415,7 +422,8 @@ pub fn asks_the_old_key(cause: DropCause) -> bool {
 /// |---|---|
 /// | none, or `valid:true` (`ok`, a server going offline, the quota grace) | re-dial |
 /// | `quota_exceeded` | end: `quota_exceeded` |
-/// | `evicted`, `revoked` | end: `revoked` |
+/// | `evicted` | end: `evicted` (MR-2333) |
+/// | `revoked` | end: `revoked` |
 /// | `reaped`, `server_offline` (a drain) | re-dial |
 /// | `not_found`, no `reason` (a server before WEB-HB), anything newer | end as `revoked` if recently alive, else re-dial (WEB-HB's client table) |
 pub fn after_teardown(
@@ -430,7 +438,8 @@ pub fn after_teardown(
         return Some(quota_exceeded_error());
     }
     match resp.reason.as_deref() {
-        Some("evicted" | "revoked") => Some(revoked_error(resp.message.as_deref())),
+        Some("evicted") => Some(evicted_error()),
+        Some("revoked") => Some(revoked_error(resp.message.as_deref())),
         Some("reaped" | "server_offline") => None,
         _ => recently_alive.then(|| revoked_error(resp.message.as_deref())),
     }
@@ -443,6 +452,18 @@ pub fn quota_exceeded_error() -> IpcError {
         IpcErrorCode::QuotaExceeded,
         "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.",
     )
+}
+
+/// The canonical sentence for an eviction (MR-2333); the UI words it by code.
+pub const EVICTED_MESSAGE: &str = "Another device on your account took over this connection.";
+
+/// The error for a heartbeat `evicted`: another device took this session's
+/// slot (the contract: "a newer connection on the account took the slot;
+/// stop, NEVER reconnect automatically"). Always this sentence, never the
+/// server's: the reply for an evicted key carries the not-found one
+/// ("Connection not found. Please reconnect."), which says nothing of why.
+pub fn evicted_error() -> IpcError {
+    IpcError::new(IpcErrorCode::Evicted, EVICTED_MESSAGE)
 }
 
 /// The error for a heartbeat `valid:false`. The server's own sentence wins
@@ -1058,6 +1079,7 @@ mod tests {
             IpcErrorCode::SubscriptionRequired,
             IpcErrorCode::SessionExpired,
             IpcErrorCode::Revoked,
+            IpcErrorCode::Evicted,
             IpcErrorCode::NotElevated,
         ] {
             let mut p = ReconnectPolicy::new(budget());
@@ -1628,6 +1650,32 @@ mod tests {
             HeartbeatVerdict::End(e) => assert_eq!(e.code, IpcErrorCode::Revoked),
             other => panic!("{other:?}"),
         }
+        // MR-2333: another device took the slot. Its own code and sentence
+        // (not the reply's "not found" one), and like a revocation it ends the
+        // session for good: no retry, the block released, not a give-up.
+        match heartbeat_verdict(&heartbeat(
+            r#"{"valid":false,"serverOnline":false,"message":"Connection not found. Please reconnect.","reason":"evicted"}"#,
+        )) {
+            HeartbeatVerdict::End(e) => {
+                assert_eq!(e, evicted_error());
+                assert_eq!(e.message, EVICTED_MESSAGE);
+                assert!(!e.retryable);
+                assert!(e.code.is_hard_refusal());
+                assert!(!give_up_keeps_block(e.code, true));
+                assert!(!marks_give_up(e.code));
+            }
+            other => panic!("{other:?}"),
+        }
+        // `revoked` keeps its code and the server's sentence.
+        match heartbeat_verdict(&heartbeat(
+            r#"{"valid":false,"serverOnline":false,"message":"Connection has been revoked. Please reconnect.","reason":"revoked"}"#,
+        )) {
+            HeartbeatVerdict::End(e) => {
+                assert_eq!(e.code, IpcErrorCode::Revoked);
+                assert_eq!(e.message, "Connection has been revoked. Please reconnect.");
+            }
+            other => panic!("{other:?}"),
+        }
         // Inside the grace window: a warning, and the tunnel stays.
         assert_eq!(
             heartbeat_verdict(&heartbeat(
@@ -1683,7 +1731,7 @@ mod tests {
         for (gone, code) in [
             (
                 r#"{"valid":false,"serverOnline":false,"reason":"evicted"}"#,
-                IpcErrorCode::Revoked,
+                IpcErrorCode::Evicted,
             ),
             (
                 r#"{"valid":false,"serverOnline":false,"reason":"revoked"}"#,
@@ -1857,6 +1905,7 @@ mod tests {
         for ended in [
             IpcErrorCode::QuotaExceeded,
             IpcErrorCode::Revoked,
+            IpcErrorCode::Evicted,
             IpcErrorCode::AccountRestricted,
         ] {
             assert!(!marks_give_up(ended), "{ended:?}");
