@@ -6,6 +6,9 @@
  * redeem voucher, export data, delete account and sign out. Managing a paid
  * subscription and the legal links live on the web (dashboard.birdo.app).
  * Usage moved to the Limit tab (P1-parity-009).
+ *
+ * MR-2335: an account deletion waiting out its 24-hour hold shows as a banner
+ * at the top, with Cancel (`PendingDeletion.tsx`), read on open and on focus.
  */
 import { useCallback, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -13,7 +16,9 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { useShallow } from 'zustand/react/shallow';
 import { Gift, LogOut, Trash, Download, CreditCard } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
+import { selectTunnelActive } from '@/store/selectors';
 import { BirdoCard, BirdoSectionHeader, BirdoNavRow } from '@/components/birdo';
+import { SignOutDialog } from '@/components/home/SignOutDialog';
 import { brand, status as statusTokens } from '@/lib/birdo-theme';
 import { planRank } from '@/lib/plan';
 import { BILLING_URL } from '@/lib/links';
@@ -21,8 +26,11 @@ import { displayableEmail, resolveAnonymousAccount } from '@/utils/helpers';
 import { anonNumberRotationEnabled } from '@/lib/features';
 import { loadSubscription } from '@/session/session-data';
 import { signOut } from '@/session/session';
+import { refreshHeldDeletionWithin, usePendingDeletion } from '@/session/held-deletion';
+import { clearHeldDeletion, getHeldDeletion } from '@/lib/held-deletion';
 import { AccountNumberCard, IdentityCard, SubscriptionCard } from './profile/ProfileCards';
 import { DeleteAccountDialog } from './profile/DeleteAccountDialog';
+import { PendingDeletionBanner } from './profile/PendingDeletion';
 import { ReplaceAccountNumberDialog } from './profile/ReplaceAccountNumberDialog';
 import { VoucherRedeemDialog } from './profile/VoucherRedeemDialog';
 
@@ -32,16 +40,20 @@ export {
   preflightStoreWarning,
   type DeleteAccountResult,
   type DeletionPreflight,
+  type DeletionHold,
+  HOLD_OFFER_NUMBER,
+  HOLD_OFFER_CODE,
 } from './profile/DeleteAccountDialog';
 
 export function Profile() {
-  const { account, planStatus, userEmail, logout, pushRoute } = useAppStore(
+  const { account, planStatus, userEmail, logout, pushRoute, tunnelActive } = useAppStore(
     useShallow((s) => ({
       account: s.account,
       planStatus: s.planStatus,
       userEmail: s.userEmail,
       logout: s.logout,
       pushRoute: s.pushRoute,
+      tunnelActive: selectTunnelActive(s),
     })),
   );
   // Unknown (null) is not free: offer "View plans" only when the plan is KNOWN
@@ -61,6 +73,31 @@ export function Profile() {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [showReplaceDialog, setShowReplaceDialog] = useState(false);
   const [exportState, setExportState] = useState<'idle' | 'working' | 'done' | 'error'>('idle');
+  const pendingDeletion = usePendingDeletion();
+  // MR-2335: while a deletion is on hold, Sign out asks first (the shared
+  // `SignOutDialog`): it says what signing out does to that hold, by where the
+  // hold came from, and offers Cancel deletion.
+  const [confirmSignOut, setConfirmSignOut] = useState(false);
+  // With no hold known yet (Profile's own opening read may still be out),
+  // Sign out reads the list before deciding, so a fast click cannot skip
+  // the warning. The row is disabled meanwhile, for at most
+  // HOLD_READ_WAIT_MS: a read that fails or is slower opens the confirmation
+  // too, which says it could not check.
+  const [checkingHold, setCheckingHold] = useState(false);
+  const handleSignOut = async () => {
+    if (checkingHold) return;
+    let answered = true;
+    if (!getHeldDeletion()) {
+      setCheckingHold(true);
+      try {
+        answered = await refreshHeldDeletionWithin();
+      } finally {
+        setCheckingHold(false);
+      }
+    }
+    if (getHeldDeletion() || !answered) setConfirmSignOut(true);
+    else void signOut();
+  };
 
   // GDPR data export (Art. 20). The backend command returns the full JSON blob;
   // save it via a webview download so the user gets a file with no extra plugin.
@@ -96,6 +133,8 @@ export function Profile() {
       </div>
 
       <div className="flex flex-col gap-3 px-5 pb-12 pt-2">
+        {pendingDeletion.hold && <PendingDeletionBanner hold={pendingDeletion.hold} />}
+
         <IdentityCard email={resolvedEmail} plan={account.plan} isAnon={isAnon} />
 
         {isAnon && (
@@ -170,7 +209,8 @@ export function Profile() {
               subtitle={isAnon ? 'Anonymous account' : (resolvedEmail ?? undefined)}
               leadingIcon={LogOut}
               leadingTint={statusTokens.red}
-              onClick={() => void signOut()}
+              enabled={!checkingHold}
+              onClick={() => void handleSignOut()}
             />
           </BirdoCard>
         </div>
@@ -188,6 +228,11 @@ export function Profile() {
           onDismiss={() => setShowReplaceDialog(false)}
         />
       )}
+      <SignOutDialog
+        open={confirmSignOut}
+        stillConnected={tunnelActive}
+        onClose={() => setConfirmSignOut(false)}
+      />
       {showDeleteDialog && (
         <DeleteAccountDialog
           open
@@ -202,6 +247,7 @@ export function Profile() {
             } catch {
               /* best effort — the account is already gone server-side */
             }
+            clearHeldDeletion();
             logout();
           }}
         />

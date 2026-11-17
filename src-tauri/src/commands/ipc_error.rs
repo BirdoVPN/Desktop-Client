@@ -14,6 +14,7 @@
 
 use serde::Serialize;
 
+use crate::api::error::StepUpKind;
 use crate::api::ApiError;
 
 /// Stable, snake_case error codes. Extend only by ADDING codes: the UI keys
@@ -30,6 +31,12 @@ pub enum IpcErrorCode {
     ServerUnavailable,
     SessionExpired,
     Revoked,
+    /// MR-2333: the heartbeat said `evicted`: a newer connection on the
+    /// account (another device) took this session's slot. Like `revoked` the
+    /// session is over and is NEVER re-dialled automatically (that would evict
+    /// the other device back); its own code so the UI can say what happened
+    /// instead of "Connection has been revoked".
+    Evicted,
     /// The Free plan's monthly allowance is used up and the server ended the
     /// session (heartbeat `reason: "quota_exceeded"`, birdo-web #590).
     QuotaExceeded,
@@ -40,6 +47,28 @@ pub enum IpcErrorCode {
     InvalidCredentials,
     TwoFactorRequired,
     TwoFactorInvalid,
+    /// MR-179: the deletion step-up (owner 2026-11-13). The dialog asks for the
+    /// anonymous account's 24-digit number / the e-mailed code, or says the one
+    /// typed was wrong. Not hard refusals: the next attempt, with the proof,
+    /// can succeed.
+    AccountNumberRequired,
+    AccountNumberInvalid,
+    EmailCodeRequired,
+    EmailCodeInvalid,
+    /// An Apple account with no e-mail address must re-sign in with Apple,
+    /// which only the iOS app does. Not retryable here.
+    AppleReauthRequired,
+    /// MR-2335: the 24-hour deletion hold was refused (409 `hold_unavailable`:
+    /// switched off, or not tied to this session), or one is already waiting
+    /// and the answer did not say which. Nothing was deleted. The UI shows the
+    /// server's sentence, which says which.
+    HoldUnavailable,
+    /// MR-2335: 403 `step_up_no_factor`: this account cannot be verified for an
+    /// in-app deletion; support can delete it. Not retryable.
+    StepUpNoFactor,
+    /// MR-2335: 503 `step_up_unavailable`: the check could not run just now and
+    /// nothing was deleted or put on hold. Retryable.
+    StepUpUnavailable,
     CertPinFailed,
     StealthFailed,
     PqFailed,
@@ -72,6 +101,9 @@ pub enum IpcErrorCode {
     /// (403 `details.code: "registration_country_not_allowed"`). The UI shows
     /// the server's sentence; "upgrade your plan" and "try again" cannot help.
     RegistrationNotAllowed,
+    /// Sign-in refused because the e-mail address was never verified (403
+    /// `details.code: "email_not_verified"`, MR-2210). Retrying cannot help.
+    EmailNotVerified,
     Unknown,
 }
 
@@ -84,6 +116,7 @@ impl IpcErrorCode {
             self,
             IpcErrorCode::SessionExpired
                 | IpcErrorCode::Revoked
+                | IpcErrorCode::Evicted
                 | IpcErrorCode::QuotaExceeded
                 | IpcErrorCode::DeviceLimit
                 | IpcErrorCode::SubscriptionRequired
@@ -95,6 +128,10 @@ impl IpcErrorCode {
                 | IpcErrorCode::ConsentRequired
                 | IpcErrorCode::AccountRestricted
                 | IpcErrorCode::RegistrationNotAllowed
+                | IpcErrorCode::AppleReauthRequired
+                | IpcErrorCode::HoldUnavailable
+                | IpcErrorCode::StepUpNoFactor
+                | IpcErrorCode::EmailNotVerified
         )
     }
 
@@ -106,6 +143,7 @@ impl IpcErrorCode {
             self,
             IpcErrorCode::SessionExpired
                 | IpcErrorCode::Revoked
+                | IpcErrorCode::Evicted
                 | IpcErrorCode::QuotaExceeded
                 | IpcErrorCode::DeviceLimit
                 | IpcErrorCode::SubscriptionRequired
@@ -324,6 +362,10 @@ impl IpcError {
                 IpcErrorCode::RegistrationNotAllowed,
                 "BirdoVPN cannot create new accounts from your country right now.",
             ),
+            ApiError::EmailNotVerified => Self::new(
+                IpcErrorCode::EmailNotVerified,
+                "Please verify your email address first. Open birdo.app/verify-email to get a new link.",
+            ),
             ApiError::CertificatePinningFailed(_) => {
                 Self::new(IpcErrorCode::CertPinFailed, error.to_string())
             }
@@ -337,6 +379,35 @@ impl IpcError {
             ApiError::TwoFactorInvalid(message) => {
                 Self::new(IpcErrorCode::TwoFactorInvalid, message)
             }
+            ApiError::StepUp { kind, message } => Self::new(
+                match kind {
+                    StepUpKind::AccountNumberRequired => IpcErrorCode::AccountNumberRequired,
+                    StepUpKind::AccountNumberInvalid => IpcErrorCode::AccountNumberInvalid,
+                    StepUpKind::EmailCodeRequired => IpcErrorCode::EmailCodeRequired,
+                    StepUpKind::EmailCodeInvalid => IpcErrorCode::EmailCodeInvalid,
+                    StepUpKind::AppleReauth => IpcErrorCode::AppleReauthRequired,
+                    StepUpKind::HoldUnavailable => IpcErrorCode::HoldUnavailable,
+                    StepUpKind::NoFactor => IpcErrorCode::StepUpNoFactor,
+                    StepUpKind::Unavailable => IpcErrorCode::StepUpUnavailable,
+                },
+                message,
+            ),
+            // MR-2335: `request_deletion_hold` reads the waiting hold from the
+            // pending-change list; this is only what is left when it cannot.
+            // The server's sentence ("A deletion is already on hold. Cancel it
+            // first ...") is the explanation.
+            ApiError::DeletionAlreadyOnHold(message) if !message.is_empty() => {
+                Self::new(IpcErrorCode::HoldUnavailable, message)
+            }
+            ApiError::DeletionAlreadyOnHold(_) => Self::new(
+                IpcErrorCode::HoldUnavailable,
+                "A deletion is already on hold for this account.",
+            ),
+            // `cancel_pending_change` answers this itself (already gone).
+            ApiError::PendingChangeNotFound => Self::new(
+                IpcErrorCode::Unknown,
+                "That change is no longer pending.",
+            ),
             // Retryable by nature: the check is down, the account was not refused.
             ApiError::QuotaCheckUnavailable { retry_after_secs } => Self::transient(
                 "BirdoVPN couldn't check your plan's data allowance just now. Please try again \
@@ -588,6 +659,7 @@ mod tests {
             (IpcErrorCode::ServerUnavailable, "server_unavailable"),
             (IpcErrorCode::SessionExpired, "session_expired"),
             (IpcErrorCode::Revoked, "revoked"),
+            (IpcErrorCode::Evicted, "evicted"),
             (IpcErrorCode::QuotaExceeded, "quota_exceeded"),
             (IpcErrorCode::DeviceLimit, "device_limit"),
             (IpcErrorCode::SubscriptionRequired, "subscription_required"),
@@ -596,6 +668,17 @@ mod tests {
             (IpcErrorCode::InvalidCredentials, "invalid_credentials"),
             (IpcErrorCode::TwoFactorRequired, "two_factor_required"),
             (IpcErrorCode::TwoFactorInvalid, "two_factor_invalid"),
+            (
+                IpcErrorCode::AccountNumberRequired,
+                "account_number_required",
+            ),
+            (IpcErrorCode::AccountNumberInvalid, "account_number_invalid"),
+            (IpcErrorCode::EmailCodeRequired, "email_code_required"),
+            (IpcErrorCode::EmailCodeInvalid, "email_code_invalid"),
+            (IpcErrorCode::AppleReauthRequired, "apple_reauth_required"),
+            (IpcErrorCode::HoldUnavailable, "hold_unavailable"),
+            (IpcErrorCode::StepUpNoFactor, "step_up_no_factor"),
+            (IpcErrorCode::StepUpUnavailable, "step_up_unavailable"),
             (IpcErrorCode::CertPinFailed, "cert_pin_failed"),
             (IpcErrorCode::StealthFailed, "stealth_failed"),
             (IpcErrorCode::PqFailed, "pq_failed"),
@@ -615,6 +698,7 @@ mod tests {
                 IpcErrorCode::RegistrationNotAllowed,
                 "registration_not_allowed",
             ),
+            (IpcErrorCode::EmailNotVerified, "email_not_verified"),
             (IpcErrorCode::Unknown, "unknown"),
         ];
         for (code, wire) in pairs {
@@ -692,6 +776,71 @@ mod tests {
                 IpcErrorCode::TwoFactorInvalid,
             ),
             (
+                ApiError::StepUp {
+                    kind: StepUpKind::AccountNumberRequired,
+                    message: "x".into(),
+                },
+                IpcErrorCode::AccountNumberRequired,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::AccountNumberInvalid,
+                    message: "x".into(),
+                },
+                IpcErrorCode::AccountNumberInvalid,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::EmailCodeRequired,
+                    message: "x".into(),
+                },
+                IpcErrorCode::EmailCodeRequired,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::EmailCodeInvalid,
+                    message: "x".into(),
+                },
+                IpcErrorCode::EmailCodeInvalid,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::AppleReauth,
+                    message: "x".into(),
+                },
+                IpcErrorCode::AppleReauthRequired,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::HoldUnavailable,
+                    message: "x".into(),
+                },
+                IpcErrorCode::HoldUnavailable,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::NoFactor,
+                    message: "x".into(),
+                },
+                IpcErrorCode::StepUpNoFactor,
+            ),
+            (
+                ApiError::StepUp {
+                    kind: StepUpKind::Unavailable,
+                    message: "x".into(),
+                },
+                IpcErrorCode::StepUpUnavailable,
+            ),
+            (
+                ApiError::DeletionAlreadyOnHold("x".into()),
+                IpcErrorCode::HoldUnavailable,
+            ),
+            (
+                ApiError::DeletionAlreadyOnHold(String::new()),
+                IpcErrorCode::HoldUnavailable,
+            ),
+            (ApiError::PendingChangeNotFound, IpcErrorCode::Unknown),
+            (
                 ApiError::QuotaCheckUnavailable {
                     retry_after_secs: Some(30),
                 },
@@ -715,6 +864,32 @@ mod tests {
         for (i, (api, code)) in cases.iter().enumerate() {
             assert_eq!(IpcError::from_api(api).code, *code, "case {i}");
         }
+    }
+
+    /// MR-2335: a hold that is switched off, or an account the app cannot
+    /// verify, is refused the same way every time; a check that could not run
+    /// is worth asking again. None of them is about a connection.
+    #[test]
+    fn deletion_hold_codes_say_whether_a_retry_can_help() {
+        assert!(!IpcErrorCode::HoldUnavailable.retryable());
+        assert!(!IpcErrorCode::StepUpNoFactor.retryable());
+        assert!(IpcErrorCode::StepUpUnavailable.retryable());
+        for code in [
+            IpcErrorCode::HoldUnavailable,
+            IpcErrorCode::StepUpNoFactor,
+            IpcErrorCode::StepUpUnavailable,
+        ] {
+            assert!(!code.is_hard_refusal(), "{code:?}");
+        }
+        // The server's sentence is what the UI shows for a refused hold.
+        let held = IpcError::from_api(&ApiError::StepUp {
+            kind: StepUpKind::HoldUnavailable,
+            message: "A delayed deletion is not available. Nothing was deleted.".into(),
+        });
+        assert_eq!(
+            held.message,
+            "A delayed deletion is not available. Nothing was deleted."
+        );
     }
 
     #[test]
@@ -814,6 +989,7 @@ mod tests {
         for code in [
             IpcErrorCode::SessionExpired,
             IpcErrorCode::Revoked,
+            IpcErrorCode::Evicted,
             IpcErrorCode::QuotaExceeded,
             IpcErrorCode::DeviceLimit,
             IpcErrorCode::SubscriptionRequired,

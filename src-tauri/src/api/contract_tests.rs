@@ -30,7 +30,7 @@
 //! build does not know is handled as a refusal without one.
 //!
 //! Fixtures come from the REAL producers wherever one exists
-//! (`utils::get_device_id`, `birdo_pq::generate_keypair`,
+//! (`utils::get_device_id`, `birdo_pq::PqSession`,
 //! `commands::vpn::generate_wireguard_keypair`, `attestation::platform` /
 //! `version`, the `FALLBACK_*` constants) so a change in WHAT desktop emits —
 //! not only in how it is named — fails here rather than in production.
@@ -204,9 +204,9 @@ fn attestation_fixture() -> DesktopAttestation {
 }
 
 /// The real BirdoPQ producer: ML-KEM-1024 public key, STANDARD base64, the
-/// exact encoding `birdo_pq::get_client_public_key_b64` uses.
+/// exact encoding `PqSession::public_key_b64` uses.
 fn real_pq_public_key() -> String {
-    STANDARD.encode(&crate::vpn::birdo_pq::generate_keypair().public_key)
+    crate::vpn::birdo_pq::PqSession::begin().public_key_b64()
 }
 
 /// The real WireGuard producer (X25519 public key, STANDARD base64 with its
@@ -1397,8 +1397,9 @@ fn in_grace(mut reply: Value, seconds: u64) -> Value {
 /// Every reason in `$defs/HeartbeatReason`, decided, in each shape the server
 /// sends it.
 fn heartbeat_cases() -> Vec<HeartbeatCase> {
-    use reconnect_policy::{quota_exceeded_error, revoked_error};
+    use reconnect_policy::{evicted_error, quota_exceeded_error, revoked_error};
     let revoked = Some(IpcErrorCode::Revoked);
+    let evicted = Some(IpcErrorCode::Evicted);
     let quota = Some(IpcErrorCode::QuotaExceeded);
     // On a live session every valid:false ends it, in the server's words.
     // For reaped and server_offline that answer is rare: the server removes
@@ -1480,12 +1481,14 @@ fn heartbeat_cases() -> Vec<HeartbeatCase> {
             probe_not_alive: revoked,
         },
         // A newer connection took the slot: a re-dial would evict it back.
+        // MR-2333: its own code and sentence (another device took over), not
+        // the reply's not-found one; it still ends the session on both paths.
         HeartbeatCase {
             reason: "evicted",
             body: key_gone("evicted"),
-            live: ended(HB_NOT_FOUND),
-            probe_alive: revoked,
-            probe_not_alive: revoked,
+            live: HeartbeatVerdict::End(evicted_error()),
+            probe_alive: evicted,
+            probe_not_alive: evicted,
         },
         // Housekeeping released it and nobody holds the slot: one re-dial.
         HeartbeatCase {
@@ -1772,4 +1775,34 @@ fn heartbeat_mutations_are_refused_by_the_contract_and_decoded_leniently() {
         format!("{:?}", heartbeat_reply(&m)),
         format!("{:?}", heartbeat_reply(&grace))
     );
+}
+
+/// MR-2210: a 403 `details.code: "email_not_verified"` at sign-in is its own
+/// code with a plain sentence, never the plan refusal a bare 403 maps to.
+#[test]
+fn an_unverified_email_refusal_is_its_own_code_and_a_bare_403_is_not() {
+    use crate::api::client::BirdoApi;
+    use reqwest::StatusCode;
+    let body = json!({
+        "statusCode": 403, "message": "Please verify your email address before signing in.",
+        "details": { "code": "email_not_verified" },
+    })
+    .to_string();
+    let err = IpcError::from_api(&BirdoApi::classify_error_response(
+        StatusCode::FORBIDDEN,
+        &body,
+    ));
+    assert_eq!(err.code, IpcErrorCode::EmailNotVerified);
+    assert!(err.message.contains("verify your email"));
+    assert!(!err.retryable);
+    let bare = IpcError::from_api(&BirdoApi::classify_error_response(
+        StatusCode::FORBIDDEN,
+        &json!({ "message": "Forbidden" }).to_string(),
+    ));
+    assert_eq!(bare.code, IpcErrorCode::SubscriptionRequired);
+    let other_status = IpcError::from_api(&BirdoApi::classify_error_response(
+        StatusCode::BAD_REQUEST,
+        &body,
+    ));
+    assert_ne!(other_status.code, IpcErrorCode::EmailNotVerified);
 }

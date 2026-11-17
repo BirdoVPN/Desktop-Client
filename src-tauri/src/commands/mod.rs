@@ -9,6 +9,7 @@ pub mod consent;
 pub mod ipc_error;
 pub mod killswitch;
 pub mod licences;
+pub mod linux_release;
 pub mod logs;
 pub mod oauth;
 pub mod servers;

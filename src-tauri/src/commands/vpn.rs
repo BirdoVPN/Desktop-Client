@@ -389,6 +389,10 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         lockdown_mode,
         ..
     } = settings;
+    // The PREFERENCE (after the Custom DNS rule). The fleet gate is applied
+    // where the flag goes on the wire (`session::attempt`, the auto-reconnect
+    // re-dial), so the session on record keeps the user's choice and each
+    // request reads the gate as it is then.
     let dns_filtering = effective_dns_filtering(dns_filtering, custom_dns.as_deref());
 
     // Mirror Local Network Sharing to the kill switch on every platform, so an
@@ -630,10 +634,11 @@ pub(crate) async fn start_stealth_tunnel(
 ///
 /// Order of preference:
 ///   1. BirdoPQ v1 ML-KEM-1024 — decapsulate the server-supplied ciphertext
-///      with our persistent client secret key. Post-quantum on the app-to-API
-///      leg only, not a complete "record now, decrypt later" defence: the key
-///      is long-lived, the relay leg is classical TLS and multi-hop's middle
-///      leg has no PQ PSK (`vpn::birdo_pq` module docs).
+///      with the secret of THIS connect's `PqSession` (one keypair per
+///      connect request, consumed here, never stored). Post-quantum on the
+///      app-to-API leg only, not a complete "record now, decrypt later"
+///      defence: the relay leg is classical TLS and multi-hop's middle leg
+///      has no PQ PSK (`vpn::birdo_pq` module docs).
 ///   2. If the server enabled quantum mode but decapsulation fails, abort.
 ///   3. Server-provided classical PSK (TLS-delivered random; not HNDL-safe).
 ///   4. None — connection runs without PSK.
@@ -642,10 +647,11 @@ pub(crate) async fn start_stealth_tunnel(
 /// real protection level instead of a no-op toggle indicator.
 pub(crate) fn derive_quantum_psk(
     response: &ConnectResponse,
+    pq_session: Option<crate::vpn::birdo_pq::PqSession>,
 ) -> Result<Option<Zeroizing<String>>, String> {
     // 1) True bilateral PQ — only succeeds when server returned a ciphertext
     //    AND we have a local keypair AND decapsulation produced a PSK.
-    if let Some(psk) = crate::vpn::birdo_pq::try_decapsulate(response) {
+    if let Some(psk) = crate::vpn::birdo_pq::try_decapsulate(response, pq_session) {
         return Ok(Some(psk));
     }
 
@@ -1764,6 +1770,50 @@ mod tests {
         assert!(!effective_dns_filtering(true, Some(&one)));
     }
 
+    /// Owner 2026-11-13: the connect flag needs the fleet gate known to be on,
+    /// whatever the preference says.
+    #[test]
+    fn dns_filtering_is_sent_only_while_the_fleet_gate_is_on() {
+        use crate::api::client::dns_filtering_with_gate as gated;
+        assert!(gated(true, true));
+        assert!(!gated(true, false));
+        assert!(!gated(false, true));
+        assert!(!gated(false, false));
+    }
+
+    /// A successful fetch sets the process-wide gate to
+    /// `dnsFilteringAvailable == Some(true)`: an explicit `false` and an absent
+    /// field both turn it off. The ONLY test that writes the process-wide gate
+    /// (nothing else in the suite reads it), so it cannot race another test.
+    #[test]
+    fn the_fleet_gate_is_on_only_for_an_explicit_true() {
+        use crate::api::client::{dns_filtering_gate_on, note_dns_filtering_gate};
+        note_dns_filtering_gate(Some(true));
+        assert!(dns_filtering_gate_on());
+        note_dns_filtering_gate(None);
+        assert!(!dns_filtering_gate_on(), "absent is not on");
+        note_dns_filtering_gate(Some(true));
+        note_dns_filtering_gate(Some(false));
+        assert!(!dns_filtering_gate_on());
+        note_dns_filtering_gate(None);
+        assert!(!dns_filtering_gate_on());
+    }
+
+    /// The gate is applied at the wire, not folded into the settings the
+    /// session records: `apply_vpn_settings` keeps the preference.
+    #[test]
+    fn apply_vpn_settings_keeps_the_preference_and_leaves_the_gate_to_the_wire() {
+        let source = include_str!("vpn.rs").replace('\r', "");
+        let body = &source[source
+            .find("pub(super) async fn apply_vpn_settings(")
+            .expect("apply_vpn_settings")..];
+        let body = &body[..body.find("\n}").expect("end of apply_vpn_settings")];
+        assert!(body.contains(
+            "let dns_filtering = effective_dns_filtering(dns_filtering, custom_dns.as_deref());"
+        ));
+        assert!(!body.contains("dns_filtering_gate_on("));
+    }
+
     #[test]
     fn dns_filtering_survives_no_or_empty_custom_dns() {
         assert!(effective_dns_filtering(true, None));
@@ -2028,7 +2078,7 @@ mod tests {
     #[test]
     fn derive_quantum_psk_fails_closed_when_psk_withheld() {
         let resp = withheld_psk_response(Some(true));
-        let r = derive_quantum_psk(&resp);
+        let r = derive_quantum_psk(&resp, Some(crate::vpn::birdo_pq::PqSession::begin()));
         assert!(r.is_err(), "expected fail-closed Err, got {r:?}");
         assert!(r.unwrap_err().contains("silent downgrade"));
     }
@@ -2039,12 +2089,24 @@ mod tests {
     #[test]
     fn derive_quantum_psk_allows_no_psk_when_quantum_off() {
         let resp = withheld_psk_response(Some(false));
-        assert_eq!(derive_quantum_psk(&resp), Ok(None));
+        assert_eq!(derive_quantum_psk(&resp, None), Ok(None));
+    }
+
+    /// MR-703: quantum on, but this connect made no keypair (a bug upstream,
+    /// never a user state). It aborts, and does so even though the server
+    /// offers a classical PSK: no session, no decapsulation, no demotion.
+    #[test]
+    fn quantum_on_without_a_session_aborts() {
+        let mut resp = withheld_psk_response(Some(true));
+        resp.preshared_key = Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".into());
+        let r = derive_quantum_psk(&resp, None);
+        assert!(r.is_err(), "expected fail-closed Err, got {r:?}");
+        assert!(r.unwrap_err().contains("silent downgrade"));
     }
 
     /// The consequence of a BirdoPQ decapsulation that cannot happen — an
-    /// unusable persisted `birdo_pq_v1.bin`, a malformed ciphertext, a missing
-    /// nonce — is an ABORTED connect, never a demotion to the server's
+    /// malformed ciphertext, a missing nonce, a connect with no keypair — is
+    /// an ABORTED connect, never a demotion to the server's
     /// classical PSK. Three comments in `vpn::birdo_pq` once justified
     /// discarding the user's long-lived ML-KEM identity key with the opposite
     /// claim: a permanent, silent demotion for the life of the install. It
@@ -2057,7 +2119,7 @@ mod tests {
     fn undecapsulatable_pq_aborts_even_when_a_server_psk_is_offered() {
         let mut resp = withheld_psk_response(Some(true));
         resp.preshared_key = Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".into());
-        let r = derive_quantum_psk(&resp);
+        let r = derive_quantum_psk(&resp, Some(crate::vpn::birdo_pq::PqSession::begin()));
         assert!(
             r.is_err(),
             "a failed PQ decapsulation must abort, not take the offered classical PSK; got {r:?}"
@@ -2066,17 +2128,16 @@ mod tests {
     }
 
     /// The other direction of the same correction: with `quantum_enabled` off,
-    /// `try_decapsulate` returns at its first line and the PQ key file is never
-    /// opened, so the state of that file cannot affect the classical path at
-    /// all — there is no install-lifetime fallback for an unusable key to
-    /// cause. The server PSK is taken. (The `PqMode` latch is process-global
+    /// `try_decapsulate` returns at its first line and no keypair is touched,
+    /// so nothing about the PQ engine can affect the classical path at all.
+    /// The server PSK is taken. (The `PqMode` latch is process-global
     /// and other tests move it, so asserting on it here would race.)
     #[test]
-    fn quantum_off_takes_the_server_psk_regardless_of_the_pq_key_file() {
+    fn quantum_off_takes_the_server_psk_regardless_of_the_pq_engine() {
         let mut resp = withheld_psk_response(Some(false));
         resp.preshared_key = Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".into());
         assert_eq!(
-            derive_quantum_psk(&resp),
+            derive_quantum_psk(&resp, None),
             Ok(Some(Zeroizing::new(
                 "c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".to_string()
             )))

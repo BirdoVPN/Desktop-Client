@@ -100,6 +100,18 @@ impl ReconnectInfo {
     }
 }
 
+/// The session on record with its BirdoShield flag put through the fleet gate
+/// as it is NOW (owner 2026-11-13). The session keeps the user's preference;
+/// the gate can go off, or on, while it runs, so the unattended re-dial reads
+/// it when it sends, exactly as a user-initiated dial does. Pure: the caller
+/// passes `client::dns_filtering_gate_on()`.
+pub(crate) fn redial_info_under_gate(info: &ReconnectInfo, gate_on: bool) -> ReconnectInfo {
+    ReconnectInfo {
+        dns_filtering: crate::api::client::dns_filtering_with_gate(info.dns_filtering, gate_on),
+        ..info.clone()
+    }
+}
+
 /// The exact `/vpn/connect` body a single-hop auto-reconnect posts for
 /// `info`. Pure (no I/O): the attestation is fetched by the caller. Every
 /// session property `ReconnectInfo` carries for the WIRE is mapped here —
@@ -1448,18 +1460,15 @@ impl ReconnectLoop {
         // wiped on drop, so no error path frees it un-wiped (AR-1). Only
         // `ReconnectInfo` outlives the attempt, and it holds no key.
         let (private_key, client_public_key) = crate::commands::vpn::generate_wireguard_keypair();
-        let pq_pk = if info.quantum_protection {
-            Some(
-                crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
-                    IpcError::new(
-                        IpcErrorCode::PqFailed,
-                        "Post-quantum engine unavailable during reconnect; refusing a downgrade.",
-                    )
-                })?,
-            )
-        } else {
-            None
-        };
+        // MR-703 / MR-1742: a re-dial is a new connect, so it gets a keypair of
+        // its own; the secret is moved into `prepare_tunnel` below and is
+        // wiped there, or on any earlier exit.
+        let pq_session = info
+            .quantum_protection
+            .then(crate::vpn::birdo_pq::PqSession::begin);
+        let pq_pk = pq_session
+            .as_ref()
+            .map(crate::vpn::birdo_pq::PqSession::public_key_b64);
 
         // MR-691: on connections of its own, like the old-key probe. A re-dial
         // always follows a teardown, and the shared client's first request
@@ -1492,6 +1501,7 @@ impl ReconnectLoop {
                 server_id: &info.server_id,
                 stealth_mode: info.stealth_mode,
                 quantum_protection: info.quantum_protection,
+                pq_session,
                 fallback_reason: info.fallback_reason.as_deref(),
                 custom_dns: info.custom_dns.clone(),
                 custom_mtu: info.custom_mtu,
@@ -1760,6 +1770,7 @@ async fn request_fresh_response(
     client_public_key: String,
     pq_client_public_key: Option<String>,
 ) -> Result<ConnectResponse, IpcError> {
+    let info = &redial_info_under_gate(info, crate::api::client::dns_filtering_gate_on());
     let attestation = api.desktop_attestation().await;
     let response = if let Some(route) = info.multi_hop.as_ref() {
         let payload = reconnect_multi_hop_request(
@@ -2865,7 +2876,7 @@ mod tests {
         .await;
         let (ending, said) = probe_verdict(&reply, false);
         assert_eq!(said, "evicted");
-        assert_eq!(ending.map(|e| e.code), Some(IpcErrorCode::Revoked));
+        assert_eq!(ending.map(|e| e.code), Some(IpcErrorCode::Evicted));
     }
 
     /// The grace warning goes out once per session, not on every 30 s

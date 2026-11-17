@@ -39,6 +39,13 @@ export const STEALTH_FAILED_COPY =
   "Stealth Mode couldn't start. Not connecting, so your traffic isn't sent unprotected. " +
   'Try again, or choose another location.';
 export const REVOKED_COPY = 'Connection has been revoked. Please reconnect.';
+/**
+ * MR-2333: the heartbeat said `evicted`: another device on the account took
+ * this connection's slot. BirdoVPN never re-dials it by itself (that would push
+ * the other device off in turn); Connect is the user's own choice.
+ */
+export const EVICTED_COPY =
+  'Another device on your account took over this connection. Click Connect to use BirdoVPN here instead.';
 export const QUOTA_EXCEEDED_COPY =
   "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.";
 export const SESSION_EXPIRED_COPY = 'Your session has expired. Sign in again.';
@@ -68,8 +75,11 @@ export const SETTINGS_UNVERIFIED_COPY =
 
 export const ACCOUNT_RESTRICTED_COPY =
   'New connections on this account are paused for now. If this is a mistake, ask for a review.';
+export const EMAIL_NOT_VERIFIED_COPY =
+  'Please verify your email address first. Open birdo.app/verify-email to get a new link.';
 export const REGISTRATION_NOT_ALLOWED_COPY =
   "BirdoVPN can't create new accounts from your country right now.";
+export const HOLD_UNAVAILABLE_COPY = 'A delayed deletion is not available right now. Nothing was deleted.';
 
 /**
  * The link for an `account_restricted` refusal's review page, only if the path
@@ -99,6 +109,7 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   },
   session_expired: { message: SESSION_EXPIRED_COPY, action: 'sign_in' },
   revoked: { message: REVOKED_COPY, action: 'connect' },
+  evicted: { message: EVICTED_COPY, action: 'connect' },
   // The server ended the session over the Free allowance (birdo-web #590):
   // reconnecting cannot help, a plan can.
   quota_exceeded: { message: QUOTA_EXCEEDED_COPY, action: 'view_plans' },
@@ -119,6 +130,44 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   },
   two_factor_invalid: {
     message: 'That verification code is invalid or has expired. Please try again.',
+    action: null,
+  },
+  // MR-179 (owner 2026-11-13): the deletion step-up. Same words as the server's
+  // own refusals (birdo-web deletion-step-up.ts), minus the "update the app"
+  // hint an app that cannot ask would need.
+  account_number_required: {
+    message: 'Enter your 24-digit account number to delete your account.',
+    action: null,
+  },
+  account_number_invalid: {
+    message: 'That account number is not the number of this account.',
+    action: null,
+  },
+  email_code_required: {
+    message: 'Enter the code we emailed you to delete your account.',
+    action: null,
+  },
+  // An Apple account with no e-mail address re-signs in with Apple, which only
+  // the iOS app can do; the website refuses it too, so say where to go.
+  apple_reauth_required: {
+    message:
+      'This account signs in with Apple. To delete it, open the BirdoVPN app on your iPhone or iPad and delete it there.',
+    action: null,
+  },
+  email_code_invalid: {
+    message: 'That code is not valid or has expired. Request a new code.',
+    action: null,
+  },
+  // MR-2335: the 24-hour deletion hold. `hold_unavailable` shows the server's
+  // own sentence when it sent one (see `errorCopy`): it says whether the hold
+  // is switched off, not tied to this session, or already waiting.
+  hold_unavailable: { message: HOLD_UNAVAILABLE_COPY, action: null },
+  step_up_no_factor: {
+    message: 'We cannot verify this account for an in-app deletion. Please contact support to delete it.',
+    action: null,
+  },
+  step_up_unavailable: {
+    message: "We couldn't check this request just now. Nothing was deleted. Please try again in a minute.",
     action: null,
   },
   // Kept apart from every connectivity message on purpose: a pin failure can
@@ -162,6 +211,7 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   // these are the fallbacks for an answer that carried none.
   account_restricted: { message: ACCOUNT_RESTRICTED_COPY, action: null },
   registration_not_allowed: { message: REGISTRATION_NOT_ALLOWED_COPY, action: null },
+  email_not_verified: { message: EMAIL_NOT_VERIFIED_COPY, action: null },
   unknown: { message: 'Something went wrong. Please try again.', action: 'retry' },
 };
 
@@ -197,10 +247,13 @@ export function errorCopy(error: IpcError, context: ErrorContext = 'general'): E
       action: null,
     };
   }
-  // The server's own sentence says why, and for these two nothing else does.
+  // The server's own sentence says why, and for these nothing else does.
   // Keyed on the code, never on the wording; the sentence is shown, not read.
   if (error.code === 'registration_not_allowed') {
     return { message: error.message.trim() || REGISTRATION_NOT_ALLOWED_COPY, action: null };
+  }
+  if (error.code === 'hold_unavailable') {
+    return { message: error.message.trim() || HOLD_UNAVAILABLE_COPY, action: null };
   }
   if (error.code === 'account_restricted') {
     const until = untilText(error.restriction?.until);
@@ -260,7 +313,7 @@ export function errorText(e: unknown, context: ErrorContext = 'general'): string
 export type GiveUpKind = 'revoked' | 'never_established' | 'died_after_handshake' | 'killswitch_failed';
 
 export function giveUpKind(error: IpcError | null | undefined): GiveUpKind {
-  if (error?.code === 'revoked') return 'revoked';
+  if (error?.code === 'revoked' || error?.code === 'evicted') return 'revoked';
   if (error?.code === 'server_unreachable') return 'never_established';
   if (error?.code === 'killswitch_failed') return 'killswitch_failed';
   return 'died_after_handshake';

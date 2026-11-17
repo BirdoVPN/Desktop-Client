@@ -4,18 +4,45 @@
 
 use reqwest::{Client, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
 use std::time::Duration;
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
 use super::endpoints;
-use super::error::ApiError;
+use super::error::{ApiError, StepUpKind};
 use super::types::*;
 
 // H-1: erased_serde is used for the generic retry interceptor
 // that needs to pass serializable bodies through a trait object.
 use erased_serde;
+
+/// The BirdoShield FLEET gate as the last successful `GET /api/client-config`
+/// reported it: on only for `dnsFilteringAvailable == Some(true)` (owner
+/// 2026-11-13: the row is hidden, and the connect flag is not sent, while the
+/// gate is off or not known). A success that says `false`, or omits the field,
+/// turns it off; a failed fetch leaves the last answer. Starts off; in memory
+/// only, like the UI's copy.
+static DNS_FILTERING_GATE_ON: AtomicBool = AtomicBool::new(false);
+
+/// Whether the last successful config fetch reported the fleet gate on.
+pub(crate) fn dns_filtering_gate_on() -> bool {
+    DNS_FILTERING_GATE_ON.load(Ordering::Relaxed)
+}
+
+/// Record a successful fetch's gate: on only for an explicit `true`.
+pub(crate) fn note_dns_filtering_gate(available: Option<bool>) {
+    DNS_FILTERING_GATE_ON.store(available == Some(true), Ordering::Relaxed);
+}
+
+/// The wire rule for `dnsFiltering`: the preference (after the Custom DNS
+/// rule, `effective_dns_filtering`) counts only while the fleet gate is on.
+/// Pure; the dial sites pass [`dns_filtering_gate_on`].
+pub(crate) fn dns_filtering_with_gate(preference: bool, gate_on: bool) -> bool {
+    preference && gate_on
+}
 
 /// Production API URL
 /// This should match the CSP in tauri.conf.json: connect-src https://*.birdo.app
@@ -91,6 +118,11 @@ pub(crate) const DESKTOP_CLIENT_HEADER: &str = "birdo-desktop";
 pub(crate) enum GdprDeleteOutcome {
     /// 2xx — the account is gone.
     Deleted(DeleteAccountResponse),
+    /// MR-2335: 202 `change_pending` (or a 2xx that says `pending`), and a 409
+    /// `change_already_pending` that names its hold. NOT a deletion: the
+    /// account and its sign-in stay until the hold applies, and it can still be
+    /// cancelled. Nothing local may be cleared for it.
+    Held(DeletionHold),
     /// 401 from the JWT guard — refresh the access token and retry once.
     SessionExpired,
     /// Anything else, carrying the error to show (the password check's 401
@@ -624,11 +656,16 @@ impl BirdoApi {
         &self,
         password: &str,
         two_factor_code: Option<&str>,
+        account_number: Option<&str>,
+        email_code: Option<&str>,
         around_the_tunnel: Option<std::net::IpAddr>,
     ) -> Result<DeleteAccountResponse, ApiError> {
         let body = DeleteAccountBody {
             password,
             two_factor_code,
+            account_number,
+            email_code,
+            step_up_method: None,
         };
         let token_before = self.access_token_value().await;
         let outcome = match self.send_gdpr_delete(&body, around_the_tunnel).await? {
@@ -647,13 +684,133 @@ impl BirdoApi {
             }
             other => other,
         };
+        self.finish_gdpr_delete(outcome).await
+    }
+
+    /// What `delete_account` does with its classified answer. The tokens are
+    /// cleared for a confirmed deletion and for nothing else.
+    pub(crate) async fn finish_gdpr_delete(
+        &self,
+        outcome: GdprDeleteOutcome,
+    ) -> Result<DeleteAccountResponse, ApiError> {
         match outcome {
             GdprDeleteOutcome::Deleted(response) => {
                 self.clear_tokens().await;
                 Ok(response)
             }
+            // MR-2335: never sent without `stepUpMethod: "hold"`, but a held
+            // deletion is not a deletion whatever asked for it: the account and
+            // this sign-in stay, so nothing is cleared.
+            GdprDeleteOutcome::Held(_) => Err(ApiError::Parse(
+                "the server put the deletion on hold instead of deleting the account".into(),
+            )),
             GdprDeleteOutcome::Refused(error) => Err(error),
             GdprDeleteOutcome::SessionExpired => Err(ApiError::Unauthorized),
+        }
+    }
+
+    /// MR-2335 (MR-179 hold fallback, birdo-web #883): ask the server to delete
+    /// the account in 24 hours instead of now, for a user who cannot present
+    /// the account number or the e-mailed code. `DELETE /api/v1/gdpr/delete`
+    /// with `stepUpMethod: "hold"`; the password and the 2FA code are still
+    /// checked, as the preflight says.
+    ///
+    /// NEVER a deletion and never a sign-out: a 202 `change_pending` and a 409
+    /// `change_already_pending` both come back as the hold, and NO token is
+    /// cleared on any answer. The hold is tied to this app's session (the
+    /// server drops it on sign-out), so the session must outlive the request.
+    /// No path around the tunnel either: a hold removes no peer, so the answer
+    /// comes back through it.
+    ///
+    /// Same two 401s as `delete_account`: the guard's bare "Unauthorized"
+    /// refreshes and retries once, the password check's sentence is the answer.
+    pub async fn request_deletion_hold(
+        &self,
+        password: &str,
+        two_factor_code: Option<&str>,
+    ) -> Result<DeletionHold, ApiError> {
+        let body = DeleteAccountBody {
+            password,
+            two_factor_code,
+            account_number: None,
+            email_code: None,
+            step_up_method: Some("hold"),
+        };
+        let token_before = self.access_token_value().await;
+        let outcome = match self.send_gdpr_delete(&body, None).await? {
+            GdprDeleteOutcome::SessionExpired => {
+                {
+                    let lock = Arc::clone(&self.refresh_lock).lock_owned().await;
+                    if self.access_token_value().await == token_before {
+                        self.refresh_detached(lock)
+                            .await
+                            .map_err(super::session_gate::error_after_failed_refresh)?;
+                    }
+                }
+                self.send_gdpr_delete(&body, None).await?
+            }
+            other => other,
+        };
+        self.finish_deletion_hold(outcome).await
+    }
+
+    /// What `request_deletion_hold` does with its classified answer: it reads
+    /// it ([`Self::deletion_hold_from`]) and leaves the session alone, on every
+    /// answer. A method on the client, holding the session, so a test can drive
+    /// a signed-in client through it and see that nothing was cleared.
+    pub(crate) async fn finish_deletion_hold(
+        &self,
+        outcome: GdprDeleteOutcome,
+    ) -> Result<DeletionHold, ApiError> {
+        Self::deletion_hold_from(outcome)
+    }
+
+    /// What a hold request's classified answer is for the caller. Only a 202
+    /// is a hold. A `Deleted` here (any other 2xx) is unexpected for a hold
+    /// request: nothing is assumed deleted, nothing is wiped, and it is not
+    /// shown as a hold the user could cancel. The session stays; if the
+    /// account really is gone, the next request says so the ordinary way
+    /// (session expired).
+    pub(crate) fn deletion_hold_from(outcome: GdprDeleteOutcome) -> Result<DeletionHold, ApiError> {
+        match outcome {
+            GdprDeleteOutcome::Held(hold) => Ok(hold),
+            GdprDeleteOutcome::Deleted(_) => Err(ApiError::Parse(
+                "an unexpected answer to the hold request; nothing is assumed deleted".into(),
+            )),
+            GdprDeleteOutcome::Refused(error) => Err(error),
+            GdprDeleteOutcome::SessionExpired => Err(ApiError::Unauthorized),
+        }
+    }
+
+    /// MR-2335: `GET /auth/pending-changes`, every sensitive change waiting out
+    /// its 24 hours (a held deletion is `action: "account_delete"`). Rows are
+    /// read leniently (`types::pending_changes_from`); a body without the list
+    /// is unreadable.
+    pub async fn list_pending_changes(&self) -> Result<Vec<PendingChange>, ApiError> {
+        let value: serde_json::Value = self.get(endpoints::auth::PENDING_CHANGES, true).await?;
+        pending_changes_from(&value)
+            .ok_or_else(|| ApiError::Parse("pendingChanges is not a list".into()))
+    }
+
+    /// MR-2335: `POST /auth/pending-changes/:id/cancel`. `Ok(true)`: cancelled
+    /// now; `Ok(false)`: 404 `pending_change_not_found`, it is gone already
+    /// (applied, cancelled elsewhere, or dropped by the server on a sign-out or
+    /// a credential change). An id that could not be one is never sent.
+    pub async fn cancel_pending_change(&self, id: &str) -> Result<bool, ApiError> {
+        if !pending_change_id_ok(id) {
+            return Err(ApiError::Unknown("not a pending change id".into()));
+        }
+        match self
+            .post::<_, serde_json::Value>(
+                &endpoints::pending_change_cancel(id),
+                &EmptyBody {},
+                true,
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(ApiError::PendingChangeNotFound) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -734,7 +891,10 @@ impl BirdoApi {
         // a retry is never held back here, only told how long to wait.
         let retry_after = retry_after_of(&response);
         let text = response.text().await.unwrap_or_default();
-        let outcome = Self::classify_gdpr_delete_response_after(status, &text, retry_after);
+        let mut outcome = Self::classify_gdpr_delete_response_after(status, &text, retry_after);
+        if body.step_up_method.is_some() {
+            outcome = Self::hold_refusal_keeps_its_sentence(outcome, &text);
+        }
         // Same one-way latch every control-plane response gets (handle_response_from).
         if let GdprDeleteOutcome::Refused(ApiError::UpgradeRequired(info)) = &outcome {
             super::upgrade_gate::latch_from(
@@ -769,9 +929,50 @@ impl BirdoApi {
         body: &str,
         retry_after: Option<u64>,
     ) -> GdprDeleteOutcome {
+        // MR-2335: a 202 put the deletion on hold. It is checked BEFORE the
+        // 2xx rule below, which reads any body as a deletion: a hold read that
+        // way signed the user out of an account that still exists. A hold body
+        // that cannot be read is an error, never a deletion and never a hold.
+        if status == StatusCode::ACCEPTED {
+            return match DeletionHold::from_body(body, false) {
+                Some(hold) => GdprDeleteOutcome::Held(hold),
+                None => GdprDeleteOutcome::Refused(ApiError::Parse(
+                    "a deletion hold the client could not read".into(),
+                )),
+            };
+        }
+        // Any OTHER 2xx that says `pending` / `change_pending` is not the
+        // contract's answer to anything: unexpected, and nothing is assumed.
+        // Not a deletion (no wipe), and not a hold either (only a 202 is).
+        if status.is_success() && deletion_body_says_pending(body) {
+            return GdprDeleteOutcome::Refused(ApiError::Parse(
+                "an unexpected answer to the deletion; nothing is assumed deleted".into(),
+            ));
+        }
         if status.is_success() {
             let parsed = serde_json::from_str::<DeleteAccountResponse>(body).unwrap_or_default();
             return GdprDeleteOutcome::Deleted(parsed);
+        }
+        // MR-2335: 409 `change_already_pending`: a deletion is on hold already.
+        // Its `stepUp` is an OBJECT (every refusal's is the factor array, and
+        // none is read); see `DeletionHold` for where it can arrive.
+        if status == StatusCode::CONFLICT
+            && serde_json::from_str::<ApiErrorBody>(body)
+                .ok()
+                .and_then(|b| b.error)
+                .as_deref()
+                == Some("change_already_pending")
+        {
+            return match DeletionHold::from_body(body, true) {
+                Some(hold) => GdprDeleteOutcome::Held(hold),
+                None => GdprDeleteOutcome::Refused(ApiError::DeletionAlreadyOnHold(
+                    serde_json::from_str::<ApiErrorBody>(body)
+                        .ok()
+                        .and_then(|b| b.message)
+                        .map(|m| m.trim().to_string())
+                        .unwrap_or_default(),
+                )),
+            };
         }
         if status == StatusCode::UNAUTHORIZED {
             let message = serde_json::from_str::<ApiErrorBody>(body)
@@ -796,6 +997,37 @@ impl BirdoApi {
         ))
     }
 
+    /// MR-2335: a hold request's 429 keeps the server's sentence. Its `error`
+    /// is `too_many_attempts` both for the daily cap on holds ("try again
+    /// tomorrow") and for the 2FA lockout ("wait 15 minutes"), so only the
+    /// sentence says how long to wait, and the generic "wait a moment" would
+    /// send the user back too soon. It stays a rate limit by status
+    /// (`IpcError::from_rejection`); the server sends no `Retry-After` here.
+    pub(crate) fn hold_refusal_keeps_its_sentence(
+        outcome: GdprDeleteOutcome,
+        body: &str,
+    ) -> GdprDeleteOutcome {
+        match outcome {
+            GdprDeleteOutcome::Refused(ApiError::RateLimited {
+                retry_after_secs: None,
+            }) => match serde_json::from_str::<ApiErrorBody>(body)
+                .ok()
+                .and_then(|b| b.message)
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty())
+            {
+                Some(message) => GdprDeleteOutcome::Refused(ApiError::Rejected {
+                    status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                    message,
+                }),
+                None => GdprDeleteOutcome::Refused(ApiError::RateLimited {
+                    retry_after_secs: None,
+                }),
+            },
+            other => other,
+        }
+    }
+
     /// GDPR: Export all user data (Right to Data Portability, Art. 20)
     pub async fn export_user_data(&self) -> Result<serde_json::Value, ApiError> {
         self.get(endpoints::auth::GDPR_EXPORT, true).await
@@ -805,6 +1037,20 @@ impl BirdoApi {
     /// Read-only; the ordinary GET path with the usual refresh-and-retry.
     pub async fn deletion_preflight(&self) -> Result<DeletionPreflightResponse, ApiError> {
         self.get(endpoints::auth::GDPR_DELETE_PREFLIGHT, true).await
+    }
+
+    /// MR-179: e-mail the one-time deletion code to an SSO account (no
+    /// password, no 2FA). The ordinary bearer POST with the usual
+    /// refresh-and-retry; no body. 400 `email_code_not_used`, 429
+    /// `too_many_attempts` past 3 an hour and 503 `email_code_not_sent` map
+    /// like any other refusal.
+    pub async fn send_deletion_code(&self) -> Result<DeletionCodeResponse, ApiError> {
+        self.post(
+            endpoints::auth::GDPR_DELETE_CODE,
+            &serde_json::json!({}),
+            true,
+        )
+        .await
     }
 
     /// MR-1707: step 1 of replacing an anonymous account number. Changes
@@ -1133,8 +1379,11 @@ impl BirdoApi {
             .send()
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
-        self.handle_response_from(response, super::upgrade_gate::Origin::Web)
-            .await
+        let config: ClientConfigResponse = self
+            .handle_response_from(response, super::upgrade_gate::Origin::Web)
+            .await?;
+        note_dns_filtering_gate(config.dns_filtering_available);
+        Ok(config)
     }
 
     /// Get per-user monthly bandwidth usage + cap for the data-usage meter.
@@ -1766,9 +2015,32 @@ impl BirdoApi {
         {
             return ApiError::RegistrationNotAllowed(message().trim().to_string());
         }
+        if status == StatusCode::FORBIDDEN
+            && body
+                .as_ref()
+                .and_then(|b| b.details.as_ref())
+                .and_then(|d| d.get("code"))
+                .and_then(|c| c.as_str())
+                == Some("email_not_verified")
+        {
+            return ApiError::EmailNotVerified;
+        }
         match body.as_ref().and_then(|b| b.error.as_deref()) {
             Some("two_factor_required") => return ApiError::TwoFactorRequired(message()),
             Some("two_factor_invalid") => return ApiError::TwoFactorInvalid(message()),
+            // MR-2335: cancelling a pending change that is gone already.
+            Some("pending_change_not_found") if status == StatusCode::NOT_FOUND => {
+                return ApiError::PendingChangeNotFound;
+            }
+            // MR-179: the deletion step-up refusals (birdo-web
+            // deletion-step-up.ts), by `error`, never by the sentence. A 429
+            // `too_many_attempts` is not one of these: it stays a rate limit.
+            Some(code) if StepUpKind::from_code(code).is_some() => {
+                return ApiError::StepUp {
+                    kind: StepUpKind::from_code(code).expect("checked above"),
+                    message: message(),
+                };
+            }
             // MR-1707: the anonymous-number replacement's own refusals. The
             // two 409s share a status, and a bare 403 would read as a plan
             // refusal.
@@ -2180,6 +2452,7 @@ mod token_restore_tests {
         for signature in [
             "async fn request_with_retry<",
             "pub async fn delete_account(",
+            "pub async fn request_deletion_hold(",
         ] {
             let body = fn_body(signature);
             assert!(
@@ -2295,6 +2568,7 @@ mod token_restore_tests {
         for signature in [
             "async fn request_with_retry<",
             "pub async fn delete_account(",
+            "pub async fn request_deletion_hold(",
         ] {
             let body = fn_body(signature);
             assert!(

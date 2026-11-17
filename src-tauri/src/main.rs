@@ -215,6 +215,10 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::auth::verify_2fa,     // FIX C-2: 2FA TOTP verification
         commands::auth::delete_account, // GDPR account deletion
         commands::auth::deletion_preflight, // what a deletion leaves billing
+        commands::auth::send_deletion_code, // MR-179: e-mail the deletion code (SSO)
+        commands::auth::request_deletion_hold, // MR-2335: delete in 24 h (cancellable)
+        commands::auth::list_pending_changes, // MR-2335: the held deletion, for Profile
+        commands::auth::cancel_pending_change, // MR-2335: cancel a held change
         commands::auth::export_user_data, // GDPR data export
         commands::session::end_expired_session, // a command answered session_expired
         // VPN operations
@@ -249,6 +253,9 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::updater::install_update,
         commands::updater::get_required_update,
         commands::update_resume::take_update_resume, // MR-1861: the session an update ended
+        // A-M50: Linux new-version notice (no updater endpoint, no apt repo)
+        commands::linux_release::check_linux_release,
+        commands::linux_release::open_linux_release_page,
         // Settings › About › Licences (MR-1685)
         commands::licences::get_third_party_notices,
         // Extended VPN info
@@ -602,6 +609,13 @@ fn main() {
             // an installer that is still in use).
             #[cfg(windows)]
             crate::utils::protected_dir::remove_updates_at_start();
+
+            // MR-703 / MR-1742: no ML-KEM key is stored any more (one keypair
+            // per connect, in memory). Delete the file an older build left,
+            // once per start; the first start after the upgrade finds it.
+            // Off the setup path: it is only a few file deletions, but setup
+            // must not wait on a slow disk.
+            std::thread::spawn(crate::vpn::birdo_pq::purge_legacy_keypair_files);
 
             // R1 / D6c LOW: consume the legacy-upgrade marker now — the PRIMARY
             // instance (only it reaches setup; the single-instance plugin turns
