@@ -11,6 +11,11 @@
  *  - when the server ended the session, an `error` status whose code is
  *    `revoked`, `evicted` (MR-2333) or `quota_exceeded` (`end_by_server` →
  *    `give_up`, no `gaveUp`);
+ *  - when server housekeeping reaped the key (`reaped`; `Rebuild`, MR-2369),
+ *    a quiet re-dial: `reconnecting`, then `connected` again, up to
+ *    `QUIET_REBUILDS_PER_EPISODE` (one) time per episode, after which the
+ *    next reap ends the session like the rows above. A drained server's
+ *    `server_offline` is not rebuilt: it ends at once;
  *  - otherwise nothing (`Fine`, and `ServerGoingOffline`, which only logs).
  *
  * This file pins the other half, per reason: that outcome, as Rust emits it,
@@ -24,6 +29,13 @@
  * The OUTCOMES below mirror `heartbeat_cases`' `live` column; keep the two in
  * step. The teardown probe's column (`after_teardown`) re-dials or ends with
  * the same codes, so it reaches the UI as one of these same outcomes.
+ *
+ * UI-level only: this file emits what each row DECLARES and checks what the
+ * controller makes of it. It does not run Rust; that a `reaped` reply really
+ * rebuilds once and then ends is pinned in Rust (`heartbeat_cases`, and
+ * `auto_reconnect`'s `a_reaped_reply_is_rebuilt_once_then_ended`, which
+ * drives the loop with the real reply). Only the cap's value is read from
+ * the Rust source here.
  *
  * Run: npx vitest run src/__tests__/HeartbeatOutcomes.test.tsx
  */
@@ -101,6 +113,14 @@ function ipcCodeWire(variant: EndCode): string {
   return snake(variant);
 }
 
+/** `reconnect_policy::QUIET_REBUILDS_PER_EPISODE` (MR-2369). */
+function quietRebuildsPerEpisode(): number {
+  const src = rustSource('src/vpn/reconnect_policy.rs');
+  const n = /pub const QUIET_REBUILDS_PER_EPISODE: u32 = (\d+);/.exec(src)?.[1];
+  if (n === undefined) throw new Error('reconnect_policy.rs: QUIET_REBUILDS_PER_EPISODE not found');
+  return Number(n);
+}
+
 /** `$defs/HeartbeatReason.enum` of the vendored contract. */
 function contractReasons(): string[] {
   const schema = JSON.parse(rustSource('contract/vpn-protocol.schema.json')) as {
@@ -119,10 +139,14 @@ const RUST_QUOTA_EXCEEDED = "You've used this month's free data allowance. Upgra
 // reconnect_policy::EVICTED_MESSAGE (MR-2333): never the reply's not-found sentence.
 const RUST_EVICTED = 'Another device on your account took over this connection.';
 
+type Ending = { kind: 'end'; code: EndCode; message: string };
+
 type Outcome =
   | { kind: 'nothing' }
   | { kind: 'grace'; secondsRemaining: number }
-  | { kind: 'end'; code: EndCode; message: string };
+  | Ending
+  /** Quiet re-dials up to the cap, then `then` (MR-2369). */
+  | { kind: 'rebuild'; then: Ending };
 
 interface ReasonCase {
   reason: string;
@@ -133,9 +157,11 @@ interface ReasonCase {
 
 const nothing: Outcome = { kind: 'nothing' };
 const grace = (secondsRemaining: number): Outcome => ({ kind: 'grace', secondsRemaining });
-const revoked = (message: string): Outcome => ({ kind: 'end', code: 'Revoked', message });
-const quotaEnded: Outcome = { kind: 'end', code: 'QuotaExceeded', message: RUST_QUOTA_EXCEEDED };
-const evicted: Outcome = { kind: 'end', code: 'Evicted', message: RUST_EVICTED };
+const revoked = (message: string): Ending => ({ kind: 'end', code: 'Revoked', message });
+const quotaEnded: Ending = { kind: 'end', code: 'QuotaExceeded', message: RUST_QUOTA_EXCEEDED };
+const evicted: Ending = { kind: 'end', code: 'Evicted', message: RUST_EVICTED };
+// MR-2369: before it, the `reaped` row was `revoked(HB_NOT_FOUND)` at once.
+const rebuilt = (then: Ending): Outcome => ({ kind: 'rebuild', then });
 
 const CASES: ReasonCase[] = [
   { reason: 'ok', shape: 'live', outcome: nothing },
@@ -146,7 +172,7 @@ const CASES: ReasonCase[] = [
   { reason: 'revoked', shape: 'a deactivated row', outcome: revoked(HB_REVOKED) },
   { reason: 'revoked', shape: 'a removal record', outcome: revoked(HB_NOT_FOUND) },
   { reason: 'evicted', shape: 'a removal record', outcome: evicted },
-  { reason: 'reaped', shape: 'a removal record', outcome: revoked(HB_NOT_FOUND) },
+  { reason: 'reaped', shape: 'a removal record', outcome: rebuilt(revoked(HB_NOT_FOUND)) },
   { reason: 'quota_exceeded', shape: 'ended at this check-in', outcome: quotaEnded },
   { reason: 'quota_exceeded', shape: 'a removal record', outcome: quotaEnded },
   { reason: 'not_found', shape: 'no record of why', outcome: revoked(HB_NOT_FOUND) },
@@ -204,18 +230,63 @@ async function connected() {
 }
 
 /** Emit what Rust emits for `outcome`, the names taken from the Rust source. */
-function rustEmits(outcome: Outcome) {
+function rustEmits(outcome: Outcome, seq = 3) {
   if (outcome.kind === 'grace') {
     const { event, secondsKey } = quotaWarningWire();
     emit(event, { [secondsKey]: outcome.secondsRemaining });
   } else if (outcome.kind === 'end') {
     emit('vpn-status-changed', {
       state: 'error',
-      seq: 3,
+      seq,
       kill_switch_blocking: false,
       error: { code: ipcCodeWire(outcome.code), message: outcome.message, retryable: false, retry_after_secs: null },
     });
   }
+}
+
+/**
+ * One quiet rebuild as Rust publishes it (MR-2369): the teardown's
+ * `Reconnecting` (attempt 1, the block up, no error), then the re-dialled
+ * session `connected`. Returns the next free seq.
+ */
+function rustRebuilds(seq: number): number {
+  emit('vpn-status-changed', {
+    state: 'reconnecting',
+    seq,
+    kill_switch_blocking: true,
+    reconnect_attempt: 1,
+    reconnect_max: 10,
+    error: null,
+  });
+  emit('vpn-status-changed', { state: 'connected', seq: seq + 1, kill_switch_blocking: false, error: null });
+  return seq + 2;
+}
+
+/**
+ * The server ended it: an error by code (not a give-up), worded by code,
+ * offered the decided way on, and never re-dialled from here.
+ */
+async function expectEnded(o: Ending) {
+  const s = useAppStore.getState();
+  const ui = END_UI[o.code];
+  expect(s.connectionState).toBe('error');
+  expect(s.vpnError?.code).toBe(ipcCodeWire(o.code));
+  expect(s.giveUp).toBeNull();
+  expect(vpnErrorCopy(s.vpnError!, s.killSwitchBlocking)).toEqual(ui);
+  await waitFor(() =>
+    expect(sendNotification).toHaveBeenCalledWith({
+      title: 'BirdoVPN — Connection error',
+      body: ui.message,
+    }),
+  );
+  expect(callsTo('connect_vpn')).toHaveLength(0);
+  expect(callsTo('connect_multi_hop')).toHaveLength(0);
+}
+
+function outcomeLabel(o: Outcome): string {
+  if (o.kind === 'end') return o.code;
+  if (o.kind === 'rebuild') return `quiet rebuilds, then ${o.then.code}`;
+  return o.kind;
 }
 
 // ── The tests ───────────────────────────────────────────────────────────────
@@ -234,8 +305,14 @@ describe('heartbeat reasons: what the UI does (MR-1638)', () => {
     expect(ipcCodeWire('QuotaExceeded')).toBe('quota_exceeded');
   });
 
+  it('the quiet-rebuild cap is the one Rust decides with (MR-2369)', () => {
+    const cap = quietRebuildsPerEpisode();
+    expect(Number.isInteger(cap)).toBe(true);
+    expect(cap).toBeGreaterThan(0);
+  });
+
   for (const c of CASES) {
-    it(`${c.reason} (${c.shape}): ${c.outcome.kind === 'end' ? c.outcome.code : c.outcome.kind}`, async () => {
+    it(`${c.reason} (${c.shape}): ${outcomeLabel(c.outcome)}`, async () => {
       const o = c.outcome;
       await connected();
       rustEmits(o);
@@ -265,22 +342,29 @@ describe('heartbeat reasons: what the UI does (MR-1638)', () => {
           break;
         }
 
-        case 'end': {
-          // The server ended it: an error by code (not a give-up), worded by
-          // code, offered the decided way on, and never re-dialled from here.
-          const ui = END_UI[o.code];
-          expect(s.connectionState).toBe('error');
-          expect(s.vpnError?.code).toBe(ipcCodeWire(o.code));
-          expect(s.giveUp).toBeNull();
-          expect(vpnErrorCopy(s.vpnError!, s.killSwitchBlocking)).toEqual(ui);
-          await waitFor(() =>
-            expect(sendNotification).toHaveBeenCalledWith({
-              title: 'BirdoVPN — Connection error',
-              body: ui.message,
-            }),
-          );
+        case 'end':
+          await expectEnded(o);
+          break;
+
+        case 'rebuild': {
+          // MR-2369: Rust re-dials by itself, and each quiet rebuild reads as
+          // any re-dial does: Reconnecting, then Connected again. No error, no
+          // give-up, nothing dialled or disconnected from here.
+          const cap = quietRebuildsPerEpisode();
+          let seq = 3;
+          for (let i = 1; i <= cap; i++) {
+            seq = rustRebuilds(seq);
+            const now = useAppStore.getState();
+            expect(now.connectionState, `rebuild ${i}`).toBe('connected');
+            expect(now.vpnError).toBeNull();
+            expect(now.giveUp).toBeNull();
+          }
           expect(callsTo('connect_vpn')).toHaveLength(0);
           expect(callsTo('connect_multi_hop')).toHaveLength(0);
+          expect(callsTo('disconnect_vpn')).toHaveLength(0);
+          // The episode's rebuilds are spent: the next release ends it.
+          rustEmits(o.then, seq);
+          await expectEnded(o.then);
           break;
         }
       }
