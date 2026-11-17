@@ -37,7 +37,7 @@ use super::manager::{
 use super::network_events::{self, PhysicalRoute};
 use super::reconnect_policy::{
     self, Action, Budget, DropCause, HeartbeatVerdict, LinkState, Liveness, LocalLink, Observed,
-    ReconnectPolicy, Tick,
+    OnRelease, QuietRebuilds, ReconnectPolicy, Tick,
 };
 use super::xray::XrayManager;
 use crate::api::attestation::DesktopAttestation;
@@ -328,6 +328,26 @@ impl QuotaNotice {
     }
 }
 
+/// The session's quiet-rebuild cap (MR-2369, `reconnect_policy::QuietRebuilds`),
+/// shared with every loop of the session like [`QuotaNotice`]: a loop the
+/// watchdog restarts must not start the episode over, or a rebuild that
+/// wedges the loop could re-dial for ever. A new session on record starts it
+/// whole, and so does the session's end; within a session only
+/// `QUIET_REBUILD_EPISODE_RESET` of health does.
+#[derive(Clone, Default)]
+struct QuietRebuildCap(Arc<std::sync::Mutex<QuietRebuilds>>);
+
+impl QuietRebuildCap {
+    /// Never held across an await.
+    fn with<R>(&self, f: impl FnOnce(&mut QuietRebuilds) -> R) -> R {
+        f(&mut self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn reset(&self) {
+        self.with(|cap| *cap = QuietRebuilds::default());
+    }
+}
+
 /// Auto-reconnect service
 #[derive(Clone)]
 pub struct AutoReconnectService {
@@ -359,6 +379,9 @@ pub struct AutoReconnectService {
 
     /// Shared with every loop of the session.
     quota_notice: QuotaNotice,
+
+    /// Shared with every loop of the session (MR-2369).
+    quiet_rebuilds: QuietRebuildCap,
 
     /// The running loop's last check-in, read by the watchdog.
     pulse: Pulse,
@@ -513,6 +536,7 @@ impl AutoReconnectService {
             task: Arc::new(TokioMutex::new(None)),
             live_loops: Arc::new(AtomicUsize::new(0)),
             quota_notice: QuotaNotice::default(),
+            quiet_rebuilds: QuietRebuildCap::default(),
             pulse: Pulse::default(),
             watchdog: Arc::new(AtomicBool::new(false)),
             restarts: Arc::new(AtomicUsize::new(0)),
@@ -536,6 +560,10 @@ impl AutoReconnectService {
         // (a Disconnect had stopped `update_resume` from recording). Before
         // the write, so a Disconnect racing it still wins.
         crate::commands::update_resume::session_started();
+        // MR-2369: a connect (the user's, the tray's, auto-connect, a
+        // settings reapply, an update's resume) starts a new episode. The
+        // reconnect loop's own re-dials never come through here.
+        self.quiet_rebuilds.reset();
         *self.last_reconnect_info.write().await = Some(info);
     }
 
@@ -571,6 +599,7 @@ impl AutoReconnectService {
         *self.last_reconnect_info.write().await = None;
         *self.connected_settings.write().await = None;
         self.quota_notice.reset();
+        self.quiet_rebuilds.reset();
     }
 
     /// Start the health check monitoring loop. Idempotent.
@@ -625,6 +654,7 @@ impl AutoReconnectService {
             policy: ReconnectPolicy::new(cfg.budget()),
             session: SessionWatch::default(),
             quota_notice: self.quota_notice.clone(),
+            quiet_rebuilds: self.quiet_rebuilds.clone(),
             alive: None,
             pulse: self.pulse.clone(),
             generation,
@@ -778,6 +808,11 @@ struct SessionWatch {
     /// The send-path rule's one rebuild per episode (interface loss).
     #[cfg(target_os = "windows")]
     send_repair: reconnect_policy::SendPathRepair,
+    /// MR-2369: a live check-in said the server released this key (`reaped`,
+    /// a drained `server_offline`) and the cap allowed a quiet rebuild. The
+    /// next look declares the tunnel dead (`DropCause::ServerReleased`), and
+    /// the policy's teardown and re-dial rebuild it.
+    released: bool,
 }
 
 enum Wake {
@@ -805,6 +840,8 @@ struct ReconnectLoop {
     policy: ReconnectPolicy,
     session: SessionWatch,
     quota_notice: QuotaNotice,
+    /// The session's quiet-rebuild cap (MR-2369), shared with the service.
+    quiet_rebuilds: QuietRebuildCap,
     /// When the session was last known to be alive on the server — it
     /// connected, or a heartbeat answered for it — and the resume count then.
     /// Kept across teardowns: it is what reads the old key's answer
@@ -1078,6 +1115,8 @@ impl ReconnectLoop {
             self.check_liveness(&wake, route, now).await
         } else {
             self.session = SessionWatch::default();
+            // MR-2369: a session that is not up is not a healthy one.
+            self.quiet_rebuilds.with(QuietRebuilds::interrupted);
             Liveness::Healthy
         };
         let tick = Tick {
@@ -1115,6 +1154,11 @@ impl ReconnectLoop {
         // dead loopback port.
         if matches!(wake, Wake::TransportDied) {
             return Liveness::Dead(DropCause::TransportDied);
+        }
+        // MR-2369: the server released this key at the last check-in, and
+        // the cap allowed a quiet rebuild.
+        if std::mem::take(&mut session.released) {
+            return Liveness::Dead(DropCause::ServerReleased);
         }
         // At most one rebuild of the relay socket per look.
         #[cfg(target_os = "windows")]
@@ -1558,6 +1602,8 @@ impl ReconnectLoop {
             // outage, and the log must say why (live retest 2026-10-02).
             Ok(Err(e)) => {
                 tracing::warn!("Heartbeat failed: {}", heartbeat_failure(&e));
+                // MR-2369: not a healthy check-in.
+                self.quiet_rebuilds.with(QuietRebuilds::interrupted);
                 // An HTTP status crossed the tunnel to arrive; only a failure
                 // on the network itself says the tunnel may carry nothing,
                 // and one never sent says nothing either way.
@@ -1574,6 +1620,7 @@ impl ReconnectLoop {
                 // on Windows a run of these only asks the tunnel to prove
                 // itself (`reconnect_policy::heartbeat_reprove`).
                 tracing::warn!("Heartbeat unanswered after {:?}", HEARTBEAT_TIMEOUT);
+                self.quiet_rebuilds.with(QuietRebuilds::interrupted);
                 #[cfg(target_os = "windows")]
                 {
                     self.session.heartbeat_misses = self.session.heartbeat_misses.saturating_add(1);
@@ -1587,6 +1634,9 @@ impl ReconnectLoop {
         }
         if resp.valid {
             self.alive = Some((now, network_events::resume_count()));
+            // MR-2369: a healthy check-in; ten minutes of them in a row give
+            // the episode's quiet rebuilds back.
+            self.quiet_rebuilds.with(|cap| cap.healthy(now));
         }
         match reconnect_policy::heartbeat_verdict(&resp) {
             HeartbeatVerdict::End(error) => {
@@ -1603,6 +1653,35 @@ impl ReconnectLoop {
                 );
                 self.end_by_server(error).await
             }
+            HeartbeatVerdict::Rebuild { ending } => match self.on_release().await {
+                // MR-2369: the key was reaped, or went with a drained server.
+                // The contract allows a quiet rebuild: look again at once,
+                // declare the tunnel dead, and let the policy tear it down
+                // (behind the kill switch's block) and re-dial with a new
+                // key — the path the old-key probe's re-dial takes.
+                OnRelease::Rebuild => {
+                    tracing::warn!(
+                        "Heartbeat: the server released this session's key — rebuilding it \
+                         quietly ({} of {} this episode)",
+                        self.quiet_rebuilds.with(|cap| cap.spent()),
+                        reconnect_policy::QUIET_REBUILDS_PER_EPISODE
+                    );
+                    self.session.released = true;
+                    Flow::Again
+                }
+                // Released again with the episode's rebuilds spent: end the
+                // session as before MR-2369, never another re-dial.
+                OnRelease::End => {
+                    tracing::warn!(
+                        "Heartbeat: the server released this session's key again and its quiet \
+                         rebuilds are spent — ending the session ({:?})",
+                        ending.code
+                    );
+                    self.end_by_server(ending).await
+                }
+                // The user is ending the session: theirs to end.
+                OnRelease::StandDown => Flow::Stop,
+            },
             HeartbeatVerdict::QuotaGrace { seconds_remaining } => {
                 // Once per session: the heartbeat repeats every 30 s for the
                 // whole grace window, and a reconnect or a reapply inside it
@@ -1665,7 +1744,21 @@ impl ReconnectLoop {
         self.give_up(error, None).await;
         *self.last_reconnect_info.write().await = None;
         self.quota_notice.reset();
+        self.quiet_rebuilds.reset();
         Flow::Stop
+    }
+
+    /// MR-2369: the server released this session's key at a live check-in.
+    /// What the episode's cap allows (`reconnect_policy::QuietRebuilds`),
+    /// asked only while the user still wants the session: it is on record,
+    /// and this loop is not being stopped (Disconnect, sign-out and quit stop
+    /// it before they clear the record). Otherwise nothing is re-dialled and
+    /// nothing spent.
+    async fn on_release(&self) -> OnRelease {
+        let stopping = *self.shutdown.borrow();
+        let on_record = self.last_reconnect_info.read().await.is_some();
+        self.quiet_rebuilds
+            .with(|cap| cap.on_release(!stopping && on_record))
     }
 
     /// The API on connections of its own (bound to the physical address on
@@ -2719,6 +2812,7 @@ mod tests {
             policy: ReconnectPolicy::new(cfg.budget()),
             session: SessionWatch::default(),
             quota_notice: QuotaNotice::default(),
+            quiet_rebuilds: QuietRebuildCap::default(),
             alive: None,
             pulse: Pulse::default(),
             generation: 0,
@@ -2916,6 +3010,234 @@ mod tests {
         })
         .unwrap();
         assert_eq!(payload, serde_json::json!({ "secondsRemaining": 540 }));
+    }
+
+    fn session_on_record() -> ReconnectInfo {
+        ReconnectInfo {
+            server_id: "node-1".into(),
+            server_name: "Test node".into(),
+            local_network_sharing: false,
+            custom_mtu: 0,
+            custom_port: "auto".into(),
+            custom_dns: None,
+            stealth_mode: false,
+            quantum_protection: false,
+            dns_filtering: false,
+            fallback_reason: None,
+            multi_hop: None,
+        }
+    }
+
+    /// A loop over a Connected session, with no tunnel, firewall or network
+    /// behind it.
+    async fn released_loop(
+        info: Option<ReconnectInfo>,
+        shutdown: watch::Receiver<bool>,
+        cap: QuietRebuildCap,
+    ) -> ReconnectLoop {
+        let vm = Arc::new(VpnManager::new());
+        vm.set_state(ConnectionState::Connected).await.unwrap();
+        ReconnectLoop {
+            vpn_manager: vm,
+            last_reconnect_info: Arc::new(RwLock::new(info)),
+            api: Arc::new(BirdoApi::new()),
+            app: None,
+            shutdown,
+            network: network_events::subscribe(),
+            transport_exits: None,
+            policy: ReconnectPolicy::new(AutoReconnectConfig::default().budget()),
+            session: SessionWatch::default(),
+            quota_notice: QuotaNotice::default(),
+            quiet_rebuilds: cap,
+            alive: None,
+            pulse: Pulse::default(),
+            generation: 0,
+            step_allowance: Duration::from_secs(1),
+        }
+    }
+
+    /// MR-2369, driven: each release the cap allows marks the session, and
+    /// the next look declares the tunnel dead as `ServerReleased`, which the
+    /// policy tears down (behind the block) and re-dials at once
+    /// (`reconnect_policy::a_released_key_is_rebuilt_at_once_without_the_breaker`).
+    /// Exactly `QUIET_REBUILDS_PER_EPISODE` of them; the next release ends
+    /// the session, however many times it comes.
+    #[tokio::test]
+    async fn a_released_key_is_rebuilt_quietly_up_to_the_cap_then_ended() {
+        let (_tx, shutdown) = watch::channel(false);
+        let mut lp = released_loop(
+            Some(session_on_record()),
+            shutdown,
+            QuietRebuildCap::default(),
+        )
+        .await;
+        let now = Instant::now();
+        for n in 1..=reconnect_policy::QUIET_REBUILDS_PER_EPISODE {
+            assert_eq!(lp.on_release().await, OnRelease::Rebuild, "release {n}");
+            // What the `Rebuild` arm does (pinned in
+            // `a_release_goes_through_the_teardown_and_the_cap`).
+            lp.session.released = true;
+            assert_eq!(
+                lp.check_liveness(&Wake::Tick, None, now).await,
+                Liveness::Dead(DropCause::ServerReleased),
+                "release {n}"
+            );
+            assert!(!lp.session.released, "the mark is taken by the look");
+            // The rebuilt tunnel is a new session watch.
+            lp.session = SessionWatch::default();
+        }
+        for _ in 0..5 {
+            assert_eq!(lp.on_release().await, OnRelease::End);
+        }
+        assert_eq!(
+            lp.quiet_rebuilds.with(|cap| cap.spent()),
+            reconnect_policy::QUIET_REBUILDS_PER_EPISODE
+        );
+    }
+
+    /// MR-2369: a release that arrives while the user ends the session
+    /// re-dials nothing and spends nothing, however the user ends it: the
+    /// loop being stopped (Disconnect, sign-out and quit stop it first), or
+    /// the session no longer on record.
+    #[tokio::test]
+    async fn a_release_while_the_user_disconnects_is_never_rebuilt() {
+        let (tx, shutdown) = watch::channel(false);
+        let cap = QuietRebuildCap::default();
+        let lp = released_loop(Some(session_on_record()), shutdown, cap.clone()).await;
+        tx.send(true).unwrap();
+        assert_eq!(lp.on_release().await, OnRelease::StandDown);
+
+        let (_tx, shutdown) = watch::channel(false);
+        let lp = released_loop(None, shutdown, cap.clone()).await;
+        assert_eq!(lp.on_release().await, OnRelease::StandDown);
+        assert_eq!(cap.with(|cap| cap.spent()), 0, "nothing spent");
+    }
+
+    /// MR-2369: the cap belongs to the session, not to a loop: a loop the
+    /// watchdog (or anything else) restarts carries on with what the episode
+    /// spent. A new session on record starts it whole, and so does the end
+    /// of the session.
+    #[tokio::test]
+    async fn the_cap_outlives_a_loop_and_ends_with_the_session() {
+        let svc = service();
+        let spend = |svc: &AutoReconnectService| {
+            for _ in 0..reconnect_policy::QUIET_REBUILDS_PER_EPISODE {
+                let release = svc.quiet_rebuilds.with(|cap| cap.on_release(true));
+                assert_eq!(release, OnRelease::Rebuild);
+            }
+        };
+        let spent = |svc: &AutoReconnectService| svc.quiet_rebuilds.with(|cap| cap.spent());
+        spend(&svc);
+        svc.start().await.unwrap();
+        svc.stop().await;
+        svc.start().await.unwrap();
+        svc.stop().await;
+        assert_eq!(spent(&svc), reconnect_policy::QUIET_REBUILDS_PER_EPISODE);
+
+        svc.store_last_config(session_on_record()).await;
+        assert_eq!(spent(&svc), 0, "a new session");
+        spend(&svc);
+        svc.clear_last_config().await;
+        assert_eq!(spent(&svc), 0, "the session ended");
+    }
+
+    /// MR-2369, the wiring: a release goes through the same teardown and
+    /// re-dial as any dead tunnel — the block engaged first, a teardown it
+    /// cannot cover held (`a_dead_tunnel_is_held_when_the_kill_switch_cannot_block`)
+    /// — never a teardown of its own; past the cap it ends as `End` does;
+    /// `revoked`, `evicted` and `quota_exceeded` (`End`) never touch the
+    /// cap; and only a valid check-in counts as healthy.
+    #[test]
+    fn a_release_goes_through_the_teardown_and_the_cap() {
+        fn in_order(haystack: &str, needles: &[&str]) {
+            let mut last = 0;
+            for needle in needles {
+                let at = haystack[last..]
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+                last += at + needle.len();
+            }
+        }
+        let source = include_str!("auto_reconnect.rs").replace('\r', "");
+        let code = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+
+        let ended = &code[code.find("HeartbeatVerdict::End(error) => {").unwrap()..];
+        let ended = &ended[..ended.find("HeartbeatVerdict::Rebuild").unwrap()];
+        assert!(ended.contains("self.end_by_server(error).await"), "{ended}");
+        assert!(!ended.contains("quiet_rebuilds"), "{ended}");
+        assert!(!ended.contains("on_release"), "{ended}");
+
+        let arm = &code[code
+            .find("HeartbeatVerdict::Rebuild { ending } =>")
+            .unwrap()..];
+        let arm = &arm[..arm.find("HeartbeatVerdict::QuotaGrace").unwrap()];
+        in_order(
+            arm,
+            &[
+                "match self.on_release().await {",
+                "OnRelease::Rebuild => {",
+                "self.session.released = true;",
+                "Flow::Again",
+                "OnRelease::End => {",
+                "self.end_by_server(ending).await",
+                "OnRelease::StandDown => Flow::Stop,",
+            ],
+        );
+        for teardown in [
+            "disconnect_to",
+            "end_in_error",
+            "killswitch::",
+            ".dial(",
+            ".redial(",
+            "give_up(",
+        ] {
+            assert!(
+                !arm.contains(teardown),
+                "the release arm calls `{teardown}`"
+            );
+        }
+
+        let look = &code[code.find("async fn check_liveness(").unwrap()..];
+        in_order(
+            look,
+            &[
+                "if std::mem::take(&mut session.released) {",
+                "return Liveness::Dead(DropCause::ServerReleased);",
+                "reconnect_policy::needs_rebind(",
+            ],
+        );
+
+        let beat = &code[code
+            .find("async fn heartbeat(&mut self, now: Instant)")
+            .unwrap()..];
+        let beat = &beat[..beat
+            .find("match reconnect_policy::heartbeat_verdict(&resp)")
+            .unwrap()];
+        assert_eq!(
+            beat.matches("QuietRebuilds::interrupted").count(),
+            2,
+            "{beat}"
+        );
+        in_order(
+            beat,
+            &[
+                "if resp.valid {",
+                "self.quiet_rebuilds.with(|cap| cap.healthy(now));",
+            ],
+        );
+        let step = &code[code.find("async fn step(&mut self, wake: Wake)").unwrap()..];
+        let step = &step[..step.find("let tick = Tick {").unwrap()];
+        in_order(
+            step,
+            &[
+                "self.session = SessionWatch::default();",
+                "self.quiet_rebuilds.with(QuietRebuilds::interrupted);",
+            ],
+        );
+
+        let end = &code[code.find("async fn end_by_server(").unwrap()..];
+        let end = &end[..end.find("Flow::Stop").unwrap()];
+        assert!(end.contains("self.quiet_rebuilds.reset();"), "{end}");
     }
 }
 
