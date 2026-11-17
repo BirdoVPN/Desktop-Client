@@ -842,7 +842,7 @@ struct PendingRelease {
 
 /// A heartbeat's outcome on the wire, apart from sending it (MR-2369), so a
 /// test hands the loop a real reply.
-enum Beat {
+enum HeartbeatReply {
     Answered(crate::api::types::HeartbeatResponse),
     Failed(crate::api::ApiError),
     /// No answer inside `HEARTBEAT_TIMEOUT`.
@@ -851,7 +851,7 @@ enum Beat {
 
 /// What a heartbeat's outcome asks of the loop.
 #[derive(Debug, PartialEq)]
-enum AfterBeat {
+enum AfterReply {
     Continue,
     /// The server ended the session: `end_by_server`.
     End(IpcError),
@@ -1668,18 +1668,18 @@ impl ReconnectLoop {
         let Some(key_id) = self.vpn_manager.get_key_id().await else {
             return Flow::Continue;
         };
-        let beat = tokio::select! {
+        let reply = tokio::select! {
             r = timeout(HEARTBEAT_TIMEOUT, self.api.heartbeat(&key_id)) => match r {
-                Ok(Ok(resp)) => Beat::Answered(resp),
-                Ok(Err(e)) => Beat::Failed(e),
-                Err(_) => Beat::Unanswered,
+                Ok(Ok(resp)) => HeartbeatReply::Answered(resp),
+                Ok(Err(e)) => HeartbeatReply::Failed(e),
+                Err(_) => HeartbeatReply::Unanswered,
             },
             _ = self.shutdown.changed() => return Flow::Stop,
         };
-        match self.take_reply(beat, now).await {
-            AfterBeat::Continue => Flow::Continue,
-            AfterBeat::End(error) => self.end_by_server(error).await,
-            AfterBeat::Stop => Flow::Stop,
+        match self.take_reply(reply, now).await {
+            AfterReply::Continue => Flow::Continue,
+            AfterReply::End(error) => self.end_by_server(error).await,
+            AfterReply::Stop => Flow::Stop,
         }
     }
 
@@ -1688,13 +1688,13 @@ impl ReconnectLoop {
     /// quiet rebuild, and what is left for the caller to carry out (an
     /// ending). Apart from the request so a test drives a real reply through
     /// it (MR-2369).
-    async fn take_reply(&mut self, beat: Beat, now: Instant) -> AfterBeat {
-        let resp = match beat {
-            Beat::Answered(resp) => resp,
+    async fn take_reply(&mut self, reply: HeartbeatReply, now: Instant) -> AfterReply {
+        let resp = match reply {
+            HeartbeatReply::Answered(resp) => resp,
             // Visible, not debug: the server reaps a session it has not heard
             // from for 5 minutes, so heartbeats failing in a row end in an
             // outage, and the log must say why (live retest 2026-10-02).
-            Beat::Failed(e) => {
+            HeartbeatReply::Failed(e) => {
                 tracing::warn!("Heartbeat failed: {}", heartbeat_failure(&e));
                 // MR-2369: not a healthy check-in.
                 self.quiet_rebuilds.with(QuietRebuilds::interrupted);
@@ -1706,9 +1706,9 @@ impl ReconnectLoop {
                     self.session.heartbeat_misses =
                         misses_after_failure(self.session.heartbeat_misses, &e);
                 }
-                return AfterBeat::Continue;
+                return AfterReply::Continue;
             }
-            Beat::Unanswered => {
+            HeartbeatReply::Unanswered => {
                 // A heartbeat that rides a dead tunnel never answers; the
                 // liveness rules, not this, decide that the tunnel is dead —
                 // on Windows a run of these only asks the tunnel to prove
@@ -1719,7 +1719,7 @@ impl ReconnectLoop {
                 {
                     self.session.heartbeat_misses = self.session.heartbeat_misses.saturating_add(1);
                 }
-                return AfterBeat::Continue;
+                return AfterReply::Continue;
             }
         };
         #[cfg(target_os = "windows")]
@@ -1748,7 +1748,7 @@ impl ReconnectLoop {
                     "Heartbeat: the server ended this VPN session ({:?})",
                     error.code
                 );
-                AfterBeat::End(error)
+                AfterReply::End(error)
             }
             HeartbeatVerdict::Rebuild { ending } => match self.on_release().await {
                 // MR-2369: housekeeping reaped the key. The contract allows
@@ -1770,7 +1770,7 @@ impl ReconnectLoop {
                         due: now + wait,
                         ending,
                     });
-                    AfterBeat::Continue
+                    AfterReply::Continue
                 }
                 // Released again with the episode's rebuild spent, or with
                 // no session on record to re-dial: end the session as before
@@ -1781,10 +1781,10 @@ impl ReconnectLoop {
                          is left — ending the session ({:?})",
                         ending.code
                     );
-                    AfterBeat::End(ending)
+                    AfterReply::End(ending)
                 }
                 // The user is ending the session: theirs to end.
-                OnRelease::StandDown => AfterBeat::Stop,
+                OnRelease::StandDown => AfterReply::Stop,
             },
             HeartbeatVerdict::QuotaGrace { seconds_remaining } => {
                 // Once per session: the heartbeat repeats every 30 s for the
@@ -1796,15 +1796,15 @@ impl ReconnectLoop {
                         let _ = app.emit(QUOTA_WARNING_EVENT, QuotaWarning { seconds_remaining });
                     }
                 }
-                AfterBeat::Continue
+                AfterReply::Continue
             }
             HeartbeatVerdict::ServerGoingOffline => {
                 tracing::warn!("Heartbeat: server going offline");
-                AfterBeat::Continue
+                AfterReply::Continue
             }
             HeartbeatVerdict::Fine => {
                 tracing::debug!("Heartbeat sent");
-                AfterBeat::Continue
+                AfterReply::Continue
             }
         }
     }
@@ -2775,11 +2775,11 @@ mod tests {
         // (What a reply decides is driven in
         // `a_reaped_reply_is_rebuilt_once_then_ended`.)
         let beat = &source[source
-            .find("match self.take_reply(beat, now).await {")
+            .find("match self.take_reply(reply, now).await {")
             .unwrap()..];
-        let beat = &beat[..beat.find("AfterBeat::Stop").unwrap()];
+        let beat = &beat[..beat.find("AfterReply::Stop").unwrap()];
         assert!(
-            beat.contains("AfterBeat::End(error) => self.end_by_server(error).await,"),
+            beat.contains("AfterReply::End(error) => self.end_by_server(error).await,"),
             "{beat}"
         );
         let helper = &source[source.find("async fn end_by_server(").unwrap()..];
@@ -3144,8 +3144,8 @@ mod tests {
     const HB_NOT_FOUND: &str = "Connection not found. Please reconnect.";
 
     /// A real heartbeat reply, decoded as `BirdoApi::heartbeat` decodes it.
-    fn reply(json: &str) -> Beat {
-        Beat::Answered(serde_json::from_str(json).unwrap())
+    fn reply(json: &str) -> HeartbeatReply {
+        HeartbeatReply::Answered(serde_json::from_str(json).unwrap())
     }
 
     /// A loop over a Connected session, with no tunnel, firewall or network
@@ -3203,7 +3203,10 @@ mod tests {
         let cap = QuietRebuildCap::default();
         let mut lp = released_loop(Some(session_on_record()), shutdown, cap.clone(), || 0.5).await;
         let now = Instant::now();
-        assert_eq!(lp.take_reply(reply(REAPED), now).await, AfterBeat::Continue);
+        assert_eq!(
+            lp.take_reply(reply(REAPED), now).await,
+            AfterReply::Continue
+        );
         let due = lp
             .session
             .release
@@ -3230,7 +3233,7 @@ mod tests {
 
         // The re-dialled tunnel is a new watch; its key is reaped too.
         lp.session = SessionWatch::default();
-        let ending = AfterBeat::End(reconnect_policy::revoked_error(Some(HB_NOT_FOUND)));
+        let ending = AfterReply::End(reconnect_policy::revoked_error(Some(HB_NOT_FOUND)));
         for k in 1..=4u64 {
             let at = due + Duration::from_secs(60 * k);
             assert_eq!(lp.take_reply(reply(REAPED), at).await, ending, "reap {k}");
@@ -3276,7 +3279,7 @@ mod tests {
                 released_loop(Some(session_on_record()), shutdown, cap.clone(), || 0.0).await;
             assert_eq!(
                 lp.take_reply(reply(json), Instant::now()).await,
-                AfterBeat::End(ending),
+                AfterReply::End(ending),
                 "{json}"
             );
             assert!(lp.session.release.is_none(), "{json}");
@@ -3297,7 +3300,7 @@ mod tests {
         tx.send(true).unwrap();
         assert_eq!(
             lp.take_reply(reply(REAPED), Instant::now()).await,
-            AfterBeat::Stop
+            AfterReply::Stop
         );
         assert!(lp.session.release.is_none());
 
@@ -3305,7 +3308,7 @@ mod tests {
         let mut lp = released_loop(None, shutdown, cap.clone(), || 0.0).await;
         assert_eq!(
             lp.take_reply(reply(REAPED), Instant::now()).await,
-            AfterBeat::End(reconnect_policy::revoked_error(Some(HB_NOT_FOUND)))
+            AfterReply::End(reconnect_policy::revoked_error(Some(HB_NOT_FOUND)))
         );
         assert!(lp.session.release.is_none());
         assert_eq!(cap.with(|cap| cap.spent()), 0, "nothing spent");
@@ -3331,7 +3334,10 @@ mod tests {
             None,
             "nothing pending"
         );
-        assert_eq!(lp.take_reply(reply(REAPED), now).await, AfterBeat::Continue);
+        assert_eq!(
+            lp.take_reply(reply(REAPED), now).await,
+            AfterReply::Continue
+        );
         assert_eq!(lp.release_stopped_by_floor(now, false), None);
         assert_eq!(
             lp.release_stopped_by_floor(now + Duration::from_secs(60), false),
@@ -3381,14 +3387,14 @@ mod tests {
         let now = Instant::now();
         assert_eq!(
             first.take_reply(reply(REAPED), now).await,
-            AfterBeat::Continue
+            AfterReply::Continue
         );
         assert!(first.session.release.is_some());
         let (_tx2, shutdown) = watch::channel(false);
         let mut second = svc.new_loop(&cfg, shutdown, 1002);
         assert_eq!(
             second.take_reply(reply(REAPED), now).await,
-            AfterBeat::End(reconnect_policy::revoked_error(Some(HB_NOT_FOUND))),
+            AfterReply::End(reconnect_policy::revoked_error(Some(HB_NOT_FOUND))),
             "the replacing loop re-dialled again"
         );
         assert_eq!(spent(&svc), 1);
@@ -3416,7 +3422,7 @@ mod tests {
         let mut third = svc.new_loop(&cfg, shutdown, 1003);
         assert_eq!(
             third.take_reply(reply(REAPED), now).await,
-            AfterBeat::Continue
+            AfterReply::Continue
         );
         assert_eq!(spent(&svc), 1);
         svc.clear_last_config().await;
@@ -3439,13 +3445,13 @@ mod tests {
         let in_run = || cap.with(|cap| cap.in_healthy_run());
         let ok = r#"{"valid":true,"serverOnline":true,"reason":"ok"}"#;
         let now = Instant::now();
-        assert_eq!(lp.take_reply(reply(ok), now).await, AfterBeat::Continue);
+        assert_eq!(lp.take_reply(reply(ok), now).await, AfterReply::Continue);
         assert!(in_run());
-        lp.take_reply(Beat::Unanswered, now).await;
+        lp.take_reply(HeartbeatReply::Unanswered, now).await;
         assert!(!in_run(), "unanswered");
         lp.take_reply(reply(ok), now).await;
         assert!(in_run());
-        lp.take_reply(Beat::Failed(ApiError::ServerError(503)), now)
+        lp.take_reply(HeartbeatReply::Failed(ApiError::ServerError(503)), now)
             .await;
         assert!(!in_run(), "failed");
     }
