@@ -12,6 +12,7 @@ import {
   errorCopy,
   errorText,
   giveUpKind,
+  HOLD_UNAVAILABLE_COPY,
   giveUpMessage,
   isSilentError,
   KILLSWITCH_HOLDING_COPY,
@@ -57,6 +58,9 @@ const ALL: IpcErrorCode[] = [
   'email_code_required',
   'email_code_invalid',
   'apple_reauth_required',
+  // 'hold_unavailable' shows the server's sentence: see its own test below.
+  'step_up_no_factor',
+  'step_up_unavailable',
   'cert_pin_failed',
   'stealth_failed',
   'pq_failed',
@@ -127,6 +131,20 @@ describe('email_not_verified (MR-2210)', () => {
     const copy = errorCopy(err('email_not_verified', { message: 'RAW RUST TEXT' }), 'sign_in');
     expect(copy).toEqual({ message: EMAIL_NOT_VERIFIED_COPY, action: null });
     expect(copy.message).not.toMatch(/upgrade/i);
+  });
+});
+
+/** MR-2335: a refused deletion hold says why in the server's own words. */
+describe('hold_unavailable', () => {
+  it('shows the server sentence, and its own copy without one', () => {
+    const sentence =
+      'We could not tie this request to your signed-in session. Sign in to the app again, then try again. Nothing was deleted.';
+    expect(errorCopy(err('hold_unavailable', { message: sentence, retryable: false }))).toEqual({
+      message: sentence,
+      action: null,
+    });
+    expect(errorCopy(err('hold_unavailable', { message: '  ' })).message).toBe(HOLD_UNAVAILABLE_COPY);
+    expect(HOLD_UNAVAILABLE_COPY).toMatch(/Nothing was deleted/);
   });
 });
 

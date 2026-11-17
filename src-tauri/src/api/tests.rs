@@ -124,6 +124,7 @@ mod gdpr_request_tests {
                     two_factor_code: None,
                     account_number: None,
                     email_code: None,
+                    step_up_method: None,
                 },
             )
             .build()
@@ -171,6 +172,7 @@ mod gdpr_request_tests {
                         two_factor_code: code,
                         account_number: None,
                         email_code: None,
+                        step_up_method: None,
                     },
                 )
                 .build()
@@ -198,6 +200,7 @@ mod gdpr_request_tests {
                         two_factor_code: None,
                         account_number: number,
                         email_code: mailed,
+                        step_up_method: None,
                     },
                 )
                 .build()
@@ -405,6 +408,457 @@ mod gdpr_request_tests {
         match BirdoApi::classify_gdpr_delete_response(StatusCode::OK, today) {
             GdprDeleteOutcome::Deleted(r) => assert!(r.store_subscriptions_still_billing.is_none()),
             other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// MR-2335 (MR-179 hold fallback, birdo-web #883 @ dd14f5ec): the 24-hour
+/// deletion hold. Every status and `stepUp` shape the server sends is decoded
+/// here, and none of them is ever a deletion.
+#[cfg(test)]
+mod deletion_hold_tests {
+    use super::super::client::{BirdoApi, GdprDeleteOutcome};
+    use super::super::endpoints;
+    use super::super::error::{ApiError, StepUpKind};
+    use super::super::types::{pending_changes_from, DeleteAccountBody, DeletionHold};
+    use reqwest::StatusCode;
+    use serde_json::json;
+
+    const APPLY_AFTER: &str = "2026-11-15T12:00:00.000Z";
+    const HOLD_ID: &str = "cmhold0000000000000000001";
+    // birdo-web gdpr.controller.ts holdDeletion, word for word.
+    const FILED: &str = "Your account will be deleted in 24 hours unless the request is \
+                         cancelled first: cancel it in the app or on the website, or sign out \
+                         of this app. Any verified e-mail address on the account was alerted.";
+    const ALREADY: &str =
+        "A deletion is already on hold. Cancel it first to ask for a different one.";
+
+    fn step_up_object() -> serde_json::Value {
+        json!({ "methods": ["hold"], "pendingChangeId": HOLD_ID, "applyAfter": APPLY_AFTER })
+    }
+
+    fn classify(status: StatusCode, body: &serde_json::Value) -> GdprDeleteOutcome {
+        BirdoApi::classify_gdpr_delete_response(status, &body.to_string())
+    }
+
+    fn held(outcome: GdprDeleteOutcome) -> DeletionHold {
+        match outcome {
+            GdprDeleteOutcome::Held(hold) => hold,
+            other => panic!("not a hold: {other:?}"),
+        }
+    }
+
+    /// The hold rides the same DELETE as the deletion, with
+    /// `stepUpMethod: "hold"`, the password and (once asked) the 2FA code, and
+    /// never the number or the e-mailed code it stands in for.
+    #[test]
+    fn the_hold_is_the_deletion_route_with_step_up_method_hold() {
+        let api = BirdoApi::new();
+        let body_of = |code: Option<&str>| -> serde_json::Value {
+            let request = api
+                .gdpr_delete_request(
+                    "tok",
+                    &DeleteAccountBody {
+                        password: "pw",
+                        two_factor_code: code,
+                        account_number: None,
+                        email_code: None,
+                        step_up_method: Some("hold"),
+                    },
+                )
+                .build()
+                .unwrap();
+            assert_eq!(request.method(), reqwest::Method::DELETE);
+            assert!(request.url().path().ends_with("/api/v1/gdpr/delete"));
+            serde_json::from_slice(request.body().and_then(|b| b.as_bytes()).unwrap()).unwrap()
+        };
+        assert_eq!(
+            body_of(None),
+            json!({ "password": "pw", "stepUpMethod": "hold" })
+        );
+        assert_eq!(
+            body_of(Some("123456")),
+            json!({ "password": "pw", "twoFactorCode": "123456", "stepUpMethod": "hold" })
+        );
+    }
+
+    /// 202 `change_pending`: the hold, with its id and time. NOT `Deleted`:
+    /// before this, any 2xx was a deletion, and `delete_account` cleared the
+    /// tokens on it.
+    #[test]
+    fn a_202_is_a_hold_never_a_deletion() {
+        let body = json!({
+            "success": true,
+            "pending": true,
+            "code": "change_pending",
+            "message": FILED,
+            "stepUp": step_up_object(),
+        });
+        let hold = held(classify(StatusCode::ACCEPTED, &body));
+        assert_eq!(hold.pending_change_id, HOLD_ID);
+        assert_eq!(hold.apply_after, APPLY_AFTER);
+        assert_eq!(hold.message.as_deref(), Some(FILED));
+        assert!(!hold.already_pending);
+        // Only a 202 is a hold. The same body under any other 2xx is
+        // unexpected: an error, and above all not a deletion (no wipe).
+        let mut by_code = body.clone();
+        by_code.as_object_mut().unwrap().remove("pending");
+        for status in [StatusCode::OK, StatusCode::CREATED, StatusCode::NO_CONTENT] {
+            for unexpected in [&body, &by_code] {
+                assert!(
+                    matches!(
+                        classify(status, unexpected),
+                        GdprDeleteOutcome::Refused(ApiError::Parse(_))
+                    ),
+                    "{status}"
+                );
+            }
+        }
+        // A deletion's own 200 is unchanged.
+        assert!(matches!(
+            classify(
+                StatusCode::OK,
+                &json!({ "success": true, "message": "Your data has been deleted." })
+            ),
+            GdprDeleteOutcome::Deleted(_)
+        ));
+    }
+
+    /// A 202 whose hold cannot be read is an error: never a deletion, never
+    /// a hold with a made-up id. (The pending-change list still shows it.)
+    #[test]
+    fn an_unreadable_202_is_an_error_not_a_success() {
+        for step_up in [
+            json!(["account_number"]),
+            json!(null),
+            json!({ "methods": ["hold"], "applyAfter": APPLY_AFTER }),
+            json!({ "methods": ["hold"], "pendingChangeId": HOLD_ID }),
+            json!({ "pendingChangeId": "../../admin", "applyAfter": APPLY_AFTER }),
+            json!({ "pendingChangeId": "", "applyAfter": APPLY_AFTER }),
+            json!({ "pendingChangeId": HOLD_ID, "applyAfter": "soon <b>" }),
+            json!({ "pendingChangeId": 42, "applyAfter": APPLY_AFTER }),
+        ] {
+            let body = json!({ "success": true, "pending": true, "code": "change_pending", "stepUp": step_up });
+            assert!(
+                matches!(
+                    classify(StatusCode::ACCEPTED, &body),
+                    GdprDeleteOutcome::Refused(ApiError::Parse(_))
+                ),
+                "{step_up}"
+            );
+        }
+        for raw in ["", "not json", "[]", "{}"] {
+            assert!(
+                matches!(
+                    BirdoApi::classify_gdpr_delete_response(StatusCode::ACCEPTED, raw),
+                    GdprDeleteOutcome::Refused(ApiError::Parse(_))
+                ),
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// 409 `change_already_pending`: `stepUp` is an OBJECT. birdo-web's
+    /// GlobalExceptionFilter keeps only `details` of a thrown body, so it is
+    /// read at the top (as #883 throws it), under `details.stepUp`, and as
+    /// `details`; with none of them it is a "find it in the list" refusal.
+    #[test]
+    fn a_409_already_pending_names_the_existing_hold_wherever_it_is() {
+        let top = json!({ "statusCode": 409, "error": "change_already_pending", "message": ALREADY, "stepUp": step_up_object() });
+        let nested = json!({ "statusCode": 409, "error": "change_already_pending", "message": ALREADY, "details": { "stepUp": step_up_object() } });
+        let flat = json!({ "statusCode": 409, "error": "change_already_pending", "message": ALREADY, "details": step_up_object() });
+        for body in [top, nested, flat] {
+            let hold = held(classify(StatusCode::CONFLICT, &body));
+            assert_eq!(hold.pending_change_id, HOLD_ID, "{body}");
+            assert_eq!(hold.apply_after, APPLY_AFTER);
+            assert!(hold.already_pending);
+            assert_eq!(hold.message.as_deref(), Some(ALREADY));
+        }
+        // What the filter sends today: no stepUp, no details.
+        let filtered = json!({
+            "statusCode": 409, "message": ALREADY, "error": "change_already_pending",
+            "timestamp": "2026-11-14T12:00:00.000Z", "path": "api/v1/gdpr/delete",
+        });
+        match classify(StatusCode::CONFLICT, &filtered) {
+            GdprDeleteOutcome::Refused(ApiError::DeletionAlreadyOnHold(message)) => {
+                assert_eq!(message, ALREADY)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Every refusal's `stepUp` is the factor ARRAY (when it reaches the wire
+    /// at all); it is never read, and the refusal maps by `error` exactly as
+    /// before. Nothing here is a hold or a deletion.
+    #[test]
+    fn refusals_with_a_factor_array_map_by_error() {
+        let factors = json!(["account_number"]);
+        let refusal = |status: u16, error: &str, message: &str| json!({ "statusCode": status, "error": error, "message": message, "stepUp": factors, "details": { "stepUp": factors } });
+        // 409 hold_unavailable: the switch is off, or no session to tie it to.
+        for message in [
+            "A delayed deletion is not available. Nothing was deleted.",
+            "We could not tie this request to your signed-in session. Sign in to the app again, then try again. Nothing was deleted.",
+        ] {
+            match classify(StatusCode::CONFLICT, &refusal(409, "hold_unavailable", message)) {
+                GdprDeleteOutcome::Refused(ApiError::StepUp { kind, message: got }) => {
+                    assert_eq!(kind, StepUpKind::HoldUnavailable);
+                    assert_eq!(got, message);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // 403 step_up_no_factor.
+        assert!(matches!(
+            classify(StatusCode::FORBIDDEN, &refusal(403, "step_up_no_factor", "We cannot verify this account for an in-app deletion. Please contact support to delete it.")),
+            GdprDeleteOutcome::Refused(ApiError::StepUp { kind: StepUpKind::NoFactor, .. })
+        ));
+        // 503 step_up_unavailable: nothing was filed; not "server unavailable".
+        assert!(matches!(
+            classify(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &refusal(
+                    503,
+                    "step_up_unavailable",
+                    "We could not check your code just now. Please try again in a minute."
+                )
+            ),
+            GdprDeleteOutcome::Refused(ApiError::StepUp {
+                kind: StepUpKind::Unavailable,
+                ..
+            })
+        ));
+        // 403 two_factor_required / 401 wrong password: as #432 handles them.
+        assert!(matches!(
+            classify(
+                StatusCode::FORBIDDEN,
+                &refusal(
+                    403,
+                    "two_factor_required",
+                    "Enter your two-factor code to delete your account."
+                )
+            ),
+            GdprDeleteOutcome::Refused(ApiError::TwoFactorRequired(_))
+        ));
+        match classify(
+            StatusCode::UNAUTHORIZED,
+            &refusal(401, "Unauthorized", "Incorrect password"),
+        ) {
+            GdprDeleteOutcome::Refused(ApiError::Rejected {
+                status: 401,
+                message,
+            }) => {
+                assert_eq!(message, "Incorrect password")
+            }
+            other => panic!("{other:?}"),
+        }
+        // 429 too_many_attempts: a rate limit on the deletion path ...
+        let capped = refusal(
+            429,
+            "too_many_attempts",
+            "You have asked for a delayed deletion too many times today. Please try again tomorrow.",
+        );
+        let limited = classify(StatusCode::TOO_MANY_REQUESTS, &capped);
+        assert!(matches!(
+            limited,
+            GdprDeleteOutcome::Refused(ApiError::RateLimited {
+                retry_after_secs: None
+            })
+        ));
+        // ... and on the hold path it keeps the sentence, which alone says
+        // "tomorrow" (the 2FA lockout has the same `error`).
+        match BirdoApi::hold_refusal_keeps_its_sentence(limited, &capped.to_string()) {
+            GdprDeleteOutcome::Refused(ApiError::Rejected {
+                status: 429,
+                message,
+            }) => {
+                assert!(message.contains("tomorrow"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+        // A 429 without a sentence stays the plain rate limit.
+        assert!(matches!(
+            BirdoApi::hold_refusal_keeps_its_sentence(
+                GdprDeleteOutcome::Refused(ApiError::RateLimited {
+                    retry_after_secs: None
+                }),
+                ""
+            ),
+            GdprDeleteOutcome::Refused(ApiError::RateLimited {
+                retry_after_secs: None
+            })
+        ));
+    }
+
+    /// The hold request's own reading of a classified answer: a hold (a 202)
+    /// is the result; any other 2xx, even a deletion-shaped one, is
+    /// "unexpected, nothing assumed deleted", never a wipe and never a hold;
+    /// refusals pass through.
+    #[test]
+    fn the_hold_request_accepts_only_a_hold() {
+        let hold = DeletionHold {
+            pending_change_id: HOLD_ID.into(),
+            apply_after: APPLY_AFTER.into(),
+            message: None,
+            already_pending: false,
+        };
+        assert_eq!(
+            BirdoApi::deletion_hold_from(GdprDeleteOutcome::Held(hold.clone())).unwrap(),
+            hold
+        );
+        assert!(matches!(
+            BirdoApi::deletion_hold_from(GdprDeleteOutcome::Deleted(Default::default())),
+            Err(ApiError::Parse(_))
+        ));
+        assert!(matches!(
+            BirdoApi::deletion_hold_from(GdprDeleteOutcome::SessionExpired),
+            Err(ApiError::Unauthorized)
+        ));
+    }
+
+    /// A session in memory, still exactly as `set_tokens` left it.
+    async fn still_signed_in(api: &BirdoApi) -> bool {
+        api.is_authenticated().await
+            && api.access_token_value().await.as_deref() == Some("access-1")
+    }
+
+    /// No sign-out on a hold, by behaviour: with a session in memory, the
+    /// server's real answers are classified and handed to the two methods of
+    /// that signed-in client that end the requests (`finish_deletion_hold` for
+    /// the hold request, `finish_gdpr_delete` for `delete_account`). Every hold
+    /// answer (202, the 409s, an unreadable 202, an unexpected 2xx) leaves the
+    /// access token and the session exactly as they were, through both; only a
+    /// confirmed deletion (a plain 200) clears them. Either method clearing on
+    /// a hold fails this test.
+    #[tokio::test]
+    async fn a_hold_leaves_the_tokens_and_the_session_untouched() {
+        let api = BirdoApi::new();
+        api.set_tokens("access-1".into(), "refresh-1".into()).await;
+        assert!(still_signed_in(&api).await);
+        let filed = json!({ "success": true, "pending": true, "code": "change_pending", "message": FILED, "stepUp": step_up_object() });
+        let already = json!({ "statusCode": 409, "error": "change_already_pending", "message": ALREADY, "details": { "stepUp": step_up_object() } });
+        let unnamed =
+            json!({ "statusCode": 409, "error": "change_already_pending", "message": ALREADY });
+        let unavailable = json!({ "statusCode": 409, "error": "hold_unavailable", "message": "x", "details": { "stepUp": ["account_number"] } });
+        let unreadable = json!({ "success": true, "pending": true, "stepUp": ["account_number"] });
+        for (status, body) in [
+            (StatusCode::ACCEPTED, &filed),
+            (StatusCode::CONFLICT, &already),
+            (StatusCode::CONFLICT, &unnamed),
+            (StatusCode::CONFLICT, &unavailable),
+            (StatusCode::ACCEPTED, &unreadable),
+            // Not the contract's answer to anything: nothing is assumed.
+            (StatusCode::OK, &filed),
+        ] {
+            // The hold request's ending, on the signed-in client.
+            let _ = api.finish_deletion_hold(classify(status, body)).await;
+            assert!(still_signed_in(&api).await, "hold request: {status} {body}");
+            // `delete_account`'s ending, given the same answer.
+            assert!(
+                api.finish_gdpr_delete(classify(status, body))
+                    .await
+                    .is_err(),
+                "{status} {body} was accepted as a deletion"
+            );
+            assert!(
+                still_signed_in(&api).await,
+                "delete_account: {status} {body}"
+            );
+        }
+        // A deletion-shaped 200 to a HOLD request: unexpected, nothing wiped.
+        let deleted = json!({ "success": true, "message": "Your data has been deleted." });
+        assert!(api
+            .finish_deletion_hold(classify(StatusCode::OK, &deleted))
+            .await
+            .is_err());
+        assert!(still_signed_in(&api).await);
+        // The one answer that ends the session: a confirmed deletion.
+        assert!(api
+            .finish_gdpr_delete(classify(StatusCode::OK, &deleted))
+            .await
+            .is_ok());
+        assert!(!api.is_authenticated().await);
+        // And the hold request ends in the method driven above, never in
+        // `delete_account`'s.
+        const SOURCE: &str = include_str!("client.rs");
+        let start = SOURCE.find("pub async fn request_deletion_hold(").unwrap();
+        let hold = &SOURCE[start..];
+        let hold = &hold[..hold.find("\n    }").unwrap()];
+        assert!(hold.contains("self.finish_deletion_hold(outcome).await"));
+        assert!(hold.contains("step_up_method: Some(\"hold\")"));
+        assert!(!hold.contains("finish_gdpr_delete") && !hold.contains("clear_tokens"));
+    }
+
+    /// `GET /auth/pending-changes`, row by row; a row it cannot use is
+    /// dropped, never the whole list.
+    #[test]
+    fn the_pending_change_list_decodes_leniently() {
+        let rows = pending_changes_from(&json!({
+            "pendingChanges": [
+                { "id": HOLD_ID, "action": "account_delete", "description": "delete the account",
+                  "applyAfter": APPLY_AFTER, "createdAt": "2026-11-14T12:00:00.000Z", "extra": 1 },
+                { "id": "cmlink1", "action": "oauth_link", "description": "connect a new sign-in method",
+                  "applyAfter": APPLY_AFTER, "createdAt": "2026-11-14T12:00:00.000Z", "detail": "Google j***@example.com" },
+                { "action": "account_delete", "applyAfter": APPLY_AFTER },
+                { "id": "a/b", "action": "account_delete" },
+                { "id": "cmnoaction" },
+                "not a row",
+            ]
+        }))
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, HOLD_ID);
+        assert_eq!(rows[0].action, "account_delete");
+        assert_eq!(rows[0].apply_after.as_deref(), Some(APPLY_AFTER));
+        assert_eq!(rows[0].detail, None);
+        assert_eq!(rows[1].detail.as_deref(), Some("Google j***@example.com"));
+        assert_eq!(
+            pending_changes_from(&json!({ "pendingChanges": [] })).unwrap(),
+            vec![]
+        );
+        for bad in [
+            json!([]),
+            json!({}),
+            json!({ "pendingChanges": {} }),
+            json!(null),
+        ] {
+            assert!(pending_changes_from(&bad).is_none(), "{bad}");
+        }
+    }
+
+    /// Cancel: the id goes into the path only once checked, and a 404
+    /// `pending_change_not_found` (gone already) is told apart from any other
+    /// 404.
+    #[test]
+    fn the_cancel_route_and_its_404() {
+        assert_eq!(
+            endpoints::pending_change_cancel(HOLD_ID),
+            format!("/auth/pending-changes/{HOLD_ID}/cancel")
+        );
+        let gone = r#"{"statusCode":404,"error":"pending_change_not_found","message":"There is no such pending change on this account."}"#;
+        assert!(matches!(
+            BirdoApi::classify_error_response(StatusCode::NOT_FOUND, gone),
+            ApiError::PendingChangeNotFound
+        ));
+        let route_missing = r#"{"statusCode":404,"message":"Cannot POST /auth/pending-changes/x/cancel","error":"Not Found"}"#;
+        assert!(!matches!(
+            BirdoApi::classify_error_response(StatusCode::NOT_FOUND, route_missing),
+            ApiError::PendingChangeNotFound
+        ));
+    }
+
+    /// An id that could not be the server's never reaches the request.
+    #[tokio::test]
+    async fn a_malformed_id_is_never_sent() {
+        let api = BirdoApi::new();
+        let long = "x".repeat(65);
+        for id in ["", "../x", "a b", "a?b=1", long.as_str()] {
+            assert!(
+                matches!(
+                    api.cancel_pending_change(id).await,
+                    Err(ApiError::Unknown(_))
+                ),
+                "{id:?}"
+            );
         }
     }
 }

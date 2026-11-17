@@ -14,6 +14,16 @@ pub enum StepUpKind {
     /// `apple_reauth_required|invalid`: an Apple account with no e-mail address
     /// re-signs in with Apple, which only the iOS app can do.
     AppleReauth,
+    /// MR-2335: 409 `hold_unavailable`. The 24-hour hold is switched off, or the
+    /// request could not be tied to this app's signed-in session. Nothing was
+    /// deleted or filed; the server's sentence says which.
+    HoldUnavailable,
+    /// MR-2335: 403 `step_up_no_factor`. The server has nothing it can ask this
+    /// account for in the app; only support can delete it.
+    NoFactor,
+    /// MR-2335: 503 `step_up_unavailable`. The check could not run just now;
+    /// nothing was deleted or filed. Worth trying again shortly.
+    Unavailable,
 }
 
 impl StepUpKind {
@@ -25,6 +35,9 @@ impl StepUpKind {
             "email_code_required" => Some(Self::EmailCodeRequired),
             "email_code_invalid" => Some(Self::EmailCodeInvalid),
             "apple_reauth_required" | "apple_reauth_invalid" => Some(Self::AppleReauth),
+            "hold_unavailable" => Some(Self::HoldUnavailable),
+            "step_up_no_factor" => Some(Self::NoFactor),
+            "step_up_unavailable" => Some(Self::Unavailable),
             _ => None,
         }
     }
@@ -90,8 +103,9 @@ pub enum ApiError {
     TwoFactorInvalid(String),
     /// MR-179: a deletion step-up refusal (`error: "account_number_required"`,
     /// `"account_number_invalid"`, `"email_code_required"`,
-    /// `"email_code_invalid"`). Carries the backend's sentence; the dialog words
-    /// it by `kind`.
+    /// `"email_code_invalid"`; MR-2335: `"hold_unavailable"`,
+    /// `"step_up_no_factor"`, `"step_up_unavailable"`). Carries the backend's
+    /// sentence; the dialog words it by `kind`.
     StepUp { kind: StepUpKind, message: String },
     /// 503 `error: "quota_check_unavailable"` (birdo-web #590): the server
     /// could not check a Free plan's allowance just now. Worth retrying, after
@@ -136,6 +150,15 @@ pub enum ApiError {
     /// `rotation_not_pending` or `rotation_account_changed` (409). The status
     /// alone cannot tell the two 409s apart.
     AnonNumberRefused(String),
+    /// MR-2335: 409 `change_already_pending` to a deletion hold whose body did
+    /// not name the hold (the error filter keeps only `details`). A deletion IS
+    /// on hold; the caller reads which one from `GET /auth/pending-changes`.
+    /// Carries the backend's sentence.
+    DeletionAlreadyOnHold(String),
+    /// MR-2335: 404 `pending_change_not_found` from
+    /// `POST /auth/pending-changes/:id/cancel`. The change is gone already
+    /// (applied, cancelled elsewhere, or dropped by the server).
+    PendingChangeNotFound,
     /// Unknown error
     Unknown(String),
 }
@@ -253,6 +276,7 @@ impl fmt::Display for ApiError {
             | ApiError::TwoFactorRequired(message)
             | ApiError::TwoFactorInvalid(message)
             | ApiError::StepUp { message, .. }
+            | ApiError::DeletionAlreadyOnHold(message)
             | ApiError::RegistrationNotAllowed(message)
             | ApiError::PowRefused { message, .. }
             | ApiError::ClientAttestationRequired(message) => write!(f, "{}", message),
@@ -274,6 +298,9 @@ impl fmt::Display for ApiError {
             }
             ApiError::AnonNumberRefused(code) => {
                 write!(f, "The account number replacement was refused ({code})")
+            }
+            ApiError::PendingChangeNotFound => {
+                write!(f, "There is no such pending change on this account")
             }
             ApiError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
         }

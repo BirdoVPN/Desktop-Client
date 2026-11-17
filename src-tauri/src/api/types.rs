@@ -80,6 +80,12 @@ pub struct DeleteAccountBody<'a> {
     /// SSO account with no 2FA.
     #[serde(rename = "emailCode", skip_serializing_if = "Option::is_none")]
     pub email_code: Option<&'a str>,
+    /// MR-2335 (MR-179 hold fallback): `"hold"` asks the server to delete in 24
+    /// hours instead of now, cancellable, for a user who cannot present the
+    /// number or the e-mailed code. Sent only by `request_deletion_hold`, so the
+    /// immediate deletion's body is unchanged.
+    #[serde(rename = "stepUpMethod", skip_serializing_if = "Option::is_none")]
+    pub step_up_method: Option<&'a str>,
 }
 
 /// Success body of `DELETE /api/v1/gdpr/delete`.
@@ -126,6 +132,162 @@ pub struct DeletionStepUp {
     pub factors: Vec<String>,
     #[serde(default)]
     pub enforced: bool,
+    /// MR-2335: the 24-hour hold can be asked for (birdo-web #883, its own
+    /// switch, independent of `enforced`). Kept raw: only a JSON `true` offers
+    /// the hold, and a value of any other type must not fail the preflight.
+    #[serde(default, rename = "holdAvailable")]
+    pub hold_available: Option<serde_json::Value>,
+}
+
+impl DeletionStepUp {
+    /// `holdAvailable === true`, and nothing else.
+    pub fn hold_available(&self) -> bool {
+        matches!(self.hold_available, Some(serde_json::Value::Bool(true)))
+    }
+}
+
+/// MR-2335: a deletion on hold, as a 202 `change_pending` or a 409
+/// `change_already_pending` names it in `stepUp` (an OBJECT there; on every
+/// refusal `stepUp` is the factor ARRAY). Nothing is deleted yet: the server
+/// erases the account at `apply_after` unless the hold is cancelled first.
+///
+/// WHERE `stepUp` IS (birdo-web #883 @ 003e0ce7). The 202 is a handler's
+/// return value and arrives as written, `stepUp` at the top. An ERROR body is
+/// rebuilt by birdo-web's GlobalExceptionFilter, which keeps only
+/// `statusCode`, `message`, `error` and a plain-object `details`, so every
+/// refusal sends `details: { stepUp }`: the hold object on the 409, the factor
+/// array otherwise. The hold is looked for at the top, then under
+/// `details.stepUp`, then as `details` itself; when none of them has it, the
+/// 409's caller asks `GET /auth/pending-changes` instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionHold {
+    /// The pending change's id, for `POST /auth/pending-changes/:id/cancel`.
+    pub pending_change_id: String,
+    /// ISO-8601 server time the deletion applies at (shown, never computed on).
+    pub apply_after: String,
+    /// The server's sentence, if it sent one.
+    pub message: Option<String>,
+    /// The 409: this hold was filed earlier, not by this request.
+    pub already_pending: bool,
+}
+
+impl DeletionHold {
+    /// The hold a 202 / 409 body names, or `None` when `stepUp` is not the
+    /// object with a usable id and time. `None` is never a success: the caller
+    /// reports a reply it could not read.
+    pub fn from_body(body: &str, already_pending: bool) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        let details = value.get("details");
+        let (pending_change_id, apply_after) = [
+            value.get("stepUp"),
+            details.and_then(|d| d.get("stepUp")),
+            details,
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(hold_fields)?;
+        let message = value
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        Some(Self {
+            pending_change_id,
+            apply_after,
+            message,
+            already_pending,
+        })
+    }
+}
+
+/// `{ pendingChangeId, applyAfter }` of one candidate `stepUp` object, both
+/// usable, or `None` (an array, a missing or malformed field).
+fn hold_fields(candidate: &serde_json::Value) -> Option<(String, String)> {
+    let step_up = candidate.as_object()?;
+    let pending_change_id = step_up
+        .get("pendingChangeId")?
+        .as_str()
+        .filter(|id| pending_change_id_ok(id))?
+        .to_string();
+    let apply_after = step_up
+        .get("applyAfter")?
+        .as_str()
+        .filter(|at| apply_after_ok(at))?
+        .to_string();
+    Some((pending_change_id, apply_after))
+}
+
+/// A short timestamp-like string (ISO-8601), shown and never parsed here.
+pub fn apply_after_ok(at: &str) -> bool {
+    (10..=40).contains(&at.len())
+        && at
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ':' | '.' | '+'))
+}
+
+/// Whether a 2xx deletion body says the deletion was put on hold rather than
+/// done (`pending: true` or `code: "change_pending"`). The server answers a hold
+/// with 202 only; any other 2xx that says this is refused as unexpected, so it
+/// is never read as a deletion.
+pub fn deletion_body_says_pending(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    value.get("pending").and_then(|p| p.as_bool()) == Some(true)
+        || value.get("code").and_then(|c| c.as_str()) == Some("change_pending")
+}
+
+/// A pending change's id as the server mints it (a cuid / uuid): goes into a
+/// URL path, so only a short run of letters, digits, `-` and `_` passes.
+pub fn pending_change_id_ok(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// One row of `GET /auth/pending-changes` (`{ pendingChanges: [...] }`): a
+/// sensitive change waiting out its 24 hours. Read leniently: a row without a
+/// usable id or action is dropped, an unknown action is kept (the UI acts on
+/// `account_delete` only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingChange {
+    pub id: String,
+    pub action: String,
+    pub description: Option<String>,
+    pub apply_after: Option<String>,
+    pub created_at: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// `{ pendingChanges: [...] }`, row by row (see [`PendingChange`]). A body that
+/// is not an object, or a list that is not an array, is `None`.
+pub fn pending_changes_from(value: &serde_json::Value) -> Option<Vec<PendingChange>> {
+    let rows = value.as_object()?.get("pendingChanges")?.as_array()?;
+    let text = |row: &serde_json::Value, key: &str| {
+        row.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && v.len() <= 200)
+            .map(str::to_string)
+    };
+    Some(
+        rows.iter()
+            .filter_map(|row| {
+                let id = text(row, "id").filter(|id| pending_change_id_ok(id))?;
+                let action = text(row, "action")?;
+                Some(PendingChange {
+                    id,
+                    action,
+                    description: text(row, "description"),
+                    apply_after: text(row, "applyAfter").filter(|at| apply_after_ok(at)),
+                    created_at: text(row, "createdAt").filter(|at| apply_after_ok(at)),
+                    detail: text(row, "detail"),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Body of `POST /api/v1/gdpr/delete/code`: the e-mailed deletion code went to
