@@ -637,10 +637,10 @@ for host in $HOSTS; do
   chain=""
   for attempt in 1 2 3; do
     chain=$(echo | openssl s_client -connect "$addr" -servername "$sni" -showcerts 2>/dev/null)
-    echo "$chain" | grep -q "BEGIN CERTIFICATE" && break
+    grep -q "BEGIN CERTIFICATE" <<<"$chain" && break
     [ "$attempt" -lt 3 ] && sleep 3
   done
-  if ! echo "$chain" | grep -q "BEGIN CERTIFICATE"; then
+  if ! grep -q "BEGIN CERTIFICATE" <<<"$chain"; then
     fail "$host: could not retrieve a certificate chain from $addr after 3 attempts"
     continue
   fi

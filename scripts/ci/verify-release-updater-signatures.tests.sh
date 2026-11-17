@@ -215,7 +215,7 @@ else
   step=$(head -n "$at" "$release_yml" | grep -nE '^      - (name|uses):' | tail -n 1 | cut -d: -f1)
   if [ "$at" -lt "$job" ] || { [ -n "$next_job" ] && [ "$at" -gt "$next_job" ]; } || [ "$at" -gt "$sums" ] || [ "$at" -gt "$publish" ]; then
     bad "release.yml: '$call' (line $at) must be in the release job (line $job), before SHA256SUMS.txt (line $sums) and the GitHub Release (line $publish)"
-  elif sed -n "${step},${at}p" "$release_yml" | grep -qE '^        (if|continue-on-error):'; then
+  elif grep -qE '^        (if|continue-on-error):' <<<"$(sed -n "${step},${at}p" "$release_yml")"; then
     bad "release.yml: the gate's step (line $step) has an if: or continue-on-error"
   else
     echo "ok   release.yml runs the gate in the release job (line $at), unconditionally, before SHA256SUMS.txt and the GitHub Release"
