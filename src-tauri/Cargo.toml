@@ -188,6 +188,16 @@ zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
 # is looking. `scripts/ci/check-pq-features.sh` gates the pin and the feature
 # set on every PR.
 #
+# Pin moves since, each together with the gate's WANT_VERSION: =0.3.3 (#377),
+# then =0.3.4 (2026-11, superseding Dependabot #421). 0.3.4's full source diff
+# against 0.3.3 was read: Debug for DecapsulationKey/DecryptionKey now redacts
+# the secret, DecapsulationKey's PartialEq is constant-time, and sample_ntt
+# reads SHAKE128 block-wise under the same rejection rule (upstream tests it
+# for identical output against the reference sampler). No new unsafe, the
+# same features, MSRV 1.87. It moves module-lattice to 0.2.4 and ctutils to
+# 0.4.8. The KAT (birdo_pq::tests) now runs on Windows, Linux and macOS. The
+# 0.3.2 file:line citations in this comment are to that release's source.
+#
 # default-features = false + ["alloc", "zeroize"]: the crate's default is
 # ["alloc"] ALONE — `zeroize` is opt-in, and without it DecapsulationKey is
 # not ZeroizeOnDrop (ml-kem-0.3.2/src/decapsulation_key.rs:142,156 gate both
@@ -208,7 +218,7 @@ zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
 # `encapsulate_deterministic` out of production is a CODE-REVIEW invariant:
 # the only caller is the `#[cfg(test)]` KAT helper in src/vpn/birdo_pq.rs,
 # and it must stay that way.
-ml-kem = { version = "=0.3.3", default-features = false, features = ["alloc", "zeroize"] }
+ml-kem = { version = "=0.3.4", default-features = false, features = ["alloc", "zeroize"] }
 hkdf = "0.13"
 
 # Fast mutex for async-safe crypto operations (replaces std::sync::Mutex)
