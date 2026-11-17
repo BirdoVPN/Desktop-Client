@@ -424,9 +424,12 @@ pub const QUIET_REBUILDS_PER_EPISODE: u32 = 1;
 
 /// MR-2369: how long a session must stay healthy before its episode closes
 /// and the next release gets its quiet rebuild again: every check-in in that
-/// time answered with the key valid, none missed, the tunnel up throughout.
-/// Twice the server's 5-minute reap window ([`ALIVE_WINDOW`]). A successful
-/// re-dial does NOT close the episode, or the cap would never bind.
+/// time that was sent answered with the key valid, the valid ones at most
+/// [`HEALTHY_RUN_MAX_GAP`] apart (so one heartbeat skipped without being sent
+/// is tolerated; one that failed or went unanswered is not), and the tunnel
+/// up throughout. Twice the server's 5-minute reap window ([`ALIVE_WINDOW`]).
+/// A successful re-dial does NOT close the episode, or the cap would never
+/// bind.
 pub const QUIET_REBUILD_EPISODE_RESET: Duration = Duration::from_secs(10 * 60);
 
 /// MR-2369: the longest gap between two valid check-ins that still counts as

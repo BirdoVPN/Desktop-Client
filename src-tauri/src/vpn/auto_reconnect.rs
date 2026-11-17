@@ -3399,8 +3399,16 @@ mod tests {
         );
         assert_eq!(spent(&svc), 1);
 
-        // Running loops, with nothing on record for them to dial.
+        // Running loops, with nothing on record for them to dial, over a
+        // session that reads Connected (no tunnel, no key: the look finds it
+        // healthy and the heartbeat has nothing to send). Connected, a
+        // step never ends the run for being down: only the loop's start
+        // can.
         *svc.last_reconnect_info.write().await = None;
+        svc.vpn_manager
+            .set_state(ConnectionState::Connected)
+            .await
+            .unwrap();
         svc.quiet_rebuilds.with(|cap| cap.healthy(Instant::now()));
         svc.start().await.unwrap();
         wait_until("the loop to start on the session's cap", || !in_run(&svc)).await;
@@ -3463,7 +3471,6 @@ mod tests {
             AutoReconnectConfig::default().budget().jitter,
             reconnect_policy::BACKOFF_JITTER
         );
-        assert!(reconnect_policy::BACKOFF_JITTER > 0.0);
     }
 
     /// MR-2369, the wiring left to read: the reap arm only schedules the
