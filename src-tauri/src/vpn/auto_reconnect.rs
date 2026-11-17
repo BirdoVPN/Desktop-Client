@@ -1641,9 +1641,12 @@ impl ReconnectLoop {
         match reconnect_policy::heartbeat_verdict(&resp) {
             HeartbeatVerdict::End(error) => {
                 // The server ended this VPN session: another device took the
-                // slot, the peer was reaped (`revoked`), or the Free allowance
-                // ran out after its grace window (`quota_exceeded`, birdo-web
-                // #590; the peer is already gone). The AUTH session is intact,
+                // slot (`evicted`), it was revoked or is gone with no record
+                // of why (`revoked`), or the Free allowance ran out after its
+                // grace window (`quota_exceeded`, birdo-web #590; the peer is
+                // already gone). A key the server released (`reaped`, a
+                // drained server) is rebuilt instead (MR-2369, the next arm),
+                // until its cap is spent. The AUTH session is intact,
                 // so this is not `session_expired`, and the owner default (iOS
                 // parity, P1-parity-021) is: tear down, release the block, no
                 // auto-retry.
