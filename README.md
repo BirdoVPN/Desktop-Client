@@ -55,9 +55,10 @@ Other distributions (Fedora, Arch, ...) have no package for now.
 
 ## Uninstall
 Removing the app keeps its data (keys, tokens, logs, crash reports) unless you
-ask for it to go: the Windows uninstaller's **Delete the application data**
-box, `apt purge` for the .deb, and on macOS (and an AppImage from 1.4.50 or
-earlier) the app's own cleanup flag. See [`docs/UNINSTALL.md`](docs/UNINSTALL.md).
+ask for it to go: the Windows uninstaller's **Delete this user's app data**
+box (that Windows account's data), `apt purge` for the .deb, and on macOS (and
+an AppImage from 1.4.50 or earlier) the app's own cleanup flag. See
+[`docs/UNINSTALL.md`](docs/UNINSTALL.md).
 
 ## Release
 Pushing a `v*` tag triggers the unified Windows/macOS/Linux release build that is

@@ -576,8 +576,11 @@ FunctionEnd
   ; (`--remove-leftovers-and-exit --with-app-data`, D6c HIGH): $APPDATA\BirdoVPN
   ; (logs; keeping dns-restore.json* — W1-008), $LOCALAPPDATA\BirdoVPN
   ; (device_id; pre-R4 birdo_pq_v1.bin), $LOCALAPPDATA\Birdo VPN (crash files),
-  ; the admin-only accounts' ML-KEM keys, and the two identifier folders the
-  ; template itself used to delete. The exe never follows a link; NSIS's
+  ; the admin-only accounts' ML-KEM keys, this account's admin-only settings
+  ; key (AUD-DESK-19), and the two identifier folders the template itself
+  ; used to delete. Only the uninstalling account's data: the folders, tokens
+  ; and settings key of the machine's other Windows accounts stay (the
+  ; owner's choice, 2026-11-13; the checkbox says "this user's"). The exe never follows a link; NSIS's
   ; `RMDir /r` does, which elevated over a user's folders could delete files
   ; anywhere on the machine. The template's own app-data block is suppressed
   ; (PREUNINSTALL zeroed $DeleteAppDataCheckboxState), so what remains here is

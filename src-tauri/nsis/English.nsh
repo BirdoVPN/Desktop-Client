@@ -11,6 +11,11 @@
 ; it on purpose (nsis-hooks.nsh, NSIS_HOOK_POSTUNINSTALL, W1-008), so the
 ; checkbox says so. It is one line in a 400 px checkbox: keep it short.
 ;
+; AUD-DESK-19: it deletes the data of the Windows account that runs the
+; uninstaller only (its folders, tokens and settings key); the machine's
+; other accounts keep theirs (the owner's choice, 2026-11-13). So it says
+; "this user's" (docs/UNINSTALL.md).
+;
 ; scripts/ci/check-nsis-language.sh (nsis-installer.yml) fails the PR when
 ; this file stops matching the locked CLI's built-in strings: a string added,
 ; removed or reworded upstream, or deleteAppData back to the template text.
@@ -40,4 +45,4 @@ LangString webview2DownloadSuccess ${LANG_ENGLISH} "WebView2 bootstrapper downlo
 LangString webview2Downloading ${LANG_ENGLISH} "Downloading WebView2 bootstrapper..."
 LangString webview2InstallError ${LANG_ENGLISH} "Error: Installing WebView2 failed with exit code $1"
 LangString webview2InstallSuccess ${LANG_ENGLISH} "WebView2 installed successfully"
-LangString deleteAppData ${LANG_ENGLISH} "Delete the application data (keeps the DNS-restore journal)"
+LangString deleteAppData ${LANG_ENGLISH} "Delete this user's app data (keeps the DNS-restore journal)"

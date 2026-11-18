@@ -35,8 +35,19 @@ tokens from the keychain, wherever the cleanup below cannot reach them.
 
 ## Windows
 
-Uninstall from Settings > Apps and tick **Delete the application data** in the
-uninstaller.
+Uninstall from Settings > Apps and tick **Delete this user's app data** in the
+uninstaller. It deletes the data of the Windows account that runs the
+uninstaller: its sign-in tokens, its folders under `%APPDATA%` and
+`%LOCALAPPDATA%`, and its settings key in `%ProgramData%\BirdoVPN`. It also
+deletes every account's post-quantum (ML-KEM) key there, which the app makes
+again when it needs one.
+
+The other Windows accounts on the PC keep their own BirdoVPN data: their
+tokens, folders and settings keys. To remove an account's data as well, sign
+out of BirdoVPN in that account before you uninstall (which deletes its
+sign-in tokens), then delete its `%APPDATA%\BirdoVPN`,
+`%APPDATA%\uk.birdo.vpn.desktop`, `%LOCALAPPDATA%\BirdoVPN`,
+`%LOCALAPPDATA%\Birdo VPN` and `%LOCALAPPDATA%\uk.birdo.vpn.desktop` folders.
 
 ## Linux (.deb)
 
