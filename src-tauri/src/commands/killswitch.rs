@@ -926,28 +926,47 @@ async fn disarm_with(
 
 async fn disarm_platform() -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    {
-        if let Err(e) = wfp::cleanup().await {
-            tracing::warn!("Failed to clean up WFP filters on disarm: {}", e);
-        }
-    }
+    let lifted = wfp::cleanup()
+        .await
+        .map_err(|e| format!("Failed to clean up WFP filters on disarm: {e}"));
 
     #[cfg(target_os = "macos")]
-    {
-        if let Err(e) = pf_deactivate_blocking().await {
-            tracing::warn!("Failed to remove pf rules on disarm: {}", e);
-        }
-    }
+    let lifted = pf_deactivate_blocking()
+        .await
+        .map_err(|e| format!("Failed to remove pf rules on disarm: {e}"));
 
     #[cfg(target_os = "linux")]
-    {
-        if let Err(e) = firewall_linux::deactivate_blocking().await {
-            tracing::warn!("Failed to remove iptables rules on disarm: {}", e);
+    let lifted = firewall_linux::deactivate_blocking()
+        .await
+        .map_err(|e| format!("Failed to remove iptables rules on disarm: {e}"));
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    let lifted: Result<(), String> = Ok(());
+
+    disarmed(lifted)
+}
+
+/// What [`disarm`] reports for the platform cleanup's result `lifted`.
+///
+/// AUD-DESK-15: a failed WFP, pf or iptables cleanup is the disarm's `Err`.
+/// It used to be logged and answered `Ok`, so the disconnect read as clean.
+/// The block it left is still reported where the platform knows of it
+/// (`platform_is_blocking`: pf stays marked loaded, iptables keeps
+/// `IPTABLES_BLOCKING`), so the status reads Disconnected with the block
+/// held, and the UI's Disconnect lifts it again. Windows drops its engine
+/// either way (`wfp::cleanup`; the engine's Drop retries the close, and a
+/// dynamic session's filters go with its handle).
+fn disarmed(lifted: Result<(), String>) -> Result<(), String> {
+    match lifted {
+        Ok(()) => {
+            tracing::info!("Kill switch disarmed");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("The kill switch's block may still be in force: {}", e);
+            Err(e)
         }
     }
-
-    tracing::info!("Kill switch disarmed");
-    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -2945,6 +2964,30 @@ mod tests {
             done = disarming => assert_eq!(done, Ok(Ok(())), "disarm waited on arm's read"),
         }
         assert!(!is_enabled());
+    }
+
+    /// AUD-DESK-15: a disarm whose firewall cleanup failed (WFP, pf or
+    /// iptables) is an `Err`; it used to be logged and answered `Ok`. The
+    /// intent is cleared either way, so nothing re-engages the block.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_disarm_whose_cleanup_failed_reports_it() {
+        let _tests = FLAG_TESTS.lock().await;
+        let held = "Failed to remove pf rules on disarm: pfctl timed out";
+        let failed = disarm_with(async { disarmed(Err(held.into())) }).await;
+        assert_eq!(failed, Err(held.to_string()));
+        assert!(!is_enabled());
+        assert_eq!(disarm_with(async { disarmed(Ok(())) }).await, Ok(()));
+
+        // Each platform's cleanup result is what `disarm_platform` returns:
+        // none is logged and dropped.
+        let source = include_str!("killswitch.rs").replace('\r', "");
+        let platform = fn_body(&source, "async fn disarm_platform(");
+        assert!(!platform.contains("if let Err(e)"), "{platform}");
+        assert_eq!(platform.matches("let lifted").count(), 4, "{platform}");
+        assert!(
+            platform.trim_end().ends_with("disarmed(lifted)"),
+            "{platform}"
+        );
     }
 
     /// The invariant [`INTENT`] documents: outside the tests, the intent is
