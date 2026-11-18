@@ -5048,7 +5048,7 @@ mod dns_hold_tests {
                 let r = t.run(a);
                 // The chain on top decides: its DROP is final.
                 let on_top = t.output.first().map(|chain| &t.chains[chain]);
-                if !on_top.is_some_and(|rules| verdict(rules, &probe) == DROPPED) {
+                if on_top.is_none_or(|rules| verdict(rules, &probe) != DROPPED) {
                     leaked.push(a.join(" "));
                 }
                 r
