@@ -898,11 +898,25 @@ impl VpnManager {
             // as Windows holds its DNS guard; a failed install warns and goes
             // on, as the IPv6 hold does. macOS carries it in the leak block
             // the IPv6 hold above keeps in force, so it is taken after that.
+            //
+            // MR-2255: and the rest of IPv4 with it. The old stop() takes the
+            // tunnel's routes away with its device, so with the kill switch
+            // off every new IPv4 flow in the gap left the physical NIC from
+            // the real address (Windows keeps its /1 routes through the gap).
+            // The hold lets out only what the kill switch's block-all would,
+            // for the incoming session: its relay, the control plane (as our
+            // euid), DHCP, the LAN with sharing on. A hostname relay keeps
+            // the DNS-only hold (`with_ipv4_hold`).
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let exempt = crate::vpn::dns_hold::dns_hold_exempt(
                 &config.endpoint,
                 &config.dns,
                 local_network_sharing,
+            )
+            .with_ipv4_hold(
+                crate::api::doh_resolver::control_plane().0,
+                // SAFETY: geteuid has no preconditions and cannot fail.
+                unsafe { libc::geteuid() },
             );
             #[cfg(target_os = "linux")]
             {
@@ -1963,6 +1977,35 @@ mod tests {
             "the hold must last through the new start() and be lifted before the outcome is handled"
         );
         assert_eq!(body.matches(".release().await").count(), 1);
+    }
+
+    /// MR-2255: the hold both platforms take is asked to hold the rest of
+    /// IPv4 too, with the permits the kill switch's block-all has, and that
+    /// before either platform's hold goes up.
+    #[test]
+    fn a_unix_switch_holds_ipv4_with_its_dns() {
+        let source = include_str!("manager.rs").replace('\r', "");
+        let start = source.find("    pub async fn connect(").expect("connect()");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("connect() has no {needle}"))
+        };
+        let exempt = at("let exempt = crate::vpn::dns_hold::dns_hold_exempt(");
+        let ipv4 = at(".with_ipv4_hold(");
+        let permits = at("crate::api::doh_resolver::control_plane().0");
+        let linux = at("crate::vpn::tunnel_linux::hold_dns(&exempt)");
+        let macos = at("crate::commands::killswitch::hold_dns(exempt).await");
+        assert!(
+            exempt < ipv4 && ipv4 < permits,
+            "the exempt is built with its IPv4 half"
+        );
+        assert!(
+            permits < linux && permits < macos,
+            "before either hold goes up"
+        );
+        assert_eq!(body.matches(".with_ipv4_hold(").count(), 1);
     }
 
     #[tokio::test]

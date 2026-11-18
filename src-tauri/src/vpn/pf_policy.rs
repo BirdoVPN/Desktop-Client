@@ -24,7 +24,7 @@
 //!
 //! Everything else, IPv6 included, meets `block drop all`.
 
-use crate::vpn::dns_hold::DnsHoldExempt;
+use crate::vpn::dns_hold::{DnsHoldExempt, Ipv4Hold};
 use std::net::{IpAddr, Ipv4Addr};
 
 /// Marker anchor in EVERY ruleset we load (this block-all and the IPv6 leak
@@ -51,6 +51,11 @@ pub(crate) const DNS_HOLD_ANCHOR: &str = "com.birdo.vpn.dnshold";
 
 /// The pf table of what the DNS hold lets through.
 pub(crate) const DNS_HOLD_TABLE: &str = "birdo_dns_hold_exempt";
+
+/// MR-2255: marker anchor of the switch hold's IPv4 half ([`ipv4_hold_rules`]),
+/// in the leak block right after the DNS hold's rules, so the read-back can
+/// tell the full hold from the DNS-only one it falls back to.
+pub(crate) const IPV4_HOLD_ANCHOR: &str = "com.birdo.vpn.ipv4hold";
 
 /// The pf table the control-plane permit is scoped to.
 pub(crate) const CONTROL_PLANE_TABLE: &str = "birdo_control";
@@ -264,6 +269,9 @@ pub(crate) const IPV6_RULESET_MINIMAL: &str =
 /// While these rules are in, the leak block is no longer IPv6-only: plain
 /// DNS over IPv4 is dropped too. That is the point, and it lasts only for
 /// the switch.
+///
+/// MR-2255: with `exempt.ipv4` set, the rest of IPv4 too
+/// ([`ipv4_hold_rules`]), right after the DNS rules.
 pub(crate) fn dns_hold_rules(exempt: &DnsHoldExempt) -> String {
     let mut r = format!("anchor \"{DNS_HOLD_ANCHOR}\"\n");
     let addresses: Vec<String> = exempt.addresses().map(IpAddr::to_string).collect();
@@ -280,7 +288,71 @@ pub(crate) fn dns_hold_rules(exempt: &DnsHoldExempt) -> String {
         "block drop out quick proto {{ udp tcp }} to {to} port {{ {} }}\n",
         exempt.held_ports().join(" ")
     ));
+    if let Some(hold) = &exempt.ipv4 {
+        r.push_str(&ipv4_hold_rules(hold, exempt.local_network_sharing));
+    }
     r
+}
+
+/// MR-2255: the rest of IPv4, held across a server switch with the kill
+/// switch off. The outgoing tunnel's stop() destroys its utun and the /1
+/// routes into it go with the device, so until the incoming start() routed
+/// its own, every new IPv4 flow went out of the physical interface from the
+/// real address. Windows keeps its /1 routes into the adapter through the
+/// gap; here the gap is held in pf instead.
+///
+/// What it lets out is what the kill switch's block-all
+/// ([`block_all_ruleset`]) lets out, for the incoming session, `out` only
+/// (nothing inbound changes): DHCP, the LAN ranges with Local Network
+/// Sharing, root's tcp/443 to the control plane (the same `<birdo_control>`
+/// table name, never loaded alongside the block-all, which owns the main
+/// ruleset when it is up) and the incoming relay. lo0 is `set skip`.
+///
+/// No utun is let through, as the DNS hold lets none through: the incoming
+/// one's name is not known when the hold goes up, and its start() sends
+/// nothing through it before it returns (the WireGuard handshake goes to the
+/// relay, over the physical interface). Traffic routed into it before the
+/// release waits for the release, right after the build.
+///
+/// `drop`, as the DNS hold: a sender retries rather than failing at once.
+pub(crate) fn ipv4_hold_rules(hold: &Ipv4Hold, lan_sharing: bool) -> String {
+    let mut r = format!("anchor \"{IPV4_HOLD_ANCHOR}\"\n");
+    if !hold.control_plane.is_empty() {
+        let addrs: Vec<String> = hold.control_plane.iter().map(Ipv4Addr::to_string).collect();
+        r.push_str(&format!(
+            "table <{CONTROL_PLANE_TABLE}> const {{ {} }}\n",
+            addrs.join(", ")
+        ));
+    }
+    // Each permit is the block-all's own, out only (see there for why each
+    // is shaped as it is).
+    r.push_str("pass out quick inet proto udp from any port 68 to any port 67 no state\n");
+    if lan_sharing {
+        r.push_str(
+            "pass out quick inet to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } no state\n",
+        );
+    }
+    if !hold.control_plane.is_empty() {
+        r.push_str(&format!(
+            "pass out quick inet proto tcp to <{CONTROL_PLANE_TABLE}> port {CONTROL_PLANE_PORT} user {} keep state\n",
+            hold.euid
+        ));
+    }
+    if let Some(ip) = hold.relay {
+        r.push_str(&format!(
+            "pass out quick inet proto {{ udp tcp }} to {ip} keep state\n"
+        ));
+    }
+    r.push_str("block drop out quick inet all\n");
+    r
+}
+
+/// MR-2255: whether `live_rules` carries the IPv4 hold's marker anchor.
+pub(crate) fn ipv4_hold_loaded(live_rules: &str) -> bool {
+    let line = format!("anchor \"{IPV4_HOLD_ANCHOR}\"");
+    live_rules
+        .lines()
+        .any(|l| l.trim_start().starts_with(&line))
 }
 
 /// `baseline` (one of the IPv6 leak block rulesets) with `hold`
@@ -471,6 +543,8 @@ pub(crate) struct Observed {
     pub tunnel_permits: Vec<String>,
     /// MR-2135: the DNS hold is in the live ruleset.
     pub dns_hold_loaded: bool,
+    /// MR-2255: and its IPv4 half.
+    pub ipv4_hold_loaded: bool,
 }
 
 impl Observed {
@@ -485,6 +559,7 @@ impl Observed {
             marker_loaded: marker_loaded(&rules),
             tunnel_permits: tunnel_permits(&rules),
             dns_hold_loaded: dns_hold_loaded(&rules),
+            ipv4_hold_loaded: ipv4_hold_loaded(&rules),
         })
     }
 
@@ -1148,7 +1223,15 @@ impl PfState {
         }
         self.load_ipv6_baseline(pf)?;
         match Observed::read(pf) {
-            Ok(s) if s.dns_hold_loaded => Ok(()),
+            Ok(s) if s.dns_hold_loaded => {
+                // MR-2255: the DNS-only fallback is still a hold in force;
+                // the switch goes on, as it did before the IPv4 half.
+                let wanted_ipv4 = self.dns_hold.as_ref().is_some_and(|h| h.ipv4.is_some());
+                if wanted_ipv4 && !s.ipv4_hold_loaded {
+                    tracing::warn!("MR-2255: only DNS is held for this switch; IPv4 is not");
+                }
+                Ok(())
+            }
             Ok(_) => Err("the DNS hold did not take effect (pf does not list it)".to_string()),
             Err(e) => Err(format!("the DNS hold could not be read back: {e}")),
         }
@@ -1208,14 +1291,31 @@ impl PfState {
     /// MR-2135: with the DNS hold in it while one is set. If no ruleset with
     /// the hold loads, the block goes in without it: the hold is only for a
     /// switch, and must never cost the session its IPv6 block.
+    ///
+    /// MR-2255: a hold with its IPv4 half that pf refuses falls back to the
+    /// DNS-only hold first, so the IPv4 half can never cost the switch the
+    /// DNS hold it had before.
     fn load_ipv6_baseline(&mut self, pf: &impl Pf) -> Result<(), String> {
-        match self.dns_hold.as_ref().map(dns_hold_rules) {
-            Some(hold) => {
-                let held = load_full_or_minimal(
-                    pf,
-                    &with_dns_hold(IPV6_RULESET_FULL, &hold),
-                    &with_dns_hold(IPV6_RULESET_MINIMAL, &hold),
-                );
+        let load_held = |exempt: &DnsHoldExempt| {
+            let hold = dns_hold_rules(exempt);
+            load_full_or_minimal(
+                pf,
+                &with_dns_hold(IPV6_RULESET_FULL, &hold),
+                &with_dns_hold(IPV6_RULESET_MINIMAL, &hold),
+            )
+        };
+        match self.dns_hold.as_ref() {
+            Some(exempt) => {
+                let held = match load_held(exempt) {
+                    Err(e) if exempt.ipv4.is_some() => {
+                        tracing::warn!(
+                            "MR-2255: the leak block with the switch's IPv4 hold failed to load \
+                             ({e}); holding DNS only"
+                        );
+                        load_held(&exempt.dns_only())
+                    }
+                    other => other,
+                };
                 if let Err(e) = held {
                     tracing::warn!(
                         "MR-2135: the IPv6 leak block with the DNS hold failed to load ({e}); \
@@ -2714,6 +2814,193 @@ mod tests {
         );
     }
 
+    // ── MR-2255: the rest of IPv4 held across the switch ──────────────
+
+    /// A switch onto `endpoint` that holds IPv4 too, as the manager asks.
+    fn ipv4_held(endpoint: &str, sharing: bool) -> DnsHoldExempt {
+        exempt(endpoint, sharing).with_ipv4_hold(vec![DOH, API], 0)
+    }
+
+    fn holds_ipv4(pf: &FakePf) -> bool {
+        ipv4_hold_loaded(&pf.rules().unwrap())
+    }
+
+    /// The DNS rules as before, then the IPv4 half: the block-all's out
+    /// permits for the incoming session, then everything else dropped.
+    #[test]
+    fn the_ipv4_hold_lets_out_the_block_alls_permits_and_drops_the_rest() {
+        assert_eq!(
+            dns_hold_rules(&ipv4_held("203.0.113.9:51820", false)),
+            "anchor \"com.birdo.vpn.dnshold\"\n\
+             table <birdo_dns_hold_exempt> const { 203.0.113.9 }\n\
+             block drop out quick proto { udp tcp } to ! <birdo_dns_hold_exempt> port { 53 853 137 5353 5355 }\n\
+             anchor \"com.birdo.vpn.ipv4hold\"\n\
+             table <birdo_control> const { 1.1.1.1, 104.16.0.1 }\n\
+             pass out quick inet proto udp from any port 68 to any port 67 no state\n\
+             pass out quick inet proto tcp to <birdo_control> port 443 user 0 keep state\n\
+             pass out quick inet proto { udp tcp } to 203.0.113.9 keep state\n\
+             block drop out quick inet all\n"
+        );
+        let sharing = dns_hold_rules(&ipv4_held("203.0.113.9:51820", true));
+        assert!(sharing.contains(
+            "pass out quick inet proto udp from any port 68 to any port 67 no state\n\
+             pass out quick inet to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } no state\n"
+        ));
+        assert!(sharing.ends_with("block drop out quick inet all\n"));
+    }
+
+    /// Every permit in the IPv4 half is one the kill switch's block-all
+    /// already has for the same inputs (out only, where the block-all's
+    /// LAN permit covers both directions), and its root permit is scoped as
+    /// the block-all's is. Nothing new to review as a way out.
+    #[test]
+    fn every_ipv4_hold_permit_is_one_the_block_all_has() {
+        for control_plane in [&[DOH, API][..], &[DOH][..], &[][..]] {
+            for relay in [Some(Ipv4Addr::new(203, 0, 113, 9)), None] {
+                for lan_sharing in [false, true] {
+                    let hold = Ipv4Hold {
+                        relay,
+                        control_plane: control_plane.to_vec(),
+                        euid: 0,
+                    };
+                    let held = ipv4_hold_rules(&hold, lan_sharing);
+                    let block = block_all_ruleset(&BlockAll {
+                        relay,
+                        tunnel_interface: None,
+                        control_plane,
+                        euid: 0,
+                        lan_sharing,
+                    });
+                    let block: Vec<&str> = block.lines().collect();
+                    for line in held.lines() {
+                        if line.starts_with("pass ") {
+                            let both_ways = line.replacen("pass out quick inet ", "pass quick ", 1);
+                            assert!(
+                                block.contains(&line) || block.contains(&both_ways.as_str()),
+                                "the block-all has no {line}"
+                            );
+                            assert!(line.starts_with("pass out quick inet "), "{line}");
+                        } else if line.starts_with("table ") {
+                            assert!(block.contains(&line), "{line}");
+                        } else {
+                            assert!(
+                                line.starts_with("anchor ")
+                                    || line == "block drop out quick inet all",
+                                "{line}"
+                            );
+                        }
+                    }
+                    assert!(
+                        root_permits_are_scoped(&held) && port_443_is_scoped(&held),
+                        "{held}"
+                    );
+                    assert_eq!(held.contains(" user "), !control_plane.is_empty());
+                    assert_eq!(held.contains("203.0.113.9"), relay.is_some());
+                    assert!(held.ends_with("block drop out quick inet all\n"));
+                }
+            }
+        }
+    }
+
+    /// An IPv6 relay holds IPv4 with no relay permit; a hostname relay
+    /// holds DNS only, its address not known when the hold goes up.
+    #[test]
+    fn only_a_relay_address_holds_ipv4() {
+        let v6 = dns_hold_rules(&ipv4_held("[2001:db8::7]:51820", false));
+        assert!(v6.contains("anchor \"com.birdo.vpn.ipv4hold\"\n"), "{v6}");
+        assert!(
+            !v6.contains("pass out quick inet proto { udp tcp } to"),
+            "{v6}"
+        );
+        let hostname = dns_hold_rules(&ipv4_held("relay.example.net:51820", false));
+        assert_eq!(
+            hostname,
+            dns_hold_rules(&exempt("relay.example.net:51820", false))
+        );
+        assert!(!hostname.contains("ipv4hold"), "{hostname}");
+    }
+
+    /// In both leak block files: the DNS rules, then the IPv4 half, all of
+    /// it ahead of every other filter anchor and pass; the file unchanged.
+    #[test]
+    fn the_ipv4_hold_follows_the_dns_rules_ahead_of_every_filter_anchor() {
+        let hold = dns_hold_rules(&ipv4_held("203.0.113.9:51820", true));
+        for baseline in [IPV6_RULESET_FULL, IPV6_RULESET_MINIMAL] {
+            let held = with_dns_hold(baseline, &hold);
+            let lines: Vec<&str> = held.lines().collect();
+            let at = |prefix: &str| lines.iter().position(|l| l.starts_with(prefix));
+            let dns_at = at("anchor \"com.birdo.vpn.dnshold\"").expect("the DNS hold");
+            let ipv4_at = at("anchor \"com.birdo.vpn.ipv4hold\"").expect("the IPv4 hold");
+            let end = at("block drop out quick inet all").expect("its last rule");
+            assert!(dns_at < ipv4_at && ipv4_at < end, "{held}");
+            for (i, line) in lines.iter().enumerate() {
+                let ours = i == dns_at || i == ipv4_at;
+                if line.starts_with("anchor \"") && !ours {
+                    assert!(i > end, "{line} is ahead of the hold:\n{held}");
+                }
+                if line.starts_with("pass ") {
+                    assert!(i > ipv4_at, "{line} is ahead of the IPv4 hold:\n{held}");
+                }
+            }
+            let rest: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|l| !hold.lines().any(|h| h == *l))
+                .collect();
+            assert_eq!(rest, baseline.lines().collect::<Vec<_>>());
+            let printed = pf_prints(&held);
+            assert!(ipv4_hold_loaded(&printed) && dns_hold_loaded(&printed));
+            assert!(marker_loaded(&printed) && !block_all_loaded(&printed));
+        }
+    }
+
+    #[test]
+    fn the_ipv4_hold_marker_is_its_own() {
+        let ipv4 = "anchor \"com.birdo.vpn.ipv4hold\" all";
+        assert!(ipv4_hold_loaded(ipv4));
+        assert!(!dns_hold_loaded(ipv4) && !marker_loaded(ipv4) && !block_all_loaded(ipv4));
+        assert!(!ipv4_hold_loaded("anchor \"com.birdo.vpn.dnshold\" all"));
+        assert!(!ipv4_hold_loaded("anchor \"com.birdo.vpn\" all"));
+    }
+
+    /// Kill switch OFF, a switch as the manager runs it, with the IPv4 half:
+    /// held from the hold to the release, through the old teardown and the
+    /// new start's re-load, then gone with the DNS hold.
+    #[test]
+    fn a_switch_holds_ipv4_in_the_leak_block_until_the_release() {
+        let (pf, mut state) = ipv6_only();
+        assert_eq!(state.ipv6_hold(&pf), Ok(()));
+        assert_eq!(
+            state.dns_hold_on(&pf, ipv4_held("203.0.113.9:51820", false), 1),
+            Ok(())
+        );
+        assert!(holds_ipv4(&pf) && holds_dns(&pf) && ipv6_contained(&pf));
+        state.ipv6_off(&pf, true);
+        assert!(holds_ipv4(&pf), "the old tunnel's teardown lifted the hold");
+        assert_eq!(state.ipv6_on(&pf), Ok(()), "the new tunnel's start");
+        assert!(holds_ipv4(&pf), "the new start's re-load dropped the hold");
+        assert_eq!(state.dns_hold_off(&pf, 1), Ok(()));
+        assert!(!holds_ipv4(&pf) && !holds_dns(&pf) && ipv6_contained(&pf));
+    }
+
+    /// pf refusing the IPv4 half costs the switch only that: the DNS hold
+    /// goes in on its own, as before MR-2255, and the IPv6 block stays.
+    #[test]
+    fn an_ipv4_hold_pf_refuses_falls_back_to_the_dns_only_hold() {
+        let (pf, mut state) = ipv6_only();
+        let pf = FakePf {
+            refuses: Some(IPV4_HOLD_ANCHOR),
+            ..pf
+        };
+        assert_eq!(
+            state.dns_hold_on(&pf, ipv4_held("203.0.113.9:51820", false), 1),
+            Ok(())
+        );
+        assert!(holds_dns(&pf) && !holds_ipv4(&pf) && ipv6_contained(&pf));
+        assert_eq!(state.dns_hold_off(&pf, 1), Ok(()));
+        assert!(!holds_dns(&pf) && ipv6_contained(&pf));
+    }
+
     /// A switch that fails: its start's unwind lifts the leak block (unheld)
     /// and the hold goes with it; the release then has nothing to load.
     #[test]
@@ -3351,13 +3638,23 @@ mod pfctl_parse_tests {
             "fd00::53".to_string(),
             "fe80::1".to_string(),
         ];
-        let shapes = [
+        let dns_only = [
             crate::vpn::dns_hold::dns_hold_exempt("203.0.113.9:51820", &dns, true),
             crate::vpn::dns_hold::dns_hold_exempt("203.0.113.9:53", &dns, false),
             crate::vpn::dns_hold::dns_hold_exempt("[2001:db8::7]:51820", &dns, true),
             crate::vpn::dns_hold::dns_hold_exempt("relay.example.net:51820", &dns, false),
         ];
+        // MR-2255: each again with the IPv4 half, as the manager asks for it
+        // (the hostname one stays DNS only), with and without control-plane
+        // addresses.
+        let control_plane = vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(104, 16, 0, 1)];
+        let mut shapes = dns_only.to_vec();
+        for exempt in &dns_only {
+            shapes.push(exempt.clone().with_ipv4_hold(control_plane.clone(), 0));
+            shapes.push(exempt.clone().with_ipv4_hold(Vec::new(), 0));
+        }
         let hold_anchor = format!("anchor \"{DNS_HOLD_ANCHOR}\"");
+        let ipv4_anchor = format!("anchor \"{IPV4_HOLD_ANCHOR}\"");
         for exempt in &shapes {
             let hold = dns_hold_rules(exempt);
             for baseline in [IPV6_RULESET_FULL, IPV6_RULESET_MINIMAL] {
@@ -3395,6 +3692,42 @@ mod pfctl_parse_tests {
                         assert!(i > at + rules, "{line} is ahead of the hold:\n{printed}");
                     }
                 }
+
+                // MR-2255: the IPv4 half, right after the DNS rules: its
+                // anchor, its out permits, its closing block, and every other
+                // filter anchor and pass after that.
+                assert_eq!(
+                    ipv4_hold_loaded(&printed),
+                    exempt.ipv4.is_some(),
+                    "{printed}"
+                );
+                if exempt.ipv4.is_none() {
+                    continue;
+                }
+                let v4_at = lines
+                    .iter()
+                    .position(|l| l.starts_with(&ipv4_anchor))
+                    .expect("the IPv4 hold's anchor");
+                assert_eq!(v4_at, at + rules + 1, "{printed}");
+                let end = lines
+                    .iter()
+                    .position(|l| l.starts_with("block drop out quick inet all"))
+                    .expect("the IPv4 hold's closing block");
+                assert!(end > v4_at + 1, "{printed}");
+                for line in &lines[v4_at + 1..end] {
+                    assert!(
+                        line.starts_with("pass out quick inet"),
+                        "{line}:\n{printed}"
+                    );
+                }
+                for (i, line) in lines.iter().enumerate() {
+                    let other_anchor = line.starts_with("anchor \"") && i != at && i != v4_at;
+                    if other_anchor || (line.starts_with("pass") && !(v4_at..end).contains(&i)) {
+                        assert!(i > end, "{line} is ahead of the IPv4 hold:\n{printed}");
+                    }
+                }
+                assert!(root_permits_are_scoped(&printed), "{printed}");
+                assert!(port_443_is_scoped(&printed), "{printed}");
             }
         }
     }
