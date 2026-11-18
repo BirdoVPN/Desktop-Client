@@ -15,7 +15,7 @@ use crate::commands::session::{
     connect_session, connect_session_for, end_session, ensure_signed_in, ConnectPurpose,
     ConnectTarget, EndReason,
 };
-use crate::commands::settings::{load_settings_off_runtime, AppSettings};
+use crate::commands::settings::{load_settings_off_runtime, load_settings_to_reapply, AppSettings};
 use crate::storage::CredentialStore;
 use crate::vpn::auto_reconnect::ReconnectInfo;
 use crate::vpn::manager::{ConnectPhase, ConnectionState, GaveUp, MultiHopStatus, VpnManager};
@@ -1091,16 +1091,20 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
     // MR-1943: a file that cannot be read has no change in it to apply. The
     // rebuild would run on `settings_in_force`'s defaults and drop this
     // healthy session's LAN sharing, custom DNS and kill-switch exceptions.
-    // The session stays as it is, and the UI offers Retry.
+    // The session stays as it is, and the UI offers Retry. AUD-DOC-18: so
+    // does a file that cannot be verified right now: its stand-in defaults
+    // are no change either, and the rebuild on them was reported Applied.
     //
     // What it reads is the change being attempted: the rebuild reads the same
     // file, and the UI holds its saves while a reapply runs. A revert puts
     // back only what this moved (WIN3-009 item 3).
-    let attempted = match load_settings_off_runtime(&app).await {
+    let attempted = match load_settings_to_reapply(&app).await {
         Ok(settings) => settings,
         Err(e) => {
-            tracing::warn!("reapply_vpn_settings: the settings could not be read — not rebuilding");
-            return Err(IpcError::unknown(e));
+            tracing::warn!(
+                "reapply_vpn_settings: the settings could not be read or verified — not rebuilding"
+            );
+            return Err(e);
         }
     };
     let previous = ar.connected_settings().await;
@@ -1625,9 +1629,10 @@ mod tests {
         let body = &body[..body.find("\n}").unwrap()];
         let mut last = 0;
         for needle in [
-            // MR-1943: an unreadable file is not rebuilt onto the defaults.
-            // What it reads is the change attempted (WIN3-009 item 3).
-            "let attempted = match load_settings_off_runtime(&app).await {",
+            // MR-1943: an unreadable file is not rebuilt onto the defaults,
+            // nor one that cannot be verified (AUD-DOC-18). What it reads is
+            // the change attempted (WIN3-009 item 3).
+            "let attempted = match load_settings_to_reapply(&app).await {",
             "ar.connected_settings().await",
             "ConnectPurpose::SettingsReapply {",
             "let rebuild = connect_session_for(&app, target.clone(), purpose, None)",

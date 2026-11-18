@@ -720,6 +720,25 @@ pub(crate) async fn load_settings_off_runtime(app: &AppHandle) -> Result<AppSett
         .map_err(|e| format!("Settings task failed: {e}"))?
 }
 
+/// The settings a live reapply applies (`vpn::reapply_vpn_settings`):
+/// [`load_settings_off_runtime`]'s load, but a file that cannot be verified
+/// right now is refused (`settings_unverified`).
+///
+/// AUD-DOC-18: Rust's other reads run on such a file's stand-in defaults
+/// ([`settings_for_rust`]), and the reapply rebuilt a healthy session on them
+/// and reported it Applied. There is no change in such a file to apply: the
+/// session stays as it is, and the UI offers Retry, as for a file that
+/// cannot be read (MR-1943).
+pub(crate) async fn load_settings_to_reapply(app: &AppHandle) -> Result<AppSettings, IpcError> {
+    let app = app.clone();
+    off_the_runtime(move || settings_to_reapply(load_settings(&app))).await
+}
+
+/// What [`load_settings_to_reapply`] answers for a load.
+fn settings_to_reapply(loaded: Result<Loaded, LoadError>) -> Result<AppSettings, IpcError> {
+    verified(loaded?)
+}
+
 /// [`load_settings_sync`] for `setup()` in `main.rs`, saying whether the
 /// settings' on-device log switch is the user's own (MR-808): `false` for the
 /// defaults served while the file cannot be verified, and for no settings at
@@ -3406,6 +3425,19 @@ mod tests {
         let command = &source[source.find("pub async fn get_settings(").unwrap()..];
         let command = &command[..command.find("\n}\n").unwrap()];
         assert!(command.contains("settings_for_the_ui(load_settings(&app))"));
+    }
+
+    /// AUD-DOC-18: a live reapply refuses a file that cannot be verified right
+    /// now; it rebuilt the session on the file's stand-in defaults and
+    /// reported Applied. A verified file, and a quarantine's defaults (what
+    /// is saved now), it applies; a file that cannot be read it refuses.
+    #[test]
+    fn a_reapply_refuses_an_unverifiable_files_stand_in_defaults() {
+        let refused = settings_to_reapply(Ok(Loaded::Unverified(AppSettings::default())));
+        assert_eq!(refused.unwrap_err().code, IpcErrorCode::SettingsUnverified);
+        assert!(settings_to_reapply(Ok(Loaded::Saved(AppSettings::default()))).is_ok());
+        assert!(settings_to_reapply(Ok(Loaded::Quarantined(AppSettings::default()))).is_ok());
+        assert!(settings_to_reapply(Err(LoadError::Unreadable("busy".into()))).is_err());
     }
 
     /// Round 6 of the review (P2-1): the UI's read refuses an unverifiable
