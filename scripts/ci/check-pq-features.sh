@@ -23,13 +23,18 @@
 # Modelled on Mobile-Client's scripts/check_pq_features.sh - Desktop-Client had
 # no equivalent.
 #
-# Run it from anywhere:  ./scripts/ci/check-pq-features.sh
+# Run it from anywhere:  ./scripts/ci/check-pq-features.sh [src-tauri-dir]
 # Only the self-test of section 5's claim scan (no cargo needed):
 #                        ./scripts/ci/check-pq-features.sh --self-test
+# The directory defaults to this repo's src-tauri. The whole gate's self-test,
+# check-pq-features.tests.sh (MR-2422), runs --self-test and then points the
+# gate at mutated copies of the tree, one per rule.
 set -euo pipefail
 
-cd "$(dirname "$0")/../.."
-cd src-tauri
+case "${1:-}" in
+  '' | --self-test) cd "$(dirname "$0")/../../src-tauri" ;;
+  *) cd "$1" ;;
+esac
 
 fail=0
 err() { printf '::error::%s\n' "$*" >&2; fail=1; }
@@ -56,6 +61,7 @@ claim_must_flag=(
   '// keeps a classical-PSK@N@// fallback for the rest of the session'
   '/* the client falls back@N@ * to the server-provided@N@ * classical PSK */'
   '/// falls back to the@R@@N@/// classical PSK@R@'
+  '/*@N@ * a key that fails to decapsulate means the classical@N@ * PSK for the rest of the session.@N@ */'
 )
 claim_must_pass=(
   '/// A failed decapsulation aborts the connect; it never@N@/// takes the classical PSK.'
@@ -144,6 +150,7 @@ done
 # `#[cfg_attr(not(feature = "hazmat"), doc(hidden))]`), so requesting it cannot
 # make a release build safer - but its presence in a manifest reads as if it
 # could, which is the false claim this gate was added alongside. Keep it out.
+# shellcheck disable=SC2016 # literal Rust in backticks, not an expansion
 case " $enabled " in
   *" hazmat "*) err 'ml-kem feature "hazmat" is enabled. It gates ONLY rustdoc visibility of `encapsulate_deterministic` (a plain `pub fn`, compiled in every profile), so declaring it buys nothing and misleads the next reader into thinking deterministic encapsulation cannot reach a release binary. Keeping it out of production is a code-review invariant: the only caller may be the #[cfg(test)] KAT helper.' ;;
   *) ok 'ml-kem feature "hazmat" is absent (it would gate rustdoc only)' ;;
@@ -209,15 +216,60 @@ else
 fi
 
 # ── 6. The manifest may not assert cross-client crate parity ─────────────────
-# Verified against BirdoVPN/Mobile-Client origin/main on 2026-09-16:
-# native/rosenpass-jni, native/birdo-pq-ios and native/birdo-pq-server are all
-# still on `pqcrypto-mlkem = { version = "0.1", ... }`. Until they move, a
-# "same crate as the Android JNI" sentence in this manifest is not aspirational,
-# it is false - in the first file a contributor reads before touching the KEM.
+# When this rule was written (2026-09-16) Mobile-Client's native/rosenpass-jni,
+# native/birdo-pq-ios and native/birdo-pq-server were still on pqcrypto-mlkem,
+# so "same crate as the Android JNI" was false. They have since moved: at
+# Mobile-Client origin/main 827dd9b7 (checked 2026-11-18) all three pin
+# `ml-kem = "=0.3.4"` with alloc + zeroize (+ getrandom), as this manifest does.
+# The rule stays, because nothing in this repo's CI reads Mobile-Client's
+# manifests and Dependabot moves each repo's pin on its own: the sentence would
+# be an unchecked claim that goes stale unseen, in the first file a contributor
+# reads before touching the KEM. Interoperability rests on the KAT fixture
+# (section 7 and the KAT test), not on crate identity.
 if parity=$(grep -niE 'same (crate|KEM crate) as the (android|ios|mobile)' Cargo.toml); then
-  err "Cargo.toml's AUDIT-C1 comment asserts the desktop and mobile clients link the same KEM crate: ${parity}. Check BirdoVPN/Mobile-Client native/*/Cargo.toml before restoring that sentence; while they differ, the KAT fixture is the interoperability guarantee, not crate identity."
+  err "Cargo.toml's AUDIT-C1 comment asserts the desktop and mobile clients link the same KEM crate: ${parity}. Nothing in this repo checks BirdoVPN/Mobile-Client native/*/Cargo.toml, so that sentence would go stale unseen the first time one repo's pin moves without the other. The KAT fixture is the interoperability guarantee, not crate identity."
 else
   ok "Cargo.toml does not assert cross-client crate identity"
+fi
+
+# ── 7. The KAT fixture is still the one birdo-web pins (MR-2421) ──────────────
+# src/vpn/fixtures/birdo-pq-ml-kem-1024.kat.json is a byte copy of birdo-web's
+# backend/src/vpn/__fixtures__/ fixture, which the server's own library
+# (@noble/post-quantum) produced; the KAT test is only an interop proof while
+# the two copies are the same bytes. birdo-web is private and this job reads no
+# other repo, so both repos pin ONE sha256 in a .sha256 file next to the
+# fixture (the same file in both) and each CI hashes its own copy against it
+# (birdo-web: scripts/ci/pq-kat-fixture-pin.mjs). A fixture edited here alone
+# fails; moving the pin is a deliberate line that must move in both repos.
+kat=src/vpn/fixtures/birdo-pq-ml-kem-1024.kat.json
+kat_pin=$kat.sha256
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
+}
+if [ ! -f "$kat" ] || [ ! -f "$kat_pin" ]; then
+  err "the ML-KEM KAT fixture or its pin is missing (want both ${kat} and ${kat_pin}). The fixture is the only proof that this client decapsulates what the server's library encapsulates; it cannot go."
+else
+  # sha256sum format: one "<hash>  <name>" line; # comments and blank lines
+  # are skipped, as `sha256sum -c` skips them. CRs are dropped so a CRLF
+  # checkout of the pin file still reads.
+  pin_lines=$(grep -vE '^[[:space:]]*(#|$)' "$kat_pin" | tr -d '\r' || true)
+  pin_count=$(printf '%s\n' "$pin_lines" | grep -c . || true)
+  pin_re='^([0-9a-f]{64}) [ *]birdo-pq-ml-kem-1024\.kat\.json$'
+  if [ "$pin_count" != 1 ] || ! [[ $pin_lines =~ $pin_re ]]; then
+    err "${kat_pin} must hold exactly one '<64 lower-case hex>  birdo-pq-ml-kem-1024.kat.json' line besides # comments (sha256sum format); it has ${pin_count}: [${pin_lines}]"
+  else
+    want=${BASH_REMATCH[1]}
+    got=$(sha256_of "$kat")
+    if [ "$got" = "$want" ]; then
+      ok "the ML-KEM KAT fixture hashes to the sha256 it shares with birdo-web (${want})"
+    else
+      crlf=""
+      if grep -q $'\r' "$kat"; then
+        crlf=" This copy has CRLF line endings: the pin is of the LF bytes git stores, which .gitattributes keeps on a fresh checkout."
+      fi
+      err "${kat} hashes to ${got}, not to the sha256 pinned beside it (${want}), the same pin birdo-web carries. The fixture is a byte copy of birdo-web's backend/src/vpn/__fixtures__/birdo-pq-ml-kem-1024.kat.json: change it there first, copy it here, and move the pin in BOTH repos (two pull requests that link each other).${crlf}"
+    fi
+  fi
 fi
 
 if [ "$fail" -ne 0 ]; then
