@@ -313,7 +313,7 @@ jobs:
       # Main only, and only when the exact archive set was not restored.
       - name: Collect the installed .debs for the cache (main)
         id: apt-collect
-        if: needs.changes.outputs.code != 'false' && matrix.os == 'linux' && (github.ref == 'refs/heads/main' || github.head_ref == 'ci/mr-2347-apt-archive-cache') && steps.apt-plan.outputs.key != '' && steps.apt-restore.outputs.cache-hit != 'true'
+        if: needs.changes.outputs.code != 'false' && matrix.os == 'linux' && github.ref == 'refs/heads/main' && steps.apt-plan.outputs.key != '' && steps.apt-restore.outputs.cache-hit != 'true'
         run: bash scripts/ci/apt-archive-cache.sh collect ~/.cache/birdo-apt-archives
 
       - name: Save the .deb cache (main)
