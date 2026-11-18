@@ -102,6 +102,29 @@ fn connect_failure_message(response: &ConnectResponse) -> String {
         .unwrap_or_else(|| "Connection failed".to_string())
 }
 
+/// AUD-DESK-08: refuse a response whose relay the kill switch could not
+/// permit. The relay the permit names is an IPv4 address, which is all the
+/// server sends (the node's address); for a host name the permit stayed on
+/// the previous relay (`session::apply_relay_permit`). The Stealth relay,
+/// which the permit names instead of the local proxy when Stealth is used
+/// (`session::prepare_tunnel`), likewise. Checked before the Stealth helper
+/// starts (`prepare_tunnel`, review of #446) and again by
+/// [`build_vpn_config`]. A port does not matter here; a missing endpoint is
+/// `build_vpn_config`'s to report.
+pub(crate) fn check_permittable_relays(response: &ConnectResponse) -> Result<(), String> {
+    let direct = response.endpoint.as_deref();
+    let stealth = response
+        .xray_endpoint
+        .as_deref()
+        .filter(|_| response.stealth_enabled.unwrap_or(false));
+    for relay in direct.into_iter().chain(stealth) {
+        if parse_endpoint_ip(relay).is_none() {
+            return Err("Invalid endpoint in server response: not an IPv4 address".to_string());
+        }
+    }
+    Ok(())
+}
+
 /// H-2 FIX: Shared helper to extract VPN config from ConnectResponse.
 /// Previously duplicated ~60 lines between connect_vpn and quick_connect.
 /// Any security fix (DNS validation, field extraction) now only needs one change.
@@ -131,6 +154,7 @@ pub fn build_vpn_config(
         tracing::error!("Server rejected connection: {}", msg);
         return Err(msg);
     }
+    check_permittable_relays(&response)?;
 
     // Extract required fields from response
     let key_id = response.key_id.ok_or("Missing key_id in response")?;
@@ -207,21 +231,6 @@ pub fn build_vpn_config(
         },
         None => endpoint,
     };
-    // AUD-DESK-08: the relay the kill switch permits is an IPv4 address, which
-    // is all the server sends (the node's address). A host name could not be
-    // permitted (`session::apply_relay_permit`): the permit stayed on the
-    // previous relay. The Stealth relay, which the permit names instead of
-    // the local proxy when Stealth is used (`prepare_tunnel`), likewise.
-    let stealth_relay = response
-        .xray_endpoint
-        .as_deref()
-        .filter(|_| response.stealth_enabled.unwrap_or(false));
-    for relay in std::iter::once(endpoint.as_str()).chain(stealth_relay) {
-        if parse_endpoint_ip(relay).is_none() {
-            return Err("Invalid endpoint in server response: not an IPv4 address".to_string());
-        }
-    }
-
     let persistent_keepalive = response.persistent_keepalive.unwrap_or(25);
 
     // Get server name for display

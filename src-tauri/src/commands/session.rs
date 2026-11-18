@@ -949,6 +949,14 @@ pub(crate) async fn prepare_tunnel(
         ));
     }
 
+    // AUD-DESK-08 (review of #446): a relay the kill switch could not permit
+    // is refused before anything starts for it, the Stealth helper and its
+    // DoH lookup of a host name included. `build_vpn_config` checks again.
+    if response.success {
+        crate::commands::vpn::check_permittable_relays(&response)
+            .map_err(|m| IpcError::new(IpcErrorCode::ServerError, m))?;
+    }
+
     if response.stealth_enabled.unwrap_or(false) {
         vm.set_phase(ConnectPhase::StartingStealth);
     }
@@ -1897,6 +1905,23 @@ mod lifecycle_tests {
         ] {
             assert!(permit.contains(rebuilt), "{rebuilt}");
         }
+    }
+
+    /// AUD-DESK-08 (review of #446): a relay the kill switch could not permit
+    /// is refused before the Stealth helper starts for it, so before it looks
+    /// a host name up. What is refused is driven in
+    /// `vpn::tests::a_relay_endpoint_that_is_not_an_ipv4_address_is_refused`.
+    #[test]
+    fn a_relay_that_cannot_be_permitted_is_refused_before_stealth_starts() {
+        order(
+            body("pub(crate) async fn prepare_tunnel("),
+            &[
+                "if response.success {",
+                "check_permittable_relays(&response)",
+                "start_stealth_tunnel(app, &response, request.custom_port)",
+                "build_vpn_config(",
+            ],
+        );
     }
 
     /// MR-2070, where the refused switch lands (`fail_connect`). A session
