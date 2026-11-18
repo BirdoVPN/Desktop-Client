@@ -14,6 +14,8 @@ name: Tests
 # the wall time; `all-checks` reports their combined result. Rust caches are written by
 # main only (`save-if`); PRs restore main's cache read-only. PR-scoped copies
 # used to push the repo to 14 GB of caches (10 GB cap) and evict main's.
+# The Linux jobs' .deb cache (MR-2347, about 70 MB) follows the same rule,
+# and apt sees only the cached archives that hash to the signed index.
 # Every cargo invocation is `--locked`: CI tests the exact dependency graph
 # that Cargo.lock (and cargo-deny) describe, or fails.
 
@@ -272,9 +274,54 @@ jobs:
         with:
           persist-credentials: false
 
+      # MR-2347: the 72 MB of .debs linux-deps installs, from a cache. On the
+      # runners whose apt mirror is us-east-2.ec2.archive.ubuntu.com their
+      # download took 9-17 min in 12 of 25 Linux jobs (70-130 kB/s), and that
+      # set this workflow's wall time. apt installs a cached archive on its
+      # size alone, so scripts/ci/apt-archive-cache.sh stages a restored
+      # archive only when it hashes to the SHA-256 the signed Packages index
+      # gives it; anything else apt downloads as before. linux-deps itself
+      # (the one package list, shared with release.yml) is unchanged and
+      # still runs the install. Main writes the cache, PRs restore it (as the
+      # Rust caches); the MSRV Linux leg restores the same entry.
+      - name: Plan the .deb cache (apt-get update; each archive linux-deps installs, with its SHA-256 from the signed index)
+        id: apt-plan
+        if: needs.changes.outputs.code != 'false' && matrix.os == 'linux'
+        run: bash scripts/ci/apt-archive-cache.sh plan
+
+      - name: Restore the .deb cache
+        id: apt-restore
+        if: needs.changes.outputs.code != 'false' && matrix.os == 'linux' && steps.apt-plan.outputs.key != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/birdo-apt-archives
+          key: ${{ steps.apt-plan.outputs.key }}
+          restore-keys: ${{ steps.apt-plan.outputs.prefix }}
+
+      - name: Self-test - the .deb cache stages only what the signed index vouches for
+        if: needs.changes.outputs.code != 'false' && matrix.os == 'linux'
+        run: bash scripts/ci/apt-archive-cache.tests.sh
+
+      - name: Stage the restored .debs that hash to the signed index (apt downloads the rest)
+        if: needs.changes.outputs.code != 'false' && matrix.os == 'linux' && steps.apt-plan.outputs.key != ''
+        run: bash scripts/ci/apt-archive-cache.sh stage ~/.cache/birdo-apt-archives
+
       - name: Install Linux system dependencies
         if: needs.changes.outputs.code != 'false' && matrix.os == 'linux'
         uses: ./.github/actions/linux-deps
+
+      # Main only, and only when the exact archive set was not restored.
+      - name: Collect the installed .debs for the cache (main)
+        id: apt-collect
+        if: needs.changes.outputs.code != 'false' && matrix.os == 'linux' && github.ref == 'refs/heads/main' && steps.apt-plan.outputs.key != '' && steps.apt-restore.outputs.cache-hit != 'true'
+        run: bash scripts/ci/apt-archive-cache.sh collect ~/.cache/birdo-apt-archives
+
+      - name: Save the .deb cache (main)
+        if: steps.apt-collect.outputs.complete == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/birdo-apt-archives
+          key: ${{ steps.apt-plan.outputs.key }}
 
       - name: Set up the pinned Rust toolchain (rust-toolchain.toml)
         if: needs.changes.outputs.code != 'false'
@@ -722,6 +769,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # The cross-check Linux leg's .deb cache (MR-2347; see there), restored
+      # and verified the same way. Only that leg saves it.
+      - name: Plan the .deb cache (apt-get update; each archive linux-deps installs, with its SHA-256 from the signed index)
+        id: apt-plan
+        if: matrix.os == 'linux'
+        run: bash scripts/ci/apt-archive-cache.sh plan
+
+      - name: Restore the .deb cache
+        if: matrix.os == 'linux' && steps.apt-plan.outputs.key != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/birdo-apt-archives
+          key: ${{ steps.apt-plan.outputs.key }}
+          restore-keys: ${{ steps.apt-plan.outputs.prefix }}
+
+      - name: Stage the restored .debs that hash to the signed index (apt downloads the rest)
+        if: matrix.os == 'linux' && steps.apt-plan.outputs.key != ''
+        run: bash scripts/ci/apt-archive-cache.sh stage ~/.cache/birdo-apt-archives
 
       - name: Install Linux system dependencies
         if: matrix.os == 'linux'
