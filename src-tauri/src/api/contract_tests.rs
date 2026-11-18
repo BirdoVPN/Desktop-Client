@@ -55,7 +55,7 @@ const SCHEMA_SRC: &str = include_str!("../../contract/vpn-protocol.schema.json")
 /// `sha256sum` of birdo-web `backend/contract/vpn-protocol.schema.json` at the
 /// commit vendored (LF bytes, as git stores them). The test normalises `\r\n`
 /// so an autocrlf checkout hashes the same as CI.
-const SCHEMA_SHA256: &str = "068ab0f30144119b9a1135bfb830ff633cd73f03f73365f7026bfabf9334a2dc";
+const SCHEMA_SHA256: &str = "acdc35e1f6f3f6e54a66f4f74b25c2e246f240d23238bde639ff33a3a2059265";
 
 const CONNECT: &str = "ConnectRequest";
 const MULTI_HOP: &str = "MultiHopConnectRequest";
@@ -274,6 +274,37 @@ fn vendored_schema_is_the_birdo_web_blob() {
         "contract/vpn-protocol.schema.json differs from the pinned birdo-web blob; \
          re-vendor verbatim from birdo-web main and update SCHEMA_SHA256 together"
     );
+}
+
+/// MR-197 / MR-1754: the version the app sends is the version of the schema it
+/// vendors. Four places say it (the schema's `x-contractVersion`, its
+/// `_status.contractVersion`, the sibling `CONTRACT_VERSION` file and the
+/// constant `X-Birdo-Contract` carries) and they must agree.
+#[test]
+fn the_contract_version_is_the_schemas() {
+    const FILE: &str = include_str!("../../contract/CONTRACT_VERSION");
+    let s = schema();
+    let version = s["x-contractVersion"]
+        .as_str()
+        .expect("the vendored schema is stamped with x-contractVersion");
+    assert_eq!(s["_status"]["contractVersion"], version);
+    assert_eq!(FILE.trim(), version, "contract/CONTRACT_VERSION");
+    assert_eq!(
+        super::client::CONTRACT_VERSION,
+        version,
+        "client::CONTRACT_VERSION"
+    );
+    // MAJOR.MINOR.PATCH, nothing else: the backend files anything odd as `invalid`.
+    let parts: Vec<&str> = version.split('.').collect();
+    assert_eq!(parts.len(), 3, "{version}");
+    assert!(parts.iter().all(|p| p.parse::<u32>().is_ok()), "{version}");
+}
+
+/// The pin file names the same hash the Rust constant does.
+#[test]
+fn the_sha_pin_file_matches_the_constant() {
+    const PIN: &str = include_str!("../../contract/CONTRACT.sha256");
+    assert_eq!(PIN.split_whitespace().next(), Some(SCHEMA_SHA256));
 }
 
 #[test]

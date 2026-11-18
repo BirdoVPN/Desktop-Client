@@ -15,6 +15,17 @@ for every user of the next release and no Rust type check can see it, so
 (`api::client::build_connect_request` / `build_multi_hop_request`) and
 validates the resulting JSON against this file.
 
+## Version (MR-197 / MR-1754)
+
+The schema carries `x-contractVersion` (also `_status.contractVersion`), and
+`CONTRACT_VERSION` repeats it. The app sends it as `X-Birdo-Contract` on every
+control-plane request (`api::client::CONTRACT_VERSION`, `do_request`), and
+`contract_tests::the_contract_version_is_the_schemas` fails when the schema, the
+file and the constant disagree. When you re-vendor, update the pin
+(`CONTRACT.sha256`, `SCHEMA_SHA256`), the version file and the constant in the
+same commit. The scheduled drift job that compares against birdo-web needs a
+read token the owner has not created yet and is not in place.
+
 ## Re-vendoring
 
 1. Copy the file byte-for-byte from birdo-web `main`:
