@@ -1019,18 +1019,26 @@ mod tests {
                         lan_sharing,
                     })
                     .out_v4;
-                    assert_eq!(held.len(), block.len());
-                    for (h, b) in held.iter().zip(&block) {
-                        let (h_target, b_target) = (h.last().unwrap(), b.last().unwrap());
-                        assert_eq!(h[..h.len() - 1], b[..b.len() - 1], "{h:?} / {b:?}");
-                        match b_target.as_str() {
-                            "ACCEPT" => assert_eq!(h_target, "RETURN", "{h:?}"),
-                            "DROP" => assert_eq!(h_target, "DROP", "{h:?}"),
-                            other => panic!("the block-all's IPv4 OUT has a {other} rule"),
-                        }
-                    }
+                    // RETURN read back as ACCEPT gives the block-all exactly,
+                    // so its scoping (tested above) is the hold's too.
+                    let as_block: Vec<Rule> = held
+                        .iter()
+                        .map(|r| {
+                            r.iter()
+                                .map(|a| match a.as_str() {
+                                    "RETURN" => "ACCEPT".to_string(),
+                                    _ => a.clone(),
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    assert_eq!(as_block, block, "RETURN for ACCEPT and nothing else");
+                    assert!(
+                        !held.iter().flatten().any(|a| a == "ACCEPT"),
+                        "an ACCEPT in mangle would end the packet's mangle pass: {held:?}"
+                    );
+                    assert!(port_443_is_scoped(&as_block, control, ROOT), "{held:?}");
                     assert_eq!(held.last().unwrap(), &rule(&["-j", "DROP"]));
-                    assert!(port_443_is_scoped(&held, control, ROOT), "{held:?}");
                 }
             }
         }
