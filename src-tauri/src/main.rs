@@ -132,10 +132,10 @@ const WITH_APP_DATA: &str = "--with-app-data";
 
 /// R2 (#287 follow-up L2): remove the updater's `updates\` and the squatted
 /// folders moved aside as `%ProgramData%\BirdoVPN.untrusted-*` (and, with
-/// [`WITH_APP_DATA`], the accounts' ML-KEM keypairs there, R4/D-23, and the
-/// per-user app-data folders, D6c HIGH), never the settings keys or the
-/// migration markers (a reinstall needs the keys to verify the user's
-/// settings). Done here, not by NSIS: the folders are a user's, and NSIS's
+/// [`WITH_APP_DATA`], the accounts' ML-KEM keypairs there, R4/D-23, the
+/// per-user app-data folders, D6c HIGH, and this account's settings key,
+/// AUD-DESK-19), never another account's settings key or the migration
+/// markers (a reinstall needs the keys to verify the user's settings). Done here, not by NSIS: the folders are a user's, and NSIS's
 /// `RMDir /r` follows the junctions a user can plant in them
 /// (`protected_dir::remove_uninstall_leftovers`). Creates nothing, touches no
 /// other state, and exits before any window, tray or plugin.
@@ -153,11 +153,12 @@ fn remove_leftovers_and_exit() -> ! {
         let done = crate::utils::protected_dir::remove_uninstall_leftovers(with_app_data);
         eprintln!(
             "{}: removed {} updates folder(s), {} set-aside folder(s), {} ML-KEM key(s), \
-             {} app-data entr(ies); {} failed",
+             {} settings key(s), {} app-data entr(ies); {} failed",
             REMOVE_LEFTOVERS_AND_EXIT,
             done.updates,
             done.set_aside,
             done.pq_keys,
+            done.settings_keys,
             done.app_data,
             done.failed
         );

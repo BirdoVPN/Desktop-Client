@@ -720,6 +720,47 @@ pub(crate) async fn load_settings_off_runtime(app: &AppHandle) -> Result<AppSett
         .map_err(|e| format!("Settings task failed: {e}"))?
 }
 
+/// [`load_settings_off_runtime`] for the connect path (`vpn::apply_vpn_settings`),
+/// saying whether the settings are the file's own: `false` for the stand-in
+/// defaults of a file that cannot be verified right now
+/// ([`Loaded::Unverified`]). AUD-DOC-18 (review of #446): those defaults are
+/// no snapshot of the user's settings (`vpn::settings_in_force`), so a
+/// reapply whose rebuild read them is reported, never Applied.
+pub(crate) async fn load_session_settings_off_runtime(
+    app: &AppHandle,
+) -> Result<(AppSettings, bool), String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || session_settings(load_settings(&app)))
+        .await
+        .map_err(|e| format!("Settings task failed: {e}"))?
+}
+
+/// What [`load_session_settings_off_runtime`] answers for a load.
+fn session_settings(loaded: Result<Loaded, LoadError>) -> Result<(AppSettings, bool), String> {
+    let loaded = loaded?;
+    let own = !matches!(loaded, Loaded::Unverified(_));
+    Ok((loaded.settings(), own))
+}
+
+/// The settings a live reapply applies (`vpn::reapply_vpn_settings`):
+/// [`load_settings_off_runtime`]'s load, but a file that cannot be verified
+/// right now is refused (`settings_unverified`).
+///
+/// AUD-DOC-18: Rust's other reads run on such a file's stand-in defaults
+/// ([`settings_for_rust`]), and the reapply rebuilt a healthy session on them
+/// and reported it Applied. There is no change in such a file to apply: the
+/// session stays as it is, and the UI offers Retry, as for a file that
+/// cannot be read (MR-1943).
+pub(crate) async fn load_settings_to_reapply(app: &AppHandle) -> Result<AppSettings, IpcError> {
+    let app = app.clone();
+    off_the_runtime(move || settings_to_reapply(load_settings(&app))).await
+}
+
+/// What [`load_settings_to_reapply`] answers for a load.
+fn settings_to_reapply(loaded: Result<Loaded, LoadError>) -> Result<AppSettings, IpcError> {
+    verified(loaded?)
+}
+
 /// [`load_settings_sync`] for `setup()` in `main.rs`, saying whether the
 /// settings' on-device log switch is the user's own (MR-808): `false` for the
 /// defaults served while the file cannot be verified, and for no settings at
@@ -1514,7 +1555,7 @@ fn no_verifying_key(
         "Settings HMAC verification failed — tampered, or its key is gone. Resetting to defaults."
     );
     let saved = crate::utils::file_log::saved_choice(Ok(content.to_owned()));
-    Loaded::Quarantined(quarantine(path, saved, keys))
+    quarantine(path, saved, keys)
 }
 
 /// MR-2004: the end of a load whose file verifies but was written over since
@@ -1523,7 +1564,7 @@ fn no_verifying_key(
 /// verifies ([`no_verifying_key`]).
 fn replayed(path: &Path, content: &str, keys: &dyn SettingsKeys) -> Loaded {
     let saved = crate::utils::file_log::saved_choice(Ok(content.to_owned()));
-    Loaded::Quarantined(quarantine(path, saved, keys))
+    quarantine(path, saved, keys)
 }
 
 /// Set `path` aside as tampered ([`aside_path`]) and return the defaults that
@@ -1540,6 +1581,12 @@ fn replayed(path: &Path, content: &str, keys: &dyn SettingsKeys) -> Loaded {
 /// file reads as the default. A file that could not be moved is not written
 /// over either; it still says "off" to the next launch.
 ///
+/// AUD-DOC-17: so a file that could not be moved loads as
+/// [`Loaded::Unverified`], not `Quarantined`: nothing was set aside, and
+/// nothing may be saved over it. It used to read as quarantined, and a reset
+/// (`reset_over`) then wrote the defaults over the file and, if that save
+/// failed, said it had been set aside. The next load tries the move again.
+///
 /// MR-2004 (review of #329): the save goes through [`write_signed`], so its
 /// MAC is recorded like every other write's. These defaults always sign the
 /// same, and a user may once have saved exactly them: unrecorded, that MAC
@@ -1549,7 +1596,7 @@ fn quarantine(
     path: &Path,
     saved: crate::utils::file_log::SavedChoice,
     keys: &dyn SettingsKeys,
-) -> AppSettings {
+) -> Loaded {
     let (defaults, _) = after_quarantine(AppSettings::default(), saved);
     let moved = aside_path(path, "tampered");
     let renamed = (|| {
@@ -1560,14 +1607,14 @@ fn quarantine(
         })
     })();
     if renamed.is_err() {
-        return defaults;
+        return Loaded::Unverified(defaults);
     }
     if !defaults.file_logging_enabled {
         if let Err(e) = write_signed(path, &defaults, keys) {
             tracing::warn!("Could not keep the log switched off after the reset: {}", e);
         }
     }
-    defaults
+    Loaded::Quarantined(defaults)
 }
 
 /// Internal save function used by both save_settings command and migration
@@ -3402,6 +3449,19 @@ mod tests {
         assert!(command.contains("settings_for_the_ui(load_settings(&app))"));
     }
 
+    /// AUD-DOC-18: a live reapply refuses a file that cannot be verified right
+    /// now; it rebuilt the session on the file's stand-in defaults and
+    /// reported Applied. A verified file, and a quarantine's defaults (what
+    /// is saved now), it applies; a file that cannot be read it refuses.
+    #[test]
+    fn a_reapply_refuses_an_unverifiable_files_stand_in_defaults() {
+        let refused = settings_to_reapply(Ok(Loaded::Unverified(AppSettings::default())));
+        assert_eq!(refused.unwrap_err().code, IpcErrorCode::SettingsUnverified);
+        assert!(settings_to_reapply(Ok(Loaded::Saved(AppSettings::default()))).is_ok());
+        assert!(settings_to_reapply(Ok(Loaded::Quarantined(AppSettings::default()))).is_ok());
+        assert!(settings_to_reapply(Err(LoadError::Unreadable("busy".into()))).is_err());
+    }
+
     /// Round 6 of the review (P2-1): the UI's read refuses an unverifiable
     /// file, Rust's read gives the defaults the session runs on — post-quantum
     /// and Windows lockdown ON. That no Rust code reads through the UI's is
@@ -3419,6 +3479,17 @@ mod tests {
             "lockdown as default"
         );
         assert!(settings_for_rust(Err(LoadError::Unreadable("busy".into()))).is_err());
+
+        // AUD-DOC-18 (review of #446): the connect path's read gives the same
+        // defaults and says they are not the file's (no snapshot).
+        let own = |loaded| session_settings(loaded).map(|(_, files)| files);
+        let defaults = AppSettings::default;
+        assert_eq!(own(unverifiable()), Ok(false));
+        assert_eq!(own(Ok(Loaded::Saved(defaults()))), Ok(true));
+        assert_eq!(own(Ok(Loaded::Quarantined(defaults()))), Ok(true));
+        assert!(own(Err(LoadError::Unreadable("busy".into()))).is_err());
+        let (session, _) = session_settings(unverifiable()).unwrap();
+        assert!(session.quantum_protection, "post-quantum stays on");
     }
 
     /// Follow-up 5 to the review of #222: no Rust code reads through the UI's
@@ -3541,7 +3612,9 @@ mod tests {
         assert_eq!(saved, SavedChoice::Off);
 
         let keys = WindowsKeys::new(KeyFile::Key(fresh.to_vec()), &[]);
-        let kept = quarantine(&path, saved, &keys);
+        let Loaded::Quarantined(kept) = quarantine(&path, saved, &keys) else {
+            panic!("the file was set aside");
+        };
         assert!(!kept.file_logging_enabled, "the saved off is kept");
 
         // A new settings file, signed, with the log off and the rest at its
@@ -3584,7 +3657,9 @@ mod tests {
         .unwrap();
         let said_on = saved_choice(Ok(fs::read_to_string(&path).unwrap()));
         let untouched = WindowsKeys::new(KeyFile::Key(fresh.to_vec()), &[]);
-        let on = quarantine(&path, said_on, &untouched);
+        let Loaded::Quarantined(on) = quarantine(&path, said_on, &untouched) else {
+            panic!("the file was set aside");
+        };
         assert!(on.file_logging_enabled);
         assert!(!path.exists(), "nothing is saved");
         assert_eq!(*untouched.ledger.borrow(), MacLedger::default());
@@ -3602,13 +3677,9 @@ mod tests {
         let choice = load
             .find("let saved = crate::utils::file_log::saved_choice(Ok(content.to_owned()));")
             .expect("the choice from the bytes the load read");
-        let quarantined = load
-            .find("Loaded::Quarantined(quarantine(path, saved,")
-            .unwrap();
+        let quarantined = load.find("quarantine(path, saved,").unwrap();
         assert!(choice < quarantined);
-        assert!(
-            load[quarantined..].starts_with("Loaded::Quarantined(quarantine(path, saved, keys))")
-        );
+        assert!(load[quarantined..].starts_with("quarantine(path, saved, keys)"));
         assert!(!body("fn quarantine(").contains("read_to_string"));
         // ...and the load hands it the keys every save uses.
         let at = body("fn load_at(");
@@ -3617,6 +3688,43 @@ mod tests {
             let last = args.rsplit(',').map(str::trim).find(|a| !a.is_empty());
             assert_eq!(last, Some("keys"), "{args}");
         }
+    }
+
+    /// AUD-DOC-17: a quarantine whose move failed (a scanner holding the file
+    /// open) set nothing aside, so the load reads Unverified: nothing is saved
+    /// over the file, and a reset sets it aside itself first, or fails
+    /// without saving and without saying it was set aside. It used to read
+    /// as Quarantined: the reset wrote the defaults over the user's file, and
+    /// a failed save said it had been set aside (`reset_settings`).
+    #[cfg(windows)]
+    #[test]
+    fn a_quarantine_that_could_not_move_the_file_sets_nothing_aside() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "the user's settings").unwrap();
+        // Held open without FILE_SHARE_DELETE, as a scanner may: no rename.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+
+        let loaded = no_verifying_key(&path, "the user's settings", false, &SignsNothing);
+        let quarantined = matches!(loaded, Loaded::Quarantined(_));
+        assert!(!quarantined, "read as set aside, but nothing was");
+        assert!(matches!(loaded, Loaded::Unverified(_)));
+        assert!(names_in(dir.path(), "settings.json.tampered-").is_empty());
+        assert!(may_save_over(Ok(loaded)).is_err(), "saved over it");
+
+        // The reset over it, as `reset_settings` makes it: the move it tries
+        // first fails while the file is held, and nothing is saved.
+        let failed = reset_over(&path, quarantined, || panic!("saved over the file"));
+        let failed = failed.unwrap_err();
+        assert!(!failed.message.contains("was set aside"), "{failed:?}");
+        drop(held);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "the user's settings");
     }
 
     /// The other side: while a key source cannot be read right now, the key
@@ -3669,6 +3777,7 @@ mod tests {
         let source = include_str!("settings.rs").replace('\r', "");
         for helper in [
             "pub(crate) async fn load_settings_off_runtime(",
+            "pub(crate) async fn load_session_settings_off_runtime(",
             "pub(crate) async fn clear_account_choices(",
             "pub(crate) async fn restore_tunnel_settings(",
         ] {

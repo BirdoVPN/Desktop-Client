@@ -2440,7 +2440,8 @@ pub mod dns_journal {
         /// MR-1606 / REVIEW-WIN2-018: the confirm page's "Delete the
         /// application data" says that the DNS-restore journal survives it.
         /// The custom English.nsh replaces the bundler's; every language the
-        /// installer offers has to carry the sentence.
+        /// installer offers has to carry the sentence. AUD-DESK-19: and that
+        /// it is this user's data (the other Windows accounts keep theirs).
         /// scripts/ci/check-nsis-language.sh checks the generated installer
         /// and the CLI's own strings.
         #[test]
@@ -2451,7 +2452,7 @@ pub mod dns_journal {
             assert_eq!(nsis["languages"], serde_json::json!(["English"]));
             assert_eq!(nsis["customLanguageFiles"]["English"], "nsis/English.nsh");
             assert!(include_str!("../../nsis/English.nsh").contains(
-                r#"LangString deleteAppData ${LANG_ENGLISH} "Delete the application data (keeps the DNS-restore journal)""#
+                r#"LangString deleteAppData ${LANG_ENGLISH} "Delete this user's app data (keeps the DNS-restore journal)""#
             ));
         }
     }

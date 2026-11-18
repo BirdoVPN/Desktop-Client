@@ -15,7 +15,10 @@ use crate::commands::session::{
     connect_session, connect_session_for, end_session, ensure_signed_in, ConnectPurpose,
     ConnectTarget, EndReason,
 };
-use crate::commands::settings::{load_settings_off_runtime, AppSettings};
+use crate::commands::settings::{
+    load_session_settings_off_runtime, load_settings_off_runtime, load_settings_to_reapply,
+    AppSettings,
+};
 use crate::storage::CredentialStore;
 use crate::vpn::auto_reconnect::ReconnectInfo;
 use crate::vpn::manager::{ConnectPhase, ConnectionState, GaveUp, MultiHopStatus, VpnManager};
@@ -99,6 +102,29 @@ fn connect_failure_message(response: &ConnectResponse) -> String {
         .unwrap_or_else(|| "Connection failed".to_string())
 }
 
+/// AUD-DESK-08: refuse a response whose relay the kill switch could not
+/// permit. The relay the permit names is an IPv4 address, which is all the
+/// server sends (the node's address); for a host name the permit stayed on
+/// the previous relay (`session::apply_relay_permit`). The Stealth relay,
+/// which the permit names instead of the local proxy when Stealth is used
+/// (`session::prepare_tunnel`), likewise. Checked before the Stealth helper
+/// starts (`prepare_tunnel`, review of #446) and again by
+/// [`build_vpn_config`]. A port does not matter here; a missing endpoint is
+/// `build_vpn_config`'s to report.
+pub(crate) fn check_permittable_relays(response: &ConnectResponse) -> Result<(), String> {
+    let direct = response.endpoint.as_deref();
+    let stealth = response
+        .xray_endpoint
+        .as_deref()
+        .filter(|_| response.stealth_enabled.unwrap_or(false));
+    for relay in direct.into_iter().chain(stealth) {
+        if parse_endpoint_ip(relay).is_none() {
+            return Err("Invalid endpoint in server response: not an IPv4 address".to_string());
+        }
+    }
+    Ok(())
+}
+
 /// H-2 FIX: Shared helper to extract VPN config from ConnectResponse.
 /// Previously duplicated ~60 lines between connect_vpn and quick_connect.
 /// Any security fix (DNS validation, field extraction) now only needs one change.
@@ -128,6 +154,7 @@ pub fn build_vpn_config(
         tracing::error!("Server rejected connection: {}", msg);
         return Err(msg);
     }
+    check_permittable_relays(&response)?;
 
     // Extract required fields from response
     let key_id = response.key_id.ok_or("Missing key_id in response")?;
@@ -204,7 +231,6 @@ pub fn build_vpn_config(
         },
         None => endpoint,
     };
-
     let persistent_keepalive = response.persistent_keepalive.unwrap_or(25);
 
     // Get server name for display
@@ -344,12 +370,21 @@ const UNREADABLE_SETTINGS_FALLBACK: &str = "Failed to load VPN settings; using t
 /// takes its default (no custom DNS, no LAN sharing, no kill-switch
 /// exceptions, automatic MTU), the restrictive side of each; the next connect
 /// reads the file again.
+///
+/// AUD-DOC-18 (review of #446): `loaded` says whether the settings are the
+/// file's own. The stand-in defaults of a file that cannot be verified right
+/// now are not, so they are no snapshot either: a reapply whose rebuild read
+/// them (the file became unverifiable after the reapply's own check) is then
+/// reported by the MR-1943 check (`reapply_vpn_settings`), never Applied.
 fn settings_in_force(
-    loaded: Result<AppSettings, String>,
+    loaded: Result<(AppSettings, bool), String>,
     live: Option<&ReconnectInfo>,
 ) -> (AppSettings, Option<AppSettings>) {
     match loaded {
-        Ok(settings) => (settings.clone(), Some(settings)),
+        Ok((settings, own)) => {
+            let snapshot = own.then(|| settings.clone());
+            (settings, snapshot)
+        }
         Err(e) => {
             tracing::warn!("{} ({})", UNREADABLE_SETTINGS_FALLBACK, e);
             let mut settings = AppSettings::default();
@@ -369,9 +404,10 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
     // gives the defaults this session runs on — post-quantum and, on Windows,
     // lockdown ON — where `get_settings`, the UI's read, refuses it. A file
     // that cannot be read at all gives them too ([`settings_in_force`]).
+    // Neither is a snapshot of the user's settings (AUD-DOC-18).
     let live = app.state::<AutoReconnectService>().current_info().await;
     let (settings, snapshot) =
-        settings_in_force(load_settings_off_runtime(app).await, live.as_ref());
+        settings_in_force(load_session_settings_off_runtime(app).await, live.as_ref());
     let AppSettings {
         custom_dns,
         local_network_sharing,
@@ -1077,16 +1113,20 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
     // MR-1943: a file that cannot be read has no change in it to apply. The
     // rebuild would run on `settings_in_force`'s defaults and drop this
     // healthy session's LAN sharing, custom DNS and kill-switch exceptions.
-    // The session stays as it is, and the UI offers Retry.
+    // The session stays as it is, and the UI offers Retry. AUD-DOC-18: so
+    // does a file that cannot be verified right now: its stand-in defaults
+    // are no change either, and the rebuild on them was reported Applied.
     //
     // What it reads is the change being attempted: the rebuild reads the same
     // file, and the UI holds its saves while a reapply runs. A revert puts
     // back only what this moved (WIN3-009 item 3).
-    let attempted = match load_settings_off_runtime(&app).await {
+    let attempted = match load_settings_to_reapply(&app).await {
         Ok(settings) => settings,
         Err(e) => {
-            tracing::warn!("reapply_vpn_settings: the settings could not be read — not rebuilding");
-            return Err(IpcError::unknown(e));
+            tracing::warn!(
+                "reapply_vpn_settings: the settings could not be read or verified — not rebuilding"
+            );
+            return Err(e);
         }
     };
     let previous = ar.connected_settings().await;
@@ -1611,9 +1651,10 @@ mod tests {
         let body = &body[..body.find("\n}").unwrap()];
         let mut last = 0;
         for needle in [
-            // MR-1943: an unreadable file is not rebuilt onto the defaults.
-            // What it reads is the change attempted (WIN3-009 item 3).
-            "let attempted = match load_settings_off_runtime(&app).await {",
+            // MR-1943: an unreadable file is not rebuilt onto the defaults,
+            // nor one that cannot be verified (AUD-DOC-18). What it reads is
+            // the change attempted (WIN3-009 item 3).
+            "let attempted = match load_settings_to_reapply(&app).await {",
             "ar.connected_settings().await",
             "ConnectPurpose::SettingsReapply {",
             "let rebuild = connect_session_for(&app, target.clone(), purpose, None)",
@@ -1725,6 +1766,57 @@ mod tests {
         };
         for setting in ["auto", "51820", "53", "5353", "not-a-port"] {
             assert_eq!(endpoint_for(setting), "203.0.113.1:51820", "{setting:?}");
+        }
+    }
+
+    /// AUD-DESK-08: a relay the kill switch could not permit, a host name or
+    /// an IPv6 literal, is refused here, the Stealth relay too when Stealth is
+    /// used. Before, it was built, and the permit stayed on the previous
+    /// relay (`session::apply_relay_permit`).
+    #[test]
+    fn a_relay_endpoint_that_is_not_an_ipv4_address_is_refused() {
+        let build = |endpoint: &str, stealth: Option<(bool, &str)>| {
+            let mut response = serde_json::json!({
+                "success": true,
+                "keyId": "k1",
+                "publicKey": "cGs=",
+                "assignedIp": "10.8.0.2",
+                "serverPublicKey": "c3BrPQ==",
+                "endpoint": endpoint,
+            });
+            if let Some((enabled, xray)) = stealth {
+                response["stealthEnabled"] = enabled.into();
+                response["xrayEndpoint"] = xray.into();
+            }
+            let response: ConnectResponse = serde_json::from_value(response).unwrap();
+            build_vpn_config(response, "ams-1", None, 0, "auto")
+                .map(|(config, _)| config.endpoint.clone())
+        };
+        for endpoint in ["relay.example.net:51820", "[2001:db8::1]:51820"] {
+            let refused = build(endpoint, None);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|e| e.contains("not an IPv4 address")),
+                "{endpoint}: {refused:?}"
+            );
+        }
+        let stealth = build("203.0.113.1:51820", Some((true, "relay.example.net:8443")));
+        assert!(stealth.is_err(), "{stealth:?}");
+
+        // The controls: addresses, and a Stealth relay that is not used.
+        assert_eq!(
+            build("203.0.113.1:51820", None).unwrap(),
+            "203.0.113.1:51820"
+        );
+        for stealth in [
+            (true, "203.0.113.1:8443"),
+            (false, "relay.example.net:8443"),
+        ] {
+            assert!(
+                build("203.0.113.1:51820", Some(stealth)).is_ok(),
+                "{stealth:?}"
+            );
         }
     }
 
@@ -2364,8 +2456,10 @@ mod tests {
             custom_dns: Some(vec!["9.9.9.9".to_string()]),
             ..AppSettings::default()
         };
-        let (settings, snapshot) =
-            settings_in_force(Ok(saved.clone()), Some(&live_session(false, true, true)));
+        let (settings, snapshot) = settings_in_force(
+            Ok((saved.clone(), true)),
+            Some(&live_session(false, true, true)),
+        );
         assert!(!settings.quantum_protection);
         assert!(!settings.lockdown_mode);
         assert!(settings.stealth_mode);
@@ -2373,6 +2467,26 @@ mod tests {
         assert_eq!(settings.custom_dns, saved.custom_dns);
         let snapshot = snapshot.expect("the file's settings are the snapshot");
         assert!(!snapshot.quantum_protection && snapshot.stealth_mode);
+    }
+
+    /// AUD-DOC-18 (review of #446): the stand-in defaults of a file that
+    /// cannot be verified right now are what the session runs on, but no
+    /// snapshot: a reapply whose rebuild read them (the file became
+    /// unverifiable after the reapply's own check) then fails the MR-1943
+    /// check in `reapply_vpn_settings` instead of reporting Applied.
+    #[test]
+    fn an_unverifiable_files_stand_in_defaults_are_no_snapshot() {
+        let (settings, snapshot) = settings_in_force(Ok((AppSettings::default(), false)), None);
+        assert!(snapshot.is_none(), "stand-in defaults as the snapshot");
+        assert!(settings.quantum_protection, "post-quantum stays on");
+        let (_, snapshot) = settings_in_force(Ok((AppSettings::default(), true)), None);
+        assert!(snapshot.is_some(), "a verified file is its own snapshot");
+
+        // The check that a missing snapshot trips, after a rebuild that ran.
+        let source = include_str!("vpn.rs");
+        let reapply = &source[source.find("pub async fn reapply_vpn_settings(").unwrap()..];
+        let reapply = &reapply[..reapply.find("\n}").unwrap()];
+        assert!(reapply.contains("&& ar.connected_settings().await.is_none() =>"));
     }
 
     /// The wiring, and the log line: `apply_vpn_settings` takes every flag
@@ -2387,7 +2501,7 @@ mod tests {
         let apply = &apply[..apply.find("\n}").unwrap()];
         for needle in [
             "app.state::<AutoReconnectService>().current_info().await",
-            "settings_in_force(load_settings_off_runtime(app).await, live.as_ref())",
+            "settings_in_force(load_session_settings_off_runtime(app).await, live.as_ref())",
             "} = settings;",
         ] {
             assert!(apply.contains(needle), "{needle}");

@@ -382,6 +382,9 @@ pub struct Leftovers {
     pub updates: u32,
     pub set_aside: u32,
     pub pq_keys: u32,
+    /// The uninstalling account's settings key, under `--with-app-data`
+    /// (AUD-DESK-19).
+    pub settings_keys: u32,
     /// Per-user app-data entries removed under `--with-app-data` (D6c HIGH).
     pub app_data: u32,
     pub failed: u32,
@@ -391,17 +394,32 @@ pub struct Leftovers {
 /// nsis-hooks.nsh's NSIS_HOOK_PREUNINSTALL): the updater's `updates\` and the
 /// squatted folders moved aside as `BirdoVPN.untrusted-*`; with
 /// `with_app_data` ("Delete the application data" ticked, D-23) also every
-/// account's ML-KEM keypair (`pq-<SID>.bin`, R4) and the per-user app-data
-/// folders (D6c HIGH — see [`remove_app_data_folders_in`]). NEVER the settings
-/// keys or the migration markers: without a key a reinstall can no longer
-/// verify (so quarantines) the user's settings.json, and the markers keep the
-/// old %APPDATA% sources closed for good. Creates nothing (no `ensure()`).
+/// account's ML-KEM keypair (`pq-<SID>.bin`, R4), the per-user app-data
+/// folders (D6c HIGH — see [`remove_app_data_folders_in`]) and, with them,
+/// THIS account's settings key (`settings-hmac-<SID>.key`, AUD-DESK-19: the
+/// owner's choice of 2026-11-13; the settings.json it signs is in those
+/// folders). The uninstalling account is the one this elevated process runs
+/// as, whose folders those are. NEVER another account's settings key, nor the
+/// migration markers: without its key a reinstall can no longer verify (so
+/// quarantines) that account's settings.json, and the markers keep the old
+/// %APPDATA% sources closed for good. Creates nothing (no `ensure()`).
 pub fn remove_uninstall_leftovers(with_app_data: bool) -> Leftovers {
+    let own_key = if with_app_data {
+        current_user_sid()
+            .map(|sid| settings_key_name(&sid))
+            .map_err(|e| {
+                tracing::warn!("No account SID, so its settings key stays ({})", e);
+            })
+            .ok()
+    } else {
+        None
+    };
     let mut done = match win_api::program_data() {
         Ok(base) => remove_uninstall_leftovers_in(
             &base,
             recorded_dir_name().filter(|name| is_state_dir_name(name)),
             with_app_data,
+            own_key.as_deref(),
         ),
         Err(e) => {
             tracing::warn!("No ProgramData to clean ({})", e);
@@ -425,6 +443,9 @@ pub fn remove_uninstall_leftovers(with_app_data: bool) -> Leftovers {
                 tracing::warn!("No %APPDATA%/%LOCALAPPDATA% to clean");
                 done.failed += 1;
             }
+        }
+        if own_key.is_none() {
+            done.failed += 1;
         }
     }
     done
@@ -692,8 +713,16 @@ fn is_pq_key_name(name: &str) -> bool {
         .is_some_and(|sid| !sid.is_empty() && sid.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
 }
 
+/// The name of an account's settings key in the admin-only directory
+/// (`commands::settings`, the HMAC key of that account's settings.json).
+fn settings_key_name(sid: &str) -> String {
+    format!("settings-hmac-{sid}.key")
+}
+
 /// [`remove_uninstall_leftovers`] under `base`, with the HKLM-recorded
-/// fallback name `recorded` (already checked).
+/// fallback name `recorded` (already checked). `own_key`: the uninstalling
+/// account's settings key ([`settings_key_name`]), the one settings key
+/// `with_app_data` removes (AUD-DESK-19).
 ///
 /// `updates\` (and the keypairs) go only from a directory that IS admin-only:
 /// a squatter's own folder of that name is theirs, and is moved aside on the
@@ -707,6 +736,7 @@ fn remove_uninstall_leftovers_in(
     base: &Path,
     recorded: Option<String>,
     with_app_data: bool,
+    own_key: Option<&str>,
 ) -> Leftovers {
     let mut done = Leftovers::default();
     for name in std::iter::once(DIR_NAME.to_string()).chain(recorded) {
@@ -728,11 +758,16 @@ fn remove_uninstall_leftovers_in(
         };
         for entry in entries.flatten() {
             let file = entry.file_name();
-            let Some(file) = file.to_str().filter(|f| is_pq_key_name(f)) else {
+            let Some(file) = file.to_str() else { continue };
+            let removed = if is_pq_key_name(file) {
+                &mut done.pq_keys
+            } else if own_key == Some(file) {
+                &mut done.settings_keys
+            } else {
                 continue;
             };
             match owned.remove_file(file) {
-                Ok(()) => done.pq_keys += 1,
+                Ok(()) => *removed += 1,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(_) => done.failed += 1,
             }
@@ -1246,7 +1281,7 @@ mod tests {
         std::fs::create_dir_all(b.join("BirdoVPN").join("updates")).unwrap();
         std::fs::write(b.join("BirdoVPN").join("updates").join("x.exe"), "MZ").unwrap();
 
-        let done = remove_uninstall_leftovers_in(b, None, true);
+        let done = remove_uninstall_leftovers_in(b, None, true, None);
 
         assert_eq!(done.set_aside, 3, "{done:?}");
         assert_eq!(done.updates, 0, "{done:?}");
@@ -1268,7 +1303,9 @@ mod tests {
 
     /// R2 (elevated): from the admin-only directory — the fixed one and the
     /// recorded fallback — only `updates\` goes; the keys and the migration
-    /// markers stay (a reinstall still verifies the user's settings).
+    /// markers stay (a reinstall still verifies the user's settings). With
+    /// the app data, the uninstalling account's settings key goes too, never
+    /// another account's (AUD-DESK-19).
     #[test]
     fn the_uninstall_cleanup_keeps_the_keys_and_markers() {
         if !elevated_or_skip("the_uninstall_cleanup_keeps_the_keys_and_markers") {
@@ -1289,11 +1326,16 @@ mod tests {
             )
             .unwrap();
             std::fs::write(dir.join("settings-hmac-S-1-5-21-1.key"), "00").unwrap();
+            std::fs::write(dir.join("settings-hmac-S-1-5-21-2.key"), "00").unwrap();
             std::fs::write(dir.join("dns-journal-migrated-S-1-5-21-1"), "").unwrap();
             std::fs::write(dir.join("pq-S-1-5-21-1.bin"), "k").unwrap();
         }
+        // The uninstalling account is S-1-5-21-2; S-1-5-21-1 is another one.
+        let own = Some("settings-hmac-S-1-5-21-2.key");
+        assert_eq!(own, Some(settings_key_name("S-1-5-21-2").as_str()));
 
-        let done = remove_uninstall_leftovers_in(base.path(), Some(fallback_name.clone()), false);
+        let done =
+            remove_uninstall_leftovers_in(base.path(), Some(fallback_name.clone()), false, own);
 
         assert_eq!(done.updates, 2, "{done:?}");
         assert_eq!(done.failed, 0, "{done:?}");
@@ -1301,6 +1343,7 @@ mod tests {
             assert!(!dir.join("updates").exists());
             for kept in [
                 "settings-hmac-S-1-5-21-1.key",
+                "settings-hmac-S-1-5-21-2.key",
                 "dns-journal-migrated-S-1-5-21-1",
                 "pq-S-1-5-21-1.bin",
             ] {
@@ -1309,11 +1352,15 @@ mod tests {
         }
 
         // "Delete the application data" (D-23): the accounts' ML-KEM keys go
-        // too; the settings keys and the markers still stay.
-        let done = remove_uninstall_leftovers_in(base.path(), Some(fallback_name), true);
+        // too, and this account's settings key (AUD-DESK-19); another
+        // account's settings key and the markers still stay.
+        let done = remove_uninstall_leftovers_in(base.path(), Some(fallback_name), true, own);
         assert_eq!(done.pq_keys, 2, "{done:?}");
+        assert_eq!(done.settings_keys, 2, "{done:?}");
+        assert_eq!(done.failed, 0, "{done:?}");
         for dir in [&fixed, &fallback] {
             assert!(!dir.join("pq-S-1-5-21-1.bin").exists());
+            assert!(!dir.join("settings-hmac-S-1-5-21-2.key").exists());
             for kept in [
                 "settings-hmac-S-1-5-21-1.key",
                 "dns-journal-migrated-S-1-5-21-1",
@@ -1321,6 +1368,9 @@ mod tests {
                 assert!(dir.join(kept).exists(), "{kept} was deleted");
             }
         }
+        // The name the settings key is written under (`commands::settings`).
+        let settings = include_str!("../commands/settings.rs");
+        assert!(settings.contains(r#"Ok(dir.join(format!("settings-hmac-{user}.key")))"#));
     }
 
     /// Only an account keypair's name is one `--with-app-data` deletes — the

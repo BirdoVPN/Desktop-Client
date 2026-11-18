@@ -763,8 +763,13 @@ const MAX_TRACKED_FILTERS: usize = 2048;
 /// deleted again by every change, and the dynamic session takes the filters
 /// with it in any case.
 ///
-/// Untested assumption (no elevated session in CI, D12): a failed
-/// FwpmFilterDeleteById0 leaves the transaction committable.
+/// D12, checked for ONE code: a FwpmFilterDeleteById0 that fails with
+/// FWP_E_FILTER_NOT_FOUND leaves the transaction committable. WFP's own
+/// answer, in an elevated dynamic session on the Windows CI runner
+/// (`tests::a_delete_of_a_missing_filter_leaves_the_transaction_committable`,
+/// AUD-DOC-12). [`undeletable`] counts that code as deleted anyway. For any
+/// other code, a stuck filter this commits past, it is still an untested
+/// assumption: D12 stays open for those.
 fn commit_policy(
     kernel: &mut impl FilterKernel,
     ids: &mut Vec<(u64, Action)>,
@@ -1391,17 +1396,43 @@ pub(crate) fn current_relay() -> Option<Relay> {
     *RELAY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The tunnel that published [`TUNNEL_LUID`], by its ownership token
+/// (`WintunTunnel::state_gen`, never 0); 0 = none (AUD-DESK-14). Held across
+/// each publish and clear, so a clear never lands between the two stores of
+/// another tunnel's publish.
+static TUNNEL_LUID_PUBLISHER: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
 /// Publish the tunnel adapter's interface LUID (from the tunnel layer once the
 /// Wintun adapter exists). Lockdown mode permits this interface so tunneled
-/// traffic flows under the always-on block-all.
-pub fn set_tunnel_luid(luid: u64) {
+/// traffic flows under the always-on block-all. `publisher`: the tunnel's
+/// ownership token, which [`clear_tunnel_luid`] must match.
+pub fn set_tunnel_luid(luid: u64, publisher: u64) {
+    let mut by = TUNNEL_LUID_PUBLISHER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     TUNNEL_LUID.store(luid, Ordering::SeqCst);
+    *by = publisher;
     tracing::debug!("Kill switch tunnel LUID set to: {}", luid);
 }
 
-/// Clear the published tunnel LUID (on tunnel teardown).
-pub fn clear_tunnel_luid() {
+/// Clear the published tunnel LUID on the teardown of `publisher`, only while
+/// it is still the tunnel that published it; `true` when cleared.
+///
+/// AUD-DESK-14: every stop() used to store 0. A late stop of a displaced
+/// tunnel then cleared the LUID of the tunnel that replaced it, and the next
+/// lockdown re-bake left that tunnel's traffic no permit (fails closed, drops
+/// it). The publisher decides, not the value: `Adapter::open` reuses one
+/// adapter, so the two tunnels usually publish the SAME LUID.
+pub fn clear_tunnel_luid(publisher: u64) -> bool {
+    let mut by = TUNNEL_LUID_PUBLISHER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if *by != publisher {
+        return false;
+    }
     TUNNEL_LUID.store(0, Ordering::SeqCst);
+    *by = 0;
+    true
 }
 
 /// Clean up and release all resources: the end of the session.
@@ -2441,5 +2472,74 @@ mod tests {
         assert!(!lifts_a_block(&block, &block));
         assert!(!lifts_a_block(&Policy::default(), &v6));
         assert!(!lifts_a_block(&Policy::default(), &guarded));
+    }
+
+    /// AUD-DESK-14: the late stop of a displaced tunnel leaves the LUID the
+    /// tunnel that replaced it published, even the SAME LUID (one adapter,
+    /// reused); only the publisher's own stop clears it. Every stop() used to
+    /// store 0 over it. The tokens are ones no tunnel in this process mints.
+    #[test]
+    fn a_late_stop_of_a_displaced_tunnel_keeps_the_new_tunnels_luid() {
+        const LUID: u64 = 0x0006_0000_0100_0000;
+        let (displaced, current) = (u64::MAX - 1, u64::MAX);
+        set_tunnel_luid(LUID, displaced);
+        set_tunnel_luid(LUID, current);
+
+        assert!(
+            !clear_tunnel_luid(displaced),
+            "the displaced tunnel cleared it"
+        );
+        assert_eq!(TUNNEL_LUID.load(Ordering::SeqCst), LUID);
+
+        assert!(clear_tunnel_luid(current));
+        assert_eq!(TUNNEL_LUID.load(Ordering::SeqCst), 0);
+    }
+
+    /// AUD-DOC-12 (D12): [`commit_policy`] deletes the old filters inside its
+    /// transaction and commits past a delete that failed. For the one code a
+    /// test can provoke, FWP_E_FILTER_NOT_FOUND (an id no filter has), that
+    /// the transaction is still committable is asked of WFP itself, in a
+    /// dynamic session of this test's own (Windows CI is elevated): the
+    /// transaction commits what was written after the failed delete. Other
+    /// codes (a stuck filter) stay untested. The session's objects go with
+    /// its handle.
+    #[test]
+    fn a_delete_of_a_missing_filter_leaves_the_transaction_committable() {
+        if !is_admin() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI is not elevated, so this test would test nothing"
+            );
+            eprintln!("SKIPPED: a WFP session needs an elevated process");
+            return;
+        }
+        let mut engine = WfpEngine::open().expect("a dynamic WFP session");
+        let handle = engine.handle;
+        let apps = HashMap::new();
+        let mut kernel = Kernel {
+            handle,
+            apps: &apps,
+        };
+        kernel.begin().expect("a transaction");
+
+        let deleted = kernel.delete_filter(u64::MAX);
+        assert_eq!(deleted, FWP_E_FILTER_NOT_FOUND, "0x{deleted:08X}");
+        // The change goes on after the failed delete, as commit_policy's does.
+        kernel.add_provider().expect("a provider after it");
+        kernel.add_sublayer().expect("a sublayer after it");
+        kernel.commit().expect("commit after a failed delete");
+
+        // What was written after the failed delete is in force.
+        let mut sublayer: *mut FWPM_SUBLAYER0 = std::ptr::null_mut();
+        // SAFETY: `handle` is the open session from `open()`, the key is a
+        // static GUID, and `sublayer` receives WFP's allocation, freed below.
+        let found = unsafe { FwpmSubLayerGetByKey0(handle, &BIRDO_SUBLAYER_KEY, &mut sublayer) };
+        if found == 0 {
+            // SAFETY: allocated by the successful FwpmSubLayerGetByKey0 above,
+            // freed once.
+            unsafe { FwpmFreeMemory0(std::ptr::addr_of_mut!(sublayer).cast()) };
+        }
+        assert_eq!(found, 0, "no sublayer after the commit");
+        engine.close().expect("close the session");
     }
 }

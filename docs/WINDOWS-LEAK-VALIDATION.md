@@ -578,7 +578,7 @@ Birdo-Compare
 
 **Part 2: uninstalling a killed session.** Connect, run
 `taskkill /F /IM BirdoVPN.exe`, then uninstall from Settings › Apps with
-**Delete the application data** ticked.
+**Delete this user's app data** ticked.
 
 **Pass:**
 
@@ -586,9 +586,9 @@ Birdo-Compare
 - `Birdo-Compare` is empty.
 - `Test-Path $Jrnl` is `False`: the uninstaller's reconcile put everything
   back and dropped the record. The uninstaller never removes
-  `%ProgramData%\BirdoVPN` itself (the settings keys and migration markers stay
-  there), so a journal is left there only when a restore could not be
-  verified; birdo.log said why before the logs went.
+  `%ProgramData%\BirdoVPN` itself (other accounts' settings keys and the
+  migration markers stay there), so a journal is left there only when a
+  restore could not be verified; birdo.log said why before the logs went.
 - `Get-ChildItem $env:APPDATA\BirdoVPN` lists nothing, or only a
   `dns-restore.json*` an older build left (the sweep keeps those names, and
   nothing reads them). `$env:LOCALAPPDATA\BirdoVPN` is gone.
