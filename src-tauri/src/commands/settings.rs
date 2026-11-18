@@ -720,6 +720,28 @@ pub(crate) async fn load_settings_off_runtime(app: &AppHandle) -> Result<AppSett
         .map_err(|e| format!("Settings task failed: {e}"))?
 }
 
+/// [`load_settings_off_runtime`] for the connect path (`vpn::apply_vpn_settings`),
+/// saying whether the settings are the file's own: `false` for the stand-in
+/// defaults of a file that cannot be verified right now
+/// ([`Loaded::Unverified`]). AUD-DOC-18 (review of #446): those defaults are
+/// no snapshot of the user's settings (`vpn::settings_in_force`), so a
+/// reapply whose rebuild read them is reported, never Applied.
+pub(crate) async fn load_session_settings_off_runtime(
+    app: &AppHandle,
+) -> Result<(AppSettings, bool), String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || session_settings(load_settings(&app)))
+        .await
+        .map_err(|e| format!("Settings task failed: {e}"))?
+}
+
+/// What [`load_session_settings_off_runtime`] answers for a load.
+fn session_settings(loaded: Result<Loaded, LoadError>) -> Result<(AppSettings, bool), String> {
+    let loaded = loaded?;
+    let own = !matches!(loaded, Loaded::Unverified(_));
+    Ok((loaded.settings(), own))
+}
+
 /// The settings a live reapply applies (`vpn::reapply_vpn_settings`):
 /// [`load_settings_off_runtime`]'s load, but a file that cannot be verified
 /// right now is refused (`settings_unverified`).
@@ -3457,6 +3479,17 @@ mod tests {
             "lockdown as default"
         );
         assert!(settings_for_rust(Err(LoadError::Unreadable("busy".into()))).is_err());
+
+        // AUD-DOC-18 (review of #446): the connect path's read gives the same
+        // defaults and says they are not the file's (no snapshot).
+        let own = |loaded| session_settings(loaded).map(|(_, files)| files);
+        let defaults = AppSettings::default;
+        assert_eq!(own(unverifiable()), Ok(false));
+        assert_eq!(own(Ok(Loaded::Saved(defaults()))), Ok(true));
+        assert_eq!(own(Ok(Loaded::Quarantined(defaults()))), Ok(true));
+        assert!(own(Err(LoadError::Unreadable("busy".into()))).is_err());
+        let (session, _) = session_settings(unverifiable()).unwrap();
+        assert!(session.quantum_protection, "post-quantum stays on");
     }
 
     /// Follow-up 5 to the review of #222: no Rust code reads through the UI's
@@ -3744,6 +3777,7 @@ mod tests {
         let source = include_str!("settings.rs").replace('\r', "");
         for helper in [
             "pub(crate) async fn load_settings_off_runtime(",
+            "pub(crate) async fn load_session_settings_off_runtime(",
             "pub(crate) async fn clear_account_choices(",
             "pub(crate) async fn restore_tunnel_settings(",
         ] {

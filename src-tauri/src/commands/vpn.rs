@@ -15,7 +15,10 @@ use crate::commands::session::{
     connect_session, connect_session_for, end_session, ensure_signed_in, ConnectPurpose,
     ConnectTarget, EndReason,
 };
-use crate::commands::settings::{load_settings_off_runtime, load_settings_to_reapply, AppSettings};
+use crate::commands::settings::{
+    load_session_settings_off_runtime, load_settings_off_runtime, load_settings_to_reapply,
+    AppSettings,
+};
 use crate::storage::CredentialStore;
 use crate::vpn::auto_reconnect::ReconnectInfo;
 use crate::vpn::manager::{ConnectPhase, ConnectionState, GaveUp, MultiHopStatus, VpnManager};
@@ -358,12 +361,21 @@ const UNREADABLE_SETTINGS_FALLBACK: &str = "Failed to load VPN settings; using t
 /// takes its default (no custom DNS, no LAN sharing, no kill-switch
 /// exceptions, automatic MTU), the restrictive side of each; the next connect
 /// reads the file again.
+///
+/// AUD-DOC-18 (review of #446): `loaded` says whether the settings are the
+/// file's own. The stand-in defaults of a file that cannot be verified right
+/// now are not, so they are no snapshot either: a reapply whose rebuild read
+/// them (the file became unverifiable after the reapply's own check) is then
+/// reported by the MR-1943 check (`reapply_vpn_settings`), never Applied.
 fn settings_in_force(
-    loaded: Result<AppSettings, String>,
+    loaded: Result<(AppSettings, bool), String>,
     live: Option<&ReconnectInfo>,
 ) -> (AppSettings, Option<AppSettings>) {
     match loaded {
-        Ok(settings) => (settings.clone(), Some(settings)),
+        Ok((settings, own)) => {
+            let snapshot = own.then(|| settings.clone());
+            (settings, snapshot)
+        }
         Err(e) => {
             tracing::warn!("{} ({})", UNREADABLE_SETTINGS_FALLBACK, e);
             let mut settings = AppSettings::default();
@@ -383,9 +395,10 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
     // gives the defaults this session runs on — post-quantum and, on Windows,
     // lockdown ON — where `get_settings`, the UI's read, refuses it. A file
     // that cannot be read at all gives them too ([`settings_in_force`]).
+    // Neither is a snapshot of the user's settings (AUD-DOC-18).
     let live = app.state::<AutoReconnectService>().current_info().await;
     let (settings, snapshot) =
-        settings_in_force(load_settings_off_runtime(app).await, live.as_ref());
+        settings_in_force(load_session_settings_off_runtime(app).await, live.as_ref());
     let AppSettings {
         custom_dns,
         local_network_sharing,
@@ -2434,8 +2447,10 @@ mod tests {
             custom_dns: Some(vec!["9.9.9.9".to_string()]),
             ..AppSettings::default()
         };
-        let (settings, snapshot) =
-            settings_in_force(Ok(saved.clone()), Some(&live_session(false, true, true)));
+        let (settings, snapshot) = settings_in_force(
+            Ok((saved.clone(), true)),
+            Some(&live_session(false, true, true)),
+        );
         assert!(!settings.quantum_protection);
         assert!(!settings.lockdown_mode);
         assert!(settings.stealth_mode);
@@ -2443,6 +2458,26 @@ mod tests {
         assert_eq!(settings.custom_dns, saved.custom_dns);
         let snapshot = snapshot.expect("the file's settings are the snapshot");
         assert!(!snapshot.quantum_protection && snapshot.stealth_mode);
+    }
+
+    /// AUD-DOC-18 (review of #446): the stand-in defaults of a file that
+    /// cannot be verified right now are what the session runs on, but no
+    /// snapshot: a reapply whose rebuild read them (the file became
+    /// unverifiable after the reapply's own check) then fails the MR-1943
+    /// check in `reapply_vpn_settings` instead of reporting Applied.
+    #[test]
+    fn an_unverifiable_files_stand_in_defaults_are_no_snapshot() {
+        let (settings, snapshot) = settings_in_force(Ok((AppSettings::default(), false)), None);
+        assert!(snapshot.is_none(), "stand-in defaults as the snapshot");
+        assert!(settings.quantum_protection, "post-quantum stays on");
+        let (_, snapshot) = settings_in_force(Ok((AppSettings::default(), true)), None);
+        assert!(snapshot.is_some(), "a verified file is its own snapshot");
+
+        // The check that a missing snapshot trips, after a rebuild that ran.
+        let source = include_str!("vpn.rs");
+        let reapply = &source[source.find("pub async fn reapply_vpn_settings(").unwrap()..];
+        let reapply = &reapply[..reapply.find("\n}").unwrap()];
+        assert!(reapply.contains("&& ar.connected_settings().await.is_none() =>"));
     }
 
     /// The wiring, and the log line: `apply_vpn_settings` takes every flag
@@ -2457,7 +2492,7 @@ mod tests {
         let apply = &apply[..apply.find("\n}").unwrap()];
         for needle in [
             "app.state::<AutoReconnectService>().current_info().await",
-            "settings_in_force(load_settings_off_runtime(app).await, live.as_ref())",
+            "settings_in_force(load_session_settings_off_runtime(app).await, live.as_ref())",
             "} = settings;",
         ] {
             assert!(apply.contains(needle), "{needle}");
