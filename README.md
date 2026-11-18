@@ -30,6 +30,9 @@ npm run test:run       # vitest
 npm run tauri:build    # produces installers under src-tauri/target/release/bundle/
 ```
 
+To rebuild a release from its tag and compare the result with the published
+artefacts, follow [BUILD-INSTRUCTIONS.md](BUILD-INSTRUCTIONS.md).
+
 ## Install
 Download from the [latest release](https://github.com/BirdoVPN/Desktop-Client/releases/latest)
 ([verify the download](docs/VERIFICATION.md) first):
