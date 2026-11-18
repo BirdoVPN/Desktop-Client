@@ -48,6 +48,10 @@ out of BirdoVPN in that account before you uninstall (which deletes its
 sign-in tokens), then delete its `%APPDATA%\BirdoVPN`,
 `%APPDATA%\uk.birdo.vpn.desktop`, `%LOCALAPPDATA%\BirdoVPN`,
 `%LOCALAPPDATA%\Birdo VPN` and `%LOCALAPPDATA%\uk.birdo.vpn.desktop` folders.
+That account's settings key stays in `%ProgramData%\BirdoVPN`
+(`settings-hmac-<that account's SID>.key`). It is harmless to leave, since the
+settings it signed are gone. To delete it too, use an administrator prompt
+(`whoami /user` in that account shows its SID).
 
 ## Linux (.deb)
 
