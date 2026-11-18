@@ -8,7 +8,7 @@
 //!
 //! ## Implementation
 //!
-//! RustCrypto `ml-kem` 0.3.2 — a pure-Rust ML-KEM with no C or assembly of its
+//! RustCrypto `ml-kem` 0.3.4 — a pure-Rust ML-KEM with no C or assembly of its
 //! own, though its dependency GRAPH has both: that qualifier belongs in the
 //! same sentence, because the half before it is the half that gets quoted. It
 //! replaced `pqcrypto-mlkem` (PQClean's portable CLEAN C) in 2026-09: PQClean
