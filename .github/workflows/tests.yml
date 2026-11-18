@@ -664,7 +664,13 @@ jobs:
       # dual-stack sessions), and with the kill switch's block-all up nothing
       # at all (counted in mangle POSTROUTING); a switch onto a relay that
       # never answers leaves no IPv6 block behind, nor does the next session's
-      # Disconnect. The tests refuse to run outside that namespace.
+      # Disconnect. MR-2255: with the kill switch off, no IPv4 leaves the
+      # uplink in the switch's gap either (a raw OUTPUT counter shows the gap
+      # was routed there), and a Stealth switch, whose WireGuard endpoint is a
+      # local proxy, reaches its upstream relay through the hold (the
+      # upstream sits behind a veth pair in a namespace of its own, so the
+      # hold judges it as a real relay). The tests refuse to run outside that
+      # namespace.
       - name: Tunnel teardown tests (Linux, root, private net+mount namespace)
         if: (success() || failure()) && steps.clippy.outcome == 'success' && matrix.os == 'linux'
         working-directory: src-tauri
@@ -677,10 +683,10 @@ jobs:
             exit 1
           }
           echo "$out"
-          # Sixteen tests, all required: an --ignored filter that matches
+          # Seventeen tests, all required: an --ignored filter that matches
           # nothing still exits 0.
-          if ! grep -qE 'test result: ok\. 16 passed' <<<"$out"; then
-            echo "::error::netns_teardown_tests did not run all sixteen tests"
+          if ! grep -qE 'test result: ok\. 17 passed' <<<"$out"; then
+            echo "::error::netns_teardown_tests did not run all seventeen tests"
             exit 1
           fi
 

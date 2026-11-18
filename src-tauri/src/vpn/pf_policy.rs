@@ -2920,6 +2920,21 @@ mod tests {
         assert!(!hostname.contains("ipv4hold"), "{hostname}");
     }
 
+    /// Review of #445 (HIGH): the Stealth shape. The hold built from the
+    /// upstream relay Xray dials (8443) lets it out over tcp, ahead of the
+    /// closing block; one built from the local Xray proxy (the WireGuard
+    /// endpoint) named only 127.0.0.1, which lo0's `set skip` passes anyway,
+    /// so Xray's upstream dial met `block drop out quick inet all`.
+    #[test]
+    fn a_stealth_hold_lets_out_the_upstream_relay_not_only_the_proxy() {
+        let upstream = dns_hold_rules(&ipv4_held("203.0.113.9:8443", false));
+        let permit = "pass out quick inet proto { udp tcp } to 203.0.113.9 keep state\n";
+        let at = upstream.find(permit).expect("the upstream relay's permit");
+        assert!(at < upstream.find("block drop out quick inet all").unwrap());
+        let proxy = dns_hold_rules(&ipv4_held("127.0.0.1:10808", false));
+        assert!(!proxy.contains("203.0.113.9"), "{proxy}");
+    }
+
     /// In both leak block files: the DNS rules, then the IPv4 half, all of
     /// it ahead of every other filter anchor and pass; the file unchanged.
     #[test]
@@ -3643,6 +3658,9 @@ mod pfctl_parse_tests {
             crate::vpn::dns_hold::dns_hold_exempt("203.0.113.9:53", &dns, false),
             crate::vpn::dns_hold::dns_hold_exempt("[2001:db8::7]:51820", &dns, true),
             crate::vpn::dns_hold::dns_hold_exempt("relay.example.net:51820", &dns, false),
+            // Review of #445: Stealth. The hold is built from the upstream
+            // relay Xray dials (8443), never from the local proxy.
+            crate::vpn::dns_hold::dns_hold_exempt("203.0.113.9:8443", &dns, false),
         ];
         // MR-2255: each again with the IPv4 half, as the manager asks for it
         // (the hostname one stays DNS only), with and without control-plane
@@ -3728,6 +3746,17 @@ mod pfctl_parse_tests {
                 }
                 assert!(root_permits_are_scoped(&printed), "{printed}");
                 assert!(port_443_is_scoped(&printed), "{printed}");
+                // The relay, both transports, inside the IPv4 half: the
+                // WireGuard handshake and Xray's upstream (tcp, 8443 for
+                // Stealth) alike.
+                if let Some(relay) = exempt.ipv4.as_ref().and_then(|h| h.relay) {
+                    for proto in ["udp", "tcp"] {
+                        let permit =
+                            format!("pass out quick inet proto {proto} from any to {relay}");
+                        let found = lines[v4_at + 1..end].iter().any(|l| l.starts_with(&permit));
+                        assert!(found, "no {permit} in the IPv4 half:\n{printed}");
+                    }
+                }
             }
         }
     }

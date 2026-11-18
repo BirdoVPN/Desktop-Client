@@ -4994,6 +4994,36 @@ mod dns_hold_tests {
         assert_eq!(judged(&t, &out("udp", RESOLVER, 53)), DROPPED);
     }
 
+    /// Review of #445 (HIGH): the Stealth shape. Built from the relay the
+    /// session reaches (the upstream on 8443), Xray's upstream dial out of
+    /// the physical link passes; built from the WireGuard endpoint (the
+    /// local Xray proxy) it is DROPPED, which failed every Stealth switch.
+    /// The manager builds it from `relay_endpoint` (manager.rs pins that).
+    #[test]
+    fn a_stealth_switch_lets_its_upstream_relay_out_not_only_the_proxy() {
+        let upstream = |exempt: &DnsHoldExempt| {
+            let t = installed(exempt, false);
+            judged(&t, &ours("tcp", RELAY_V4, 8443)).map(str::to_string)
+        };
+        let from_relay =
+            dns_hold_exempt(&format!("{RELAY_V4}:8443"), &[], false).with_ipv4_hold(vec![DOH], 0);
+        assert_eq!(upstream(&from_relay).as_deref(), PASSED);
+        let from_proxy =
+            dns_hold_exempt("127.0.0.1:10808", &[], false).with_ipv4_hold(vec![DOH], 0);
+        assert_eq!(
+            upstream(&from_proxy).as_deref(),
+            DROPPED,
+            "the pre-review hold: only the proxy was let through"
+        );
+        // The proxy hop itself is loopback, open under every hold.
+        let t = installed(&from_relay, false);
+        let proxy_hop = Packet {
+            oif: "lo",
+            ..ours("udp", "127.0.0.1", 10808)
+        };
+        assert_eq!(judged(&t, &proxy_hop), PASSED);
+    }
+
     /// iptables refusing the IPv4 hold costs the switch only that: the DNS
     /// hold goes in on its own, as before MR-2255.
     #[test]
@@ -5166,14 +5196,20 @@ mod netns_teardown_tests {
     }
 
     async fn relay(client: boringtun::x25519::PublicKey) -> Relay {
+        let socket = tokio::net::UdpSocket::bind(format!("{RELAY}:0"))
+            .await
+            .expect("bind the relay on RELAY: the script puts it on lo");
+        relay_on(socket, client)
+    }
+
+    /// [`relay`] on a socket bound elsewhere: the Stealth test's upstream
+    /// relay answers from another network namespace ([`Upstream`]).
+    fn relay_on(socket: tokio::net::UdpSocket, client: boringtun::x25519::PublicKey) -> Relay {
         use base64::Engine as _;
         use boringtun::noise::{Tunn, TunnResult};
         let server_secret = crate::utils::os_rng::x25519_static_secret();
         let server_public = boringtun::x25519::PublicKey::from(&server_secret);
         let mut tunn = Tunn::new(server_secret, client, None, None, 1, None);
-        let socket = tokio::net::UdpSocket::bind(format!("{RELAY}:0"))
-            .await
-            .expect("bind the relay on RELAY: the script puts it on lo");
         let endpoint = socket.local_addr().expect("the relay's port").to_string();
         let task = tokio::spawn(async move {
             let mut buf = [0u8; 2048];
@@ -6191,10 +6227,17 @@ mod netns_teardown_tests {
     /// leak block and no DNS hold left.
     async fn switch_while_probing(dual_stack: bool) -> (u64, u64, u64, u64) {
         let vm = crate::vpn::manager::VpnManager::new();
-        let (a, key_a, _relay_a) = session(dual_stack).await;
-        vm.connect(a, key_a, label("netns-a"), false, vm.begin_attempt())
-            .await
-            .expect("session A");
+        let (a, key_a, relay_a) = session(dual_stack).await;
+        vm.connect(
+            a,
+            key_a,
+            label("netns-a"),
+            &relay_a.endpoint,
+            false,
+            vm.begin_attempt(),
+        )
+        .await
+        .expect("session A");
         if dual_stack {
             // Otherwise the dual-stack test is the IPv4-only one again.
             let rules = ipv6_leak_block_rules();
@@ -6205,10 +6248,17 @@ mod netns_teardown_tests {
             );
         }
         UplinkCounters::zero();
-        let (b, key_b, _relay_b) = session(dual_stack).await;
-        vm.connect(b, key_b, label("netns-b"), false, vm.begin_attempt())
-            .await
-            .expect("the switch onto B");
+        let (b, key_b, relay_b) = session(dual_stack).await;
+        vm.connect(
+            b,
+            key_b,
+            label("netns-b"),
+            &relay_b.endpoint,
+            false,
+            vm.begin_attempt(),
+        )
+        .await
+        .expect("the switch onto B");
         let escaped = (
             UplinkCounters::escaped(PROBE_V6),
             UplinkCounters::escaped(PROBE_V4),
@@ -6332,10 +6382,17 @@ mod netns_teardown_tests {
         plain_resolv_conf();
         let before = resolv_conf();
         let vm = crate::vpn::manager::VpnManager::new();
-        let (a, key_a, _relay_a) = session(false).await;
-        vm.connect(a, key_a, label("netns-a"), false, vm.begin_attempt())
-            .await
-            .expect("session A");
+        let (a, key_a, relay_a) = session(false).await;
+        vm.connect(
+            a,
+            key_a,
+            label("netns-a"),
+            &relay_a.endpoint,
+            false,
+            vm.begin_attempt(),
+        )
+        .await
+        .expect("session A");
         assert!(
             !ipv6_leak_block_rules().is_empty(),
             "precondition: session A blocks IPv6"
@@ -6347,6 +6404,7 @@ mod netns_teardown_tests {
                 config(&silent),
                 WgPrivateKey::generate(),
                 label("netns-silent"),
+                &silent.endpoint,
                 false,
                 vm.begin_attempt(),
             )
@@ -6369,10 +6427,17 @@ mod netns_teardown_tests {
         assert!(after.nothing_of_ours(), "{after:?}");
         assert_eq!(resolv_conf(), before);
 
-        let (c, key_c, _relay_c) = session(false).await;
-        vm.connect(c, key_c, label("netns-c"), false, vm.begin_attempt())
-            .await
-            .expect("the session after the failed switch");
+        let (c, key_c, relay_c) = session(false).await;
+        vm.connect(
+            c,
+            key_c,
+            label("netns-c"),
+            &relay_c.endpoint,
+            false,
+            vm.begin_attempt(),
+        )
+        .await
+        .expect("the session after the failed switch");
         vm.disconnect().await.expect("disconnect");
         let rules = ipv6_leak_block_rules();
         assert!(
@@ -6436,6 +6501,237 @@ mod netns_teardown_tests {
         );
         drop(probe);
         drop(counters);
+        let after = net();
+        assert!(after.nothing_of_ours(), "{after:?}");
+        assert_eq!(resolv_conf(), before);
+    }
+
+    // ── MR-2255, review of #445: a Stealth switch through the hold ─────
+
+    /// The Stealth test's upstream relay, `UPSTREAM:UPSTREAM_PORT`, on the
+    /// far end of a veth pair whose other end lives in a network namespace
+    /// of its own. Packets to it leave this namespace through `UPSTREAM_IF`,
+    /// a real interface the switch's hold judges, as a real relay's would
+    /// leave the physical NIC. (RELAY sits on `lo`, which every hold lets
+    /// through, so it cannot show what the hold does to a relay.)
+    const UPSTREAM: &str = "10.98.0.2";
+    const UPSTREAM_PORT: u16 = 8443;
+    const UPSTREAM_IF: &str = "upstream0";
+    const UPSTREAM_PEER: &str = "upstream1";
+
+    /// The veth pair. Dropping it deletes the pair; the far namespace goes
+    /// with the last socket bound in it.
+    struct Upstream;
+
+    impl Upstream {
+        /// The pair, with its far end moved into a fresh network namespace
+        /// (a thread's own: `unshare(CLONE_NEWNET)` moves the calling thread
+        /// only, and the `ip` it runs inherits it), and a UDP socket bound to
+        /// `UPSTREAM:UPSTREAM_PORT` there.
+        fn start() -> (Self, std::net::UdpSocket) {
+            let (ok, out) = ip(&[
+                "link",
+                "add",
+                UPSTREAM_IF,
+                "type",
+                "veth",
+                "peer",
+                "name",
+                UPSTREAM_PEER,
+            ]);
+            assert!(ok, "add the veth pair: {out}");
+            let pair = Self;
+            for args in [
+                &["addr", "add", "10.98.0.1/24", "dev", UPSTREAM_IF][..],
+                &["link", "set", UPSTREAM_IF, "up"],
+            ] {
+                let (ok, out) = ip(args);
+                assert!(ok, "ip {args:?}: {out}");
+            }
+            let (tid_tx, tid_rx) = std::sync::mpsc::channel::<String>();
+            let (moved_tx, moved_rx) = std::sync::mpsc::channel::<()>();
+            let far = std::thread::spawn(move || {
+                // SAFETY: unshare has no memory-safety preconditions; with
+                // CLONE_NEWNET it moves this thread alone.
+                let unshared = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+                assert_eq!(
+                    unshared,
+                    0,
+                    "unshare(CLONE_NEWNET): {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: gettid has no preconditions and cannot fail.
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                tid_tx
+                    .send(tid.to_string())
+                    .expect("send the far thread's id");
+                moved_rx.recv().expect("the far end moved in");
+                let cidr = format!("{UPSTREAM}/24");
+                for args in [
+                    &["link", "set", "lo", "up"][..],
+                    &["addr", "add", cidr.as_str(), "dev", UPSTREAM_PEER],
+                    &["link", "set", UPSTREAM_PEER, "up"],
+                ] {
+                    let (ok, out) = ip(args);
+                    assert!(ok, "far namespace: ip {args:?}: {out}");
+                }
+                std::net::UdpSocket::bind((UPSTREAM, UPSTREAM_PORT))
+                    .expect("bind the upstream relay in the far namespace")
+            });
+            let tid = tid_rx.recv().expect("the far thread's id");
+            let (ok, out) = ip(&["link", "set", UPSTREAM_PEER, "netns", tid.as_str()]);
+            assert!(ok, "move the far end: {out}");
+            moved_tx.send(()).expect("tell the far thread");
+            let socket = far.join().expect("the far namespace's setup");
+            (pair, socket)
+        }
+    }
+
+    impl Drop for Upstream {
+        fn drop(&mut self) {
+            // Gone already if the far namespace went first: deleting either
+            // end deletes the pair.
+            let _ = ip(&["link", "del", UPSTREAM_IF]);
+        }
+    }
+
+    /// A stand-in for Xray: the WireGuard endpoint a Stealth tunnel is given
+    /// is this proxy on 127.0.0.1, and it carries each datagram to the
+    /// upstream relay and back, sending upstream only once the tunnel sends
+    /// its first packet, as Xray dials lazily (xray.rs).
+    struct StealthProxy {
+        endpoint: String,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StealthProxy {
+        fn start(upstream: std::net::SocketAddr) -> Self {
+            let local = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the proxy");
+            let endpoint = local.local_addr().expect("the proxy's port").to_string();
+            let up = std::net::UdpSocket::bind("0.0.0.0:0").expect("the proxy's upstream socket");
+            for socket in [&local, &up] {
+                socket
+                    .set_read_timeout(Some(Duration::from_millis(5)))
+                    .expect("a read timeout");
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let mut client = None;
+                while !stopping.load(Ordering::SeqCst) {
+                    if let Ok((n, from)) = local.recv_from(&mut buf) {
+                        client = Some(from);
+                        let _ = up.send_to(&buf[..n], upstream);
+                    }
+                    if let (Ok((n, _)), Some(to)) = (up.recv_from(&mut buf), client) {
+                        let _ = local.send_to(&buf[..n], to);
+                    }
+                }
+            });
+            Self {
+                endpoint,
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for StealthProxy {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// MR-2255, review of #445 (HIGH), kill switch OFF: a STEALTH server
+    /// switch goes through the hold. A Stealth session's WireGuard endpoint
+    /// is the local Xray proxy (127.0.0.1); its relay is the proxy's
+    /// upstream, which Xray dials only at the new start()'s handshake,
+    /// inside the hold. Built from the WireGuard endpoint, the hold let
+    /// 127.0.0.1 through and dropped the upstream dial, and every Stealth
+    /// switch failed. The manager is given the upstream as `relay_endpoint`,
+    /// as session.rs and auto_reconnect.rs pass `PreparedTunnel::relay_endpoint`.
+    ///
+    /// The CONTROL: the probe's other IPv4 was routed to the uplink in that
+    /// window and none of it got out, so the switch got through the hold,
+    /// not around it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_stealth_switch_reaches_its_upstream_relay_through_the_hold() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+        let (pair, far_socket) = Upstream::start();
+        let (counters, probe) = probing().await;
+
+        let vm = crate::vpn::manager::VpnManager::new();
+        let (a, key_a, relay_a) = session(false).await;
+        vm.connect(
+            a,
+            key_a,
+            label("netns-a"),
+            &relay_a.endpoint,
+            false,
+            vm.begin_attempt(),
+        )
+        .await
+        .expect("session A");
+
+        far_socket
+            .set_nonblocking(true)
+            .expect("the upstream relay's socket, non-blocking");
+        let far = tokio::net::UdpSocket::from_std(far_socket).expect("the upstream relay's socket");
+        let key_b = WgPrivateKey::generate();
+        let relay_b = relay_on(far, key_b.public_key());
+        let upstream_endpoint = relay_b.endpoint.clone();
+        let proxy = StealthProxy::start(upstream_endpoint.parse().expect("the upstream's address"));
+        let mut b = config(&relay_b);
+        b.endpoint = proxy.endpoint.clone();
+
+        UplinkCounters::zero();
+        let switched = vm
+            .connect(
+                b,
+                key_b,
+                label("netns-stealth"),
+                &upstream_endpoint,
+                false,
+                vm.begin_attempt(),
+            )
+            .await;
+        let (v4, routed) = (
+            UplinkCounters::escaped(PROBE_V4),
+            UplinkCounters::routed_v4(),
+        );
+        let held = dns_hold_rules();
+        let disconnected = vm.disconnect().await;
+        drop(proxy);
+        drop(relay_b);
+        drop(probe);
+        drop(counters);
+        drop(pair);
+
+        assert_eq!(upstream_endpoint, format!("{UPSTREAM}:{UPSTREAM_PORT}"));
+        switched.expect(
+            "the Stealth switch failed: the hold must let the upstream relay out, not the proxy",
+        );
+        disconnected.expect("disconnect");
+        assert!(
+            held.is_empty(),
+            "the switch left its hold in force once B was up: {held:?}"
+        );
+        assert!(
+            routed > 0,
+            "CONTROL: the kernel never routed the probe's IPv4 to the uplink during the switch"
+        );
+        assert_eq!(
+            v4, 0,
+            "{v4} IPv4 packets left the uplink during the Stealth switch"
+        );
         let after = net();
         assert!(after.nothing_of_ours(), "{after:?}");
         assert_eq!(resolv_conf(), before);

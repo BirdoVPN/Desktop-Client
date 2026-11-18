@@ -596,6 +596,7 @@ async fn attempt(
         prepared.config,
         private_key,
         label.clone(),
+        &prepared.relay_endpoint,
         settings.local_network_sharing,
         ctx.epoch,
     )

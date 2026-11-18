@@ -733,15 +733,26 @@ impl VpnManager {
     /// it. (The short synchronous stack temporaries are listed at
     /// `WgPrivateKey`.)
     ///
+    /// `relay_endpoint`: the relay this session reaches, `host:port`
+    /// (`PreparedTunnel::relay_endpoint`). It is `config.endpoint` except in
+    /// Stealth, where `config.endpoint` is the local Xray proxy
+    /// (`127.0.0.1:<port>`) and this is the upstream relay Xray dials. A
+    /// server switch's hold lets this relay out (MR-2255): Xray dials it
+    /// lazily, at the new start()'s handshake, inside the hold.
+    ///
     /// SM-002: Uses operation lock to prevent concurrent connect/disconnect
     pub async fn connect(
         &self,
         config: VpnConfig,
         private_key: WgPrivateKey,
         label: SessionLabel,
+        relay_endpoint: &str,
         local_network_sharing: bool,
         epoch: u64,
     ) -> Result<(), IpcError> {
+        // Only the Unix server-switch hold reads it.
+        #[cfg(target_os = "windows")]
+        let _ = relay_endpoint;
         // LOG-001: the chosen node is connection history — keep the name out
         // of the release log (info reaches birdo.log); debug is dev-only.
         tracing::info!("VpnManager::connect called");
@@ -907,9 +918,18 @@ impl VpnManager {
             // for the incoming session: its relay, the control plane (as our
             // euid), DHCP, the LAN with sharing on. A hostname relay keeps
             // the DNS-only hold (`with_ipv4_hold`).
+            //
+            // The relay is `relay_endpoint`, NEVER `config.endpoint`: in
+            // Stealth that is the local Xray proxy, and Xray dials the
+            // upstream relay lazily, at the new start()'s handshake, inside
+            // this hold. Built from `config.endpoint` (review of #445), the
+            // hold permitted 127.0.0.1 and dropped Xray's upstream dial, so a
+            // Stealth switch or settings reapply failed (Linux with the kill
+            // switch on or off, its mangle DROP coming before filter; macOS
+            // with it off).
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let exempt = crate::vpn::dns_hold::dns_hold_exempt(
-                &config.endpoint,
+                relay_endpoint,
                 &config.dns,
                 local_network_sharing,
             )
@@ -2006,6 +2026,42 @@ mod tests {
             "before either hold goes up"
         );
         assert_eq!(body.matches(".with_ipv4_hold(").count(), 1);
+    }
+
+    /// MR-2255, review of #445 (HIGH): the hold's relay is the relay the
+    /// session reaches, never `config.endpoint`, which in Stealth is the
+    /// local Xray proxy (127.0.0.1). Both callers pass the prepared
+    /// session's `relay_endpoint`: the upstream for Stealth. The netns test
+    /// `a_stealth_switch_reaches_its_upstream_relay_through_the_hold` runs
+    /// the switch.
+    #[test]
+    fn the_switch_hold_names_the_relay_the_session_reaches_not_the_stealth_proxy() {
+        let source = include_str!("manager.rs").replace('\r', "");
+        let start = source.find("    pub async fn connect(").expect("connect()");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        let built = &body[body
+            .find("let exempt = crate::vpn::dns_hold::dns_hold_exempt(")
+            .expect("the exempt")..];
+        let built = &built[..built.find(".with_ipv4_hold(").expect("its IPv4 half")];
+        assert!(built.contains("relay_endpoint,"), "{built}");
+        assert!(!built.contains("config.endpoint"), "{built}");
+
+        for (file, source) in [
+            ("session.rs", include_str!("../commands/session.rs")),
+            ("auto_reconnect.rs", include_str!("auto_reconnect.rs")),
+        ] {
+            let source = source.replace('\r', "");
+            let call = &source[source
+                .find("        vm.connect(\n")
+                .or_else(|| source.find("    vm.connect(\n"))
+                .unwrap_or_else(|| panic!("{file}: no vm.connect("))..];
+            let call = &call[..call.find(".await").expect("the call's end")];
+            assert!(
+                call.contains("&prepared.relay_endpoint,"),
+                "{file} must pass the prepared relay endpoint: {call}"
+            );
+        }
     }
 
     #[tokio::test]
