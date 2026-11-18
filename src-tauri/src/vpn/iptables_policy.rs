@@ -256,6 +256,37 @@ pub(crate) fn block_all(b: &BlockAll<'_>) -> Chains {
     }
 }
 
+/// MR-2255: the IPv4 half of a server switch's hold (`tunnel_linux`'s mangle
+/// chain, after its DNS rules), for the incoming session `hold` with Local
+/// Network Sharing `lan_sharing`.
+///
+/// It is the block-all's IPv4 OUT, rule for rule, with RETURN for ACCEPT: a
+/// RETURN ends the hold's chain and the packet goes on to the filter table
+/// (where an armed kill switch still has its say), and the closing DROP
+/// drops it in mangle, before filter is reached. So with the kill switch off
+/// the gap between two tunnels lets out exactly what it would let out with
+/// the kill switch on, and nothing new needs reviewing as a permit.
+pub(crate) fn switch_hold_v4(
+    hold: &crate::vpn::dns_hold::Ipv4Hold,
+    lan_sharing: bool,
+) -> Vec<Rule> {
+    block_all(&BlockAll {
+        relay: hold.relay,
+        control_plane: &hold.control_plane,
+        euid: hold.euid,
+        lan_sharing,
+    })
+    .out_v4
+    .into_iter()
+    .map(|mut rule| {
+        if let Some(target) = rule.last_mut().filter(|t| t.as_str() == "ACCEPT") {
+            *target = "RETURN".to_string();
+        }
+        rule
+    })
+    .collect()
+}
+
 /// Whether `rule` is a control-plane self-permit. Its failure to load is
 /// tolerated (the block still goes up, only narrower: no control plane), where
 /// any other rule's failure abandons the generation.
@@ -959,6 +990,123 @@ mod tests {
         assert_eq!(
             verdict(&unscoped, &tcp443(IpAddr::V4(API), ROOT)),
             Some("ACCEPT")
+        );
+    }
+
+    // ── MR-2255: the IPv4 half of a server switch's hold ───────────────
+
+    fn hold(relay: Option<Ipv4Addr>, control_plane: &[Ipv4Addr]) -> crate::vpn::dns_hold::Ipv4Hold {
+        crate::vpn::dns_hold::Ipv4Hold {
+            relay,
+            control_plane: control_plane.to_vec(),
+            euid: ROOT,
+        }
+    }
+
+    /// The hold is the block-all's IPv4 OUT and nothing else: the same rules
+    /// in the same order, RETURN where the block-all says ACCEPT, so it can
+    /// never let out what the kill switch would not.
+    #[test]
+    fn the_switch_hold_is_the_block_alls_ipv4_out_rule_for_rule() {
+        for control in CONTROL_SETS {
+            for relay in [None, Some(RELAY)] {
+                for lan_sharing in [false, true] {
+                    let held = switch_hold_v4(&hold(relay, control), lan_sharing);
+                    let block = block_all(&BlockAll {
+                        relay,
+                        control_plane: control,
+                        euid: ROOT,
+                        lan_sharing,
+                    })
+                    .out_v4;
+                    // RETURN read back as ACCEPT gives the block-all exactly,
+                    // so its scoping (tested above) is the hold's too.
+                    let as_block: Vec<Rule> = held
+                        .iter()
+                        .map(|r| {
+                            r.iter()
+                                .map(|a| match a.as_str() {
+                                    "RETURN" => "ACCEPT".to_string(),
+                                    _ => a.clone(),
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    assert_eq!(as_block, block, "RETURN for ACCEPT and nothing else");
+                    assert!(
+                        !held.iter().flatten().any(|a| a == "ACCEPT"),
+                        "an ACCEPT in mangle would end the packet's mangle pass: {held:?}"
+                    );
+                    assert!(port_443_is_scoped(&as_block, control, ROOT), "{held:?}");
+                    assert_eq!(held.last().unwrap(), &rule(&["-j", "DROP"]));
+                }
+            }
+        }
+    }
+
+    /// What the gap does with each kind of IPv4 packet, kill switch off.
+    #[test]
+    fn the_switch_hold_drops_everything_the_kill_switch_drops() {
+        let held = switch_hold_v4(&hold(Some(RELAY), &[DOH]), false);
+        let v4 = |a: [u8; 4]| IpAddr::V4(Ipv4Addr::from(a));
+        let anywhere = v4([198, 51, 100, 1]);
+        // The leak MR-2255 closes: any new flow, out of the physical link.
+        assert_eq!(verdict(&held, &udp(40000, anywhere, 9)), Some("DROP"));
+        assert_eq!(
+            verdict(&held, &tcp443(anywhere, 1000)),
+            Some("DROP"),
+            "a browser's HTTPS"
+        );
+        assert_eq!(
+            verdict(&held, &tcp443(anywhere, ROOT)),
+            Some("DROP"),
+            "root, but not to the control plane"
+        );
+        // What the incoming tunnel and the host need through the gap.
+        assert_eq!(
+            verdict(&held, &udp(40000, IpAddr::V4(RELAY), 51820)),
+            Some("RETURN"),
+            "the handshake"
+        );
+        assert_eq!(
+            verdict(&held, &tcp443(IpAddr::V4(RELAY), 1000)),
+            Some("RETURN"),
+            "the stealth transport"
+        );
+        assert_eq!(
+            verdict(&held, &tcp443(IpAddr::V4(DOH), ROOT)),
+            Some("RETURN"),
+            "the app's own DoH and API"
+        );
+        assert_eq!(
+            verdict(&held, &udp(68, v4([255, 255, 255, 255]), 67)),
+            Some("RETURN"),
+            "a DHCP lease"
+        );
+        for oif in ["lo", TUNNEL_INTERFACE] {
+            let p = Packet {
+                oif,
+                ..udp(40000, anywhere, 9)
+            };
+            assert_eq!(verdict(&held, &p), Some("RETURN"), "{oif}");
+        }
+        // The LAN only with Local Network Sharing on, as the block-all.
+        let printer = udp(40000, v4([192, 168, 1, 20]), 631);
+        assert_eq!(verdict(&held, &printer), Some("DROP"));
+        let sharing = switch_hold_v4(&hold(Some(RELAY), &[DOH]), true);
+        assert_eq!(verdict(&sharing, &printer), Some("RETURN"));
+        assert_eq!(verdict(&sharing, &udp(40000, anywhere, 9)), Some("DROP"));
+    }
+
+    /// An IPv6 relay: IPv4 is held all the same, with no relay rule in it.
+    #[test]
+    fn with_an_ipv6_relay_the_switch_hold_names_no_relay() {
+        let held = switch_hold_v4(&hold(None, &[DOH]), false);
+        let relay = RELAY.to_string();
+        assert!(!held.iter().flatten().any(|a| *a == relay));
+        assert_eq!(
+            verdict(&held, &udp(40000, IpAddr::V4(RELAY), 51820)),
+            Some("DROP")
         );
     }
 }

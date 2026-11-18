@@ -1650,6 +1650,7 @@ impl ReconnectLoop {
             prepared.config,
             private_key,
             info.label(),
+            &prepared.relay_endpoint,
             info.local_network_sharing,
             epoch,
         )
