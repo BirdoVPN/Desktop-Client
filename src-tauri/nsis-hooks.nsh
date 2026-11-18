@@ -505,20 +505,23 @@ FunctionEnd
 
   ; R2 (#287 follow-up L2): the admin-only %ProgramData%\BirdoVPN keeps what
   ; the uninstall must leave — the accounts' settings keys (without them a
-  ; reinstall can no longer verify, so quarantines, the user's settings.json)
-  ; and the per-account migration markers (which keep the old %APPDATA%
-  ; sources closed for good) — and what it should not: the in-app updater's
-  ; installer in updates\, and the squatted folders the app moved aside
-  ; (BirdoVPN.untrusted-*). `--remove-leftovers-and-exit` removes those two
-  ; and nothing else; with "Delete the application data" ticked, also the
+  ; reinstall can no longer verify, so quarantines, that account's
+  ; settings.json) and the per-account migration markers (which keep the old
+  ; %APPDATA% sources closed for good) — and what it should not: the in-app
+  ; updater's installer in updates\, and the squatted folders the app moved
+  ; aside (BirdoVPN.untrusted-*). `--remove-leftovers-and-exit` removes those
+  ; two and nothing else; with "Delete this user's app data" ticked, also the
   ; accounts' ML-KEM keys (pq-<SID>.bin, which R4 moved there from
-  ; $LOCALAPPDATA\BirdoVPN: D-23 below). The exe does it, not NSIS: the
-  ; set-aside folders are a user's, who can plant junctions in them, and
-  ; NSIS's recursive delete follows junctions (checked with NSIS 3.11).
+  ; $LOCALAPPDATA\BirdoVPN: D-23 below) and the uninstalling account's own
+  ; settings key (settings-hmac-<SID>.key, AUD-DESK-19), whose settings.json
+  ; goes with its folders. Other accounts' settings keys stay. The exe does
+  ; it, not NSIS: the set-aside folders are a user's, who can plant
+  ; junctions in them, and NSIS's recursive delete follows junctions
+  ; (checked with NSIS 3.11).
   ; Bounded like the reconcile; a real uninstall only (an in-place update
   ; keeps everything).
   ;
-  ; D6c HIGH: with "Delete the application data" ticked, the exe ALSO removes
+  ; D6c HIGH: with "Delete this user's app data" ticked, the exe ALSO removes
   ; the per-user folders (the BirdoVPN data folder — keeping dns-restore.json* —
   ; the local data and crash folders, and the two identifier folders the
   ; template would) without following links. The template's own recursive
@@ -576,8 +579,11 @@ FunctionEnd
   ; (`--remove-leftovers-and-exit --with-app-data`, D6c HIGH): $APPDATA\BirdoVPN
   ; (logs; keeping dns-restore.json* — W1-008), $LOCALAPPDATA\BirdoVPN
   ; (device_id; pre-R4 birdo_pq_v1.bin), $LOCALAPPDATA\Birdo VPN (crash files),
-  ; the admin-only accounts' ML-KEM keys, and the two identifier folders the
-  ; template itself used to delete. The exe never follows a link; NSIS's
+  ; the admin-only accounts' ML-KEM keys, this account's admin-only settings
+  ; key (AUD-DESK-19), and the two identifier folders the template itself
+  ; used to delete. Only the uninstalling account's data: the folders, tokens
+  ; and settings key of the machine's other Windows accounts stay (the
+  ; owner's choice, 2026-11-13; the checkbox says "this user's"). The exe never follows a link; NSIS's
   ; `RMDir /r` does, which elevated over a user's folders could delete files
   ; anywhere on the machine. The template's own app-data block is suppressed
   ; (PREUNINSTALL zeroed $DeleteAppDataCheckboxState), so what remains here is

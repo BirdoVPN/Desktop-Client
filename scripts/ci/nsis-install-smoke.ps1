@@ -26,6 +26,9 @@
 #     removes %ProgramData%\BirdoVPN\updates and the set-aside
 #     %ProgramData%\BirdoVPN.untrusted-* folders WITHOUT following a junction
 #     planted in them, and keeps the admin-only directory's keys and markers.
+#   - AUD-DESK-19: --with-app-data ("Delete this user's app data") also
+#     removes the running account's settings key there, and keeps another
+#     account's and the migration markers.
 #
 # Safe on a runner, and checked rather than assumed. No VPN is started: a
 # silent install without /R never launches the app. --reconcile-and-exit
@@ -244,6 +247,26 @@ $code = Invoke-Bounded $exe @('--reconcile-and-exit') 'the exe (--reconcile-and-
 if ($code -ne 0) { Fail "$exe --reconcile-and-exit exited $code" }
 if (-not (Test-Path -LiteralPath $protected -PathType Container)) { Fail "the app did not create $protected" }
 Write-Host "   $protected  $((Get-Acl -LiteralPath $protected).Sddl)"
+
+# AUD-DESK-19 (owner, 2026-11-13): with the app data, the uninstalling
+# account's settings key goes with its settings; another account's settings
+# key and the migration markers stay.
+Step "AUD-DESK-19: --with-app-data removes this account's settings key, not another's"
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$ownKey = Join-Path $protected "settings-hmac-$sid.key"
+$otherKey = Join-Path $protected 'settings-hmac-S-1-5-21-0-0-0-1002.key'
+foreach ($k in @($ownKey, $otherKey)) { Set-Content -LiteralPath $k -Value '00' }
+$markers = @(Get-ChildItem -LiteralPath $protected -File -Filter 'dns-journal-migrated-*' | ForEach-Object { $_.FullName })
+if ($markers.Count -eq 0) { Fail "the app wrote no dns-journal-migrated marker in $protected" }
+$code = Invoke-Bounded $exe @('--remove-leftovers-and-exit', '--with-app-data') 'the exe (--with-app-data, settings keys)'
+if ($code -ne 0) { Fail "$exe --remove-leftovers-and-exit --with-app-data exited $code" }
+if (Test-Path -LiteralPath $ownKey) { Fail "$ownKey survived --with-app-data: this account's settings key goes with its settings" }
+foreach ($k in @($otherKey) + $markers) {
+    if (-not (Test-Path -LiteralPath $k -PathType Leaf)) { Fail "$k was deleted: another account's settings key and the markers stay" }
+}
+Write-Host "   gone: $(Split-Path -Leaf $ownKey); kept: $(Split-Path -Leaf $otherKey) and $($markers.Count) marker(s)"
+Remove-Item -LiteralPath $otherKey -Force
+
 # The log this run wrote must not stand in for the uninstaller's run below.
 if (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log -Force }
 # The updater's leftovers: its temp folder and the installer it launched.

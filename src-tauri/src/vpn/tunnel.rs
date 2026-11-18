@@ -1219,7 +1219,7 @@ impl WintunTunnel {
                 };
                 if rc.0 == 0 {
                     // SAFETY: on success the union's `Value` field holds the LUID.
-                    crate::vpn::wfp::set_tunnel_luid(unsafe { luid.Value });
+                    crate::vpn::wfp::set_tunnel_luid(unsafe { luid.Value }, self.state_gen);
                     luid_published = true;
                     // LOCKDOWN server-switch / reconnect: if the block is already
                     // active (lockdown holds it on continuously), rebuild it NOW with
@@ -2111,8 +2111,10 @@ impl WintunTunnel {
 
         // LOCKDOWN: the tunnel interface is going away — clear its LUID so a
         // stale value can never be permitted on a future kill-switch activation.
+        // Only this tunnel's own (AUD-DESK-14): the late stop of a displaced
+        // tunnel leaves the LUID of the tunnel that replaced it.
         #[cfg(windows)]
-        crate::vpn::wfp::clear_tunnel_luid();
+        crate::vpn::wfp::clear_tunnel_luid(self.state_gen);
 
         // STEP 3: Network cleanup — run all three in parallel since they
         // are independent and each spawns external processes.
