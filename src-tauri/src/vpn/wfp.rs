@@ -763,8 +763,10 @@ const MAX_TRACKED_FILTERS: usize = 2048;
 /// deleted again by every change, and the dynamic session takes the filters
 /// with it in any case.
 ///
-/// Untested assumption (no elevated session in CI, D12): a failed
-/// FwpmFilterDeleteById0 leaves the transaction committable.
+/// A failed FwpmFilterDeleteById0 leaves the transaction committable (D12):
+/// WFP's own answer, checked in an elevated dynamic session on the Windows CI
+/// runner by `tests::a_failed_filter_delete_leaves_the_transaction_committable`
+/// (AUD-DOC-12).
 fn commit_policy(
     kernel: &mut impl FilterKernel,
     ids: &mut Vec<(u64, Action)>,
@@ -2488,5 +2490,51 @@ mod tests {
 
         assert!(clear_tunnel_luid(current));
         assert_eq!(TUNNEL_LUID.load(Ordering::SeqCst), 0);
+    }
+
+    /// AUD-DOC-12 (D12): [`commit_policy`] deletes the old filters inside its
+    /// transaction and commits past a delete that failed. That the
+    /// transaction is still committable then is asked of WFP itself, in a
+    /// dynamic session of this test's own (Windows CI is elevated): a delete
+    /// of an id no filter has fails, and the transaction still commits what
+    /// was written after it. The session's objects go with its handle.
+    #[test]
+    fn a_failed_filter_delete_leaves_the_transaction_committable() {
+        if !is_admin() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI is not elevated, so this test would test nothing"
+            );
+            eprintln!("SKIPPED: a WFP session needs an elevated process");
+            return;
+        }
+        let mut engine = WfpEngine::open().expect("a dynamic WFP session");
+        let handle = engine.handle;
+        let apps = HashMap::new();
+        let mut kernel = Kernel {
+            handle,
+            apps: &apps,
+        };
+        kernel.begin().expect("a transaction");
+
+        let deleted = kernel.delete_filter(u64::MAX);
+        assert_ne!(deleted, 0, "a filter with id u64::MAX was deleted");
+        // The change goes on after the failed delete, as commit_policy's does.
+        kernel.add_provider().expect("a provider after it");
+        kernel.add_sublayer().expect("a sublayer after it");
+        kernel.commit().expect("commit after a failed delete");
+
+        // What was written after the failed delete is in force.
+        let mut sublayer: *mut FWPM_SUBLAYER0 = std::ptr::null_mut();
+        // SAFETY: `handle` is the open session from `open()`, the key is a
+        // static GUID, and `sublayer` receives WFP's allocation, freed below.
+        let found = unsafe { FwpmSubLayerGetByKey0(handle, &BIRDO_SUBLAYER_KEY, &mut sublayer) };
+        if found == 0 {
+            // SAFETY: allocated by the successful FwpmSubLayerGetByKey0 above,
+            // freed once.
+            unsafe { FwpmFreeMemory0(std::ptr::addr_of_mut!(sublayer).cast()) };
+        }
+        assert_eq!(found, 0, "no sublayer after the commit");
+        engine.close().expect("close the session");
     }
 }
