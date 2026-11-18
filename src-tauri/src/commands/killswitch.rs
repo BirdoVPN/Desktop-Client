@@ -943,7 +943,7 @@ async fn disarm_platform() -> Result<(), String> {
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     let lifted: Result<(), String> = Ok(());
 
-    disarmed(lifted)
+    disarmed(lifted, platform_is_blocking)
 }
 
 /// What [`disarm`] reports for the platform cleanup's result `lifted`.
@@ -956,14 +956,22 @@ async fn disarm_platform() -> Result<(), String> {
 /// held, and the UI's Disconnect lifts it again. Windows drops its engine
 /// either way (`wfp::cleanup`; the engine's Drop retries the close, and a
 /// dynamic session's filters go with its handle).
-fn disarmed(lifted: Result<(), String>) -> Result<(), String> {
+///
+/// The log says which (review of #446): `blocking` is asked only after a
+/// failure. A cleanup can fail after the block itself came down (pf lifted,
+/// and only its fallback ruleset did not apply), which is no block held.
+fn disarmed(lifted: Result<(), String>, blocking: impl FnOnce() -> bool) -> Result<(), String> {
     match lifted {
         Ok(()) => {
             tracing::info!("Kill switch disarmed");
             Ok(())
         }
+        Err(e) if blocking() => {
+            tracing::error!("The kill switch's block is still in force: {}", e);
+            Err(e)
+        }
         Err(e) => {
-            tracing::error!("The kill switch's block may still be in force: {}", e);
+            tracing::warn!("Block lifted, but the kill switch's cleanup failed: {}", e);
             Err(e)
         }
     }
@@ -2973,10 +2981,13 @@ mod tests {
     async fn a_disarm_whose_cleanup_failed_reports_it() {
         let _tests = FLAG_TESTS.lock().await;
         let held = "Failed to remove pf rules on disarm: pfctl timed out";
-        let failed = disarm_with(async { disarmed(Err(held.into())) }).await;
-        assert_eq!(failed, Err(held.to_string()));
-        assert!(!is_enabled());
-        assert_eq!(disarm_with(async { disarmed(Ok(())) }).await, Ok(()));
+        for blocking in [true, false] {
+            let failed = disarm_with(async { disarmed(Err(held.into()), || blocking) }).await;
+            assert_eq!(failed, Err(held.to_string()), "blocking {blocking}");
+            assert!(!is_enabled());
+        }
+        let lifted = disarm_with(async { disarmed(Ok(()), || panic!("asked when lifted")) }).await;
+        assert_eq!(lifted, Ok(()));
 
         // Each platform's cleanup result is what `disarm_platform` returns:
         // none is logged and dropped.
@@ -2985,7 +2996,9 @@ mod tests {
         assert!(!platform.contains("if let Err(e)"), "{platform}");
         assert_eq!(platform.matches("let lifted").count(), 4, "{platform}");
         assert!(
-            platform.trim_end().ends_with("disarmed(lifted)"),
+            platform
+                .trim_end()
+                .ends_with("disarmed(lifted, platform_is_blocking)"),
             "{platform}"
         );
     }
