@@ -428,14 +428,20 @@ jobs:
             exit 1
           }
           echo "$out"
-          if ! echo "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; then
+          # Here-strings, never `echo "$out" | grep -q` (MR-2391): grep -q
+          # exits at its first match, the echo still writing the rest of a
+          # long test log dies of SIGPIPE, and pipefail turns a match into a
+          # miss. Dependabot #423's macOS run failed exactly so: "filter
+          # 'app_data_removal::tests' matched no passing test" with all five
+          # of those tests "... ok" in the log above it.
+          if ! grep -qE 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
             echo "::error::no tests ran on $OS - the filter '$FILTER' matched nothing"
             exit 1
           fi
           # Each named module must have run at least one test, or a typo in
           # one filter hides behind the other's passes.
           for f in "${filters[@]}"; do
-            if ! echo "$out" | grep -qE "^test [a-z0-9_:]*${f}::[a-z0-9_]+ \.\.\. ok"; then
+            if ! grep -qE "^test [a-z0-9_:]*${f}::[a-z0-9_]+ \.\.\. ok" <<<"$out"; then
               echo "::error::filter '$f' matched no passing test on $OS"
               exit 1
             fi
@@ -595,7 +601,7 @@ jobs:
             exit 1
           }
           echo "$out"
-          if ! echo "$out" | grep -qE 'test result: ok\. 5 passed'; then
+          if ! grep -qE 'test result: ok\. 5 passed' <<<"$out"; then
             echo "::error::the macOS endpoint-route root tests did not all run"
             exit 1
           fi
@@ -629,7 +635,7 @@ jobs:
           # Two tests, both required. An --ignored filter that matches nothing
           # still exits 0, which is the exact failure this repo has been bitten
           # by before: a green job proving only that a filter typo compiled.
-          if ! echo "$out" | grep -qE 'test result: ok\. 2 passed'; then
+          if ! grep -qE 'test result: ok\. 2 passed' <<<"$out"; then
             echo "::error::configure_ipv6_tests did not run both tests"
             exit 1
           fi
@@ -854,7 +860,7 @@ jobs:
           out=$(eval "$probe" 2>&1) || rc=$?
           echo "$out"
           echo "(tauri exited $rc; not the gate)"
-          if ! printf '%s\n' "$out" | grep -qE '^build .*--locked'; then
+          if ! grep -qE '^build .*--locked' <<<"$out"; then
             echo "::error::release.yml's Linux/macOS build command did not hand --locked to cargo"
             exit 1
           fi

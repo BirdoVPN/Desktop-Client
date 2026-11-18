@@ -94,7 +94,7 @@ expect() { # expect <exit-code> <case> [must-mention] -- <gate args...>
   shift 4
   local out code=0
   out="$(bash "$gate" "$@" 2>&1)" || code=$?
-  if [ "$code" -eq "$want" ] && { [ -z "$mention" ] || printf '%s' "$out" | grep -qF -- "$mention"; }; then
+  if [ "$code" -eq "$want" ] && { [ -z "$mention" ] || grep -qF -- "$mention" <<<"$out"; }; then
     passes=$((passes + 1))
     echo "PASS  $case (exit $code)"
   else

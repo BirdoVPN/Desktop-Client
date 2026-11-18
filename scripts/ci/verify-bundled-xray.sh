@@ -66,7 +66,7 @@ fi
 
 expected="$1"
 shift
-if ! printf '%s' "$expected" | grep -qE '^[0-9a-fA-F]{64}$'; then
+if ! grep -qE '^[0-9a-fA-F]{64}$' <<<"$expected"; then
   echo "::error::verify-bundled-xray: expected SHA-256 is not 64 hex chars (got '$expected'). An empty value means the build never captured XRAY_BINARY_SHA256 - the app would refuse xray at runtime."
   exit 1
 fi

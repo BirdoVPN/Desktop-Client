@@ -1569,7 +1569,7 @@ jobs:
             fi
             while read -r f; do
               local b; b="$(basename "$f")"
-              if ! printf '%s' "$b" | grep -qE "$arch_re"; then
+              if ! grep -qE -- "$arch_re" <<<"$b"; then
                 echo "::error::$b has no arch token matching $arch_re — updater cannot serve it"
                 fail=1
               fi
@@ -1630,7 +1630,7 @@ jobs:
       # repo's workflow or an edited SHA256SUMS.txt fails. docs/VERIFICATION.md.)
       - name: Install Cosign
         if: startsWith(github.ref, 'refs/tags/')
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Generate + Sigstore-sign the unified SHA256SUMS.txt
         if: startsWith(github.ref, 'refs/tags/')
@@ -1679,7 +1679,7 @@ jobs:
           draft=false
           if [ "$type" = tag ]; then
             message=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .message)
-            if printf '%s' "$message" | grep -qxE 'release:[[:space:]]*draft[[:space:]]*'; then
+            if grep -qxE 'release:[[:space:]]*draft[[:space:]]*' <<<"$message"; then
               draft=true
             fi
           fi
@@ -1704,7 +1704,7 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+          if ! grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$TAG"; then
             echo "make_latest=false" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
             echo "::notice::$TAG is not plain vX.Y.Z - publishing it as a prerelease that does not take Latest"
@@ -1744,7 +1744,7 @@ jobs:
       # required platform succeeded.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ github.ref_name }}
           files: |
