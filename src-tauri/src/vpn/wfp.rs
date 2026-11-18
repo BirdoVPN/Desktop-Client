@@ -763,10 +763,13 @@ const MAX_TRACKED_FILTERS: usize = 2048;
 /// deleted again by every change, and the dynamic session takes the filters
 /// with it in any case.
 ///
-/// A failed FwpmFilterDeleteById0 leaves the transaction committable (D12):
-/// WFP's own answer, checked in an elevated dynamic session on the Windows CI
-/// runner by `tests::a_failed_filter_delete_leaves_the_transaction_committable`
-/// (AUD-DOC-12).
+/// D12, checked for ONE code: a FwpmFilterDeleteById0 that fails with
+/// FWP_E_FILTER_NOT_FOUND leaves the transaction committable. WFP's own
+/// answer, in an elevated dynamic session on the Windows CI runner
+/// (`tests::a_delete_of_a_missing_filter_leaves_the_transaction_committable`,
+/// AUD-DOC-12). [`undeletable`] counts that code as deleted anyway. For any
+/// other code, a stuck filter this commits past, it is still an untested
+/// assumption: D12 stays open for those.
 fn commit_policy(
     kernel: &mut impl FilterKernel,
     ids: &mut Vec<(u64, Action)>,
@@ -2493,13 +2496,15 @@ mod tests {
     }
 
     /// AUD-DOC-12 (D12): [`commit_policy`] deletes the old filters inside its
-    /// transaction and commits past a delete that failed. That the
-    /// transaction is still committable then is asked of WFP itself, in a
-    /// dynamic session of this test's own (Windows CI is elevated): a delete
-    /// of an id no filter has fails, and the transaction still commits what
-    /// was written after it. The session's objects go with its handle.
+    /// transaction and commits past a delete that failed. For the one code a
+    /// test can provoke, FWP_E_FILTER_NOT_FOUND (an id no filter has), that
+    /// the transaction is still committable is asked of WFP itself, in a
+    /// dynamic session of this test's own (Windows CI is elevated): the
+    /// transaction commits what was written after the failed delete. Other
+    /// codes (a stuck filter) stay untested. The session's objects go with
+    /// its handle.
     #[test]
-    fn a_failed_filter_delete_leaves_the_transaction_committable() {
+    fn a_delete_of_a_missing_filter_leaves_the_transaction_committable() {
         if !is_admin() {
             assert!(
                 std::env::var_os("CI").is_none(),
@@ -2518,7 +2523,7 @@ mod tests {
         kernel.begin().expect("a transaction");
 
         let deleted = kernel.delete_filter(u64::MAX);
-        assert_ne!(deleted, 0, "a filter with id u64::MAX was deleted");
+        assert_eq!(deleted, FWP_E_FILTER_NOT_FOUND, "0x{deleted:08X}");
         // The change goes on after the failed delete, as commit_policy's does.
         kernel.add_provider().expect("a provider after it");
         kernel.add_sublayer().expect("a sublayer after it");
