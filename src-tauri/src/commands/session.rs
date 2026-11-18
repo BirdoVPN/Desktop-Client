@@ -1026,31 +1026,34 @@ pub(crate) async fn prepare_tunnel(
 /// old tunnel is touched (`attempt`). The re-dial dials on: the block its
 /// `dial` put up first stays in force and drops a handshake it does not
 /// permit.
+///
+/// AUD-DESK-08: an endpoint that is not an IPv4 address (a host name) is
+/// `Err` before anything moves. It used to be logged and answered `Ok` with
+/// the permit left on the PREVIOUS relay. The server sends only addresses,
+/// and `build_vpn_config` refuses anything else first.
 pub(crate) async fn apply_relay_permit(
     endpoint: &str,
     stealth: bool,
     engage: bool,
 ) -> Result<(), String> {
-    let ip = parse_endpoint_ip(endpoint);
+    let Some(ip) = parse_endpoint_ip(endpoint) else {
+        // P6-CLI-D-03: the endpoint names the relay, so both lines are
+        // redacted (`redact_*` is a pass-through in debug builds).
+        tracing::warn!(
+            "Kill switch endpoint '{}' is not an IPv4 address; refusing it rather than \
+             keeping the previous relay's permit",
+            crate::utils::redact::redact_hostname(endpoint)
+        );
+        tracing::debug!(
+            "Unresolvable kill switch endpoint: {}",
+            crate::utils::redact_endpoint(endpoint)
+        );
+        return Err("the relay endpoint is not an IPv4 address".to_string());
+    };
     // macOS/Linux: the relay the block permits now, for a guard that fails.
     #[cfg(not(target_os = "windows"))]
     let previous = killswitch::vpn_server_ip();
-    match ip {
-        Some(ip) => killswitch::set_vpn_server_ip(Some(ip)).await,
-        None => {
-            // P6-CLI-D-03: the endpoint names the relay, so both lines are
-            // redacted (`redact_*` is a pass-through in debug builds).
-            tracing::warn!(
-                "Could not resolve kill switch endpoint IP from '{}'; kill switch may not \
-                 filter traffic to the VPN server correctly",
-                crate::utils::redact::redact_hostname(endpoint)
-            );
-            tracing::debug!(
-                "Unresolvable kill switch endpoint: {}",
-                crate::utils::redact_endpoint(endpoint)
-            );
-        }
-    }
+    killswitch::set_vpn_server_ip(Some(ip)).await;
     #[cfg(target_os = "windows")]
     {
         use crate::vpn::wfp_policy::{parse_relay, RelayTransport};
@@ -1060,7 +1063,7 @@ pub(crate) async fn apply_relay_permit(
             RelayTransport::WireGuardUdp
         };
         let relay = parse_relay(endpoint, transport);
-        if relay.is_none() && ip.is_some() {
+        if relay.is_none() {
             tracing::warn!("Kill switch relay endpoint has no usable port");
         }
         permit_relay(
@@ -1087,9 +1090,6 @@ pub(crate) async fn apply_relay_permit(
                 }
             };
         }
-        let Some(ip) = ip else {
-            return Ok(());
-        };
         // Linux twin: the relay is permitted by ADDRESS and the self-permit is
         // scoped to tcp/443, so a connect onto a different server needs the
         // live block re-armed or its handshake is dropped.
@@ -2257,5 +2257,35 @@ mod release_deadline_tests {
             finished.load(Ordering::SeqCst),
             "the teardown was cancelled at the deadline"
         );
+    }
+}
+
+/// AUD-DESK-08: a relay endpoint that is not an IPv4 address (a host name, an
+/// IPv6 literal) is refused before the kill switch's permit moves, on every
+/// platform. It used to answer `Ok` with the permit left on the PREVIOUS
+/// relay. Nothing here reaches the kill switch: the refusal comes first, and
+/// `engage` is off, so an old build answers `Ok` without touching it either.
+/// Runs on Windows, Linux and macOS (tests.yml FILTER).
+#[cfg(test)]
+mod hostname_relay_tests {
+    use super::apply_relay_permit;
+
+    #[tokio::test]
+    async fn a_relay_endpoint_that_is_not_an_ipv4_address_is_refused() {
+        for endpoint in [
+            "relay.example.net:51820",
+            "relay.example.net:8443",
+            "[2001:db8::1]:51820",
+        ] {
+            for stealth in [false, true] {
+                let refused = apply_relay_permit(endpoint, stealth, false).await;
+                assert!(
+                    refused
+                        .as_ref()
+                        .is_err_and(|e| e.contains("not an IPv4 address")),
+                    "{endpoint} (stealth {stealth}): {refused:?}"
+                );
+            }
+        }
     }
 }

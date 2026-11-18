@@ -204,6 +204,20 @@ pub fn build_vpn_config(
         },
         None => endpoint,
     };
+    // AUD-DESK-08: the relay the kill switch permits is an IPv4 address, which
+    // is all the server sends (the node's address). A host name could not be
+    // permitted (`session::apply_relay_permit`): the permit stayed on the
+    // previous relay. The Stealth relay, which the permit names instead of
+    // the local proxy when Stealth is used (`prepare_tunnel`), likewise.
+    let stealth_relay = response
+        .xray_endpoint
+        .as_deref()
+        .filter(|_| response.stealth_enabled.unwrap_or(false));
+    for relay in std::iter::once(endpoint.as_str()).chain(stealth_relay) {
+        if parse_endpoint_ip(relay).is_none() {
+            return Err("Invalid endpoint in server response: not an IPv4 address".to_string());
+        }
+    }
 
     let persistent_keepalive = response.persistent_keepalive.unwrap_or(25);
 
@@ -1725,6 +1739,57 @@ mod tests {
         };
         for setting in ["auto", "51820", "53", "5353", "not-a-port"] {
             assert_eq!(endpoint_for(setting), "203.0.113.1:51820", "{setting:?}");
+        }
+    }
+
+    /// AUD-DESK-08: a relay the kill switch could not permit, a host name or
+    /// an IPv6 literal, is refused here, the Stealth relay too when Stealth is
+    /// used. Before, it was built, and the permit stayed on the previous
+    /// relay (`session::apply_relay_permit`).
+    #[test]
+    fn a_relay_endpoint_that_is_not_an_ipv4_address_is_refused() {
+        let build = |endpoint: &str, stealth: Option<(bool, &str)>| {
+            let mut response = serde_json::json!({
+                "success": true,
+                "keyId": "k1",
+                "publicKey": "cGs=",
+                "assignedIp": "10.8.0.2",
+                "serverPublicKey": "c3BrPQ==",
+                "endpoint": endpoint,
+            });
+            if let Some((enabled, xray)) = stealth {
+                response["stealthEnabled"] = enabled.into();
+                response["xrayEndpoint"] = xray.into();
+            }
+            let response: ConnectResponse = serde_json::from_value(response).unwrap();
+            build_vpn_config(response, "ams-1", None, 0, "auto")
+                .map(|(config, _)| config.endpoint.clone())
+        };
+        for endpoint in ["relay.example.net:51820", "[2001:db8::1]:51820"] {
+            let refused = build(endpoint, None);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|e| e.contains("not an IPv4 address")),
+                "{endpoint}: {refused:?}"
+            );
+        }
+        let stealth = build("203.0.113.1:51820", Some((true, "relay.example.net:8443")));
+        assert!(stealth.is_err(), "{stealth:?}");
+
+        // The controls: addresses, and a Stealth relay that is not used.
+        assert_eq!(
+            build("203.0.113.1:51820", None).unwrap(),
+            "203.0.113.1:51820"
+        );
+        for stealth in [
+            (true, "203.0.113.1:8443"),
+            (false, "relay.example.net:8443"),
+        ] {
+            assert!(
+                build("203.0.113.1:51820", Some(stealth)).is_ok(),
+                "{stealth:?}"
+            );
         }
     }
 
