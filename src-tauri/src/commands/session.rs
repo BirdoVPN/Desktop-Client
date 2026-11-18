@@ -1317,6 +1317,18 @@ async fn end_the_tunnel(app: &AppHandle, reason: EndReason) {
         tracing::error!("Tunnel disconnect failed: {}", e);
     }
     app.state::<XrayManager>().stop().await;
+
+    // MR-2255 (review of #445): on Linux the server switch's hold is lifted
+    // only by its guard's Drop, and since MR-2255 it holds every non-tunnel
+    // IPv4 flow, not just DNS. A removal that failed there (an iptables
+    // error) left it in the kernel past the switch, cutting the host off
+    // after this Disconnect until the next launch. Every Disconnect lifts it
+    // again. Idempotent, our chains only: a no-op with no hold. A hold lives
+    // only inside a switch's connect(), which needs a tunnel to displace,
+    // and the disconnect above has just taken it. (macOS's pf watchdog
+    // retries a lift that did not take.)
+    #[cfg(target_os = "linux")]
+    crate::vpn::tunnel_linux::remove_dns_hold();
 }
 
 static EXPIRY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -1461,6 +1473,32 @@ mod lifecycle_tests {
                 "killswitch::disarm()",
                 "ConnectionState::Disconnected",
             ],
+        );
+    }
+
+    /// MR-2255 (review of #445, LOW): every Disconnect lifts a server-switch
+    /// hold left in the kernel on Linux, after the tunnel and the stealth
+    /// transport are down and before the block is released. With the IPv4
+    /// half, a hold whose own removal failed cut every non-tunnel IPv4 flow
+    /// until the next launch. `tunnel_linux`'s netns test
+    /// `a_dns_hold_left_by_a_killed_run_is_lifted_by_the_startup_sweep` pins
+    /// that the call lifts a hold left exactly as a failed removal leaves it.
+    #[test]
+    fn a_disconnect_lifts_a_switch_hold_left_in_the_kernel() {
+        let steps = body("async fn end_the_tunnel(");
+        order(
+            steps,
+            &[
+                "vm.disconnect()",
+                "XrayManager>().stop()",
+                "#[cfg(target_os = \"linux\")]",
+                "crate::vpn::tunnel_linux::remove_dns_hold();",
+            ],
+        );
+        // Inside the teardown, so it runs before tear_down's disarm.
+        order(
+            body("async fn tear_down("),
+            &["end_the_tunnel(&app, reason).await", "killswitch::disarm()"],
         );
     }
 
