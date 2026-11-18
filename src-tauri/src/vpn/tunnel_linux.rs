@@ -378,9 +378,12 @@ fn fill_dns_hold(
             t(&["-A", chain, "-p", proto, "--dport", port, "-j", "DROP"])?;
         }
     }
-    // MR-2255: then the rest of IPv4, after the DNS rules, so a query the
-    // DNS rules let through (to the relay, a LAN resolver) is judged by the
-    // IPv4 hold as any other packet. IPv6 is the leak block's.
+    // MR-2255: then the rest of IPv4, after the DNS rules. A packet the DNS
+    // rules RETURN (loopback, birdo0, the relay, a LAN resolver with sharing
+    // on) leaves the chain there and never meets these rules. That changes
+    // nothing: each is something the IPv4 rules let through as well (a LAN
+    // resolver is a LAN address, and it is exempt only with sharing on).
+    // IPv6 is the leak block's.
     let ipv4 = if v6 { None } else { exempt.ipv4.as_ref() };
     if let Some(hold) = ipv4 {
         for rule in super::iptables_policy::switch_hold_v4(hold, exempt.local_network_sharing) {
