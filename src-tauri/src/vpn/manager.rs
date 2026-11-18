@@ -2206,7 +2206,14 @@ mod tests {
             persistent_keepalive: 25,
         };
         let err = mgr
-            .connect(config, WgPrivateKey::generate(), label(), false, stale)
+            .connect(
+                config,
+                WgPrivateKey::generate(),
+                label(),
+                "203.0.113.1:51820",
+                false,
+                stale,
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, IpcErrorCode::Cancelled);
