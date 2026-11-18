@@ -1391,17 +1391,43 @@ pub(crate) fn current_relay() -> Option<Relay> {
     *RELAY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The tunnel that published [`TUNNEL_LUID`], by its ownership token
+/// (`WintunTunnel::state_gen`, never 0); 0 = none (AUD-DESK-14). Held across
+/// each publish and clear, so a clear never lands between the two stores of
+/// another tunnel's publish.
+static TUNNEL_LUID_PUBLISHER: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
 /// Publish the tunnel adapter's interface LUID (from the tunnel layer once the
 /// Wintun adapter exists). Lockdown mode permits this interface so tunneled
-/// traffic flows under the always-on block-all.
-pub fn set_tunnel_luid(luid: u64) {
+/// traffic flows under the always-on block-all. `publisher`: the tunnel's
+/// ownership token, which [`clear_tunnel_luid`] must match.
+pub fn set_tunnel_luid(luid: u64, publisher: u64) {
+    let mut by = TUNNEL_LUID_PUBLISHER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     TUNNEL_LUID.store(luid, Ordering::SeqCst);
+    *by = publisher;
     tracing::debug!("Kill switch tunnel LUID set to: {}", luid);
 }
 
-/// Clear the published tunnel LUID (on tunnel teardown).
-pub fn clear_tunnel_luid() {
+/// Clear the published tunnel LUID on the teardown of `publisher`, only while
+/// it is still the tunnel that published it; `true` when cleared.
+///
+/// AUD-DESK-14: every stop() used to store 0. A late stop of a displaced
+/// tunnel then cleared the LUID of the tunnel that replaced it, and the next
+/// lockdown re-bake left that tunnel's traffic no permit (fails closed, drops
+/// it). The publisher decides, not the value: `Adapter::open` reuses one
+/// adapter, so the two tunnels usually publish the SAME LUID.
+pub fn clear_tunnel_luid(publisher: u64) -> bool {
+    let mut by = TUNNEL_LUID_PUBLISHER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if *by != publisher {
+        return false;
+    }
     TUNNEL_LUID.store(0, Ordering::SeqCst);
+    *by = 0;
+    true
 }
 
 /// Clean up and release all resources: the end of the session.
@@ -2441,5 +2467,26 @@ mod tests {
         assert!(!lifts_a_block(&block, &block));
         assert!(!lifts_a_block(&Policy::default(), &v6));
         assert!(!lifts_a_block(&Policy::default(), &guarded));
+    }
+
+    /// AUD-DESK-14: the late stop of a displaced tunnel leaves the LUID the
+    /// tunnel that replaced it published, even the SAME LUID (one adapter,
+    /// reused); only the publisher's own stop clears it. Every stop() used to
+    /// store 0 over it. The tokens are ones no tunnel in this process mints.
+    #[test]
+    fn a_late_stop_of_a_displaced_tunnel_keeps_the_new_tunnels_luid() {
+        const LUID: u64 = 0x0006_0000_0100_0000;
+        let (displaced, current) = (u64::MAX - 1, u64::MAX);
+        set_tunnel_luid(LUID, displaced);
+        set_tunnel_luid(LUID, current);
+
+        assert!(
+            !clear_tunnel_luid(displaced),
+            "the displaced tunnel cleared it"
+        );
+        assert_eq!(TUNNEL_LUID.load(Ordering::SeqCst), LUID);
+
+        assert!(clear_tunnel_luid(current));
+        assert_eq!(TUNNEL_LUID.load(Ordering::SeqCst), 0);
     }
 }
