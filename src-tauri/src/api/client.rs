@@ -2964,11 +2964,12 @@ mod retry_after_tests {
             )
         };
         for (header, wait) in [(Some("42"), Some(42)), (None, Some(17))] {
-            let error = BirdoApi::new()
+            let Err(error) = BirdoApi::new()
                 .handle_response::<RefreshResponse>(limited(header))
                 .await
-                .err()
-                .expect("a 429 is an error");
+            else {
+                panic!("a 429 is an error");
+            };
             assert!(
                 matches!(error, ApiError::RateLimited { retry_after_secs } if retry_after_secs == wait),
                 "{header:?}"
@@ -3136,11 +3137,9 @@ mod retry_after_tests {
             let server = ScriptedRefresh::default();
             let started = tokio::time::Instant::now();
 
-            let failed = api
-                .fly_refresh(server.send(&api, answer))
-                .await
-                .err()
-                .expect(case);
+            let Err(failed) = api.fly_refresh(server.send(&api, answer)).await else {
+                panic!("{case}");
+            };
             assert_eq!(tokio::time::Instant::now(), started, "{case}: it waited");
             assert_eq!(server.sent(), 1, "{case}");
             match held_as {
@@ -3385,7 +3384,9 @@ mod retry_after_tests {
             let held = api.fly_refresh(server.send(&api, renewed())).await;
             assert_eq!(server.sent(), 1, "{case}");
             for (when, result) in [("met", met), ("held", held)] {
-                let error = result.err().expect(case);
+                let Err(error) = result else {
+                    panic!("{case}");
+                };
                 let told = IpcError::from_api(&session_gate::error_after_failed_refresh(error));
                 assert!(
                     !matches!(
