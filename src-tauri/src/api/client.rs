@@ -321,13 +321,20 @@ pub(crate) fn never_left(error: &reqwest::Error) -> bool {
 
 /// The response's `Retry-After`, parsed and clamped
 /// (`error::retry_after_header`, MR-1808). Read before the body consumes the
-/// response.
+/// response. MR-2500 / MR-1771 (the one timing table, lead 2026-11-19
+/// 21:39Z): the token refresh's answer reads delta-seconds only
+/// (`error::retry_after_delta`); an HTTP-date there names no wait, as on
+/// Mobile #653.
 fn retry_after_of(response: &reqwest::Response) -> Option<u64> {
-    response
+    let value = response
         .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| super::error::retry_after_header(value, std::time::SystemTime::now()))
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    if response.url().path() == endpoints::auth::REFRESH {
+        return super::error::retry_after_delta(value);
+    }
+    super::error::retry_after_header(value, std::time::SystemTime::now())
 }
 
 /// What the token refresh is held under in the retry gate (MR-1808): its
@@ -416,6 +423,24 @@ impl BirdoApi {
         *self.refresh_token.write().await = Some(Zeroizing::new(refresh));
     }
 
+    /// A sign-in's pair (password, SSO, 2FA, anonymous, a new account, a
+    /// number rotation): a NEW session, so the refresh owes nothing from
+    /// before it (MR-2500 / MR-1771; L1 of the Mobile #653 review). The last
+    /// session's refresh hold, its backoff step and the retry it left owed
+    /// go (`RetryGate::session_started`); a sign-out already forgot them
+    /// (`forget_session`), and this covers a session that started without one.
+    ///
+    /// Under the refresh lock, as a restore is: a refresh of the last session
+    /// still in flight (it runs detached, WIN3-004, and can outlive a Sign
+    /// Out) ends first, so what it records lands BEFORE this clean slate,
+    /// never on the new session's. Its pair is not adopted either
+    /// (`adopt_refreshed`).
+    async fn begin_session(&self, access: String, refresh: String) {
+        let _refreshing = self.refresh_lock.lock().await;
+        self.retry_gate.session_started();
+        self.set_tokens(access, refresh).await;
+    }
+
     /// Fill the in-memory session from the keystore — ONLY if there is none.
     ///
     /// W1-028: `get_auth_state` (and every command's token restore) used to
@@ -425,12 +450,15 @@ impl BirdoApi {
     /// refresh token back in memory; the server treats reusing it as theft and
     /// revokes the session. Memory is authoritative once set, and the check
     /// runs under the same lock the refresh holds for its whole write.
-    /// Returns whether the tokens were taken.
+    /// Returns whether the tokens were taken. A pair restored into an empty
+    /// session starts the refresh over, as a sign-in does
+    /// ([`Self::begin_session`]).
     pub async fn restore_tokens_if_absent(&self, access: String, refresh: String) -> bool {
         let _guard = self.refresh_lock.lock().await;
         if self.access_token.read().await.is_some() {
             return false;
         }
+        self.retry_gate.session_started();
         self.set_tokens(access, refresh).await;
         true
     }
@@ -531,7 +559,7 @@ impl BirdoApi {
 
         // Only store tokens if login succeeded (not 2FA challenge)
         if let super::pow::Registered::Done(LoginResult::Success { ref tokens, .. }) = registered {
-            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+            self.begin_session(tokens.access_token.clone(), tokens.refresh_token.clone())
                 .await;
         }
 
@@ -559,7 +587,7 @@ impl BirdoApi {
             .await?;
 
         if let LoginResult::Success { ref tokens, .. } = result {
-            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+            self.begin_session(tokens.access_token.clone(), tokens.refresh_token.clone())
                 .await;
         }
 
@@ -584,7 +612,7 @@ impl BirdoApi {
 
         // Store tokens from successful 2FA verification
         if let Some(ref tokens) = response.tokens {
-            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+            self.begin_session(tokens.access_token.clone(), tokens.refresh_token.clone())
                 .await;
         }
 
@@ -1210,7 +1238,7 @@ impl BirdoApi {
         let response: RotateConfirmResponse =
             serde_json::from_str(&text).map_err(|e| ApiError::Parse(e.to_string()))?;
         if let Some(ref tokens) = response.tokens {
-            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+            self.begin_session(tokens.access_token.clone(), tokens.refresh_token.clone())
                 .await;
         }
         Ok(response)
@@ -1462,7 +1490,7 @@ impl BirdoApi {
 
         if let super::pow::Registered::Done(ref result) = registered {
             if let Some(ref tokens) = result.tokens {
-                self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                self.begin_session(tokens.access_token.clone(), tokens.refresh_token.clone())
                     .await;
             }
         }
@@ -1517,7 +1545,7 @@ impl BirdoApi {
 
         if let pow::Registered::Done(ref result) = registered {
             if let Some(ref tokens) = result.tokens {
-                self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                self.begin_session(tokens.access_token.clone(), tokens.refresh_token.clone())
                     .await;
             }
         }
@@ -3034,6 +3062,34 @@ mod retry_after_tests {
         Err(ApiError::Network("operation timed out".into()))
     }
 
+    /// A TLS pin failure, as the client reports one.
+    fn pin_failed() -> Result<RefreshResponse, ApiError> {
+        Err(ApiError::CertificatePinningFailed("pin".into()))
+    }
+
+    /// An unreadable 2xx, through the client's real mapping: a 200 whose
+    /// body is cut off.
+    async fn unreadable_2xx() -> Result<RefreshResponse, ApiError> {
+        BirdoApi::new()
+            .handle_response::<RefreshResponse>(reqwest::Response::from(
+                tauri::http::Response::builder()
+                    .status(200)
+                    .body(r#"{"access_token":"#.to_string())
+                    .unwrap(),
+            ))
+            .await
+    }
+
+    /// The three answers the one timing table holds and tells as they are
+    /// (lead 2026-11-19 21:39Z), by label. ApiError is not `Clone`.
+    async fn held_as_it_is(case: &str) -> Result<RefreshResponse, ApiError> {
+        match case {
+            "426" => refused(426, "", None),
+            "pin" => pin_failed(),
+            _ => unreadable_2xx().await,
+        }
+    }
+
     const LIMITED_17: &str = r#"{"statusCode":429,"message":"Too many token refresh attempts","error":"TOO_MANY_REQUESTS","details":{"code":"rate_limited","retryAfter":17}}"#;
     const BLOCKED: &str = r#"{"statusCode":403,"message":"Your IP address has been blocked"}"#;
 
@@ -3303,6 +3359,266 @@ mod retry_after_tests {
         assert!(api.lock_for_held_refresh().is_none(), "owed after sign-out");
     }
 
+    /// The one timing table (lead 2026-11-19 21:39Z: Desktop's numbers,
+    /// Mobile #653's hold): the version floor (426), a TLS pin failure and an
+    /// unreadable 2xx are HELD like a 5xx. The flight sends once and never
+    /// waits (the clock is paused); the session and its tokens are kept, and
+    /// nothing reads as a sign-out; the call that met it is told it as it is
+    /// (`upgrade_required`, `cert_pin_failed`, `server_error`); the next
+    /// request inside the hold sends nothing and is told the hold (a busy
+    /// 503); once it is over, the next request, or the window's focus
+    /// (`lock_for_held_refresh`, as `retry_held_refresh` takes it), sends the
+    /// SAME token through the same single flight, and nothing is owed after.
+    /// At 6e3ac07b none of the three held: the next 401 sent the same token
+    /// straight back.
+    #[tokio::test(start_paused = true)]
+    async fn a_426_a_pin_failure_and_an_unreadable_2xx_are_held_like_a_5xx() {
+        use crate::api::refresh_policy::told_as_it_is;
+        use crate::api::session_gate;
+        use crate::commands::ipc_error::{IpcError, IpcErrorCode};
+        for (case, code) in [
+            ("426", IpcErrorCode::UpgradeRequired),
+            ("pin", IpcErrorCode::CertPinFailed),
+            ("unreadable 2xx", IpcErrorCode::ServerError),
+        ] {
+            for on_focus in [false, true] {
+                let api = BirdoApi::new();
+                api.set_tokens("a1".into(), "r1".into()).await;
+                let server = ScriptedRefresh::default();
+                let started = tokio::time::Instant::now();
+
+                let answer = held_as_it_is(case).await;
+                let Err(met) = api.fly_refresh(server.send(&api, answer)).await else {
+                    panic!("{case}");
+                };
+                assert_eq!(tokio::time::Instant::now(), started, "{case}: it waited");
+                assert_eq!(server.sent(), 1, "{case}");
+                assert!(told_as_it_is(&met), "{case}: told the hold");
+                assert!(!session_gate::refresh_rejected(&met), "{case}: signed out");
+                let told = IpcError::from_api(&session_gate::error_after_failed_refresh(met));
+                assert_eq!(told.code, code, "{case}");
+                assert!(tokens_untouched(&api).await, "{case}: the session changed");
+
+                // The next request inside the hold sends nothing, at once.
+                let Err(held) = api.fly_refresh(server.send(&api, renewed())).await else {
+                    panic!("{case}: renewed inside the hold");
+                };
+                assert!(
+                    matches!(held, ApiError::Held { status: 503, .. }),
+                    "{case}: not the hold"
+                );
+                let told = IpcError::from_api(&session_gate::error_after_failed_refresh(held));
+                assert_eq!(told.code, IpcErrorCode::ServerError, "{case}");
+                assert!(told.retryable, "{case}");
+                assert_eq!(server.sent(), 1, "{case}: sent inside the hold");
+                assert!(!api.refresh_retry_due(), "{case}: due inside the hold");
+                assert!(api.lock_for_held_refresh().is_none(), "{case}");
+                assert!(tokens_untouched(&api).await, "{case}: the session changed");
+
+                // Once it is over (the first step is at most 1 s), the SAME
+                // token goes: with the next request, or on focus.
+                api.retry_gate.elapse(Duration::from_secs(1));
+                assert!(api.refresh_retry_due(), "{case}: not owed");
+                let focus = if on_focus {
+                    let Some(lock) = api.lock_for_held_refresh() else {
+                        panic!("{case}: focus sent nothing after the hold");
+                    };
+                    Some(lock)
+                } else {
+                    None
+                };
+                let again = api.fly_refresh(server.send(&api, renewed())).await;
+                drop(focus);
+                assert!(again.is_ok(), "{case}: not renewed");
+                assert_eq!(server.sent(), 2, "{case}");
+                assert!(server.all_the_same_token(), "{case}: another token went");
+                assert!(!api.refresh_retry_due(), "{case}: owed after renewing");
+                assert_eq!(tokio::time::Instant::now(), started, "{case}: it waited");
+            }
+        }
+    }
+
+    /// L1 of the Mobile #653 review: a fresh sign-in is never held by the
+    /// last session's refresh. A hold a few backoff steps in, with a retry
+    /// owed after it; then a sign-in (`begin_session`, the pair every sign-in
+    /// installs), straight away or after a sign-out: nothing is owed, focus
+    /// sends nothing, the first refresh goes out at once, and the next
+    /// failure holds for the first step only. At 6e3ac07b a sign-in without
+    /// a sign-out kept all three.
+    #[tokio::test]
+    async fn a_fresh_sign_in_is_never_held_by_the_last_sessions_refresh() {
+        for signed_out_first in [false, true] {
+            let api = BirdoApi::new();
+            api.set_tokens("a1".into(), "r1".into()).await;
+            let server = ScriptedRefresh::default();
+            for _ in 0..3 {
+                api.retry_gate.elapse(Duration::from_secs(60));
+                let _ = api
+                    .fly_refresh(server.send(&api, refused(503, "", None)))
+                    .await;
+            }
+            assert_eq!(server.sent(), 3);
+            let held = api.fly_refresh(server.send(&api, renewed())).await;
+            assert!(matches!(held, Err(ApiError::Held { status: 503, .. })));
+            assert_eq!(server.sent(), 3, "sent inside the hold");
+
+            if signed_out_first {
+                api.clear_tokens().await;
+            }
+            api.begin_session("b1".into(), "s1".into()).await;
+            assert!(
+                !api.refresh_retry_due(),
+                "a retry owed from the last session"
+            );
+            assert!(api.lock_for_held_refresh().is_none(), "focus would send");
+            let first = api.fly_refresh(server.send(&api, renewed())).await;
+            assert!(first.is_ok(), "the first refresh was held");
+            assert_eq!(server.sent(), 4);
+
+            let _ = api
+                .fly_refresh(server.send(&api, refused(503, "", None)))
+                .await;
+            assert!(
+                matches!(
+                    api.retry_gate
+                        .check(&refresh_hold_key(), std::time::Instant::now()),
+                    Err(ApiError::Held {
+                        status: 503,
+                        retry_after_secs: 1
+                    })
+                ),
+                "the backoff did not start over"
+            );
+        }
+    }
+
+    /// L1, the race: the last session's refresh is still in flight at the
+    /// sign-in (it runs detached and can outlive a Sign Out). The sign-in
+    /// waits for it on the refresh lock, so the hold its failure records
+    /// lands BEFORE the clean slate, never on the new session.
+    #[tokio::test]
+    async fn a_sign_in_waits_out_the_last_sessions_refresh() {
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let server = ScriptedRefresh::default();
+        let flight = Arc::clone(&api.refresh_lock).lock_owned().await;
+        api.clear_tokens().await;
+        let signing_in = {
+            let api = api.clone();
+            tokio::spawn(async move { api.begin_session("b1".into(), "s1".into()).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !signing_in.is_finished(),
+            "signed in beside a refresh in flight"
+        );
+        // The flight's answer, recorded while it holds the lock.
+        let _ = api
+            .fly_refresh(server.send(&api, refused(503, "", None)))
+            .await;
+        drop(flight);
+        signing_in.await.unwrap();
+        assert!(!api.refresh_retry_due(), "the old flight's retry is owed");
+        let first = api.fly_refresh(server.send(&api, renewed())).await;
+        assert!(first.is_ok(), "the new session's first refresh was held");
+        assert_eq!(server.sent(), 2);
+    }
+
+    /// The wiring of L1: every sign-in installs its pair through
+    /// `begin_session`, which starts the refresh over under the refresh
+    /// lock; past it, only the restore sets tokens (and starts the refresh
+    /// over too).
+    #[test]
+    fn every_sign_in_starts_the_refresh_over() {
+        const SOURCE: &str = include_str!("client.rs");
+        let fn_body = |signature: &str| {
+            let start = SOURCE.find(signature).expect(signature);
+            let rest = &SOURCE[start..];
+            &rest[..rest.find("\n    }").expect("end of fn")]
+        };
+        for signature in [
+            "pub async fn login(",
+            "pub async fn native_exchange(",
+            "pub async fn verify_2fa(",
+            "pub async fn rotate_number_confirm(",
+            "pub async fn login_anonymous(",
+            "pub async fn register_anonymous(",
+        ] {
+            let body = fn_body(signature);
+            assert!(body.contains("self.begin_session("), "{signature}");
+            assert!(!body.contains("self.set_tokens("), "{signature}");
+        }
+        let begin = fn_body("async fn begin_session(");
+        assert!(begin.contains("self.refresh_lock.lock().await"));
+        assert!(begin.contains("self.retry_gate.session_started();"));
+        assert!(fn_body("pub async fn restore_tokens_if_absent(")
+            .contains("self.retry_gate.session_started();"));
+        let code = &SOURCE[..SOURCE.find("mod empty_body_tests").unwrap()];
+        assert_eq!(
+            code.matches("self.set_tokens(").count(),
+            2,
+            "a pair installed past begin_session and the restore"
+        );
+    }
+
+    /// The one timing table (lead 2026-11-19 21:39Z): the refresh's answer
+    /// reads `Retry-After` as delta-seconds only. An HTTP-date there names no
+    /// wait (the body's `details.retryAfter`, else 60 s, as on Mobile #653),
+    /// a `0` is 1 s, and a wait is clamped to 60 s. Every other route still
+    /// reads the date (MR-1808).
+    #[tokio::test]
+    async fn the_refresh_reads_retry_after_by_the_one_table() {
+        use reqwest::ResponseBuilderExt;
+        let in_30s = (chrono::Utc::now() + chrono::TimeDelta::seconds(30))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let limited = |path: &str, header: &str, body: &str| {
+            reqwest::Response::from(
+                tauri::http::Response::builder()
+                    .status(429)
+                    .url(reqwest::Url::parse(&format!("{API_BASE_URL}{path}")).unwrap())
+                    .header("Retry-After", header)
+                    .body(body.to_string())
+                    .unwrap(),
+            )
+        };
+        for (header, body, wait) in [
+            (in_30s.as_str(), "", None),
+            (in_30s.as_str(), LIMITED_17, Some(17)),
+            ("0", "", Some(1)),
+            ("42", LIMITED_17, Some(42)),
+            ("900", "", Some(60)),
+            ("-5", LIMITED_17, Some(17)),
+            ("soon", "", None),
+        ] {
+            let Err(error) = BirdoApi::new()
+                .handle_response::<RefreshResponse>(limited(endpoints::auth::REFRESH, header, body))
+                .await
+            else {
+                panic!("{header}: a 429 is an error");
+            };
+            assert!(
+                matches!(error, ApiError::RateLimited { retry_after_secs } if retry_after_secs == wait),
+                "{header}"
+            );
+        }
+        let Err(error) = BirdoApi::new()
+            .handle_response::<serde_json::Value>(limited("/vpn/servers", &in_30s, ""))
+            .await
+        else {
+            panic!("a 429 is an error");
+        };
+        assert!(
+            matches!(
+                error,
+                ApiError::RateLimited {
+                    retry_after_secs: Some(29..=30)
+                }
+            ),
+            "another route lost the date"
+        );
+    }
+
     /// The wiring of decision 1: the window's focus asks `refresh_retry_due`
     /// and runs `retry_held_refresh`, which takes the refresh lock and runs
     /// the detached refresh a 401 runs. Nothing else calls it: no timer.
@@ -3348,14 +3664,21 @@ mod retry_after_tests {
     /// server list are `server_unavailable` and `server_unreachable`
     /// (`src/lib/errors.ts`). Through the real flight (the gate's hold
     /// included) and what the request then answers its caller, a 403, a 429,
-    /// a 5xx, a timeout, and the refresh held after each, read as none of
-    /// those, as no plan refusal, and as no transport fallback. At 75b1eaa8
-    /// a refresh 503 read as `server_unavailable` ("Try another location").
+    /// a 5xx, a timeout, a 426, a pin failure, an unreadable 2xx, and the
+    /// refresh held after each, read as none of those, as no plan refusal,
+    /// and as no transport fallback; none sends the token twice. The one
+    /// hard stop is the version floor where it was met (`upgrade_required`:
+    /// it asks for the update and stops auto-reconnect; it moves nobody). At
+    /// 75b1eaa8 a refresh 503 read as `server_unavailable` ("Try another
+    /// location").
     #[tokio::test]
     async fn a_refresh_failure_never_points_at_another_server() {
         use crate::api::session_gate;
         use crate::commands::ipc_error::{IpcError, IpcErrorCode};
         let cases: Vec<(&str, Result<RefreshResponse, ApiError>)> = vec![
+            ("426", held_as_it_is("426").await),
+            ("pin", held_as_it_is("pin").await),
+            ("unreadable 2xx", held_as_it_is("unreadable 2xx").await),
             ("403", refused(403, "", None)),
             ("403, blocked", refused(403, BLOCKED, None)),
             ("429", refused(429, "", None)),
@@ -3398,12 +3721,19 @@ mod retry_after_tests {
                     ),
                     "{case}, {when}"
                 );
-                assert!(!told.code.is_hard_refusal(), "{case}, {when}");
+                // The version floor, where it was met, is the one hard stop.
+                let floor = case == "426" && when == "met";
+                assert_eq!(
+                    told.code == IpcErrorCode::UpgradeRequired,
+                    floor,
+                    "{case}, {when}"
+                );
+                assert_eq!(told.code.is_hard_refusal(), floor, "{case}, {when}");
                 assert!(
                     !crate::vpn::reconnect_policy::server_ended(told.code),
                     "{case}, {when}"
                 );
-                assert!(told.retryable, "{case}, {when}");
+                assert_eq!(told.retryable, !floor, "{case}, {when}");
                 assert!(
                     crate::commands::vpn::transport_fallback_reason(&told).is_none(),
                     "{case}, {when}"

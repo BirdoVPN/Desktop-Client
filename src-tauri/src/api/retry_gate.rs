@@ -42,7 +42,9 @@
 //! Holds are the session's: sign-out (`BirdoApi::clear_tokens`) forgets them
 //! ([`RetryGate::forget_session`]), all but the credential bucket, which the
 //! server keys on the network rather than on the account and so still holds
-//! for whoever signs in next from here.
+//! for whoever signs in next from here. A sign-in (`BirdoApi::begin_session`)
+//! starts the refresh over too ([`RetryGate::session_started`]): its hold,
+//! backoff step and owed retry were the last token's.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -174,7 +176,8 @@ impl RetryGate {
     /// `BirdoApi::fly_refresh`) that did not renew the session leaves behind.
     /// A 401 ends the session, and the backoff starts over. An answer
     /// `refresh_policy::after_failure` holds for (a 429, a 403, a 5xx, a
-    /// timeout, no answer, any other status) holds the refresh `key` for it:
+    /// timeout, no answer, any other status; a 426, a pin failure and an
+    /// unreadable 2xx too) holds the refresh `key` for it:
     /// a 429 for its own wait, the rest for the next step of a capped
     /// exponential backoff with jitter, counted across flights. The hold
     /// answers 429 for a rate limit and 503 for the rest
@@ -251,6 +254,19 @@ impl RetryGate {
     /// them nothing. The credential bucket is the network's.
     pub(crate) fn forget_session(&self) {
         self.held.lock().retain(|key, _| key == CREDENTIAL_BUCKET);
+        self.refresh_settled();
+    }
+
+    /// MR-2500 / MR-1771 (L1 of the Mobile #653 review): a new session's pair
+    /// was installed (a sign-in, or a restore into an empty session). The
+    /// refresh owes nothing from before it: the hold on the refresh, the
+    /// backoff step and the retry owed were the last refresh token's (the
+    /// server keys its refresh limiter on the token), so they go, and the new
+    /// session's first refresh is not held and its first failure is step 1.
+    /// Every other hold stays: the same account, or the network, may still
+    /// owe it (a sign-out has already forgotten the last account's).
+    pub(crate) fn session_started(&self) {
+        self.held.lock().retain(|key, _| !is_refresh(key));
         self.refresh_settled();
     }
 
@@ -613,9 +629,9 @@ mod tests {
     /// MR-2500 / MR-1771: the hold after a failed flight never cuts short
     /// the server's own wait (a 429's 60 s, a busy 5xx's `Retry-After`), a
     /// 429 stays a rate limit, and nothing is held for a 401 (the session is
-    /// over), a flight that sent nothing (already held), a session that
-    /// ended mid-flight, an unreadable 2xx or a pin failure. The cases are
-    /// labelled, never formatted (CodeQL reads an assert's message as a log).
+    /// over), a flight that sent nothing (already held) or a session that
+    /// ended mid-flight. The cases are labelled, never formatted (CodeQL
+    /// reads an assert's message as a log).
     #[test]
     fn the_hold_after_a_failed_flight_keeps_the_servers_wait() {
         let refresh = hold_key(
@@ -672,8 +688,6 @@ mod tests {
                 },
             ),
             ("session ended", ApiError::NotAuthenticated),
-            ("unreadable 2xx", ApiError::Parse("eof".into())),
-            ("pin", ApiError::CertificatePinningFailed("x".into())),
         ];
         for (case, error) in &nothing {
             let gate = RetryGate::default();
@@ -681,6 +695,109 @@ mod tests {
             assert_eq!(held_for(&gate, &refresh, t0), None, "{case}");
             assert!(!gate.refresh_retry_due(&refresh, t0), "{case}");
         }
+    }
+
+    /// The one timing table (lead 2026-11-19 21:39Z, Mobile #653's hold):
+    /// the version floor (426), a TLS pin failure and an unreadable 2xx hold
+    /// the refresh for the same growing, capped backoff as a 5xx, held as
+    /// 503, with a retry owed once the hold is over. Before, none of them
+    /// held anything or owed a retry.
+    #[test]
+    fn a_426_a_pin_failure_and_an_unreadable_2xx_hold_the_refresh() {
+        use super::super::refresh_policy::{backoff, BACKOFF_CAP};
+        use super::super::upgrade_gate::RequiredUpdate;
+        let refresh = hold_key(
+            &reqwest::Method::POST,
+            super::super::endpoints::auth::REFRESH,
+        );
+        let t0 = Instant::now();
+        fn floor() -> ApiError {
+            ApiError::UpgradeRequired(RequiredUpdate {
+                required_version: None,
+                download_url: None,
+                message: None,
+            })
+        }
+        fn pin() -> ApiError {
+            ApiError::CertificatePinningFailed("x".into())
+        }
+        fn unreadable() -> ApiError {
+            ApiError::Parse("eof".into())
+        }
+        let cases: [(&str, fn() -> ApiError); 3] =
+            [("426", floor), ("pin", pin), ("unreadable 2xx", unreadable)];
+        for (case, error) in cases {
+            let gate = RetryGate::default();
+            let mut last = 0;
+            for flight in 0..8u32 {
+                let now = t0 + s(1000 * u64::from(flight));
+                assert!(
+                    gate.refresh_failed(&refresh, &error(), now, 0.5),
+                    "{case}: not held at flight {flight}"
+                );
+                let secs = whole_secs_left(backoff(flight + 1, 0.5));
+                assert_eq!(
+                    held_for(&gate, &refresh, now),
+                    Some((503, secs)),
+                    "{case}: flight {flight}"
+                );
+                assert!(
+                    (last..=BACKOFF_CAP.as_secs()).contains(&secs),
+                    "{case}: shrank or past the cap"
+                );
+                last = secs;
+                assert!(!gate.refresh_retry_due(&refresh, now), "{case}: due early");
+                assert!(
+                    gate.refresh_retry_due(&refresh, now + s(secs)),
+                    "{case}: not owed after the hold"
+                );
+            }
+        }
+    }
+
+    /// L1 of the Mobile #653 review: a sign-in starts the refresh over. The
+    /// last session's refresh hold, backoff step and owed retry go, so the
+    /// new session's first refresh is not held and its first failure holds
+    /// for step 1; every other hold stays (the same account, or the network,
+    /// may still owe it). A sign-out forgets them too (`forget_session`).
+    #[test]
+    fn a_sign_in_starts_the_refresh_over() {
+        use reqwest::Method;
+        let refresh = hold_key(&Method::POST, super::super::endpoints::auth::REFRESH);
+        let servers = hold_key(&Method::GET, "/vpn/servers");
+        let login = hold_key(&Method::POST, "/auth/login/desktop");
+        let t0 = Instant::now();
+        let gate = RetryGate::default();
+        let limited = ApiError::RateLimited {
+            retry_after_secs: Some(60),
+        };
+        // Four failed flights in: a long hold, and a retry owed after it.
+        for _ in 0..4 {
+            gate.refresh_failed(&refresh, &ApiError::ServerError(503), t0, 0.0);
+        }
+        gate.note(&servers, &limited, t0);
+        gate.note(&login, &limited, t0);
+        assert!(held_for(&gate, &refresh, t0).is_some());
+        assert_eq!(gate.refresh_failures.load(Ordering::SeqCst), 4, "owed");
+
+        gate.session_started();
+        assert_eq!(
+            held_for(&gate, &refresh, t0),
+            None,
+            "the first refresh is held"
+        );
+        assert!(
+            !gate.refresh_retry_due(&refresh, t0 + s(60)),
+            "a retry is owed from the last session"
+        );
+        assert!(gate.check(&servers, t0).is_err(), "the account's hold went");
+        assert!(gate.check(&login, t0).is_err(), "the network's hold went");
+        gate.refresh_failed(&refresh, &ApiError::ServerError(503), t0, 0.0);
+        assert_eq!(
+            held_for(&gate, &refresh, t0),
+            Some((503, 1)),
+            "the backoff did not start over"
+        );
     }
 
     /// MR-2500 / MR-1771 (no background timer): a retry is owed after a

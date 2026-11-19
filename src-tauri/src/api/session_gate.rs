@@ -107,12 +107,13 @@ pub(crate) fn stored_session_after(error: &ApiError) -> StoredSession {
 /// server or a plan the user should change. Auto-Connect and server
 /// selection must never move anyone because of auth. The refresh flight
 /// already answers a 429, a 403, a 5xx or an unexpected status with its hold
-/// (`ApiError::Held`, 429 or 503, with the wait; `refresh_policy::told`), and
-/// no answer at all with the network failure; those, and the other transient
-/// answers, pass through as they are. Anything else that reaches here (a 403,
-/// a 404, a 5xx as the server sent it) becomes a busy 503 with the first
-/// backoff step's wait: `server_error`, "please try again". Not the answer
-/// as the server sent it:
+/// (`ApiError::Held`, 429 or 503, with the wait; `refresh_policy::told`), no
+/// answer at all with the network failure, and a 426, a pin failure or an
+/// unreadable 2xx as itself (held all the same); those, and the other
+/// transient answers, pass through as they are. Anything else that reaches
+/// here (a 403, a 404, a 5xx as the server sent it) becomes a busy 503 with
+/// the first backoff step's wait: `server_error`, "please try again". Not the
+/// answer as the server sent it:
 /// - a bare 403 reads as `subscription_required` ("Your plan does not include
 ///   this"), a hard refusal that stops auto-reconnect;
 /// - a 404, a bare 503 (`ServerError(503)`) or one with a sentence reads as
@@ -309,7 +310,10 @@ mod tests {
     /// never a hard refusal (auto-reconnect would give up instead of
     /// re-dialling the session's own server), never an ending the server
     /// decided, never `session_expired` and never the plan copy; and it is
-    /// retryable.
+    /// retryable. The one timing table (lead 2026-11-19 21:39Z) adds a 426,
+    /// a pin failure and an unreadable 2xx, told as they are: the version
+    /// floor is the one hard stop (`upgrade_required` asks for the update
+    /// and stops auto-reconnect), and it moves nobody either.
     #[test]
     fn a_refresh_failure_never_reads_as_another_server_or_a_plan() {
         let failed = |status: u16, body: &str, header: Option<u64>| {
@@ -366,6 +370,17 @@ mod tests {
                     retry_after_secs: 4,
                 },
             ),
+            ("426", failed(426, "", None)),
+            (
+                "426, the server's body",
+                failed(
+                    426,
+                    r#"{"statusCode":426,"error":"update_required","message":"Please update the app.","details":{"minVersion":"9.9.9"}}"#,
+                    None,
+                ),
+            ),
+            ("pin", ApiError::CertificatePinningFailed("x".into())),
+            ("unreadable 2xx", ApiError::Parse("eof".into())),
         ];
         for (case, error) in cases {
             let told = IpcError::from_api(&error_after_failed_refresh(error));
@@ -379,12 +394,14 @@ mod tests {
                 ),
                 "{case}"
             );
-            assert!(!told.code.is_hard_refusal(), "{case}");
+            let floor = case.starts_with("426");
+            assert_eq!(told.code == IpcErrorCode::UpgradeRequired, floor, "{case}");
+            assert_eq!(told.code.is_hard_refusal(), floor, "{case}");
             assert!(
                 !crate::vpn::reconnect_policy::server_ended(told.code),
                 "{case}"
             );
-            assert!(told.retryable, "{case}");
+            assert_eq!(told.retryable, !floor, "{case}");
         }
     }
 

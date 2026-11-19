@@ -16,6 +16,22 @@
 //!   the backend's refresh route has no 403 of its own; one comes from in
 //!   front of it. The refresh is held for a capped exponential backoff with
 //!   jitter, never shorter than the server's own `Retry-After`.
+//! - **426, a TLS pin failure, an unreadable 2xx**: kept likewise, and held
+//!   for the same backoff as a 5xx (the one timing table, lead 2026-11-19
+//!   21:39Z: Desktop's numbers, Mobile #653's hold). Unlike the answers
+//!   above, the call that met one is told it as it is ([`told`]): the
+//!   version floor (the upgrade gate's own screen), the pin failure ("this
+//!   network may be intercepting"), the unreadable answer. The calls after it
+//!   inside the hold get the hold (`ApiError::Held` 503) and send nothing.
+//!
+//! The one timing table (both clients):
+//! - backoff: [`BACKOFF_BASE`] 1 s doubling to [`BACKOFF_CAP`] 30 s, equal
+//!   jitter ([`backoff`]);
+//! - a server-named wait (`Retry-After`, else `details.retryAfter`): clamped
+//!   to `1..=error::RETRY_AFTER_MAX_SECS` (60 s), a `0` read as 1 s; a value
+//!   that is junk, negative, not a number or an HTTP-date names no wait
+//!   (`error::retry_after_delta`, as the refresh reads its header), so a 429
+//!   then holds [`RATE_LIMIT_DEFAULT_WAIT`], 60 s.
 //!
 //! No wait inside a call (lead decision 2026-11-19, as Mobile #653). A flight
 //! sends the token ONCE. When that fails, the hold and the backoff step are
@@ -62,10 +78,8 @@ pub(crate) enum Next {
     /// window's return to the foreground). Nobody waits for it.
     Hold(Duration),
     /// Keep everything and hold nothing: a refresh still held from an earlier
-    /// answer (nothing was sent), a session that ended under it, an
-    /// unreadable 2xx (the server may have spent the token, and sending it
-    /// again cannot help), a pin failure, the version floor (426: the upgrade
-    /// gate answers every request from then on).
+    /// answer (nothing was sent), or a session that ended under it (nobody
+    /// is left to hold for).
     Keep,
 }
 
@@ -76,11 +90,7 @@ pub(crate) fn after_failure(error: &ApiError, step: u32, unit: f64) -> Next {
         return Next::SignOut;
     }
     match error {
-        ApiError::Held { .. }
-        | ApiError::NotAuthenticated
-        | ApiError::Parse(_)
-        | ApiError::CertificatePinningFailed(_)
-        | ApiError::UpgradeRequired(_) => Next::Keep,
+        ApiError::Held { .. } | ApiError::NotAuthenticated => Next::Keep,
         ApiError::RateLimited { retry_after_secs } => {
             Next::Hold(rate_limit_wait(*retry_after_secs))
         }
@@ -89,9 +99,24 @@ pub(crate) fn after_failure(error: &ApiError, step: u32, unit: f64) -> Next {
             retry_after_secs, ..
         } => Next::Hold(backoff(step, unit).max(Duration::from_secs(*retry_after_secs))),
         // A 403, any other 5xx, a timeout, no answer, any other status (Mobile
-        // #653: "an unexpected status" backs off like a 5xx).
+        // #653: "an unexpected status" backs off like a 5xx). And, by the one
+        // timing table (lead 2026-11-19 21:39Z), the version floor (426), a
+        // pin failure and an unreadable 2xx: the same token sent again at
+        // once would only meet the same answer.
         _ => Next::Hold(backoff(step, unit)),
     }
+}
+
+/// The answers a refresh is held for that the call which met them is told as
+/// they are, never as the hold (see [`told`]): the version floor (426), a TLS
+/// pin failure and an unreadable 2xx. Each says something the user has to
+/// see (update the app; this network may be intercepting; the answer was
+/// unreadable), and none of them reads as a reason to change server.
+pub(crate) fn told_as_it_is(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::UpgradeRequired(_) | ApiError::CertificatePinningFailed(_) | ApiError::Parse(_)
+    )
 }
 
 /// The status a held refresh answers with (`ApiError::Held`), as Mobile #653's
@@ -109,10 +134,13 @@ pub(crate) fn held_status(error: &ApiError) -> u16 {
 /// gate's answer for the refresh right after the failure was recorded: the
 /// hold (`Held`, a transient error with the wait), the same answer every
 /// caller after it gets until the hold is over. No answer at all stays the
-/// network failure ("check your connection"), which names no server either.
+/// network failure ("check your connection"), which names no server either;
+/// the version floor, a pin failure and an unreadable 2xx stay themselves
+/// ([`told_as_it_is`]). The calls after it get the hold all the same.
 pub(crate) fn told(error: ApiError, held: Result<(), ApiError>) -> ApiError {
     match (error, held) {
         (error @ ApiError::Network(_), _) => error,
+        (error, _) if told_as_it_is(&error) => error,
         (_, Err(held)) => held,
         (error, Ok(())) => error,
     }
@@ -309,9 +337,7 @@ mod tests {
     }
 
     /// Nothing is held where nothing was learned: a refresh still held sent
-    /// nothing, a session that ended has nobody to hold for, an unreadable
-    /// 2xx may have spent the token, a pin failure will not pass on the next
-    /// try, and the version floor answers for itself.
+    /// nothing, and a session that ended has nobody to hold for.
     #[test]
     fn nothing_is_held_where_nothing_was_learned() {
         let kept = [
@@ -329,13 +355,75 @@ mod tests {
                     retry_after_secs: 4,
                 },
             ),
-            ("unreadable 2xx", ApiError::Parse("eof".into())),
-            ("pin", ApiError::CertificatePinningFailed("x".into())),
             ("session ended", ApiError::NotAuthenticated),
-            ("426", answered(426, "", None)),
         ];
         for (case, error) in &kept {
             assert_eq!(after_failure(error, 1, 0.5), Next::Keep, "{case}");
+        }
+    }
+
+    /// The one timing table (lead 2026-11-19 21:39Z: Desktop's numbers,
+    /// Mobile #653's hold): the version floor (426), a TLS pin failure and an
+    /// unreadable 2xx are held for the same capped, jittered backoff as a
+    /// 5xx, held as 503, and never sign out. The call that met one is told it
+    /// as it is, not the hold. Before, each was `Keep`: nothing held, and the
+    /// next 401 sent the same token straight back into the same answer.
+    #[test]
+    fn a_426_a_pin_failure_and_an_unreadable_2xx_hold_like_a_5xx() {
+        let held = || -> Result<(), ApiError> {
+            Err(ApiError::Held {
+                status: 503,
+                retry_after_secs: 1,
+            })
+        };
+        let cases = [
+            ("426", answered(426, "", None)),
+            (
+                "426, the server's body",
+                answered(
+                    426,
+                    r#"{"statusCode":426,"error":"update_required","message":"Please update the app.","details":{"minVersion":"9.9.9"}}"#,
+                    None,
+                ),
+            ),
+            ("pin", ApiError::CertificatePinningFailed("x".into())),
+            ("unreadable 2xx", ApiError::Parse("eof".into())),
+        ];
+        for (case, error) in cases {
+            for step in 1..=8 {
+                assert_eq!(
+                    after_failure(&error, step, 0.25),
+                    Next::Hold(backoff(step, 0.25)),
+                    "{case} at step {step}"
+                );
+            }
+            assert!(
+                matches!(
+                    after_failure(&error, 40, 0.999_999),
+                    Next::Hold(wait) if wait <= BACKOFF_CAP
+                ),
+                "{case}: past the cap"
+            );
+            assert_eq!(held_status(&error), 503, "{case}");
+            assert!(told_as_it_is(&error), "{case}");
+            let is_426 = matches!(error, ApiError::UpgradeRequired(_));
+            let is_pin = matches!(error, ApiError::CertificatePinningFailed(_));
+            let is_parse = matches!(error, ApiError::Parse(_));
+            let answer = told(error, held());
+            assert!(
+                (is_426 && matches!(answer, ApiError::UpgradeRequired(_)))
+                    || (is_pin && matches!(answer, ApiError::CertificatePinningFailed(_)))
+                    || (is_parse && matches!(answer, ApiError::Parse(_))),
+                "{case}: told the hold"
+            );
+        }
+        // Everything else the backoff holds is told the hold.
+        for (case, error) in [
+            ("403", answered(403, "", None)),
+            ("503", answered(503, "", None)),
+            ("404", answered(404, "", None)),
+        ] {
+            assert!(!told_as_it_is(&error), "{case}");
         }
     }
 
