@@ -4,15 +4,25 @@ Two committed vectors guard the ML-KEM-1024 (FIPS 203) path in
 `src-tauri/src/vpn/birdo_pq.rs`. Both are consumed by `#[cfg(test)]` tests in
 that file, which CI runs (`.github/workflows/tests.yml` -> `cargo test --lib`).
 The crate and feature set those tests run against are themselves gated by
-`scripts/ci/check-pq-features.sh` in the same workflow.
+`scripts/ci/check-pq-features.sh` in the same workflow, which also checks the
+KAT fixture against its pin (below). The gate has its own self-test,
+`scripts/ci/check-pq-features.tests.sh`.
 
 ## `birdo-pq-ml-kem-1024.kat.json` — the interop guard
 
 A byte-for-byte copy of birdo-web's
 `backend/src/vpn/__fixtures__/birdo-pq-ml-kem-1024.kat.json`, generated with
 `@noble/post-quantum` — **the library the production server actually
-encapsulates with** (`backend/src/vpn/birdo-pq.service.ts`). Keep the two copies
-identical; if the backend regenerates its fixture, copy it here in the same PR.
+encapsulates with** (`backend/src/vpn/birdo-pq.service.ts`).
+
+The two copies must stay identical, and CI holds them to it (MR-2421). Neither
+repo can read the other's copy (birdo-web is private; no cross-repo token), so
+both pin the same sha256 in `birdo-pq-ml-kem-1024.kat.json.sha256`, a file
+that is the same in both repos, and each CI fails if its own copy does not hash
+to it: `scripts/ci/check-pq-features.sh` (section 7) here,
+`scripts/ci/pq-kat-fixture-pin.mjs` in birdo-web. If the backend regenerates
+its fixture: change it in birdo-web first, copy the file here, and move the
+pin in both repos, in two pull requests that link each other.
 
 `kat_vs_noble` asserts, from the fixture's 64-byte `keygenSeed`:
 
@@ -29,25 +39,25 @@ server passes all of them. FIPS 203 implicit rejection then makes the failure
 **silent** — a wrong key yields a plausible shared secret and the WireGuard
 handshake simply never completes. This is the only test that can catch that.
 
-## `birdo-pq-pqclean-stored-key.json` — the install-base guard
+## `birdo-pq-pqclean-stored-key.json` — the linked-KEM guard
 
 A real ML-KEM-1024 keypair and ciphertext produced by **PQClean CLEAN C**
 (`pqcrypto-mlkem 0.1.1`), the implementation the desktop client shipped up to
-and including v1.4.43. Every install created before the RustCrypto `ml-kem`
-migration has a `birdo_pq_v1.bin` holding exactly this kind of 3168-byte
-decapsulation key.
+and including v1.4.43.
 
-`stored_pqclean_dk_loads_and_derives_same_psk` asserts the current
-implementation still loads it, re-exports it unchanged, decapsulates the
-PQClean-produced ciphertext, and derives the same PSK. A future KEM swap that
-breaks stored-key reading would otherwise brick every existing install with no
-error anyone would see before release.
+It was the install-base guard while the client kept a long-lived keypair in
+`birdo_pq_v1.bin`: two tests proved that the RustCrypto `ml-kem` migration
+still loaded such a stored key and re-keyed on a corrupt one. Per-connect keys
+(MR-703 / MR-1742, #429) removed that path, and those two tests with it: the
+client now makes one keypair per connect, in memory only, never reads a stored
+key, and deletes the old files on first run (`the_legacy_keypair_file_is_purged`).
 
-`corrupt_dk_returns_invalid_key_and_rekeys` flips one bit inside the key's
-embedded `H(ek)` field (offset 3110, in `dk[3104..3136]`) to exercise the
-FIPS 203 §7.3 validation that `ml-kem` performs and `pqcrypto-mlkem`'s
-length-only `from_bytes` did not — and to prove the caller re-keys instead of
-failing forever.
+Its one remaining test is `pq_impl_name_matches_linked_crate`. The untouched
+PQClean key must load; the same key with one bit flipped inside its embedded
+`H(ek)` field (offset 3110, in `dk[3104..3136]`) must be REJECTED. Only
+RustCrypto `ml-kem` performs that FIPS 203 §7.3 check (`pqcrypto-mlkem`'s
+length-only `from_bytes` accepted the key), so the test proves which KEM is
+linked, and that `PQ_IMPL_NAME` says so truthfully.
 
 ### These secret keys are PUBLISHED
 

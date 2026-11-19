@@ -357,10 +357,19 @@ jobs:
       # pqcrypto/PQClean C trio out (RUSTSEC-2026-0161/-0162/-0163), and
       # enforces by hand the invariant the `hazmat` feature was wrongly
       # believed to enforce: `encapsulate_deterministic` stays inside the
-      # #[cfg(test)] module.
+      # #[cfg(test)] module. And (MR-2421) the KAT fixture still hashes to the
+      # sha256 pinned beside it, which birdo-web pins for its own copy too.
       - name: PQ dependency + feature gate
         if: needs.changes.outputs.code != 'false' && matrix.os == 'linux'
         run: ./scripts/ci/check-pq-features.sh
+
+      # MR-2422: the gate above, run against mutated copies of this tree, one
+      # per regression it exists for, each of which must fail it with that
+      # rule's own message. A stand-in cargo answers the gate's `cargo tree`
+      # with this job's real graph (captured here, then mutated per case).
+      - name: Self-test - the PQ gate fails each regression it exists for
+        if: needs.changes.outputs.code != 'false' && matrix.os == 'linux'
+        run: bash scripts/ci/check-pq-features.tests.sh
 
       # Clippy on the Linux/macOS cfg code (tunnel_linux.rs, tunnel_macos.rs,
       # ...), which the Windows rust-lint job never compiles, with the

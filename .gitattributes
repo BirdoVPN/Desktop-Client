@@ -3,3 +3,9 @@
 # and scripts/ci/check-pq-features.sh runs on a CI runner whose checkout
 # settings this repo does not control.
 *.sh text eol=lf
+
+# MR-2421: the ML-KEM KAT fixture is hashed byte for byte against a sha256
+# that birdo-web pins too (scripts/ci/check-pq-features.sh section 7). A CRLF
+# checkout would hash differently from the LF bytes git stores.
+src-tauri/src/vpn/fixtures/birdo-pq-ml-kem-1024.kat.json text eol=lf
+src-tauri/src/vpn/fixtures/birdo-pq-ml-kem-1024.kat.json.sha256 text eol=lf

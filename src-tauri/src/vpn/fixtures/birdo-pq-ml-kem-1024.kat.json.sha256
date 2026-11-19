@@ -1,0 +1,24 @@
+# MR-2421 (PQ-FIXTURE-PARITY-CI): the sha256 of the ML-KEM-1024 known-answer
+# fixture, pinned in BOTH repos that carry a copy of it. This file is the same
+# in both:
+#
+#   BirdoVPN/birdo-web       backend/src/vpn/__fixtures__/birdo-pq-ml-kem-1024.kat.json
+#   BirdoVPN/Desktop-Client  src-tauri/src/vpn/fixtures/birdo-pq-ml-kem-1024.kat.json
+#
+# The two copies must stay byte-identical. birdo-web's is what the server's own
+# library (@noble/post-quantum) produced; Desktop-Client's KAT test proves the
+# client's ml-kem reproduces those exact bytes. birdo-web is private and no
+# cross-repo token is used, so neither CI can read the other copy. Instead each
+# CI hashes its OWN copy against the line below and fails on any difference:
+#
+#   birdo-web       scripts/ci/pq-kat-fixture-pin.mjs        (ci.yml, backend job)
+#   Desktop-Client  scripts/ci/check-pq-features.sh, sect. 7 (tests.yml)
+#
+# So a fixture edited in one repo fails that repo's CI. Moving the pin is a
+# deliberate, reviewed line, and it must move in BOTH repos: regenerate the
+# fixture in birdo-web, copy the file into Desktop-Client, and change this line
+# in both, in two pull requests that link each other. Neither CI can see the
+# other half; the cross-links are how a reviewer does.
+#
+# sha256sum format: `sha256sum -c` in this directory checks it too.
+b67f4364a09b3770a865412e035d3923116fc4789d235040bd3e5bafcc48a114  birdo-pq-ml-kem-1024.kat.json

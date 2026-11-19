@@ -140,14 +140,15 @@ base64 = "0.23"
 zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
 # AUDIT-C1: BirdoPQ v1 — ML-KEM-1024 KEM (FIPS 203). The KAT fixture in
 # src/vpn/fixtures/, not crate identity, is what keeps the four clients
-# interoperable while Mobile-Client is still on pqcrypto-mlkem. Checked against
-# BirdoVPN/Mobile-Client origin/main on 2026-09-16: native/rosenpass-jni,
-# native/birdo-pq-ios and native/birdo-pq-server all still declare
-# `pqcrypto-mlkem = { version = "0.1", ... }`, so "same crate everywhere" is
-# NOT true today and must not be written here as if it were. What every client
-# does share is the byte-for-byte encoding the backend's @noble/post-quantum
-# encapsulates with, and the KAT is what proves it. The gate at
-# scripts/ci/check-pq-features.sh fails if this comment claims parity again.
+# interoperable. Mobile-Client has moved off pqcrypto-mlkem as well (origin/main
+# 827dd9b7, checked 2026-11-18: native/rosenpass-jni, native/birdo-pq-ios and
+# native/birdo-pq-server all pin ml-kem =0.3.4), but nothing in this repo's CI
+# reads those manifests and Dependabot moves each repo's pin separately, so
+# "same crate everywhere" must not be written here as a guarantee. What every
+# client does share is the byte-for-byte encoding the backend's
+# @noble/post-quantum encapsulates with, and the KAT is what proves it (its
+# sha256 is pinned here and in birdo-web, MR-2421). The gate at
+# scripts/ci/check-pq-features.sh fails if this comment claims crate parity.
 #
 # 2026-09: migrated off `pqcrypto-mlkem` (PQClean's portable CLEAN C). PQClean
 # upstream is archived read-only, and pqcrypto-mlkem / -traits / -internals all
