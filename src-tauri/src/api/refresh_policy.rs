@@ -7,36 +7,39 @@
 //!   ONLY answer that ends a session.
 //! - **429**: rate limited, and the server has NOT spent the token. The
 //!   session, the token and its keystore entry are kept, and the user is never
-//!   shown "signed out". The flight waits `Retry-After`, else the body's
-//!   `details.retryAfter` (birdo-web #912), else 60 s, and sends the SAME
-//!   token again.
-//! - **5xx, a timeout, no answer**: kept likewise, and the token is never
-//!   discarded. A 503 can be the server putting back a token whose rotation
-//!   failed after it was consumed (MR-2500; MR-2466 design), so the token is
-//!   good. The flight waits a capped exponential backoff with jitter (never
-//!   less than the server's own `Retry-After`) and sends the SAME token again.
-//! - **403**: never a verdict on the token. The backend's refresh route has
-//!   no 403 of its own; one comes from in front of it. Kept, and surfaced as
-//!   the server failing to answer (`session_gate::error_after_failed_refresh`).
+//!   shown "signed out". The refresh is held for `Retry-After`, else the
+//!   body's `details.retryAfter` (birdo-web #912), else 60 s.
+//! - **403, 5xx, a timeout, no answer, any other status**: kept likewise, and
+//!   the token is never discarded. A 503 can be the server putting back a
+//!   token whose rotation failed after it was consumed (MR-2500; MR-2466
+//!   design), so the token is good. A 403 is never a verdict on the token:
+//!   the backend's refresh route has no 403 of its own; one comes from in
+//!   front of it. The refresh is held for a capped exponential backoff with
+//!   jitter, never shorter than the server's own `Retry-After`.
+//!
+//! No wait inside a call (lead decision 2026-11-19, as Mobile #653). A flight
+//! sends the token ONCE. When that fails, the hold and the backoff step are
+//! recorded in the retry gate (`RetryGate::refresh_failed`), and the call
+//! that asked fails at once with a transient error that keeps the session
+//! ([`told`]): the hold itself (`ApiError::Held`, 429 for a rate limit, else
+//! 503, with the wait), or the network failure when nothing answered. It is
+//! never a 403, and never an answer that reads as "this server is
+//! unavailable": an auth failure must never send anyone to another server
+//! (`session_gate::error_after_failed_refresh`). The SAME token goes again
+//! with the next request that needs it once the hold is over, or when the
+//! window comes to the foreground (`BirdoApi::retry_held_refresh`). There is
+//! no background timer: an app nobody uses sends nothing.
 //!
 //! One refresh is in flight at a time (single flight). Every refresh runs
 //! under the client's refresh lock (`BirdoApi::refresh_detached`,
 //! `refresh_token`), so concurrent callers wait for the one in flight. Each
 //! then finds either the rotated pair (its request goes again with it) or,
-//! after a flight that failed, the refresh held for the next backoff step
-//! (`RetryGate::refresh_failed`). In the second case it is answered at once
+//! after a flight that failed, the refresh held: it is answered at once
 //! (`ApiError::Held`) and never sends the token again on its own.
 
-use std::future::Future;
 use std::time::Duration;
 
 use super::error::ApiError;
-
-/// Sends of one token in one flight, the first included. Bounded so a caller
-/// waiting on the refresh lock is not held for long: a flight lasts at most
-/// two waits (one rate-limit wait of up to `RETRY_AFTER_MAX_SECS`, or two
-/// backoff steps), and the gate's hold takes over after it.
-pub(crate) const REFRESH_ATTEMPTS: u32 = 3;
 
 /// The first backoff step. Each step doubles it, up to [`BACKOFF_CAP`].
 pub(crate) const BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -49,36 +52,69 @@ pub(crate) const BACKOFF_CAP: Duration = Duration::from_secs(30);
 pub(crate) const RATE_LIMIT_DEFAULT_WAIT: Duration =
     Duration::from_secs(super::retry_gate::REFRESH_DEFAULT_HOLD_SECS);
 
-/// What a failed send of the refresh asks for next.
+/// What a refresh that did not renew the session asks for next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Next {
     /// A 401: the session is over (the session gate ends it).
     SignOut,
-    /// Keep everything and send the SAME token again after this wait.
-    Retry(Duration),
-    /// Keep everything and stop here: a 403, a refresh still held from an
-    /// earlier answer (nothing was sent), an unreadable 2xx (the server may
-    /// have spent the token, and sending it again cannot help), a pin
-    /// failure, anything else.
+    /// Keep everything, and hold the refresh this long. The SAME token goes
+    /// again with the first request that needs it after that (or the
+    /// window's return to the foreground). Nobody waits for it.
+    Hold(Duration),
+    /// Keep everything and hold nothing: a refresh still held from an earlier
+    /// answer (nothing was sent), a session that ended under it, an
+    /// unreadable 2xx (the server may have spent the token, and sending it
+    /// again cannot help), a pin failure, the version floor (426: the upgrade
+    /// gate answers every request from then on).
     Keep,
 }
 
-/// What the `sent`th failed send of one flight asks for. `unit` is the
-/// jitter, uniform in `[0, 1)` ([`unit_random`]).
-pub(crate) fn after_failure(error: &ApiError, sent: u32, unit: f64) -> Next {
+/// What a failed refresh asks for, `step` failed flights in a row (this one
+/// included). `unit` is the jitter, uniform in `[0, 1)` ([`unit_random`]).
+pub(crate) fn after_failure(error: &ApiError, step: u32, unit: f64) -> Next {
     if super::session_gate::refresh_rejected(error) {
         return Next::SignOut;
     }
     match error {
+        ApiError::Held { .. }
+        | ApiError::NotAuthenticated
+        | ApiError::Parse(_)
+        | ApiError::CertificatePinningFailed(_)
+        | ApiError::UpgradeRequired(_) => Next::Keep,
         ApiError::RateLimited { retry_after_secs } => {
-            Next::Retry(rate_limit_wait(*retry_after_secs))
+            Next::Hold(rate_limit_wait(*retry_after_secs))
         }
         // A 5xx that named its wait: the backoff, but never sooner than that.
         ApiError::ServerBusy {
             retry_after_secs, ..
-        } => Next::Retry(backoff(sent, unit).max(Duration::from_secs(*retry_after_secs))),
-        error if server_failed_or_no_answer(error) => Next::Retry(backoff(sent, unit)),
-        _ => Next::Keep,
+        } => Next::Hold(backoff(step, unit).max(Duration::from_secs(*retry_after_secs))),
+        // A 403, any other 5xx, a timeout, no answer, any other status (Mobile
+        // #653: "an unexpected status" backs off like a 5xx).
+        _ => Next::Hold(backoff(step, unit)),
+    }
+}
+
+/// The status a held refresh answers with (`ApiError::Held`), as Mobile #653's
+/// does: 429 while a rate limit's wait runs, 503 during a backoff. Never the
+/// 403 the refresh may have met.
+pub(crate) fn held_status(error: &ApiError) -> u16 {
+    if matches!(error, ApiError::RateLimited { .. }) {
+        429
+    } else {
+        503
+    }
+}
+
+/// What the call whose refresh just failed is told, given `held`, the retry
+/// gate's answer for the refresh right after the failure was recorded: the
+/// hold (`Held`, a transient error with the wait), the same answer every
+/// caller after it gets until the hold is over. No answer at all stays the
+/// network failure ("check your connection"), which names no server either.
+pub(crate) fn told(error: ApiError, held: Result<(), ApiError>) -> ApiError {
+    match (error, held) {
+        (error @ ApiError::Network(_), _) => error,
+        (_, Err(held)) => held,
+        (error, Ok(())) => error,
     }
 }
 
@@ -103,77 +139,18 @@ pub(crate) fn backoff(step: u32, unit: f64) -> Duration {
     step / 2 + step.mul_f64(unit) / 2
 }
 
-/// A 5xx, a timeout, or no answer at all: the server or the path failed, not
-/// the token.
-pub(crate) fn server_failed_or_no_answer(error: &ApiError) -> bool {
-    match error {
-        ApiError::Network(_) | ApiError::ServerError(_) | ApiError::ServerBusy { .. } => true,
-        ApiError::Rejected { status, .. } => (500..600).contains(status),
-        // `classify_error_response_after`'s answer for a status it does not
-        // name, a 504 among them.
-        ApiError::Unknown(message) => message.starts_with("HTTP 5"),
-        _ => false,
-    }
-}
-
-/// Whether a flight that ended on `error` holds the refresh for the next
-/// backoff step (`RetryGate::refresh_failed`): a 429, a 403, a 5xx, a
-/// timeout or no answer. Not a 401 (the session is over), a refresh that was
-/// held already (it sent nothing), a flight whose session ended under it, an
-/// unreadable 2xx or a pin failure.
-pub(crate) fn holds_after(error: &ApiError) -> bool {
-    matches!(error, ApiError::RateLimited { .. })
-        || super::session_gate::refresh_forbidden(error)
-        || server_failed_or_no_answer(error)
-}
-
-/// One refresh flight. `send` presents the SAME refresh token each time it is
-/// called. After a failure [`after_failure`] retries, `wait` waits and answers
-/// whether the session still presents that token. A sign-out, or another
-/// account's sign-in, during the wait ends the flight with nothing more sent
-/// (`NotAuthenticated`, as an adoption that finds the session gone does). The
-/// flight ends on the first success, a 401, a failure that is not retried, or
-/// after [`REFRESH_ATTEMPTS`] sends, with that send's answer.
-pub(crate) async fn fly<T, S, SF, W, WF>(
-    mut send: S,
-    mut wait: W,
-    unit: impl Fn() -> f64,
-) -> Result<T, ApiError>
-where
-    S: FnMut() -> SF,
-    SF: Future<Output = Result<T, ApiError>>,
-    W: FnMut(Duration) -> WF,
-    WF: Future<Output = bool>,
-{
-    let mut sent = 0;
-    loop {
-        sent += 1;
-        let error = match send().await {
-            Ok(done) => return Ok(done),
-            Err(error) => error,
-        };
-        match after_failure(&error, sent, unit()) {
-            Next::Retry(pause) if sent < REFRESH_ATTEMPTS => {
-                if !wait(pause).await {
-                    return Err(ApiError::NotAuthenticated);
-                }
-            }
-            _ => return Err(error),
-        }
-    }
-}
-
 /// The jitter in production: uniform in `[0, 1)`.
 pub(crate) fn unit_random() -> f64 {
     rand::random::<f64>()
 }
 
+// The cases below are labelled, never formatted: CodeQL reads an assert's
+// message as a log, and a test `ApiError` in one is flagged as cleartext.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::BirdoApi;
     use reqwest::StatusCode;
-    use std::cell::RefCell;
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
@@ -192,29 +169,40 @@ mod tests {
 
     #[test]
     fn only_a_401_signs_out() {
-        for error in [
-            ApiError::Unauthorized,
-            answered(401, "", None),
-            answered(
-                401,
-                r#"{"statusCode":401,"message":"Invalid refresh token"}"#,
-                None,
+        let signs_out = [
+            ("bare variant", ApiError::Unauthorized),
+            ("401, no body", answered(401, "", None)),
+            (
+                "401, the server's sentence",
+                answered(
+                    401,
+                    r#"{"statusCode":401,"message":"Invalid refresh token"}"#,
+                    None,
+                ),
             ),
-        ] {
-            assert_eq!(after_failure(&error, 1, 0.5), Next::SignOut, "{error:?}");
+        ];
+        for (case, error) in &signs_out {
+            assert_eq!(after_failure(error, 1, 0.5), Next::SignOut, "{case}");
         }
-        for error in [
-            answered(403, "", None),
-            answered(403, r#"{"statusCode":403,"message":"Forbidden"}"#, None),
-        ] {
-            assert_eq!(after_failure(&error, 1, 0.5), Next::Keep, "{error:?}");
+        let kept = [
+            ("403, no body", answered(403, "", None)),
+            (
+                "403, the server's sentence",
+                answered(403, r#"{"statusCode":403,"message":"Forbidden"}"#, None),
+            ),
+            ("429", answered(429, LIMITED_17, None)),
+            ("503", answered(503, "", None)),
+            ("timeout", ApiError::Network("operation timed out".into())),
+        ];
+        for (case, error) in &kept {
+            assert_ne!(after_failure(error, 1, 0.5), Next::SignOut, "{case}");
         }
     }
 
-    /// MR-1771: a 429 waits the header's `Retry-After`, else the body's
+    /// MR-1771: a 429 holds the header's `Retry-After`, else the body's
     /// `details.retryAfter`, else 60 s; the header wins over the body.
     #[test]
-    fn a_429_waits_the_header_then_the_body_then_60_s() {
+    fn a_429_holds_the_header_then_the_body_then_60_s() {
         for (body, header, wait) in [
             (LIMITED_17, Some(42), 42),
             (LIMITED_17, None, 17),
@@ -236,37 +224,54 @@ mod tests {
             let error = answered(429, body, header);
             assert_eq!(
                 after_failure(&error, 1, 0.5),
-                Next::Retry(secs(wait)),
+                Next::Hold(secs(wait)),
                 "{body} {header:?}"
             );
-            // Not jittered, and the same on every send of the flight.
-            assert_eq!(after_failure(&error, 2, 0.0), Next::Retry(secs(wait)));
+            // Not jittered, and the same whatever the step.
+            assert_eq!(after_failure(&error, 4, 0.0), Next::Hold(secs(wait)));
+            assert_eq!(held_status(&error), 429);
         }
         assert_eq!(RATE_LIMIT_DEFAULT_WAIT, secs(60));
     }
 
-    /// MR-2500: a 5xx, a timeout or no answer backs off exponentially with
-    /// jitter, capped; a 5xx that named its wait never comes back sooner.
+    /// MR-2500, and the lead's decision on a 403 (2026-11-19): a 403, a 5xx,
+    /// a timeout, no answer or any other status backs off exponentially with
+    /// jitter, capped, and is held as a 503; a 5xx that named its wait is
+    /// never asked again sooner.
     #[test]
-    fn server_failures_back_off_exponentially_with_jitter_and_a_cap() {
+    fn everything_else_backs_off_exponentially_with_jitter_and_a_cap() {
         let failures = [
-            answered(500, "", None),
-            answered(502, "", None),
-            answered(503, "", None),
-            answered(503, r#"{"statusCode":503,"message":"Deploying"}"#, None),
-            answered(504, "", None),
-            ApiError::Network("operation timed out".into()),
-            ApiError::Network("connection reset".into()),
+            ("403", answered(403, "", None)),
+            (
+                "403, blocked",
+                answered(
+                    403,
+                    r#"{"statusCode":403,"message":"Your IP address has been blocked"}"#,
+                    None,
+                ),
+            ),
+            ("500", answered(500, "", None)),
+            ("502", answered(502, "", None)),
+            ("503", answered(503, "", None)),
+            (
+                "503, deploying",
+                answered(503, r#"{"statusCode":503,"message":"Deploying"}"#, None),
+            ),
+            ("504", answered(504, "", None)),
+            ("404", answered(404, "", None)),
+            ("400", answered(400, r#"{"message":"Bad request"}"#, None)),
+            ("timeout", ApiError::Network("operation timed out".into())),
+            ("reset", ApiError::Network("connection reset".into())),
         ];
-        for error in &failures {
-            assert!(server_failed_or_no_answer(error), "{error:?}");
+        for (case, error) in &failures {
             for step in 1..=8 {
                 assert_eq!(
                     after_failure(error, step, 0.25),
-                    Next::Retry(backoff(step, 0.25)),
-                    "{error:?}"
+                    Next::Hold(backoff(step, 0.25)),
+                    "{case} at step {step}"
                 );
             }
+            assert_eq!(held_status(error), 503, "{case}");
         }
         // Doubling from 1 s, half of each step at least, capped at 30 s.
         let low: Vec<Duration> = (1..=7).map(|step| backoff(step, 0.0)).collect();
@@ -298,173 +303,85 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(after_failure(&busy, 1, 0.5), Next::Retry(secs(10)));
-        assert_eq!(after_failure(&busy, 6, 0.0), Next::Retry(secs(15)));
+        assert_eq!(after_failure(&busy, 1, 0.5), Next::Hold(secs(10)));
+        assert_eq!(after_failure(&busy, 6, 0.0), Next::Hold(secs(15)));
+        assert_eq!(held_status(&busy), 503);
     }
 
-    /// Nothing else is sent again inside the flight: a refresh still held
-    /// sent nothing, an unreadable 2xx may have spent the token, a pin
-    /// failure will not pass on the next try, and a 4xx is the answer.
+    /// Nothing is held where nothing was learned: a refresh still held sent
+    /// nothing, a session that ended has nobody to hold for, an unreadable
+    /// 2xx may have spent the token, a pin failure will not pass on the next
+    /// try, and the version floor answers for itself.
     #[test]
-    fn everything_else_is_kept_and_not_sent_again() {
-        for error in [
+    fn nothing_is_held_where_nothing_was_learned() {
+        let kept = [
+            (
+                "held 429",
+                ApiError::Held {
+                    status: 429,
+                    retry_after_secs: 30,
+                },
+            ),
+            (
+                "held 503",
+                ApiError::Held {
+                    status: 503,
+                    retry_after_secs: 4,
+                },
+            ),
+            ("unreadable 2xx", ApiError::Parse("eof".into())),
+            ("pin", ApiError::CertificatePinningFailed("x".into())),
+            ("session ended", ApiError::NotAuthenticated),
+            ("426", answered(426, "", None)),
+        ];
+        for (case, error) in &kept {
+            assert_eq!(after_failure(error, 1, 0.5), Next::Keep, "{case}");
+        }
+    }
+
+    /// The lead's decisions (2026-11-19): the call whose refresh failed is
+    /// told the hold, a transient answer with its wait, never the 403 or the
+    /// 5xx it met; no answer at all stays the network failure.
+    #[test]
+    fn the_caller_is_told_the_hold_or_the_network_failure() {
+        let held = || -> Result<(), ApiError> {
+            Err(ApiError::Held {
+                status: 503,
+                retry_after_secs: 1,
+            })
+        };
+        for (case, error) in [
+            ("403", answered(403, "", None)),
+            ("503", answered(503, "", None)),
+            ("500", answered(500, "", None)),
+        ] {
+            assert!(
+                matches!(
+                    told(error, held()),
+                    ApiError::Held {
+                        status: 503,
+                        retry_after_secs: 1
+                    }
+                ),
+                "{case}"
+            );
+        }
+        assert!(matches!(
+            told(
+                answered(429, LIMITED_17, None),
+                Err(ApiError::Held {
+                    status: 429,
+                    retry_after_secs: 17
+                })
+            ),
             ApiError::Held {
                 status: 429,
-                retry_after_secs: 30,
-            },
-            ApiError::Held {
-                status: 503,
-                retry_after_secs: 4,
-            },
-            ApiError::Parse("eof".into()),
-            ApiError::CertificatePinningFailed("x".into()),
-            ApiError::NotAuthenticated,
-            answered(400, "", None),
-            answered(404, "", None),
-            answered(403, "", None),
-            ApiError::Unknown("the token refresh did not finish: cancelled".into()),
-        ] {
-            assert_eq!(after_failure(&error, 1, 0.5), Next::Keep, "{error:?}");
-            assert!(!server_failed_or_no_answer(&error), "{error:?}");
-        }
-    }
-
-    /// One scripted flight: the answers to give, in order, and what the
-    /// flight did. Every send records the token it presented.
-    struct Script {
-        answers: RefCell<Vec<Result<&'static str, ApiError>>>,
-        presented: RefCell<Vec<&'static str>>,
-        waits: RefCell<Vec<Duration>>,
-    }
-
-    impl Script {
-        fn new(mut answers: Vec<Result<&'static str, ApiError>>) -> Self {
-            answers.reverse();
-            Self {
-                answers: RefCell::new(answers),
-                presented: RefCell::default(),
-                waits: RefCell::default(),
+                retry_after_secs: 17
             }
-        }
-
-        /// Fly with `token`, the session still presenting it after
-        /// `still_ours` waits (then signed out).
-        async fn fly(
-            &self,
-            token: &'static str,
-            still_ours: usize,
-        ) -> Result<&'static str, ApiError> {
-            fly(
-                || {
-                    self.presented.borrow_mut().push(token);
-                    let answer = self.answers.borrow_mut().pop().expect("a send too many");
-                    async move { answer }
-                },
-                |pause| {
-                    self.waits.borrow_mut().push(pause);
-                    let ours = self.waits.borrow().len() <= still_ours;
-                    async move { ours }
-                },
-                || 0.5,
-            )
-            .await
-        }
-
-        fn sent(&self) -> usize {
-            self.presented.borrow().len()
-        }
-    }
-
-    /// MR-1771: a 429 keeps everything and waits, then the SAME token goes
-    /// again, and the session is renewed. On main the flight ended at the
-    /// 429; the next 401 sent the refresh again only after the gate's 30 s.
-    #[tokio::test]
-    async fn a_429_keeps_the_token_waits_and_sends_the_same_token_again() {
-        let script = Script::new(vec![
-            Err(answered(429, LIMITED_17, None)),
-            Ok("rotated pair"),
-        ]);
-        assert_eq!(script.fly("r1", usize::MAX).await.unwrap(), "rotated pair");
-        assert_eq!(*script.presented.borrow(), ["r1", "r1"]);
-        assert_eq!(*script.waits.borrow(), [secs(17)]);
-    }
-
-    /// MR-2500: a 503 (a rotation that failed after the token was consumed,
-    /// and was put back) keeps the token and backs off; the same token
-    /// renews the session. No token is lost on the way.
-    #[tokio::test]
-    async fn a_503_keeps_the_token_and_backs_off_until_it_renews() {
-        let script = Script::new(vec![
-            Err(answered(503, "", None)),
-            Err(ApiError::Network("operation timed out".into())),
-            Ok("rotated pair"),
-        ]);
-        assert_eq!(script.fly("r1", usize::MAX).await.unwrap(), "rotated pair");
-        assert_eq!(*script.presented.borrow(), ["r1", "r1", "r1"]);
-        assert_eq!(*script.waits.borrow(), [backoff(1, 0.5), backoff(2, 0.5)]);
-        assert!(script.waits.borrow()[0] < script.waits.borrow()[1]);
-    }
-
-    /// A 401 ends the flight at once: nothing more is sent, and the answer
-    /// is the one that signs out.
-    #[tokio::test]
-    async fn a_401_ends_the_flight_at_once() {
-        let script = Script::new(vec![Err(answered(401, "", None))]);
-        let ended = script.fly("r1", usize::MAX).await.unwrap_err();
-        assert!(super::super::session_gate::refresh_rejected(&ended));
-        assert_eq!(script.sent(), 1);
-        assert!(script.waits.borrow().is_empty());
-    }
-
-    /// A 403 keeps the session and is not sent again inside the flight.
-    #[tokio::test]
-    async fn a_403_keeps_the_session_and_is_not_sent_again() {
-        let script = Script::new(vec![Err(answered(403, "", None))]);
-        let kept = script.fly("r1", usize::MAX).await.unwrap_err();
-        assert!(!super::super::session_gate::refresh_rejected(&kept));
-        assert_eq!(script.sent(), 1);
-    }
-
-    /// The flight is bounded: after `REFRESH_ATTEMPTS` sends it ends on the
-    /// last answer, still a transient one that keeps the session.
-    #[tokio::test]
-    async fn a_flight_gives_up_after_its_attempts_and_keeps_the_session() {
-        let script = Script::new(vec![
-            Err(answered(503, "", None)),
-            Err(answered(502, "", None)),
-            Err(answered(500, "", None)),
-        ]);
-        let last = script.fly("r1", usize::MAX).await.unwrap_err();
-        assert!(matches!(last, ApiError::ServerError(500)), "{last:?}");
-        assert!(!super::super::session_gate::refresh_rejected(&last));
-        assert!(holds_after(&last));
-        assert_eq!(script.sent(), REFRESH_ATTEMPTS as usize);
-        assert_eq!(script.waits.borrow().len(), REFRESH_ATTEMPTS as usize - 1);
-    }
-
-    /// A sign-out (or another account's sign-in) during the wait ends the
-    /// flight: the old token is not sent again.
-    #[tokio::test]
-    async fn a_session_that_ended_during_the_wait_is_not_refreshed() {
-        let script = Script::new(vec![Err(answered(429, LIMITED_17, None))]);
-        let ended = script.fly("r1", 0).await.unwrap_err();
-        assert!(matches!(ended, ApiError::NotAuthenticated), "{ended:?}");
-        assert_eq!(script.sent(), 1);
-        assert!(!holds_after(&ended));
-    }
-
-    /// A refresh the gate still holds sent nothing: the flight ends at once,
-    /// with no wait (the callers waiting on the lock share that answer).
-    #[tokio::test]
-    async fn a_held_refresh_ends_the_flight_without_a_wait() {
-        let script = Script::new(vec![Err(ApiError::Held {
-            status: 503,
-            retry_after_secs: 4,
-        })]);
-        assert!(matches!(
-            script.fly("r1", usize::MAX).await,
-            Err(ApiError::Held { .. })
         ));
-        assert!(script.waits.borrow().is_empty());
+        assert!(matches!(
+            told(ApiError::Network("operation timed out".into()), held()),
+            ApiError::Network(_)
+        ));
     }
 }

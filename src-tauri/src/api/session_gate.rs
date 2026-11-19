@@ -16,7 +16,7 @@
 //! and discarding a live refresh token over one of those costs the user their
 //! account session (see `commands::auth::get_auth_state`), and an anonymous
 //! user who never saved the 24-digit number the account itself. What the
-//! client then does (waits, sends the same token again) is
+//! client then does (holds the refresh, sends the same token again later) is
 //! `api::refresh_policy`.
 //!
 //! A 403 used to end the session too (keeping the keystore copy). It is never
@@ -24,7 +24,8 @@
 //! one comes from in front of it (the IP blocklist, the CORS check, the edge
 //! proxy), and an infrastructure block answers it to everyone (the Caddy
 //! client-ip outage put every user in one rate-limit bucket). So it keeps the
-//! session now, and the caller is told the server could not answer.
+//! session now, and the caller is told a transient, 503-like answer
+//! ([`error_after_failed_refresh`]).
 
 use std::sync::OnceLock;
 
@@ -101,26 +102,40 @@ pub(crate) fn stored_session_after(error: &ApiError) -> StoredSession {
 /// as itself (`network_offline`, `server_error`, `rate_limited`, …) and the
 /// session survives it.
 ///
-/// MR-1771: a 403 from the refresh keeps the session and is surfaced as the
-/// server failing to answer (`server_error`, "please try again"), not as
-/// itself: a bare 403 reads as `subscription_required` ("Your plan does not
-/// include this"), wrong for a block in front of the backend.
+/// MR-2500 / MR-1771 (lead decision 2026-11-19, as Mobile #653): a refresh
+/// that failed for any other reason is TRANSIENT, and never reads as a
+/// server or a plan the user should change. Auto-Connect and server
+/// selection must never move anyone because of auth. The refresh flight
+/// already answers a 429, a 403, a 5xx or an unexpected status with its hold
+/// (`ApiError::Held`, 429 or 503, with the wait; `refresh_policy::told`), and
+/// no answer at all with the network failure; those, and the other transient
+/// answers, pass through as they are. Anything else that reaches here (a 403,
+/// a 404, a 5xx as the server sent it) becomes a busy 503 with the first
+/// backoff step's wait: `server_error`, "please try again". Not the answer
+/// as the server sent it:
+/// - a bare 403 reads as `subscription_required` ("Your plan does not include
+///   this"), a hard refusal that stops auto-reconnect;
+/// - a 404, a bare 503 (`ServerError(503)`) or one with a sentence reads as
+///   `server_unavailable` ("This server isn't available right now. Try
+///   another location.", whose action opens the server list).
 pub(crate) fn error_after_failed_refresh(refresh_error: ApiError) -> ApiError {
     if refresh_rejected(&refresh_error) {
-        ApiError::Unauthorized
-    } else if refresh_forbidden(&refresh_error) {
-        ApiError::ServerError(403)
-    } else {
-        refresh_error
+        return ApiError::Unauthorized;
     }
-}
-
-/// A 403 from the refresh, with or without the server's sentence.
-pub(crate) fn refresh_forbidden(error: &ApiError) -> bool {
-    matches!(
-        error,
-        ApiError::Forbidden | ApiError::Rejected { status: 403, .. }
-    )
+    match refresh_error {
+        ApiError::Held { .. }
+        | ApiError::RateLimited { .. }
+        | ApiError::ServerBusy { .. }
+        | ApiError::Network(_)
+        | ApiError::NotAuthenticated
+        | ApiError::Parse(_)
+        | ApiError::CertificatePinningFailed(_)
+        | ApiError::UpgradeRequired(_) => refresh_error,
+        _ => ApiError::ServerBusy {
+            status: 503,
+            retry_after_secs: super::refresh_policy::BACKOFF_BASE.as_secs(),
+        },
+    }
 }
 
 /// Report a failed refresh. Does nothing unless the server refused it.
@@ -174,13 +189,15 @@ mod tests {
         }
     }
 
-    /// MR-1771: a 403 from the refresh keeps the session (it never reaches
-    /// the session-expiry handler) and the caller is told the server could
-    /// not answer: never `session_expired`, never the plan copy a bare 403
-    /// gets. On main it ended the session (keystore kept) and the UI dropped
-    /// to Login.
+    /// MR-1771, and the lead's decision of 2026-11-19: a 403 from the refresh
+    /// keeps the session (it never reaches the session-expiry handler) and
+    /// the caller is told a transient, 503-like answer: a busy server
+    /// (`server_error`, retryable, with a wait). Never `session_expired`,
+    /// never the plan copy a bare 403 gets, never "this server is
+    /// unavailable". On main it ended the session (keystore kept) and the UI
+    /// dropped to Login.
     #[test]
-    fn a_403_from_the_refresh_keeps_the_session_and_says_the_server_failed() {
+    fn a_403_from_the_refresh_keeps_the_session_and_reads_as_a_busy_server() {
         for body in [
             "",
             r#"{"statusCode":403,"message":"Forbidden"}"#,
@@ -194,11 +211,21 @@ mod tests {
             );
             let e = result.unwrap_err();
             assert!(!refresh_rejected(&e), "{body}");
-            assert!(refresh_forbidden(&e), "{body}");
-            let told = IpcError::from_api(&error_after_failed_refresh(e));
+            let after = error_after_failed_refresh(e);
+            assert!(
+                matches!(
+                    after,
+                    ApiError::ServerBusy {
+                        status: 503,
+                        retry_after_secs: 1
+                    }
+                ),
+                "{body}"
+            );
+            let told = IpcError::from_api(&after);
             assert_eq!(told.code, IpcErrorCode::ServerError, "{body}");
-            assert_ne!(told.code, IpcErrorCode::SessionExpired);
-            assert_ne!(told.code, IpcErrorCode::SubscriptionRequired);
+            assert!(told.retryable, "{body}");
+            assert_eq!(told.retry_after_secs, Some(1), "{body}");
         }
     }
 
@@ -224,44 +251,140 @@ mod tests {
 
     /// REVIEW-WIN2-003: everything else is transient. The session is kept,
     /// and the request answers as what happened — never `session_expired`.
+    /// MR-2500 / MR-1771: a refresh 503 reads as a busy server, no longer as
+    /// `server_unavailable` ("Try another location"). The cases are labelled,
+    /// never formatted (CodeQL reads an assert's message as a log).
     #[test]
     fn a_transient_refresh_failure_keeps_the_session() {
-        let cases: Vec<(Result<(), ApiError>, IpcErrorCode)> = vec![
+        let cases: Vec<(&str, Result<(), ApiError>, IpcErrorCode)> = vec![
             (
+                "reset",
                 Err(ApiError::Network("connection reset".into())),
                 IpcErrorCode::NetworkOffline,
             ),
-            (refresh_answered(502, ""), IpcErrorCode::ServerError),
-            (refresh_answered(500, ""), IpcErrorCode::ServerError),
+            ("502", refresh_answered(502, ""), IpcErrorCode::ServerError),
+            ("500", refresh_answered(500, ""), IpcErrorCode::ServerError),
             (
+                "503, deploying",
                 refresh_answered(503, r#"{"message":"Deploying"}"#),
-                IpcErrorCode::ServerUnavailable,
+                IpcErrorCode::ServerError,
             ),
-            (refresh_answered(429, ""), IpcErrorCode::RateLimited),
+            ("429", refresh_answered(429, ""), IpcErrorCode::RateLimited),
             (
+                "429, slow down",
                 refresh_answered(429, r#"{"message":"Slow down"}"#),
                 IpcErrorCode::RateLimited,
             ),
             (
+                "unreadable 2xx",
                 Err(ApiError::Parse("eof".into())),
                 IpcErrorCode::ServerError,
             ),
             (
+                "pin",
                 Err(ApiError::CertificatePinningFailed("x".into())),
                 IpcErrorCode::CertPinFailed,
             ),
         ];
-        for (result, code) in cases {
+        for (case, result, code) in cases {
             assert_eq!(
                 refresh_outcome(&result),
                 RefreshOutcome::Transient,
-                "{result:?}"
+                "{case}"
             );
             let e = result.unwrap_err();
-            assert!(!refresh_rejected(&e), "{e:?}");
+            assert!(!refresh_rejected(&e), "{case}");
             let answered = IpcError::from_api(&error_after_failed_refresh(e));
-            assert_eq!(answered.code, code);
+            assert_eq!(answered.code, code, "{case}");
             assert_ne!(answered.code, IpcErrorCode::SessionExpired);
+        }
+    }
+
+    /// The lead's decision of 2026-11-19 (Mobile #653): a refresh failure
+    /// never reads as a reason to change server, even as the server sent it
+    /// (the flight's own answer, the hold, is driven in `client.rs`
+    /// `a_refresh_failure_never_points_at_another_server`). Its code is
+    /// never one whose UI action opens the server list
+    /// (`server_unavailable`, `server_unreachable`: `src/lib/errors.ts`),
+    /// never a hard refusal (auto-reconnect would give up instead of
+    /// re-dialling the session's own server), never an ending the server
+    /// decided, never `session_expired` and never the plan copy; and it is
+    /// retryable.
+    #[test]
+    fn a_refresh_failure_never_reads_as_another_server_or_a_plan() {
+        let failed = |status: u16, body: &str, header: Option<u64>| {
+            BirdoApi::classify_error_response_after(
+                StatusCode::from_u16(status).unwrap(),
+                body,
+                header,
+            )
+        };
+        let cases = [
+            ("403", failed(403, "", None)),
+            (
+                "403, blocked",
+                failed(
+                    403,
+                    r#"{"statusCode":403,"message":"Your IP address has been blocked"}"#,
+                    None,
+                ),
+            ),
+            ("404", failed(404, "", None)),
+            ("410, sentence", failed(410, r#"{"message":"Gone"}"#, None)),
+            ("429", failed(429, "", None)),
+            ("429, header", failed(429, "", Some(42))),
+            (
+                "429, body",
+                failed(
+                    429,
+                    r#"{"details":{"code":"rate_limited","retryAfter":17}}"#,
+                    None,
+                ),
+            ),
+            ("500", failed(500, "", None)),
+            ("502", failed(502, "", None)),
+            ("503", failed(503, "", None)),
+            (
+                "503, sentence",
+                failed(503, r#"{"message":"Service unavailable"}"#, None),
+            ),
+            ("503, busy", failed(503, "", Some(10))),
+            ("504", failed(504, "", None)),
+            ("timeout", ApiError::Network("operation timed out".into())),
+            ("no answer", ApiError::Network("connection refused".into())),
+            (
+                "held 429",
+                ApiError::Held {
+                    status: 429,
+                    retry_after_secs: 30,
+                },
+            ),
+            (
+                "held 503",
+                ApiError::Held {
+                    status: 503,
+                    retry_after_secs: 4,
+                },
+            ),
+        ];
+        for (case, error) in cases {
+            let told = IpcError::from_api(&error_after_failed_refresh(error));
+            assert!(
+                !matches!(
+                    told.code,
+                    IpcErrorCode::ServerUnavailable
+                        | IpcErrorCode::ServerUnreachable
+                        | IpcErrorCode::SubscriptionRequired
+                        | IpcErrorCode::SessionExpired
+                ),
+                "{case}"
+            );
+            assert!(!told.code.is_hard_refusal(), "{case}");
+            assert!(
+                !crate::vpn::reconnect_policy::server_ended(told.code),
+                "{case}"
+            );
+            assert!(told.retryable, "{case}");
         }
     }
 
