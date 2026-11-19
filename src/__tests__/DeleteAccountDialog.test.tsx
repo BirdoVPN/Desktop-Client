@@ -174,6 +174,34 @@ describe('Delete account dialog', () => {
     expect(logout).not.toHaveBeenCalled();
   });
 
+  it('a 2xx Rust could not read as a deletion asks for a retry and changes nothing (MR-2370)', async () => {
+    // What `delete_account` rejects with when the answer's body did not
+    // confirm the deletion: `server_error`, before anything local is touched.
+    deleteResult = () =>
+      Promise.reject({
+        code: 'server_error',
+        message:
+          'Account deletion failed: Failed to parse response: an unreadable answer to the ' +
+          'deletion; nothing is assumed deleted',
+        retryable: true,
+        retry_after_secs: null,
+      });
+    await openAndConfirm();
+    expect(
+      await screen.findByText('Something went wrong on our side. Please try again in a moment.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/unreadable answer/)).not.toBeInTheDocument();
+    expect(logout).not.toHaveBeenCalled();
+    expect(setConnectionState).not.toHaveBeenCalled();
+    // The dialog stays open with the password kept: the retry is one click.
+    const retry = screen.getByRole('button', { name: /delete my account/i });
+    expect(retry).toBeEnabled();
+    deleteResult = () => Promise.resolve({ storeSubscriptionsStillBilling: [] });
+    await userEvent.click(retry);
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'delete_account')).toHaveLength(2);
+  });
+
   it('lists store subscriptions still billing, and OK finishes the sign-out', async () => {
     deleteResult = () =>
       Promise.resolve({ storeSubscriptionsStillBilling: ['Apple App Store', 'Google Play'] });

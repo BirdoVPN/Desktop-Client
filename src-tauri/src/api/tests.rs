@@ -305,18 +305,97 @@ mod gdpr_request_tests {
         );
     }
 
-    /// 2xx is a deletion whatever the body says; a missing or unparsable body
-    /// must not become an error the user would "retry" against an erased
-    /// account.
+    /// birdo-web `GdprController.deleteData`'s 200, word for word (origin/main
+    /// a5a4ad3b): the confirmation of a deletion.
+    const DELETED: &str = r#"{"success":true,"message":"Your data has been deleted. Some records may have been anonymized for legal compliance.","deletedItems":7,"anonymizedItems":2,"storeSubscriptionsStillBilling":[]}"#;
+
+    /// 2xx bodies that cannot be read as that confirmation: none of them is
+    /// what the server sends for a deletion.
+    const UNREADABLE: &[&str] = &[
+        "",
+        "not json",
+        "<html><body>Sign in to this network</body></html>",
+        "null",
+        "true",
+        "[]",
+        r#"[{"success":true}]"#,
+        "{}",
+        r#"{"message":"Your data has been deleted."}"#,
+        r#"{"success":false,"message":"Your data has been deleted."}"#,
+        r#"{"success":"true"}"#,
+        r#"{"success":1}"#,
+        r#"{"success":null}"#,
+        // Cut off mid-body.
+        r#"{"success":true,"message":"Your data has been del"#,
+    ];
+
+    /// MR-2370: a 2xx is a deletion only when its body confirms one
+    /// (`success: true`); the store-subscription list stays as lenient as
+    /// before (`store_subscription_labels_tolerate_every_plausible_shape`).
     #[test]
-    fn a_2xx_is_a_deletion_even_with_an_unexpected_body() {
-        let real = r#"{"success":true,"message":"Your data has been deleted.","deletedItems":7,"anonymizedItems":2}"#;
-        for body in [real, "", "not json"] {
-            assert!(matches!(
-                BirdoApi::classify_gdpr_delete_response(StatusCode::OK, body),
-                GdprDeleteOutcome::Deleted(_)
-            ));
+    fn a_2xx_is_a_deletion_only_when_its_body_confirms_it() {
+        for status in [StatusCode::OK, StatusCode::CREATED] {
+            for body in [
+                DELETED,
+                r#"{"success":true}"#,
+                r#"{"success":true,"storeSubscriptionsStillBilling":"odd"}"#,
+            ] {
+                assert!(
+                    matches!(
+                        BirdoApi::classify_gdpr_delete_response(status, body),
+                        GdprDeleteOutcome::Deleted(_)
+                    ),
+                    "{status} {body}"
+                );
+            }
         }
+    }
+
+    /// MR-2370: an unreadable non-202 2xx is NOT a deletion. Before, any 2xx
+    /// body (`unwrap_or_default`) was read as one, and `delete_account` wiped
+    /// the sign-in, the device id and the PQ state on it. Now it is an error
+    /// (`ApiError::Parse`), which the dialog words as `server_error` ("Please
+    /// try again") and leaves open for the retry.
+    #[test]
+    fn an_unreadable_2xx_is_an_error_not_a_deletion() {
+        for status in [StatusCode::OK, StatusCode::CREATED, StatusCode::NO_CONTENT] {
+            for body in UNREADABLE {
+                match BirdoApi::classify_gdpr_delete_response(status, body) {
+                    GdprDeleteOutcome::Refused(ApiError::Parse(why)) => {
+                        assert!(why.contains("nothing is assumed deleted"), "{why}")
+                    }
+                    other => panic!("{status} {body:?} was read as {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// MR-2370, by behaviour: a signed-in client handed an unreadable 2xx
+    /// through `finish_gdpr_delete` (the ending `delete_account` uses) keeps
+    /// its session; only the confirmation clears it.
+    #[tokio::test]
+    async fn an_unreadable_2xx_leaves_the_session_signed_in() {
+        let api = BirdoApi::new();
+        api.set_tokens("access-1".into(), "refresh-1".into()).await;
+        for body in UNREADABLE {
+            let outcome = BirdoApi::classify_gdpr_delete_response(StatusCode::OK, body);
+            assert!(
+                matches!(
+                    api.finish_gdpr_delete(outcome).await,
+                    Err(ApiError::Parse(_))
+                ),
+                "{body:?}"
+            );
+            assert!(api.is_authenticated().await, "{body:?} signed the user out");
+            assert_eq!(
+                api.access_token_value().await.as_deref(),
+                Some("access-1"),
+                "{body:?}"
+            );
+        }
+        let outcome = BirdoApi::classify_gdpr_delete_response(StatusCode::OK, DELETED);
+        assert!(api.finish_gdpr_delete(outcome).await.is_ok());
+        assert!(!api.is_authenticated().await);
     }
 
     /// The password check's 401 is the ANSWER and must reach the user

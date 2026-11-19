@@ -487,8 +487,10 @@ pub async fn delete_account(
         .await
         .map_err(|e| delete_failure_message(&e))?;
 
-    // The server has confirmed (2xx). Only NOW take the tunnel down, before
-    // the local state is cleared (second-pass #15). This used to happen in
+    // The server has confirmed (a 2xx whose body says `success: true`; an
+    // unreadable one came back above as an error the dialog offers to retry,
+    // MR-2370). Only NOW take the tunnel down, before the local state is
+    // cleared (second-pass #15). This used to happen in
     // the dialog before the request, so a wrong password or an offline delete
     // left the user disconnected from an account that still existed. The
     // account's keys are gone server-side, so the tunnel could not carry
@@ -1703,6 +1705,30 @@ mod account_boundary_tests {
                 .find("settings::clear_account_choices(&app)")
                 .unwrap_or_else(|| panic!("{name} keeps the account's server"));
             assert!(end < forget, "{name}");
+        }
+    }
+
+    /// MR-2370: a 2xx whose body does not confirm the deletion reaches the
+    /// dialog as `server_error`, which it words "Something went wrong on our
+    /// side. Please try again in a moment." and stays open for the retry
+    /// (DeleteAccountDialog's DELETION_CODES); never `session_expired`, which
+    /// would send the user to sign in. `delete_account` returns it before
+    /// anything local is touched (see
+    /// `deletion_disconnects_only_after_the_server_confirmed`).
+    #[test]
+    fn an_unreadable_deletion_answer_reaches_the_dialog_as_a_retry() {
+        use crate::api::client::{BirdoApi, GdprDeleteOutcome};
+        use reqwest::StatusCode;
+        for body in ["", "<html></html>", "{}", r#"{"success":false}"#] {
+            let outcome = BirdoApi::classify_gdpr_delete_response(StatusCode::OK, body);
+            let error = match outcome {
+                GdprDeleteOutcome::Refused(error) => error,
+                other => panic!("{body:?} was read as {other:?}"),
+            };
+            let shown = super::delete_failure_message(&error);
+            assert_eq!(shown.code, super::IpcErrorCode::ServerError, "{body:?}");
+            assert!(shown.retryable, "{body:?}");
+            assert_eq!(shown.retry_after_secs, None);
         }
     }
 
