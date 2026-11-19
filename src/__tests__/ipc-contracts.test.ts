@@ -226,9 +226,24 @@ const SERVER: Server = {
 const callsTo = (cmd: string) => mockedInvoke.mock.calls.filter(([c]) => c === cmd);
 
 describe('what the real actions send', () => {
-  it('connect_vpn { serverId }', async () => {
+  // MR-2390: every connect says who chose the server, as the store records
+  // it (MR-2492); the user's when the caller does not say.
+  it("connect_vpn { serverId, origin: 'user' }", async () => {
     await connectToServer(SERVER);
-    expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'de-fra-1' }]]);
+    expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'de-fra-1', origin: 'user' }]]);
+  });
+
+  // Rust's command takes `origin`, optional, mapping exactly 'automatic' to
+  // the client's pick (anything else, or nothing, is the user's).
+  it("connect_vpn { serverId, origin: 'automatic' } for the client's own pick", async () => {
+    await connectToServer(SERVER, 'automatic');
+    expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'de-fra-1', origin: 'automatic' }]]);
+    const vpn = readFileSync(findUp('src-tauri/src/commands/vpn.rs'), 'utf8');
+    const command = vpn.slice(vpn.indexOf('pub async fn connect_vpn('));
+    expect(command.slice(0, command.indexOf('-> Result'))).toMatch(/\borigin: Option<String>,/);
+    expect(readFileSync(findUp('src-tauri/src/vpn/relay_retry.rs'), 'utf8')).toContain(
+      'Some("automatic") => Self::Automatic',
+    );
   });
 
   it('connect_multi_hop { entryNodeId, exitNodeId }', async () => {

@@ -37,6 +37,24 @@ export function expireSession(): void {
 }
 
 /**
+ * MR-2483: a retried deletion found the account already gone (the first
+ * try's 2xx could not be read, MR-2370). Rust's `delete_account` has already
+ * ended the session and cleared everything a confirmed deletion clears; drop
+ * to Login and say the account is gone.
+ *
+ * Synchronous, and it wins whatever the order: the refresh that found the
+ * session dead may also have sent `session-expired`. If that arrived first,
+ * `endSession('expired')` signed out and this corrects the reason; if it
+ * arrives after, `endSession` finds nobody signed in and does nothing.
+ */
+export function endDeletedSession(): void {
+  const s = useAppStore.getState();
+  clearHeldDeletion();
+  if (s.isAuthenticated) s.logout();
+  s.setSessionEndedReason('deleted');
+}
+
+/**
  * The user signs out (W2-005). One implementation for Home, Profile and every
  * future caller: the two copies this replaces each disconnected only in
  * connected / connecting / reconnecting, so signing out after a failed switch

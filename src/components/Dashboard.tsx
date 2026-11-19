@@ -29,12 +29,13 @@ import { SignOutDialog } from './home/SignOutDialog';
 import { hairline, motion as motionTokens, white } from '@/lib/birdo-theme';
 import { connectCta } from '@/lib/vpn-display';
 import { lowestPlanWith, planHasFeature, planName, titleCasePlan } from '@/lib/plan';
-import { appealUrl, type ErrorAction } from '@/lib/errors';
+import { appealUrl, blockedUntilAnotherServer, type ErrorAction } from '@/lib/errors';
 import { openWebsite } from '@/lib/links';
 import { useAppStore, type Server } from '@/store/app-store';
 import { selectDisplayState, selectTunnelActive } from '@/store/selectors';
 import {
   connectPreferred,
+  connectToServer,
   disconnectVpn,
   findLiveServer,
   resolveConnectTarget,
@@ -168,6 +169,19 @@ export function Dashboard() {
     // On a live single-hop session, picking another node is a real switch.
     if ((d === 'connected' || d === 'reconnecting') && !s.liveMultiHop && liveServer?.id !== server.id) {
       void switchToServer(server);
+      return;
+    }
+    // MR-2390: traffic is blocked on purpose until the user chooses another
+    // server (a drained server with nowhere to go, under the always-on kill
+    // switch). The pick is that choice, so it connects; Rust keeps the block
+    // until the new tunnel is up. It used to change only the card, under a
+    // Disconnect button that drops the block.
+    if (
+      d === 'error' &&
+      !s.settings.multiHopEnabled &&
+      blockedUntilAnotherServer(s.vpnError ?? s.commandError, s.killSwitchBlocking)
+    ) {
+      void connectToServer(server);
       return;
     }
     s.setCurrentServer(server);

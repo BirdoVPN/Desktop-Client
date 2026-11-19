@@ -2,6 +2,7 @@
 //!
 //! Handles login, logout, token refresh, and auth state management.
 
+use crate::api::client::AccountDeletion;
 use crate::api::error::ApiError;
 use crate::api::session_gate::{self, RefreshOutcome, StoredSession};
 use crate::api::types::{
@@ -381,6 +382,12 @@ pub struct DeleteAccountResult {
     /// does not report them yet — the dialog warns about store billing before
     /// the user confirms either way.
     pub store_subscriptions_still_billing: Vec<String>,
+    /// MR-2483: this retry found the account already deleted (an earlier
+    /// attempt's 2xx could not be read, MR-2370). Everything local was cleared
+    /// exactly as for a confirmed deletion; the UI says the account is gone
+    /// and the user is signed out. The store list is empty then: it rode on
+    /// the answer that was lost.
+    pub already_deleted: bool,
 }
 
 /// The error a refused deletion shows. The backend's own words when it gave
@@ -476,7 +483,7 @@ pub async fn delete_account(
         .map(str::trim)
         .filter(|c| !c.is_empty());
     let around_the_tunnel = around_the_tunnel(&app).await;
-    let response = api
+    let deletion = api
         .delete_account(
             &request.password,
             two_factor_code,
@@ -489,7 +496,9 @@ pub async fn delete_account(
 
     // The server has confirmed (a 2xx whose body says `success: true`; an
     // unreadable one came back above as an error the dialog offers to retry,
-    // MR-2370). Only NOW take the tunnel down, before the local state is
+    // MR-2370), or the retry after that unreadable one found the account
+    // already gone (MR-2483): the same ending either way. Only NOW take the
+    // tunnel down, before the local state is
     // cleared (second-pass #15). This used to happen in
     // the dialog before the request, so a wrong password or an offline delete
     // left the user disconnected from an account that still existed. The
@@ -509,16 +518,32 @@ pub async fn delete_account(
     crate::vpn::birdo_pq::record_disabled();
     crate::utils::device_id::rotate();
 
-    let store_subscriptions_still_billing = response
-        .store_subscriptions_still_billing
-        .as_ref()
-        .map(crate::api::types::store_subscription_labels)
-        .unwrap_or_default();
+    let result = deletion_result(&deletion);
+    if result.already_deleted {
+        tracing::info!("Account already deleted by an earlier attempt — signed out");
+    } else {
+        tracing::info!("Account permanently deleted");
+    }
+    Ok(result)
+}
 
-    tracing::info!("Account permanently deleted");
-    Ok(DeleteAccountResult {
-        store_subscriptions_still_billing,
-    })
+/// What the dialog is told about a deletion that ended the account.
+fn deletion_result(deletion: &AccountDeletion) -> DeleteAccountResult {
+    match deletion {
+        AccountDeletion::Deleted(response) => DeleteAccountResult {
+            store_subscriptions_still_billing: response
+                .store_subscriptions_still_billing
+                .as_ref()
+                .map(crate::api::types::store_subscription_labels)
+                .unwrap_or_default(),
+            already_deleted: false,
+        },
+        // MR-2483: the list rode on the answer that was lost.
+        AccountDeletion::AlreadyDeleted => DeleteAccountResult {
+            store_subscriptions_still_billing: Vec::new(),
+            already_deleted: true,
+        },
+    }
 }
 
 /// What the deletion dialog shows BEFORE the user confirms (second-pass #9).
@@ -1732,6 +1757,82 @@ mod account_boundary_tests {
             assert!(shown.retryable, "{body:?}");
             assert_eq!(shown.retry_after_secs, None);
         }
+    }
+
+    /// MR-2483 review L1: after an unreadable 2xx, a 404 that is not the
+    /// API's own (an HTML page, an empty body, another responder's JSON) is no
+    /// deletion. `delete_account` returns it as an error before anything local
+    /// is touched (never `Ok` with `alreadyDeleted`, so the dialog never says
+    /// "deleted"), and the dialog offers to retry it (`server_unavailable`,
+    /// "Couldn't delete your account. Please try again.").
+    #[test]
+    fn a_404_that_is_not_the_apis_after_an_unreadable_2xx_reaches_the_dialog_as_a_retry() {
+        use crate::api::client::{BirdoApi, GdprDeleteOutcome};
+        use reqwest::StatusCode;
+        for body in [
+            "",
+            "<html><body><h1>404 Not Found</h1></body></html>",
+            "{}",
+            r#"{"message":"Not Found"}"#,
+        ] {
+            let outcome = BirdoApi::after_unconfirmed(
+                true,
+                BirdoApi::classify_gdpr_delete_response(StatusCode::NOT_FOUND, body),
+            );
+            let GdprDeleteOutcome::Refused(error) = outcome else {
+                panic!("{body:?} was not read as a refusal");
+            };
+            let shown = super::delete_failure_message(&error);
+            assert_eq!(
+                shown.code,
+                super::IpcErrorCode::ServerUnavailable,
+                "{body:?}"
+            );
+            assert!(shown.retryable, "{body:?}");
+        }
+    }
+
+    /// MR-2483: a retry that found the account already deleted reaches the
+    /// dialog as a deletion (`Ok`), flagged `alreadyDeleted`, with no store
+    /// list (it rode on the answer that was lost). `delete_account` clears
+    /// everything local for it exactly as for a confirmed deletion: one path
+    /// after the server call (`deletion_disconnects_only_after_the_server_confirmed`).
+    #[test]
+    fn a_deletion_found_already_done_tells_the_dialog_so() {
+        use crate::api::client::AccountDeletion;
+        use crate::api::types::DeleteAccountResponse;
+        let gone = super::deletion_result(&AccountDeletion::AlreadyDeleted);
+        assert!(gone.already_deleted);
+        assert!(gone.store_subscriptions_still_billing.is_empty());
+        assert_eq!(
+            serde_json::to_value(&gone).unwrap(),
+            serde_json::json!({ "storeSubscriptionsStillBilling": [], "alreadyDeleted": true })
+        );
+
+        let confirmed = DeleteAccountResponse::confirmation(
+            r#"{"success":true,"storeSubscriptionsStillBilling":["GOOGLE_PLAY"]}"#,
+        )
+        .expect("a confirmation");
+        let deleted = super::deletion_result(&AccountDeletion::Deleted(confirmed));
+        assert!(!deleted.already_deleted);
+        assert_eq!(
+            deleted.store_subscriptions_still_billing,
+            vec!["Google Play"]
+        );
+        assert_eq!(
+            serde_json::to_value(&deleted).unwrap()["alreadyDeleted"],
+            serde_json::json!(false)
+        );
+
+        // Both endings run the same local clean-up: nothing between the
+        // server call and the session's end tells them apart.
+        let del = body("delete_account");
+        let confirmed = del.find(".delete_account(").unwrap();
+        let ended = del
+            .find("end_session(&app, EndReason::AccountDeleted)")
+            .unwrap();
+        assert!(!del[confirmed..ended].contains("AlreadyDeleted"));
+        assert!(!del[confirmed..ended].contains("already_deleted"));
     }
 
     #[test]

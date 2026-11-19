@@ -15,7 +15,8 @@
  *    a quiet re-dial: `reconnecting`, then `connected` again, up to
  *    `QUIET_REBUILDS_PER_EPISODE` (one) time per episode, after which the
  *    next reap ends the session like the rows above. A drained server's
- *    `server_offline` is not rebuilt: it ends at once;
+ *    `server_offline` is rebuilt the same way on ANOTHER server (MR-2390),
+ *    and past the cap, or with nowhere to go, ends as `server_unavailable`;
  *  - otherwise nothing (`Fine`, and `ServerGoingOffline`, which only logs).
  *
  * This file pins the other half, per reason: that outcome, as Rust emits it,
@@ -102,7 +103,7 @@ function quotaWarningWire(): { event: string; secondsKey: string } {
   return { event, secondsKey: camel(fields[0]) };
 }
 
-type EndCode = 'Revoked' | 'Evicted' | 'QuotaExceeded';
+type EndCode = 'Revoked' | 'Evicted' | 'QuotaExceeded' | 'ServerUnavailable';
 
 /** The wire name of an `IpcErrorCode` variant (`ipc_error.rs`, `rename_all = "snake_case"`). */
 function ipcCodeWire(variant: EndCode): string {
@@ -138,6 +139,8 @@ const HB_REVOKED = 'Connection has been revoked. Please reconnect.';
 const RUST_QUOTA_EXCEEDED = "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.";
 // reconnect_policy::EVICTED_MESSAGE (MR-2333): never the reply's not-found sentence.
 const RUST_EVICTED = 'Another device on your account took over this connection.';
+// reconnect_policy::server_left_error() (MR-2390).
+const RUST_SERVER_LEFT = 'This server was taken out of service. Choose another location to connect.';
 
 type Ending = { kind: 'end'; code: EndCode; message: string };
 
@@ -160,6 +163,8 @@ const grace = (secondsRemaining: number): Outcome => ({ kind: 'grace', secondsRe
 const revoked = (message: string): Ending => ({ kind: 'end', code: 'Revoked', message });
 const quotaEnded: Ending = { kind: 'end', code: 'QuotaExceeded', message: RUST_QUOTA_EXCEEDED };
 const evicted: Ending = { kind: 'end', code: 'Evicted', message: RUST_EVICTED };
+// MR-2390: a drained server's key, past the move or with nowhere to go.
+const serverLeft: Ending = { kind: 'end', code: 'ServerUnavailable', message: RUST_SERVER_LEFT };
 // MR-2369: before it, the `reaped` row was `revoked(HB_NOT_FOUND)` at once.
 const rebuilt = (then: Ending): Outcome => ({ kind: 'rebuild', then });
 
@@ -168,7 +173,8 @@ const CASES: ReasonCase[] = [
   { reason: 'ok', shape: 'live, inside the Free grace window (540 s)', outcome: grace(540) },
   { reason: 'server_offline', shape: 'valid: the key lives, its server is not ONLINE', outcome: nothing },
   { reason: 'server_offline', shape: 'valid, inside the Free grace window (60 s)', outcome: grace(60) },
-  { reason: 'server_offline', shape: 'invalid: the key went with a drained server', outcome: revoked(HB_NOT_FOUND) },
+  // MR-2390: before it, this row was `revoked(HB_NOT_FOUND)` at once.
+  { reason: 'server_offline', shape: 'invalid: the key went with a drained server', outcome: rebuilt(serverLeft) },
   { reason: 'revoked', shape: 'a deactivated row', outcome: revoked(HB_REVOKED) },
   { reason: 'revoked', shape: 'a removal record', outcome: revoked(HB_NOT_FOUND) },
   { reason: 'evicted', shape: 'a removal record', outcome: evicted },
@@ -183,6 +189,9 @@ const END_UI: Record<EndCode, { message: string; action: string }> = {
   Revoked: { message: REVOKED_COPY, action: 'connect' },
   Evicted: { message: EVICTED_COPY, action: 'connect' },
   QuotaExceeded: { message: QUOTA_EXCEEDED_COPY, action: 'view_plans' },
+  // Nothing held here (`rustEmits` sends no block): the plain copy. With the
+  // always-on block held it says so (HomeBanners.test.tsx, MR-2390).
+  ServerUnavailable: { message: "This server isn't available right now. Try another location.", action: 'choose_server' },
 };
 
 // ── The harness (as SessionController.test.tsx) ─────────────────────────────

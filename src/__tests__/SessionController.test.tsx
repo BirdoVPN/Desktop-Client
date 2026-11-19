@@ -316,7 +316,7 @@ describe('Auto-Connect (W2-002)', () => {
     rustSettings = { ...rustSettings, auto_connect: true };
     useAppStore.setState({ lastServerId: 'a' });
     const { rerender } = render(<VpnSessionController />);
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'a' }]]));
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'a', origin: 'user' }]]));
     expect(callsTo('quick_connect')).toHaveLength(0);
 
     // The tunnel drops back to disconnected and the app re-renders (the old
@@ -330,7 +330,10 @@ describe('Auto-Connect (W2-002)', () => {
   it('without a remembered server, picks the fastest (lowest load), the Rust/iOS rule', async () => {
     rustSettings = { ...rustSettings, auto_connect: true };
     render(<VpnSessionController />);
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'b' }]]));
+    // MR-2390: the client's own pick says so; the user's server above does not.
+    await waitFor(() =>
+      expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'b', origin: 'automatic' }]]),
+    );
   });
 
   // Round 7 (N3): a start-up that could not verify the file leaves the
@@ -499,7 +502,7 @@ describe("Auto-Connect keeps the user's server in its country (MR-2492)", () => 
     ];
     useAppStore.setState({ lastServerId: 'fra' });
     render(<VpnSessionController />);
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'fra2' }]]));
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'fra2', origin: 'user' }]]));
     expect(callsTo('quick_connect')).toHaveLength(0);
   });
 
@@ -507,7 +510,7 @@ describe("Auto-Connect keeps the user's server in its country (MR-2492)", () => 
     servers = fleetWith('nyc', { isOnline: false }).map((s) => (s.id === 'yyz' ? { ...s, load: 0 } : s));
     useAppStore.setState({ lastServerId: 'nyc' });
     render(<VpnSessionController />);
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'lax' }]]));
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'lax', origin: 'user' }]]));
     expect(callsTo('quick_connect')).toHaveLength(0);
   });
 
@@ -519,7 +522,7 @@ describe("Auto-Connect keeps the user's server in its country (MR-2492)", () => 
     });
     useAppStore.setState({ lastServerId: 'fra' });
     render(<VpnSessionController />);
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'fra' }]]));
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'fra', origin: 'user' }]]));
     expect(useAppStore.getState().servers).toHaveLength(0);
     expect(callsTo('quick_connect')).toHaveLength(0);
   });
@@ -539,7 +542,7 @@ describe("Auto-Connect keeps the user's server in its country (MR-2492)", () => 
   it("the client's own pick (no server on record) may move to another country at the next launch", async () => {
     const first = render(<VpnSessionController />);
     // Nothing on record: Auto-Connect takes the fastest server.
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'fra' }]]));
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'fra', origin: 'automatic' }]]));
     await waitFor(() => expect(useAppStore.getState().lastServerId).toBe('fra'));
     first.unmount();
 
@@ -547,7 +550,7 @@ describe("Auto-Connect keeps the user's server in its country (MR-2492)", () => 
     relaunch();
     servers = fleetWith('fra', { isOnline: false });
     render(<VpnSessionController />);
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'nyc' }]]));
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'nyc', origin: 'automatic' }]]));
     expect(useAppStore.getState().notice?.text).not.toBe(HELD_COPY);
   });
 
@@ -565,8 +568,32 @@ describe("Auto-Connect keeps the user's server in its country (MR-2492)", () => 
     rustSettings = { ...rustSettings, auto_connect: true };
     servers = fleetWith('sto', { isOnline: false });
     render(<VpnSessionController />);
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'fra' }]]));
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'fra', origin: 'automatic' }]]));
     expect(useAppStore.getState().notice?.text).not.toBe(HELD_COPY);
+  });
+
+  // MR-2390: Rust is told the same origin this store records, on every dial,
+  // so a later drain moves the session as far as that origin allows.
+  it("a Quick Connect pick that Auto-Connect dials again stays the client's pick in Rust too", async () => {
+    rustSettings = { ...rustSettings, auto_connect: false };
+    useAppStore.setState({ lastServerId: 'fra' });
+    const first = render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));
+    emit('vpn-status-changed', { state: 'connected', seq: 5, server_id: 'sto', error: null });
+    await waitFor(() => expect(useAppStore.getState().lastServerOrigin).toBe('automatic'));
+    first.unmount();
+
+    relaunch();
+    rustSettings = { ...rustSettings, auto_connect: true };
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'sto', origin: 'automatic' }]]));
+    await waitFor(() => expect(useAppStore.getState().lastServerOrigin).toBe('automatic'));
+  });
+
+  it("the user's own server is sent as the user's, the exact word Rust reads", async () => {
+    useAppStore.setState({ lastServerId: 'sto', lastServerOrigin: 'user' });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'sto', origin: 'user' }]]));
   });
 });
 
@@ -590,7 +617,7 @@ describe('Resume after an update (MR-1861)', () => {
     answerResume({ kind: 'singleHop', serverId: 'c' });
     useAppStore.setState({ lastServerId: 'a' });
     const { rerender } = render(<VpnSessionController />);
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'c' }]]));
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'c', origin: 'user' }]]));
     expect(useAppStore.getState().notice?.text).toBe(RESUME_AFTER_UPDATE_COPY);
     expect(callsTo('quick_connect')).toHaveLength(0);
 
@@ -659,7 +686,7 @@ describe('Resume after an update (MR-1861)', () => {
     });
     useAppStore.setState({ lastServerId: 'a' });
     render(<VpnSessionController />);
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'c' }]]));
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'c', origin: 'user' }]]));
     expect(useAppStore.getState().servers).toHaveLength(0);
     expect(callsTo('quick_connect')).toHaveLength(0);
     expect(useAppStore.getState().notice?.text).toBe(RESUME_AFTER_UPDATE_COPY);

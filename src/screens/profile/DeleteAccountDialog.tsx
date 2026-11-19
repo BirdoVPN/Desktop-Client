@@ -17,6 +17,9 @@
  *    clearing local state). Disconnecting first left a user who typed a wrong
  *    password, or was offline, disconnected from an account that still exists.
  *  - Local state is only cleared once the server confirms (Rust side).
+ *  - MR-2483: a 2xx Rust could not read as a deletion asks for a retry
+ *    (MR-2370); a retry that then finds the account gone is a deletion
+ *    (`alreadyDeleted`): signed out, and Login says the account is deleted.
  *
  * Accounts with 2FA (Account API contract 2026-10-01, item 85): the server
  * answers the first attempt `two_factor_required`, and the dialog stays open
@@ -69,11 +72,18 @@ import {
 } from '@/lib/held-deletion';
 import { command } from '@/session/command';
 import { cancelErrorText, cancelHeldDeletion, refreshHeldDeletion } from '@/session/held-deletion';
+import { endDeletedSession } from '@/session/session';
 
 /** Shape returned by the Rust `delete_account` command. */
 export interface DeleteAccountResult {
   /** Store names ("Apple App Store", "Google Play"); empty if none/unknown. */
   storeSubscriptionsStillBilling: string[];
+  /**
+   * MR-2483: this retry found the account already deleted (the last try's 2xx
+   * could not be read, MR-2370). Rust has signed out and cleared everything,
+   * as for a confirmed deletion.
+   */
+  alreadyDeleted?: boolean;
 }
 
 export const STORE_BILLING_WARNING =
@@ -425,6 +435,15 @@ export function DeleteAccountDialog({
       const ns = useAppStore.getState();
       ns.setConnectionState('disconnected');
       ns.setCurrentServer(null);
+      if (result?.alreadyDeleted === true) {
+        // MR-2483: the last try's answer was lost, and this retry met an
+        // account that is gone (the API's own 404, or a session that went
+        // with it; any other 404 comes back as an error to retry). Not
+        // "wrong password", not "sign in again": Rust has signed out and
+        // cleared everything, and Login says the account is deleted.
+        endDeletedSession();
+        return;
+      }
       const billing = result?.storeSubscriptionsStillBilling ?? [];
       if (billing.length > 0) {
         setStillBilling(billing);

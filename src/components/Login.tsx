@@ -9,7 +9,12 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { BirdoButton, BirdoTextField, AppIconMark } from './birdo';
 import { brand, gradient, white, status, hairline, motion as motionTokens } from '@/lib/birdo-theme';
 import { copySensitive } from '@/lib/clipboard';
-import { errorCopy, SESSION_EXPIRED_COPY, type ErrorContext } from '@/lib/errors';
+import {
+  ACCOUNT_ALREADY_DELETED_COPY,
+  errorCopy,
+  SESSION_EXPIRED_COPY,
+  type ErrorContext,
+} from '@/lib/errors';
 import { toIpcError } from '@/lib/ipc';
 import { formatAccountNumber, identityPatch, type AuthStateIdentity } from '@/utils/helpers';
 import {
@@ -401,7 +406,9 @@ export function Login() {
       ? SESSION_EXPIRED_COPY
       : sessionEndedReason === 'revoked'
         ? 'You were signed out because this session was ended. Sign in again.'
-        : null;
+        : sessionEndedReason === 'deleted'
+          ? ACCOUNT_ALREADY_DELETED_COPY
+          : null;
 
   return (
     // Transparent root so the App-level PixelCanvas shows through.

@@ -39,6 +39,7 @@ use super::reconnect_policy::{
     self, Action, Budget, DropCause, HeartbeatVerdict, LinkState, Liveness, LocalLink, Observed,
     OnRelease, QuietRebuilds, ReconnectPolicy, ReleaseLook, Tick,
 };
+use super::relay_retry::{self, SelectionOrigin};
 use super::xray::XrayManager;
 use crate::api::attestation::DesktopAttestation;
 use crate::api::client::{build_connect_request, build_multi_hop_request};
@@ -83,6 +84,10 @@ pub struct ReconnectInfo {
     pub fallback_reason: Option<String>,
     /// The confirmed Multi-Hop route. None means a single-hop session.
     pub multi_hop: Option<MultiHopStatus>,
+    /// MR-2390: who chose `server_id`. It decides how far the session may
+    /// move when that server leaves the pool (`relay_retry::next`). A move
+    /// keeps it.
+    pub origin: SelectionOrigin,
 }
 
 impl ReconnectInfo {
@@ -252,6 +257,12 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 /// refresh can chain three of them.
 const REDIAL_API_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// MR-2390: the cap on the server list a re-dial fetches to move off a
+/// server that left the pool. When it runs out, that attempt fails like a
+/// refused one and the next asks again; the server that left is never
+/// re-dialled meanwhile.
+const SERVER_LIST_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// How many health-check intervals the loop may go without checking in, when
 /// it has not announced a longer step, before the watchdog restarts it.
 const WATCHDOG_TICKS: u32 = 6;
@@ -268,7 +279,8 @@ const WATCHDOG_TICKS: u32 = 6;
 const TEARDOWN_ALLOWANCE: Duration =
     Duration::from_secs(90).saturating_add(crate::vpn::EMERGENCY_TEARDOWN_BOUND);
 
-/// What a re-dial may take after its backoff: the DNS flush (5 s),
+/// What a re-dial may take after its backoff: the server list of a move
+/// ([`SERVER_LIST_TIMEOUT`], MR-2390), the DNS flush (5 s),
 /// [`REDIAL_API_TIMEOUT`], the stealth helper's start, and `connect` (the
 /// operation lock, 30 s, then `CONNECT_TIMEOUT`, 30 s), with room to spare —
 /// plus, when the build failed, the wait for the dropped tunnel's cleanup
@@ -1537,7 +1549,13 @@ impl ReconnectLoop {
         // manager's epoch (end_session cancels before it stops this loop),
         // which unwinds a half-built tunnel properly. Dropping the future
         // would not.
-        match self.redial(vm.current_epoch()).await {
+        let epoch = vm.current_epoch();
+        // MR-2390: the session's server left the pool. Move it off that
+        // server first. The re-dial never goes back to it.
+        if let Some(flow) = self.leave_the_server(attempt, epoch).await {
+            return flow;
+        }
+        match self.redial(epoch).await {
             Ok(()) => {
                 tracing::info!("Auto-reconnect successful on attempt {}", attempt);
                 Flow::Again
@@ -1657,6 +1675,70 @@ impl ReconnectLoop {
         .await
     }
 
+    /// MR-2390: the session's server left the pool (drained or deleted, seen
+    /// at a check-in or in the old key's answer), and the cap allowed the
+    /// episode's one move. Before the re-dial goes out, this fetches the
+    /// server list on connections of its own (like the re-dial) and puts the
+    /// server it chooses on record ([`move_record`]). The re-dial and its
+    /// retries then dial that server, and the session is published on it.
+    ///
+    /// `None`: dial what the record says. `Some`: this attempt ends here.
+    /// When the list does not arrive, the attempt fails like a refused
+    /// re-dial: it is spent and backed off, and the next attempt asks again.
+    /// The server that left is never re-dialled meanwhile. When no server
+    /// qualifies, the session ends at once as unavailable. A location the
+    /// user picked is never moved abroad.
+    async fn leave_the_server(&mut self, attempt: u32, epoch: u64) -> Option<Flow> {
+        let leaving = self
+            .quiet_rebuilds
+            .with(|cap| cap.leaving().map(str::to_string))?;
+        let vm = Arc::clone(&self.vpn_manager);
+        let api = self.api_after_teardown();
+        let listed = match vm
+            .run_cancellable(epoch, timeout(SERVER_LIST_TIMEOUT, api.get_servers()))
+            .await
+        {
+            // A Disconnect or a newer connect: the session is theirs now.
+            Err(_) => return Some(Flow::Continue),
+            Ok(Ok(listed)) => listed.map_err(IpcError::from),
+            Ok(Err(_)) => Err(IpcError::new(
+                IpcErrorCode::ServerUnreachable,
+                "The VPN service did not answer in time.",
+            )),
+        };
+        let servers = match listed {
+            Ok(servers) => servers,
+            Err(error) => {
+                tracing::warn!(
+                    "Auto-reconnect attempt {} failed: no server list to move the session off a \
+                     server that left ({:?})",
+                    attempt,
+                    error.code
+                );
+                self.policy.on_dial_failed(error.clone());
+                vm.set_reconnecting(attempt, Some(error), self.policy.reconnect_max())
+                    .await;
+                return Some(Flow::Again);
+            }
+        };
+        // The move is decided now, whatever it comes to.
+        self.quiet_rebuilds.with(QuietRebuilds::left);
+        // A deleted server is gone from this list: where it was comes from
+        // the lists fetched before it (owner, 2026-11-19).
+        let last_known = relay_retry::known_location(&leaving);
+        relay_retry::remember(&servers);
+        let moved = move_record(
+            &mut *self.last_reconnect_info.write().await,
+            &leaving,
+            &servers,
+            last_known.as_ref(),
+        );
+        match moved {
+            Ok(()) => None,
+            Err(ending) => Some(self.end_by_server(ending).await),
+        }
+    }
+
     async fn heartbeat(&mut self, now: Instant) -> Flow {
         if !heartbeat_due(
             self.session.connected_since,
@@ -1737,10 +1819,10 @@ impl ReconnectLoop {
             HeartbeatVerdict::End(error) => {
                 // The server ended this VPN session: another device took the
                 // slot (`evicted`), it was revoked or is gone with no record
-                // of why (`revoked`; a drained server's key too, MR-2369), or
-                // the Free allowance ran out after its grace window
-                // (`quota_exceeded`, birdo-web #590; the peer is already
-                // gone). A key housekeeping reaped is rebuilt instead (the
+                // of why (`revoked`), or the Free allowance ran out after its
+                // grace window (`quota_exceeded`, birdo-web #590; the peer is
+                // already gone). A key housekeeping reaped, or one that went
+                // with a drained server (MR-2390), is rebuilt instead (the
                 // next arm), until its cap is spent. The AUTH session is
                 // intact, so this is not `session_expired`, and the owner
                 // default (iOS parity, P1-parity-021) is: tear down, release
@@ -1751,18 +1833,22 @@ impl ReconnectLoop {
                 );
                 AfterReply::End(error)
             }
-            HeartbeatVerdict::Rebuild { ending } => match self.on_release().await {
+            HeartbeatVerdict::Rebuild { ending, moves } => match self.on_release(moves).await {
                 // MR-2369: housekeeping reaped the key. The contract allows
                 // one quiet rebuild: after a random wait (so a fleet-wide
                 // reap does not come back as one burst), the next look
                 // declares the tunnel dead, and the policy tears it down
                 // (behind the kill switch's block) and re-dials with a new
                 // key — the path every dead tunnel's re-dial takes.
+                // MR-2390: a drained server's key (`moves`) takes the same
+                // path, and its re-dial moves off that server first
+                // (`leave_the_server`).
                 OnRelease::Rebuild => {
                     let wait = reconnect_policy::release_wait((self.rng)());
                     tracing::warn!(
-                        "Heartbeat: the server released this session's key — rebuilding it \
-                         quietly in {} ms ({} of {} this episode)",
+                        "Heartbeat: the server {} — rebuilding it quietly in {} ms ({} of {} \
+                         this episode)",
+                        release_words(moves),
                         wait.as_millis(),
                         self.quiet_rebuilds.with(|cap| cap.spent()),
                         reconnect_policy::QUIET_REBUILDS_PER_EPISODE
@@ -1778,8 +1864,9 @@ impl ReconnectLoop {
                 // MR-2369, never another re-dial.
                 OnRelease::End => {
                     tracing::warn!(
-                        "Heartbeat: the server released this session's key and no quiet rebuild \
-                         is left — ending the session ({:?})",
+                        "Heartbeat: the server {} and no quiet rebuild is left — ending the \
+                         session ({:?})",
+                        release_words(moves),
                         ending.code
                     );
                     AfterReply::End(ending)
@@ -1853,17 +1940,29 @@ impl ReconnectLoop {
         Flow::Stop
     }
 
-    /// MR-2369: housekeeping released this session's key at a live check-in.
-    /// While this loop is being stopped (Disconnect, sign-out and quit stop
-    /// it before they clear the record) nothing is re-dialled, ended or
-    /// spent. Otherwise what the episode's cap allows
-    /// (`reconnect_policy::QuietRebuilds::on_release`) — an ending, with no
-    /// session on record to re-dial.
-    async fn on_release(&self) -> OnRelease {
+    /// MR-2369: housekeeping released this session's key at a live check-in
+    /// or, MR-2390 (`moves`), its server left the pool, at a check-in or
+    /// in the old key's answer. While this loop is being stopped
+    /// (Disconnect, sign-out and quit stop it before they clear the record)
+    /// nothing is re-dialled, ended or spent. Otherwise the result is what
+    /// the episode's cap allows (`reconnect_policy::QuietRebuilds`). With no
+    /// session on record to re-dial, that is an ending. A rebuild for a
+    /// server that left must move off the server on record.
+    async fn on_release(&self, moves: bool) -> OnRelease {
         let stopping = *self.shutdown.borrow();
-        let on_record = self.last_reconnect_info.read().await.is_some();
-        self.quiet_rebuilds
-            .with(|cap| cap.on_release(stopping, on_record))
+        let on_record = self
+            .last_reconnect_info
+            .read()
+            .await
+            .as_ref()
+            .map(|info| info.server_id.clone());
+        self.quiet_rebuilds.with(|cap| {
+            if moves {
+                cap.on_server_left(stopping, on_record.as_deref())
+            } else {
+                cap.on_release(stopping, on_record.is_some())
+            }
+        })
     }
 
     /// The API on connections of its own (bound to the physical address on
@@ -1907,13 +2006,37 @@ impl ReconnectLoop {
                 .is_some_and(|(_, resumes)| resumes != network_events::resume_count()),
         );
         let (ending, answer) = probe_verdict(&reply, alive);
-        let outcome = if ending.is_some() {
-            "end the session"
-        } else {
-            "re-dial"
+        let (ending, left) = self
+            .unless_the_server_left(ending, reply.as_ref().ok())
+            .await;
+        let outcome = match (&ending, left) {
+            (Some(_), _) => "end the session",
+            (None, true) => "re-dial another server",
+            (None, false) => "re-dial",
         };
         tracing::info!("Old-key probe: {answer} (recently alive: {alive}) -> {outcome}");
         ending
+    }
+
+    /// MR-2390: the old key's verdict (`ending`, from
+    /// `reconnect_policy::after_teardown`), unless its `answer` says the
+    /// server left the pool (`reconnect_policy::server_left`). Such a server
+    /// is never re-dialled. The re-dial moves off it (`leave_the_server`),
+    /// once per episode on the quiet-rebuild cap, and past that the session
+    /// ends as unavailable. The second value says whether the server left.
+    async fn unless_the_server_left(
+        &self,
+        ending: Option<IpcError>,
+        answer: Option<&crate::api::types::HeartbeatResponse>,
+    ) -> (Option<IpcError>, bool) {
+        if ending.is_some() || !reconnect_policy::server_left(answer) {
+            return (ending, false);
+        }
+        let ending = match self.on_release(true).await {
+            OnRelease::End => Some(reconnect_policy::server_left_error()),
+            OnRelease::Rebuild | OnRelease::StandDown => None,
+        };
+        (ending, true)
     }
 
     /// End recovery in `Error`. Always-on keeps the block engaged (the user
@@ -2030,6 +2153,51 @@ fn probe_verdict<'r>(
         Err(why) => why,
     };
     (ending, answer)
+}
+
+/// MR-2390: move the session on `record` off `leaving`, the server that left
+/// the pool, to the server `relay_retry::next` picks from `servers` for the
+/// session's origin. The name moves with the id, so the session is published
+/// on the new server. Kept apart from the loop so a test can drive it.
+///
+/// `Ok`: the record names the new server, or there was nothing to move (no
+/// session on record, or one that is not on that server). `Err`: no server
+/// qualifies, so the session ends with this error. That covers a location
+/// the user picked with nothing else in its country (or, deleted, no country
+/// known), and a Multi-Hop route, which is the user's own pair of locations
+/// and never moves.
+///
+/// `last_known`: where `leaving` was when an earlier list named it
+/// (`relay_retry::known_location`), for a deleted server `servers` no longer
+/// has.
+fn move_record(
+    record: &mut Option<ReconnectInfo>,
+    leaving: &str,
+    servers: &[crate::api::types::VpnServer],
+    last_known: Option<&relay_retry::Location>,
+) -> Result<(), IpcError> {
+    let Some(info) = record.as_mut().filter(|info| info.server_id == leaving) else {
+        return Ok(());
+    };
+    let choice = match info.multi_hop {
+        None => relay_retry::next(leaving, servers, info.origin, last_known),
+        Some(_) => None,
+    };
+    tracing::warn!("{}", relay_retry::log_line(choice.as_ref(), info.origin));
+    let choice = choice.ok_or_else(reconnect_policy::server_left_error)?;
+    info.server_id = choice.server.id;
+    info.server_name = choice.server.name;
+    Ok(())
+}
+
+/// What a quiet rebuild's log line says happened at the check-in: a reap
+/// (MR-2369) or a server that left the pool (MR-2390). No identifiers.
+fn release_words(moves: bool) -> &'static str {
+    if moves {
+        "left the pool with this session's key"
+    } else {
+        "released this session's key"
+    }
 }
 
 /// Ask, and ask once more if the request FAILED, all inside `budget`
@@ -2494,7 +2662,11 @@ mod tests {
         // as long as the bound the manager waits on (65 s on Windows).
         let cleanup = crate::vpn::emergency_teardowns().bound;
         assert_eq!(cleanup, crate::vpn::EMERGENCY_TEARDOWN_BOUND);
-        assert!(REDIAL_API_TIMEOUT + Duration::from_secs(60 + 5) + cleanup < DIAL_ALLOWANCE);
+        // MR-2390: a move's server list goes before all of it.
+        assert!(
+            SERVER_LIST_TIMEOUT + REDIAL_API_TIMEOUT + Duration::from_secs(60 + 5) + cleanup
+                < DIAL_ALLOWANCE
+        );
         assert!(
             Duration::from_secs(30 + 15 + 5) + cleanup + OLD_KEY_PROBE_TIMEOUT < TEARDOWN_ALLOWANCE
         );
@@ -2579,6 +2751,7 @@ mod tests {
                 exit_id: "exit-1".into(),
                 exit_name: "Reykjavik".into(),
             }),
+            origin: SelectionOrigin::User,
         };
         assert_eq!(info.label().server_id, "exit-1");
         let single = ReconnectInfo {
@@ -3138,10 +3311,12 @@ mod tests {
             dns_filtering: false,
             fallback_reason: None,
             multi_hop: None,
+            origin: SelectionOrigin::User,
         }
     }
 
     const REAPED: &str = r#"{"valid":false,"serverOnline":false,"message":"Connection not found. Please reconnect.","reason":"reaped"}"#;
+    const DRAINED: &str = r#"{"valid":false,"serverOnline":false,"message":"Connection not found. Please reconnect.","reason":"server_offline"}"#;
     const HB_NOT_FOUND: &str = "Connection not found. Please reconnect.";
 
     /// A real heartbeat reply, decoded as `BirdoApi::heartbeat` decodes it.
@@ -3243,13 +3418,12 @@ mod tests {
         assert_eq!(cap.with(|cap| cap.spent()), 1);
     }
 
-    /// MR-2369: `revoked`, `evicted`, `quota_exceeded` and a drained
-    /// server's `server_offline` end the session from the reply, as before:
-    /// no rebuild pending, the cap untouched. (A drained server is not
-    /// rebuilt: the re-dial would go to that same server, which refuses it.)
+    /// MR-2369: `revoked`, `evicted` and `quota_exceeded` end the session
+    /// from the reply, as before: no rebuild pending, the cap untouched. (A
+    /// drained server's `server_offline` is rebuilt elsewhere since MR-2390:
+    /// `a_drained_reply_is_rebuilt_once_on_another_server_then_ended`.)
     #[tokio::test]
     async fn every_other_ending_reply_ends_without_touching_the_cap() {
-        let not_found = reconnect_policy::revoked_error(Some(HB_NOT_FOUND));
         for (json, ending) in [
             (
                 r#"{"valid":false,"serverOnline":false,"message":"Connection has been revoked. Please reconnect.","reason":"revoked"}"#,
@@ -3270,8 +3444,8 @@ mod tests {
                 reconnect_policy::quota_exceeded_error(),
             ),
             (
-                r#"{"valid":false,"serverOnline":false,"message":"Connection not found. Please reconnect.","reason":"server_offline"}"#,
-                not_found.clone(),
+                r#"{"valid":false,"serverOnline":false,"quotaExceeded":true,"message":"x","reason":"server_offline"}"#,
+                reconnect_policy::quota_exceeded_error(),
             ),
         ] {
             let (_tx, shutdown) = watch::channel(false);
@@ -3286,6 +3460,357 @@ mod tests {
             assert!(lp.session.release.is_none(), "{json}");
             assert_eq!(cap.with(|cap| cap.spent()), 0, "{json}");
         }
+    }
+
+    /// MR-2390, driven with real replies: a drained server's check-in
+    /// (`server_offline`, `valid:false`) schedules the episode's ONE quiet
+    /// rebuild, like a reap: the same random wait, then a look that declares
+    /// the tunnel dead as `ServerReleased` (no old-key probe). The rebuild
+    /// names the server to move off, so the re-dial does not go back to it.
+    /// It used to end the session as a revocation, and before that it
+    /// re-dialled the same server ten times. Drained again in the same
+    /// episode, or reaped after it, the session ends: as unavailable, and as
+    /// the reap's revocation. Never a loop.
+    #[tokio::test]
+    async fn a_drained_reply_is_rebuilt_once_on_another_server_then_ended() {
+        let (_tx, shutdown) = watch::channel(false);
+        let cap = QuietRebuildCap::default();
+        let mut lp = released_loop(Some(session_on_record()), shutdown, cap.clone(), || 0.5).await;
+        let now = Instant::now();
+        assert_eq!(
+            lp.take_reply(reply(DRAINED), now).await,
+            AfterReply::Continue
+        );
+        let due = lp
+            .session
+            .release
+            .as_ref()
+            .map(|r| r.due)
+            .expect("a quiet rebuild is pending");
+        assert_eq!(due, now + Duration::from_millis(7500));
+        assert_eq!(cap.with(|cap| cap.spent()), 1);
+        assert_eq!(
+            cap.with(|cap| cap.leaving().map(str::to_string)),
+            Some("node-1".to_string()),
+            "the re-dial must move off the server on record"
+        );
+        let liveness = lp.check_liveness(&Wake::Tick, None, due).await;
+        assert_eq!(liveness, Liveness::Dead(DropCause::ServerReleased));
+        let Action::TearDown { cause } = lp.policy.decide(&connected_tick(due, liveness)) else {
+            panic!("expected the teardown");
+        };
+        assert!(!reconnect_policy::asks_the_old_key(cause));
+
+        // The re-dial moved the session (`leave_the_server`, driven in
+        // `the_session_on_record_moves_by_its_origin`). Then the rebuilt
+        // tunnel's server drains too, and it is reaped: the episode's one
+        // rebuild is spent.
+        assert_eq!(
+            move_record(
+                &mut *lp.last_reconnect_info.write().await,
+                "node-1",
+                &drained_fleet(),
+                None
+            ),
+            Ok(())
+        );
+        cap.with(QuietRebuilds::left);
+        lp.session = SessionWatch::default();
+        let at = due + Duration::from_secs(60);
+        assert_eq!(
+            lp.take_reply(reply(DRAINED), at).await,
+            AfterReply::End(reconnect_policy::server_left_error())
+        );
+        assert_eq!(
+            lp.take_reply(reply(REAPED), at).await,
+            AfterReply::End(reconnect_policy::revoked_error(Some(HB_NOT_FOUND)))
+        );
+        assert!(lp.session.release.is_none());
+        assert_eq!(cap.with(|cap| cap.spent()), 1);
+    }
+
+    /// MR-2390: the old key's answer after a teardown. `server_offline` (the
+    /// key removed with a drained server, or still live on a server that is
+    /// not ONLINE) re-dials on ANOTHER server, on the same one-per-episode
+    /// cap. It used to re-dial the same server, which the backend refuses.
+    /// Past the cap it ends as unavailable. Any other answer keeps its
+    /// verdict, and the cap is not touched.
+    #[tokio::test]
+    async fn the_old_keys_drained_answer_moves_the_re_dial_once() {
+        let answer = |json: &str| -> crate::api::types::HeartbeatResponse {
+            serde_json::from_str(json).unwrap()
+        };
+        let (_tx, shutdown) = watch::channel(false);
+        let cap = QuietRebuildCap::default();
+        let lp = released_loop(Some(session_on_record()), shutdown, cap.clone(), || 0.0).await;
+
+        for kept in [
+            r#"{"valid":true,"serverOnline":true,"reason":"ok"}"#,
+            r#"{"valid":false,"serverOnline":false,"reason":"reaped"}"#,
+        ] {
+            assert_eq!(
+                lp.unless_the_server_left(None, Some(&answer(kept))).await,
+                (None, false),
+                "{kept}"
+            );
+        }
+        let evicted = reconnect_policy::evicted_error();
+        assert_eq!(
+            lp.unless_the_server_left(Some(evicted.clone()), Some(&answer(DRAINED)))
+                .await,
+            (Some(evicted), false),
+            "an ending stands"
+        );
+        assert_eq!(lp.unless_the_server_left(None, None).await, (None, false));
+        assert_eq!(cap.with(|cap| cap.spent()), 0);
+
+        assert_eq!(
+            lp.unless_the_server_left(
+                None,
+                Some(&answer(
+                    r#"{"valid":true,"serverOnline":false,"reason":"server_offline"}"#
+                ))
+            )
+            .await,
+            (None, true),
+            "re-dial, elsewhere"
+        );
+        assert_eq!(
+            cap.with(|cap| cap.leaving().map(str::to_string)),
+            Some("node-1".to_string())
+        );
+        // A check-in had already reported the drain: still that one move.
+        assert_eq!(
+            lp.unless_the_server_left(None, Some(&answer(DRAINED)))
+                .await,
+            (None, true),
+            "the same drain, before its move"
+        );
+        assert_eq!(cap.with(|cap| cap.spent()), 1);
+        // Once moved, the next drain finds the episode's move spent.
+        cap.with(QuietRebuilds::left);
+        assert_eq!(
+            lp.unless_the_server_left(None, Some(&answer(DRAINED)))
+                .await,
+            (Some(reconnect_policy::server_left_error()), true),
+            "the episode's move is spent"
+        );
+        assert_eq!(cap.with(|cap| cap.spent()), 1);
+    }
+
+    /// A list of servers in the `/vpn/servers` wire shape, and a session on
+    /// `node-1` (DE, Frankfurt) chosen by `origin`.
+    fn drained_fleet() -> Vec<crate::api::types::VpnServer> {
+        [
+            ("node-1", "DE", "Frankfurt", 0, false),
+            ("de-ber", "DE", "Berlin", 60, true),
+            ("nl-ams", "NL", "Amsterdam", 5, true),
+        ]
+        .into_iter()
+        .map(|(id, cc, city, load, online)| {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "name": format!("Name {id}"), "country": cc, "countryCode": cc,
+                "city": city, "load": load, "isOnline": online, "accessible": true,
+            }))
+            .unwrap()
+        })
+        .collect()
+    }
+
+    fn on_record(origin: SelectionOrigin) -> Option<ReconnectInfo> {
+        Some(ReconnectInfo {
+            origin,
+            ..session_on_record()
+        })
+    }
+
+    /// MR-2390, the move itself: a server the client chose moves to the best
+    /// server anywhere; one the user picked stays in its country. The name
+    /// moves with the id, so the session is published on the new server,
+    /// and the origin stays. With nothing left in the user's country, or on a
+    /// Multi-Hop route, nothing moves and the session ends as unavailable.
+    /// It is never moved abroad.
+    #[test]
+    fn the_session_on_record_moves_by_its_origin() {
+        let fleet = drained_fleet();
+        let mut record = on_record(SelectionOrigin::Automatic);
+        assert_eq!(move_record(&mut record, "node-1", &fleet, None), Ok(()));
+        let moved = record.unwrap();
+        assert_eq!(
+            (moved.server_id.as_str(), moved.server_name.as_str()),
+            ("nl-ams", "Name nl-ams")
+        );
+        assert_eq!(moved.origin, SelectionOrigin::Automatic);
+
+        let mut record = on_record(SelectionOrigin::User);
+        assert_eq!(move_record(&mut record, "node-1", &fleet, None), Ok(()));
+        assert_eq!(record.unwrap().server_id, "de-ber", "never abroad");
+
+        let abroad_only: Vec<_> = fleet.iter().filter(|s| s.id != "de-ber").cloned().collect();
+        let mut record = on_record(SelectionOrigin::User);
+        assert_eq!(
+            move_record(&mut record, "node-1", &abroad_only, None),
+            Err(reconnect_policy::server_left_error())
+        );
+        assert_eq!(record.unwrap().server_id, "node-1", "not moved");
+
+        let mut record = on_record(SelectionOrigin::Automatic);
+        if let Some(info) = record.as_mut() {
+            info.multi_hop = Some(MultiHopStatus {
+                entry_id: "node-1".into(),
+                entry_name: "Frankfurt".into(),
+                exit_id: "nl-ams".into(),
+                exit_name: "Amsterdam".into(),
+            });
+        }
+        assert_eq!(
+            move_record(&mut record, "node-1", &fleet, None),
+            Err(reconnect_policy::server_left_error()),
+            "a Multi-Hop route is never moved"
+        );
+
+        // Nothing on record, or a session that is not on that server:
+        // nothing to move.
+        let mut none = None;
+        assert_eq!(move_record(&mut none, "node-1", &fleet, None), Ok(()));
+        let mut elsewhere = on_record(SelectionOrigin::Automatic);
+        assert_eq!(move_record(&mut elsewhere, "other", &fleet, None), Ok(()));
+        assert_eq!(elsewhere.unwrap().server_id, "node-1");
+    }
+
+    /// MR-2390, a DELETED server (owner, 2026-11-19, every client): gone from
+    /// the list the move fetches, so where it was comes from the lists
+    /// fetched before (`relay_retry::known_location`). A server the client
+    /// chose moves to the best server anywhere, another country when its own
+    /// has none. One the user picked moves only within its country. With
+    /// nothing there, or its country unknown, it does not move: the session
+    /// ends as unavailable, and the always-on kill switch keeps its block
+    /// (the UI then says the block is on purpose, `vpnErrorCopy`). The
+    /// deleted server is never picked, and the episode has one move.
+    #[test]
+    fn a_deleted_server_moves_by_its_origin_from_where_it_was() {
+        let frankfurt = relay_retry::Location {
+            country_code: "DE".into(),
+            city: "Frankfurt".into(),
+        };
+        // node-1 (DE, Frankfurt) is deleted: the list no longer has it.
+        let listed: Vec<_> = drained_fleet()
+            .into_iter()
+            .filter(|s| s.id != "node-1")
+            .collect();
+        let abroad_only: Vec<_> = listed
+            .iter()
+            .filter(|s| s.id != "de-ber")
+            .cloned()
+            .collect();
+
+        // The client's pick: another country when its own has none, and
+        // anywhere when where it was is not known.
+        for last_known in [Some(&frankfurt), None] {
+            let mut record = on_record(SelectionOrigin::Automatic);
+            assert_eq!(
+                move_record(&mut record, "node-1", &abroad_only, last_known),
+                Ok(())
+            );
+            let moved = record.unwrap();
+            assert_eq!(
+                (moved.server_id.as_str(), moved.origin),
+                ("nl-ams", SelectionOrigin::Automatic),
+                "{last_known:?}"
+            );
+        }
+
+        // The user's pick: within its country when a server is there.
+        let mut record = on_record(SelectionOrigin::User);
+        assert_eq!(
+            move_record(&mut record, "node-1", &listed, Some(&frankfurt)),
+            Ok(())
+        );
+        let moved = record.unwrap();
+        assert_eq!(
+            (moved.server_id.as_str(), moved.server_name.as_str()),
+            ("de-ber", "Name de-ber")
+        );
+        assert_eq!(moved.origin, SelectionOrigin::User);
+
+        // Nothing in its country, or its country unknown: no move, and the
+        // session ends as unavailable, the block held under always-on only.
+        for last_known in [Some(&frankfurt), None] {
+            let mut record = on_record(SelectionOrigin::User);
+            let ending = move_record(&mut record, "node-1", &abroad_only, last_known).unwrap_err();
+            assert_eq!(ending, reconnect_policy::server_left_error());
+            assert_eq!(ending.code, IpcErrorCode::ServerUnavailable);
+            assert!(reconnect_policy::give_up_keeps_block(ending.code, true));
+            assert!(!reconnect_policy::give_up_keeps_block(ending.code, false));
+            assert_eq!(record.unwrap().server_id, "node-1", "not moved");
+        }
+
+        // The deleted server is never picked, whatever an earlier list said
+        // of it.
+        for origin in [SelectionOrigin::Automatic, SelectionOrigin::User] {
+            let mut record = on_record(origin);
+            let _ = move_record(&mut record, "node-1", &listed, Some(&frankfurt));
+            assert_ne!(record.unwrap().server_id, "node-1", "{origin:?}");
+        }
+
+        // One move per episode: the server it moved to is deleted too, and
+        // the cap ends the session instead of moving it again.
+        let mut cap = QuietRebuilds::default();
+        assert_eq!(
+            cap.on_server_left(false, Some("node-1")),
+            OnRelease::Rebuild
+        );
+        cap.left();
+        assert_eq!(cap.on_server_left(false, Some("de-ber")), OnRelease::End);
+        assert_eq!(cap.spent(), 1);
+    }
+
+    /// MR-2390, the wiring of the move (the choice and the record are driven
+    /// above): a dial moves the session off a server that left BEFORE it
+    /// re-dials, under the same epoch. The server list comes on connections
+    /// of its own (like the re-dial), capped and cancellable. The cap's mark
+    /// is cleared only once the list is in hand, and a move that finds
+    /// nowhere to go ends the session.
+    #[test]
+    fn a_dial_moves_off_a_server_that_left_before_it_re_dials() {
+        fn in_order(haystack: &str, needles: &[&str]) {
+            let mut last = 0;
+            for needle in needles {
+                let at = haystack[last..]
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+                last += at + needle.len();
+            }
+        }
+        let source = include_str!("auto_reconnect.rs").replace('\r', "");
+        let code = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        let dial = &code[code.find("async fn dial(").unwrap()..];
+        let dial = &dial[..dial.find("\n    }\n").unwrap()];
+        in_order(
+            dial,
+            &[
+                "let epoch = vm.current_epoch();",
+                "self.leave_the_server(attempt, epoch).await",
+                "return flow;",
+                "self.redial(epoch).await",
+            ],
+        );
+        let leave = &code[code.find("async fn leave_the_server(").unwrap()..];
+        let leave = &leave[..leave.find("\n    }\n").unwrap()];
+        in_order(
+            leave,
+            &[
+                "cap.leaving()",
+                "let api = self.api_after_teardown();",
+                ".run_cancellable(epoch, timeout(SERVER_LIST_TIMEOUT, api.get_servers()))",
+                "self.policy.on_dial_failed(error.clone());",
+                "self.quiet_rebuilds.with(QuietRebuilds::left);",
+                "relay_retry::known_location(&leaving)",
+                "relay_retry::remember(&servers);",
+                "move_record(",
+                "self.end_by_server(ending).await",
+            ],
+        );
     }
 
     /// MR-2369: a reap that arrives while the user ends the session (the
@@ -3484,7 +4009,7 @@ mod tests {
         let source = include_str!("auto_reconnect.rs").replace('\r', "");
         let code = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
         let arm = &code[code
-            .find("HeartbeatVerdict::Rebuild { ending } =>")
+            .find("HeartbeatVerdict::Rebuild { ending, moves } =>")
             .unwrap()..];
         let arm = &arm[..arm.find("HeartbeatVerdict::QuotaGrace").unwrap()];
         assert!(arm.contains("self.session.release = Some(PendingRelease {"));

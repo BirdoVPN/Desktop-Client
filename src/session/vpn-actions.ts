@@ -79,10 +79,27 @@ export function findLiveServer(
   return null;
 }
 
-/** `origin`: who chose `server` (MR-2492), recorded with it once connected. */
+/**
+ * `connect_vpn`'s arguments: the server, and who chose it, on EVERY connect
+ * (MR-2390). Rust keeps the origin with the session (`ReconnectInfo.origin`):
+ * if the server later leaves the pool (a drain), Rust moves an `automatic`
+ * pick to the best server anywhere and a `user` pick only within its country,
+ * else it says the location is unavailable. It is the origin this store
+ * records with the server (`lastServerOrigin`, MR-2492), so both sides read
+ * the session the same way. Rust maps exactly `'automatic'` to the client's
+ * pick and anything else to the user's (`SelectionOrigin::from_ipc`).
+ */
+function connectArgs(serverId: string, origin: SelectionOrigin): { serverId: string; origin: SelectionOrigin } {
+  return { serverId, origin };
+}
+
+/**
+ * `origin`: who chose `server` (MR-2492), sent to Rust with the connect
+ * (MR-2390) and recorded with the server once connected.
+ */
 export async function connectToServer(server: Server, origin: SelectionOrigin = 'user'): Promise<boolean> {
   useAppStore.getState().setCurrentServer(server);
-  const ok = await run('connecting', 'connect_vpn', { serverId: server.id });
+  const ok = await run('connecting', 'connect_vpn', connectArgs(server.id, origin));
   if (ok) useAppStore.getState().setLastServerId(server.id, origin);
   return ok;
 }
@@ -96,7 +113,8 @@ export async function connectToServer(server: Server, origin: SelectionOrigin = 
 export async function switchToServer(server: Server): Promise<boolean> {
   const before = useAppStore.getState().currentServer;
   useAppStore.getState().setCurrentServer(server);
-  const ok = await run('switching', 'connect_vpn', { serverId: server.id });
+  // A server picked on a live session is the user's.
+  const ok = await run('switching', 'connect_vpn', connectArgs(server.id, 'user'));
   const s = useAppStore.getState();
   if (ok) {
     s.setLastServerId(server.id, 'user');
@@ -249,7 +267,8 @@ async function connectUnattended(): Promise<boolean> {
     case 'dial':
       return connectToServer(plan.server, plan.origin);
     case 'dialRecorded': {
-      const ok = await run('connecting', 'connect_vpn', { serverId: plan.serverId });
+      // Only ever the user's server (`planUnattendedConnect`).
+      const ok = await run('connecting', 'connect_vpn', connectArgs(plan.serverId, 'user'));
       if (ok) useAppStore.getState().setLastServerId(plan.serverId, 'user');
       return ok;
     }
@@ -325,7 +344,7 @@ export async function resumeAfterUpdate(target: ResumeTarget): Promise<boolean> 
   // The same server, so whoever chose it still has (MR-2492).
   const origin: SelectionOrigin = s.lastServerId === target.serverId ? s.lastServerOrigin : 'user';
   if (usable(server)) return connectToServer(server, origin);
-  const ok = await run('connecting', 'connect_vpn', { serverId: target.serverId });
+  const ok = await run('connecting', 'connect_vpn', connectArgs(target.serverId, origin));
   if (ok) useAppStore.getState().setLastServerId(target.serverId, origin);
   return ok;
 }
