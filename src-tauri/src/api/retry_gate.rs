@@ -45,6 +45,7 @@
 //! for whoever signs in next from here.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -87,9 +88,11 @@ fn is_credential_route(path: &str) -> bool {
 /// is a burst of refreshes into the same limit, each refused, and the limit
 /// never rests. birdo-web's own refresh limiters always name their wait
 /// (contract README "Token refresh"), so this covers a 429 from in front of
-/// them. Android holds the same 30 s (Mobile-Client #511); within
-/// `RETRY_AFTER_MAX_SECS` like every hold.
-pub(crate) const REFRESH_DEFAULT_HOLD_SECS: u64 = 30;
+/// them. MR-2500 / MR-1771 (the one refresh rule, 2026-11-19): 60 s, the
+/// controller's own wait, when neither `Retry-After` nor the body's
+/// `details.retryAfter` names one; within `RETRY_AFTER_MAX_SECS` like every
+/// hold. The refresh flight waits the same (`refresh_policy`).
+pub(crate) const REFRESH_DEFAULT_HOLD_SECS: u64 = 60;
 
 /// The token refresh's hold key: method and path, like every route outside
 /// the credential bucket.
@@ -107,6 +110,10 @@ const MAX_HELD: usize = 32;
 #[derive(Default)]
 pub(crate) struct RetryGate {
     held: Mutex<HashMap<String, (u16, Instant)>>,
+    /// MR-2500: refresh flights in a row that ended with neither new tokens
+    /// nor a 401: the step of the backoff the next failed one holds for
+    /// ([`Self::refresh_failed`]).
+    refresh_failures: AtomicU32,
 }
 
 impl RetryGate {
@@ -144,7 +151,11 @@ impl RetryGate {
             } => (*status, *retry_after_secs),
             _ => return,
         };
-        let until = now + Duration::from_secs(secs);
+        self.hold(key, status, now + Duration::from_secs(secs), now);
+    }
+
+    /// Hold `key` until `until`, answering `status`; bounded by [`MAX_HELD`].
+    fn hold(&self, key: &str, status: u16, until: Instant, now: Instant) {
         let mut held = self.held.lock();
         held.retain(|_, (_, t)| *t > now);
         if held.len() >= MAX_HELD && !held.contains_key(key) {
@@ -159,6 +170,48 @@ impl RetryGate {
         held.insert(key.to_owned(), (status, until));
     }
 
+    /// MR-2500 / MR-1771: a refresh flight (`refresh_policy::fly`) ended with
+    /// neither new tokens nor a 401. The refresh `key` is held for the next
+    /// step of a capped exponential backoff with jitter, counted across
+    /// flights. The callers that waited on the refresh lock for this flight
+    /// are then answered at once (`Held`) instead of each sending the same
+    /// token again (single flight), and a long outage is asked less and less
+    /// often. Never shorter than a hold the server's own answer left
+    /// ([`Self::note`]). Nothing when the answer is no reason to wait
+    /// (`refresh_policy::holds_after`: a refresh already held sent nothing, a
+    /// flight whose session ended has nobody to hold for).
+    pub(crate) fn refresh_failed(&self, key: &str, error: &ApiError, now: Instant, unit: f64) {
+        if !super::refresh_policy::holds_after(error) {
+            return;
+        }
+        let failures = self
+            .refresh_failures
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        let pause = super::refresh_policy::backoff(failures, unit);
+        // The status the callers it holds are told, as for any hold: a 429
+        // reads as the rate limit, anything else as a busy server.
+        let status = match error {
+            ApiError::RateLimited { .. } => 429,
+            ApiError::ServerError(status)
+            | ApiError::ServerBusy { status, .. }
+            | ApiError::Rejected { status, .. } => *status,
+            ApiError::Forbidden => 403,
+            _ => 503,
+        };
+        let until = now + pause;
+        if matches!(self.held.lock().get(key), Some(&(_, longer)) if longer >= until) {
+            return;
+        }
+        self.hold(key, status, until, now);
+    }
+
+    /// MR-2500: a refresh flight renewed the session, or the server ended it
+    /// (401): the refresh backoff starts over.
+    pub(crate) fn refresh_settled(&self) {
+        self.refresh_failures.store(0, Ordering::SeqCst);
+    }
+
     /// The session ended (sign-out, an expired or deleted account): forget
     /// every hold but the credential routes' (MR-2012). The others were the
     /// signed-out account's: the server keys them on the account (or, for
@@ -166,6 +219,7 @@ impl RetryGate {
     /// them nothing. The credential bucket is the network's.
     pub(crate) fn forget_session(&self) {
         self.held.lock().retain(|key, _| key == CREDENTIAL_BUCKET);
+        self.refresh_settled();
     }
 
     #[cfg(test)]
@@ -298,13 +352,15 @@ mod tests {
             gate.check(&refresh, t0 + s(1)),
             Err(ApiError::Held {
                 status: 429,
-                retry_after_secs: 29
+                retry_after_secs: 59
             })
         ));
         assert!(gate
             .check(&refresh, t0 + s(REFRESH_DEFAULT_HOLD_SECS))
             .is_ok());
-        assert_eq!(REFRESH_DEFAULT_HOLD_SECS, 30);
+        // MR-2500 / MR-1771: 60 s when neither the header nor the body names
+        // a wait (it was 30).
+        assert_eq!(REFRESH_DEFAULT_HOLD_SECS, 60);
         const _: () =
             assert!(REFRESH_DEFAULT_HOLD_SECS <= super::super::error::RETRY_AFTER_MAX_SECS);
 
@@ -312,7 +368,7 @@ mod tests {
         gate.note(
             &refresh,
             &ApiError::RateLimited {
-                retry_after_secs: Some(60),
+                retry_after_secs: Some(45),
             },
             t0,
         );
@@ -320,7 +376,7 @@ mod tests {
             gate.check(&refresh, t0 + s(31)),
             Err(ApiError::Held {
                 status: 429,
-                retry_after_secs: 29
+                retry_after_secs: 14
             })
         ));
 
@@ -426,6 +482,127 @@ mod tests {
         );
         for key in &keys[1..] {
             assert!(gate.check(key, t0).is_ok(), "{key}");
+        }
+    }
+
+    /// The refresh's hold, as `Held`'s wait in whole seconds at `at`.
+    fn held_for(gate: &RetryGate, key: &str, at: Instant) -> Option<(u16, u64)> {
+        match gate.check(key, at) {
+            Err(ApiError::Held {
+                status,
+                retry_after_secs,
+            }) => Some((status, retry_after_secs)),
+            _ => None,
+        }
+    }
+
+    /// MR-2500 / MR-1771: a refresh flight that ended with neither new tokens
+    /// nor a 401 holds the refresh for the next backoff step, growing flight
+    /// after flight up to the cap, so the callers that waited for it are
+    /// answered at once instead of sending the same token again. A flight
+    /// that renewed (or ended) the session starts the backoff over; so does
+    /// a sign-out. On main a 5xx or a network failure held nothing: every
+    /// caller waiting on the refresh lock sent the token again.
+    #[test]
+    fn a_failed_refresh_flight_holds_the_refresh_for_a_growing_backoff() {
+        use super::super::refresh_policy::{backoff, BACKOFF_CAP};
+        let gate = RetryGate::default();
+        let refresh = hold_key(
+            &reqwest::Method::POST,
+            super::super::endpoints::auth::REFRESH,
+        );
+        let t0 = Instant::now();
+        let mut last = 0;
+        for (flight, (error, status)) in [
+            (ApiError::ServerError(503), 503),
+            (ApiError::Network("timed out".into()), 503),
+            (
+                ApiError::Rejected {
+                    status: 502,
+                    message: "Bad gateway".into(),
+                },
+                502,
+            ),
+            (ApiError::Unknown("HTTP 504".into()), 503),
+            (ApiError::ServerError(500), 500),
+            (ApiError::ServerError(503), 503),
+            (ApiError::ServerError(503), 503),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let now = t0 + s(1000 * flight as u64);
+            gate.refresh_failed(&refresh, &error, now, 0.5);
+            let step = backoff(flight as u32 + 1, 0.5);
+            let secs = whole_secs_left(step);
+            assert_eq!(
+                held_for(&gate, &refresh, now),
+                Some((status, secs)),
+                "{error:?}"
+            );
+            assert!(secs >= last, "the backoff shrank at flight {flight}");
+            assert!(secs <= BACKOFF_CAP.as_secs(), "past the cap");
+            last = secs;
+        }
+        assert_eq!(backoff(7, 0.5), backoff(30, 0.5), "capped");
+        assert_eq!(last, whole_secs_left(backoff(30, 0.5)));
+
+        // Renewed: the next failure is the first step again.
+        gate.refresh_settled();
+        let now = t0 + s(100_000);
+        gate.refresh_failed(&refresh, &ApiError::ServerError(503), now, 0.0);
+        assert_eq!(held_for(&gate, &refresh, now), Some((503, 1)));
+
+        // A sign-out forgets the backoff with the hold.
+        gate.refresh_failed(&refresh, &ApiError::ServerError(503), now, 0.0);
+        gate.forget_session();
+        assert_eq!(held_for(&gate, &refresh, now), None);
+        gate.refresh_failed(&refresh, &ApiError::ServerError(503), now, 0.0);
+        assert_eq!(held_for(&gate, &refresh, now), Some((503, 1)));
+    }
+
+    /// MR-2500 / MR-1771: the hold after a failed flight never cuts short
+    /// the server's own wait (a 429's 60 s), says what was answered (a 429
+    /// stays a rate limit, a 403 is held as itself), and nothing is held
+    /// for a 401 (the session is over), a flight that sent nothing (already
+    /// held), a session that ended mid-flight, or an unreadable 2xx.
+    #[test]
+    fn the_hold_after_a_failed_flight_keeps_the_servers_wait() {
+        let refresh = hold_key(
+            &reqwest::Method::POST,
+            super::super::endpoints::auth::REFRESH,
+        );
+        let t0 = Instant::now();
+
+        let gate = RetryGate::default();
+        let limited = ApiError::RateLimited {
+            retry_after_secs: Some(60),
+        };
+        gate.note(&refresh, &limited, t0);
+        gate.refresh_failed(&refresh, &limited, t0, 0.0);
+        assert_eq!(held_for(&gate, &refresh, t0), Some((429, 60)));
+
+        let gate = RetryGate::default();
+        gate.refresh_failed(&refresh, &ApiError::Forbidden, t0, 0.0);
+        assert_eq!(held_for(&gate, &refresh, t0), Some((403, 1)));
+
+        for nothing in [
+            ApiError::Unauthorized,
+            ApiError::Rejected {
+                status: 401,
+                message: "Invalid refresh token".into(),
+            },
+            ApiError::Held {
+                status: 429,
+                retry_after_secs: 30,
+            },
+            ApiError::NotAuthenticated,
+            ApiError::Parse("eof".into()),
+            ApiError::CertificatePinningFailed("x".into()),
+        ] {
+            let gate = RetryGate::default();
+            gate.refresh_failed(&refresh, &nothing, t0, 0.5);
+            assert_eq!(held_for(&gate, &refresh, t0), None, "{nothing:?}");
         }
     }
 

@@ -174,7 +174,21 @@ pub const RETRY_AFTER_MAX_SECS: u64 = 60;
 /// non-negative number: the refusal stays retryable, just without a wait.
 /// A 0 reads as 1 so a retry can never spin.
 pub fn retry_after_secs(details: Option<&serde_json::Value>) -> Option<u64> {
-    let value = details?.get("retryAfterSeconds")?;
+    details_wait(details, "retryAfterSeconds")
+}
+
+/// MR-1771: `details.retryAfter` of a 429, in whole seconds, clamped exactly
+/// like [`retry_after_secs`]. birdo-web's `refusal()` names the wait so
+/// (`{"code": "rate_limited", "retryAfter": N}`, on every refresh 429 since
+/// birdo-web #912); the connect refusals call it `retryAfterSeconds`. Read
+/// only when the response carried no readable `Retry-After`: the header wins.
+pub fn retry_after_detail(details: Option<&serde_json::Value>) -> Option<u64> {
+    details_wait(details, "retryAfter")
+}
+
+/// The wait `details.<field>` names: see [`retry_after_secs`].
+fn details_wait(details: Option<&serde_json::Value>, field: &str) -> Option<u64> {
+    let value = details?.get(field)?;
     let secs = match value.as_u64() {
         Some(secs) => secs,
         // The contract says integer; a `30.0` is read, rounded up.

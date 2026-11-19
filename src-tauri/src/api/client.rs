@@ -601,12 +601,10 @@ impl BirdoApi {
             .clone()
             .ok_or(ApiError::NotAuthenticated)?;
 
-        let payload = RefreshRequest {
-            refresh_token: (*refresh).clone(),
-        };
-
+        // MR-2500 / MR-1771: one flight under the policy (a 429 or a 5xx keeps
+        // the token and sends it again), and only a 401 ends the session.
         let response: RefreshResponse = self
-            .post(endpoints::auth::REFRESH, &payload, false)
+            .refresh_flight(refresh.as_str())
             .await
             .inspect_err(super::session_gate::report_refresh_failure)?;
 
@@ -1797,20 +1795,12 @@ impl BirdoApi {
             .clone()
             .ok_or(ApiError::NotAuthenticated)?;
 
-        let payload = RefreshRequest {
-            refresh_token: (*refresh).clone(),
-        };
-
-        // Use do_request directly to avoid infinite retry loop. A 401 here is
-        // the server rejecting the refresh token: contract §3.3 ends the
-        // session everywhere (see `session_gate`).
+        // MR-2500 / MR-1771: one flight under the policy (a 429 or a 5xx keeps
+        // the token and sends the same one again; `refresh_policy`). Only a
+        // 401 is the server rejecting the refresh token: contract §3.3 ends
+        // the session everywhere (see `session_gate`).
         let response: RefreshResponse = self
-            .do_request(
-                &reqwest::Method::POST,
-                endpoints::auth::REFRESH,
-                Some(&payload),
-                false,
-            )
+            .refresh_flight(refresh.as_str())
             .await
             .inspect_err(super::session_gate::report_refresh_failure)?;
 
@@ -1862,6 +1852,79 @@ impl BirdoApi {
             return Err(ApiError::NotAuthenticated);
         }
         Ok(())
+    }
+
+    /// MR-2500 / MR-1771: one refresh flight presenting `presented`, run by
+    /// a caller that holds the refresh lock (so it is the only one in flight).
+    /// Each send goes through `do_request`, so the retry gate holds and
+    /// learns as for any request; see `refresh_policy` for the rule.
+    async fn refresh_flight(&self, presented: &str) -> Result<RefreshResponse, ApiError> {
+        let payload = RefreshRequest {
+            refresh_token: presented.to_owned(),
+        };
+        let post = reqwest::Method::POST;
+        self.fly_refresh(presented, || {
+            self.do_request::<RefreshResponse>(
+                &post,
+                endpoints::auth::REFRESH,
+                Some(&payload),
+                false,
+            )
+        })
+        .await
+    }
+
+    /// [`Self::refresh_flight`] with its send given, so a test can script the
+    /// server's answers. The gate learns how the flight ended: a renewal or a
+    /// 401 starts the backoff over; any other end holds the refresh for the
+    /// next backoff step (`RetryGate::refresh_failed`), so the callers that
+    /// waited on the refresh lock for this flight share its answer instead
+    /// of each sending the same token again.
+    async fn fly_refresh<S, SF>(
+        &self,
+        presented: &str,
+        send: S,
+    ) -> Result<RefreshResponse, ApiError>
+    where
+        S: FnMut() -> SF,
+        SF: std::future::Future<Output = Result<RefreshResponse, ApiError>>,
+    {
+        use super::refresh_policy;
+        let key = super::retry_gate::hold_key(&reqwest::Method::POST, endpoints::auth::REFRESH);
+        let result = refresh_policy::fly(
+            send,
+            |pause| self.wait_to_refresh_again(pause, presented, &key),
+            refresh_policy::unit_random,
+        )
+        .await;
+        match &result {
+            Err(error) if !super::session_gate::refresh_rejected(error) => {
+                self.retry_gate.refresh_failed(
+                    &key,
+                    error,
+                    std::time::Instant::now(),
+                    refresh_policy::unit_random(),
+                )
+            }
+            _ => self.retry_gate.refresh_settled(),
+        }
+        result
+    }
+
+    /// The wait between two sends of one refresh flight. It never sends
+    /// early: a hold the server's own answer left on the refresh
+    /// (`Retry-After`, MR-1808) is waited out as well. `false` once the
+    /// session no longer presents `presented` (signed out, or another account
+    /// signed in): the flight then ends, and the old token is not sent again.
+    async fn wait_to_refresh_again(&self, pause: Duration, presented: &str, key: &str) -> bool {
+        tokio::time::sleep(pause).await;
+        if let Err(ApiError::Held {
+            retry_after_secs, ..
+        }) = self.retry_gate.check(key, std::time::Instant::now())
+        {
+            tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
+        }
+        self.refresh_token.read().await.as_ref().map(|t| t.as_str()) == Some(presented)
     }
 
     /// Store a refresh's result only if the refresh token it presented is
@@ -2124,8 +2187,13 @@ impl BirdoApi {
             };
         }
         if status == StatusCode::TOO_MANY_REQUESTS {
+            // MR-1771: the header's wait, else the body's `details.retryAfter`
+            // (birdo-web #912 puts `{code: "rate_limited", retryAfter}` on
+            // every refresh 429; a plain-text 429 from in front has neither).
             return ApiError::RateLimited {
-                retry_after_secs: retry_after,
+                retry_after_secs: retry_after.or_else(|| {
+                    super::error::retry_after_detail(body.as_ref().and_then(|b| b.details.as_ref()))
+                }),
             };
         }
         if let (true, Some(secs)) = (status.is_server_error(), retry_after) {
@@ -2796,8 +2864,8 @@ mod retry_after_tests {
     /// `refresh_rejected` accepts, and the rotated pair is adopted only on
     /// `Ok`). It is never `session_expired`, the caller is told
     /// `rate_limited`, and the next refresh is not sent until the wait is
-    /// over: the server's `Retry-After`, or 30 s when it named none (on main
-    /// that one went straight out again). Then it goes out.
+    /// over: the server's `Retry-After`, or 60 s when it named none
+    /// (MR-2500 / MR-1771; it was 30). Then it goes out.
     #[tokio::test]
     async fn a_refresh_429_keeps_the_session_and_holds_the_next_refresh() {
         use super::super::retry_gate::{hold_key, REFRESH_DEFAULT_HOLD_SECS};
@@ -2854,6 +2922,155 @@ mod retry_after_tests {
         }
     }
 
+    /// MR-1771: birdo-web #912's refresh 429 names its wait in the body too
+    /// (`details: {code: "rate_limited", retryAfter}`). The header wins; the
+    /// body's wait is read when there is no header; with neither, 60 s.
+    #[tokio::test]
+    async fn a_refresh_429_names_its_wait_in_the_header_or_the_body() {
+        let limited = |header: Option<&str>| {
+            let mut response = tauri::http::Response::builder().status(429);
+            if let Some(value) = header {
+                response = response.header("Retry-After", value);
+            }
+            reqwest::Response::from(
+                response
+                    .body(
+                        r#"{"statusCode":429,"message":"Too many token refresh attempts","error":"TOO_MANY_REQUESTS","details":{"code":"rate_limited","retryAfter":17}}"#
+                            .to_string(),
+                    )
+                    .unwrap(),
+            )
+        };
+        for (header, wait) in [(Some("42"), Some(42)), (None, Some(17))] {
+            let error = BirdoApi::new()
+                .handle_response::<RefreshResponse>(limited(header))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ApiError::RateLimited { retry_after_secs } if retry_after_secs == wait),
+                "{header:?}: {error:?}"
+            );
+        }
+    }
+
+    /// One send of the refresh as `do_request` makes it, against a scripted
+    /// server answering `status`: the gate is asked first (a held refresh is
+    /// answered there, and nothing is sent), and told the answer.
+    async fn scripted_send(
+        api: &BirdoApi,
+        key: &str,
+        sent: &std::sync::atomic::AtomicU32,
+        status: u16,
+    ) -> Result<RefreshResponse, ApiError> {
+        api.retry_gate.check(key, std::time::Instant::now())?;
+        sent.fetch_add(1, Ordering::SeqCst);
+        if status == 200 {
+            return Ok(
+                serde_json::from_str(r#"{"access_token":"a2","refresh_token":"r2"}"#).unwrap(),
+            );
+        }
+        let error = BirdoApi::classify_error_response(StatusCode::from_u16(status).unwrap(), "");
+        api.retry_gate.note(key, &error, std::time::Instant::now());
+        Err(error)
+    }
+
+    /// MR-2500 / MR-1771, single flight. A caller whose request met a 401
+    /// while a refresh flight was out waits for it on the refresh lock, and
+    /// sends nothing meanwhile. After a flight that failed (a 503 three
+    /// times, backing off between), it shares that answer: the refresh is
+    /// held, so its own refresh is answered at once and the token is not sent
+    /// again. The tokens are untouched throughout (no token lost), and once
+    /// the hold is over the SAME token renews the session. On main a 503 held
+    /// nothing, and every waiting caller sent the same token again in turn.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_refreshes_share_one_flight() {
+        use std::sync::atomic::AtomicU32;
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let key =
+            super::super::retry_gate::hold_key(&reqwest::Method::POST, endpoints::auth::REFRESH);
+        let sent = Arc::new(AtomicU32::new(0));
+        // Well into an outage already (four failed flights, their holds
+        // over): this flight's hold is seconds long, so the waiter meets it
+        // however slowly this machine runs. (The gate keeps real time; the
+        // flight's own waits run on this test's paused clock.)
+        for _ in 0..4 {
+            api.retry_gate.refresh_failed(
+                &key,
+                &ApiError::ServerError(503),
+                std::time::Instant::now(),
+                0.0,
+            );
+        }
+        assert!(api
+            .retry_gate
+            .check(&key, std::time::Instant::now() + Duration::from_secs(60))
+            .is_ok());
+
+        let flight = |status: u16, lock: tokio::sync::OwnedMutexGuard<()>| {
+            let (api, key, sent) = (api.clone(), key.clone(), Arc::clone(&sent));
+            tokio::spawn(async move {
+                let result = api
+                    .fly_refresh("r1", || scripted_send(&api, &key, &sent, status))
+                    .await;
+                drop(lock);
+                result.map(|renewed| renewed.access_token)
+            })
+        };
+        let first = flight(503, Arc::clone(&api.refresh_lock).lock_owned().await);
+        let waiter = {
+            let api = api.clone();
+            tokio::spawn(async move { Arc::clone(&api.refresh_lock).lock_owned().await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(sent.load(Ordering::SeqCst), 1, "the flight's first send");
+        assert!(
+            !waiter.is_finished(),
+            "a second refresh ran beside the flight"
+        );
+
+        let first = first.await.unwrap();
+        assert!(
+            matches!(first, Err(ApiError::ServerError(503))),
+            "{first:?}"
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), 3, "one flight, three sends");
+
+        // The waiter's turn: its refresh shares the flight's answer.
+        let second = flight(503, waiter.await.unwrap()).await.unwrap();
+        assert!(
+            matches!(second, Err(ApiError::Held { status: 503, .. })),
+            "{second:?}"
+        );
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            3,
+            "the waiter sent the token again"
+        );
+        assert!(
+            !super::super::session_gate::refresh_rejected(second.as_ref().unwrap_err()),
+            "a held refresh ended the session"
+        );
+
+        // Nothing was lost: the same pair is there, for the next flight.
+        assert_eq!(api.access_token_value().await.as_deref(), Some("a1"));
+        assert_eq!(
+            api.refresh_token.read().await.as_ref().map(|t| t.as_str()),
+            Some("r1")
+        );
+
+        // Once the hold is over (asked past its end), the SAME token renews.
+        assert!(api
+            .retry_gate
+            .check(&key, std::time::Instant::now() + Duration::from_secs(60))
+            .is_ok());
+        let renewed = flight(200, Arc::clone(&api.refresh_lock).lock_owned().await)
+            .await
+            .unwrap();
+        assert_eq!(renewed.unwrap(), "a2");
+        assert_eq!(sent.load(Ordering::SeqCst), 4);
+    }
+
     /// The wiring: every control-plane request (the refresh a 401 runs
     /// included — it goes through `do_request` too) asks the gate before it
     /// is sent and tells it what came back.
@@ -2871,7 +3088,23 @@ mod retry_after_tests {
             .find(".note(&held, error, std::time::Instant::now())")
             .expect("the note");
         assert!(check < send && send < note);
-        let refresh = &SOURCE[SOURCE.find("async fn refresh_token_internal(").unwrap()..];
-        assert!(refresh[..refresh.find("\n    }").unwrap()].contains(".do_request("));
+        // MR-2500 / MR-1771: both refreshes fly under the policy, and each
+        // send of a flight is a `do_request`.
+        let fn_body = |signature: &str| {
+            let start = SOURCE.find(signature).expect(signature);
+            let rest = &SOURCE[start..];
+            &rest[..rest.find("\n    }").expect("end of fn")]
+        };
+        for signature in [
+            "async fn refresh_token_internal(",
+            "pub async fn refresh_token(",
+        ] {
+            assert!(
+                fn_body(signature).contains(".refresh_flight(refresh.as_str())"),
+                "{signature}"
+            );
+        }
+        assert!(fn_body("async fn refresh_flight(").contains(".do_request::<RefreshResponse>("));
+        assert!(fn_body("async fn fly_refresh<").contains("refresh_policy::fly("));
     }
 }
