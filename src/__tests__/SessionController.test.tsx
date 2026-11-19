@@ -170,7 +170,7 @@ describe('status sync: Rust events first, resync as the fallback', () => {
     emit('vpn-status-changed', { state: 'reconnecting', seq: 3, server_id: 'b', error: null });
     await waitFor(() =>
       expect(sendNotification).toHaveBeenCalledWith(
-        expect.objectContaining({ title: 'BirdoVPN — Reconnecting…' }),
+        expect.objectContaining({ title: 'Reconnecting…' }),
       ),
     );
   });
@@ -191,7 +191,7 @@ describe('give-up (REVIEW-WIN-009)', () => {
     await waitFor(() =>
       expect(sendNotification).toHaveBeenCalledWith(
         expect.objectContaining({
-          title: 'BirdoVPN — Connection error',
+          title: 'Connection error',
           body: expect.stringContaining('BirdoVPN stopped reconnecting'),
         }),
       ),
@@ -847,7 +847,7 @@ describe('the Free data allowance', () => {
     expect(notice?.actionLabel).toBe('View plans');
     await waitFor(() =>
       expect(sendNotification).toHaveBeenCalledWith({
-        title: 'BirdoVPN — Free data allowance used',
+        title: 'Free data allowance used',
         body: 'Free data allowance used — your connection ends in 9 min.',
       }),
     );
@@ -871,7 +871,7 @@ describe('the Free data allowance', () => {
     expect(useAppStore.getState().giveUp).toBeNull();
     await waitFor(() =>
       expect(sendNotification).toHaveBeenCalledWith({
-        title: 'BirdoVPN — Connection error',
+        title: 'Connection error',
         body: "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.",
       }),
     );
