@@ -14,7 +14,7 @@ import {
   heldDeletionGeneration,
   noteHeldDeletion,
 } from '@/lib/held-deletion';
-import { endSession, expireSession, signOut } from '@/session/session';
+import { endDeletedSession, endSession, expireSession, signOut } from '@/session/session';
 import { useAppStore } from '@/store/app-store';
 
 vi.mock('@tauri-apps/api/core');
