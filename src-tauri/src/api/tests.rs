@@ -398,6 +398,267 @@ mod gdpr_request_tests {
         assert!(!api.is_authenticated().await);
     }
 
+    /// birdo-web `GdprController.deleteData`'s 401 when the guard admitted the
+    /// token but no account was there to check (origin/main a5a4ad3b).
+    const IDENTITY_UNVERIFIED: &str =
+        r#"{"statusCode":401,"message":"Unable to verify identity","error":"Unauthorized"}"#;
+
+    /// One deletion attempt's ending, as `delete_account` concludes it.
+    fn after(unconfirmed_before: bool, status: StatusCode, body: &str) -> GdprDeleteOutcome {
+        BirdoApi::after_unconfirmed(
+            unconfirmed_before,
+            BirdoApi::classify_gdpr_delete_response(status, body),
+        )
+    }
+
+    /// MR-2483: only MR-2370's answer (a non-202 2xx whose body does not
+    /// confirm) marks a deletion unconfirmed. A hold, a 2xx that says
+    /// pending, a confirmation and every refusal do not.
+    #[test]
+    fn only_an_unreadable_2xx_leaves_the_deletion_unconfirmed() {
+        for status in [StatusCode::OK, StatusCode::CREATED, StatusCode::NO_CONTENT] {
+            for body in UNREADABLE {
+                assert!(
+                    BirdoApi::classify_gdpr_delete_response(status, body).is_unconfirmed(),
+                    "{status} {body:?}"
+                );
+            }
+        }
+        for (status, body) in [
+            (StatusCode::OK, DELETED),
+            (StatusCode::ACCEPTED, ""),
+            (StatusCode::OK, r#"{"success":true,"pending":true}"#),
+            (StatusCode::OK, r#"{"code":"change_pending"}"#),
+            (StatusCode::NOT_FOUND, ""),
+            (StatusCode::UNAUTHORIZED, IDENTITY_UNVERIFIED),
+            (StatusCode::INTERNAL_SERVER_ERROR, ""),
+            (StatusCode::TOO_MANY_REQUESTS, ""),
+        ] {
+            assert!(
+                !BirdoApi::classify_gdpr_delete_response(status, body).is_unconfirmed(),
+                "{status} {body:?}"
+            );
+        }
+    }
+
+    /// MR-2483: after an unreadable 2xx, a retry that meets an account that
+    /// is gone (a 404, or the handler's "Unable to verify identity" 401) is
+    /// the deletion: `AlreadyDeleted`. On main it was `NotFound` (a generic
+    /// error) or `Rejected { 401 }`, which the dialog words as a WRONG
+    /// PASSWORD (`invalid_credentials`).
+    #[test]
+    fn after_an_unreadable_2xx_a_gone_account_is_already_deleted() {
+        let not_found = r#"{"statusCode":404,"message":"User not found","error":"Not Found"}"#;
+        for (status, body) in [
+            (StatusCode::NOT_FOUND, ""),
+            (StatusCode::NOT_FOUND, not_found),
+            (StatusCode::UNAUTHORIZED, IDENTITY_UNVERIFIED),
+            (
+                StatusCode::UNAUTHORIZED,
+                r#"{"statusCode":401,"message":"  unable to verify identity "}"#,
+            ),
+        ] {
+            assert!(
+                matches!(after(true, status, body), GdprDeleteOutcome::AlreadyDeleted),
+                "{status} {body}"
+            );
+            // Without the unreadable 2xx before: today's mapping, unchanged.
+            assert!(
+                matches!(after(false, status, body), GdprDeleteOutcome::Refused(_)),
+                "{status} {body}"
+            );
+        }
+    }
+
+    /// MR-2483: everything else keeps its meaning after an unreadable 2xx.
+    /// The password check's 401s read the account's password, so the account
+    /// exists and the sentence is the answer; the guard's bare 401 still
+    /// refreshes first (the refresh decides, `refresh_says_gone`); a
+    /// confirmation is a deletion; another unreadable 2xx stays one.
+    #[test]
+    fn after_an_unreadable_2xx_the_password_check_is_still_the_answer() {
+        for (body, sentence) in [
+            (
+                r#"{"statusCode":401,"message":"Incorrect password","error":"Unauthorized","details":{"stepUp":["password"]}}"#,
+                "Incorrect password",
+            ),
+            (
+                r#"{"statusCode":401,"message":"Password confirmation is required to delete your account","error":"Unauthorized"}"#,
+                "Password confirmation is required to delete your account",
+            ),
+        ] {
+            match after(true, StatusCode::UNAUTHORIZED, body) {
+                GdprDeleteOutcome::Refused(ApiError::Rejected { status, message }) => {
+                    assert_eq!(status, 401);
+                    assert_eq!(message, sentence);
+                }
+                other => panic!("{body} was read as {other:?}"),
+            }
+        }
+        for bare in [
+            r#"{"statusCode":401,"message":"Unauthorized","error":"Unauthorized"}"#,
+            "",
+        ] {
+            assert!(matches!(
+                after(true, StatusCode::UNAUTHORIZED, bare),
+                GdprDeleteOutcome::SessionExpired
+            ));
+        }
+        assert!(matches!(
+            after(true, StatusCode::TOO_MANY_REQUESTS, ""),
+            GdprDeleteOutcome::Refused(ApiError::RateLimited { .. })
+        ));
+        assert!(matches!(
+            after(true, StatusCode::BAD_GATEWAY, ""),
+            GdprDeleteOutcome::Refused(ApiError::ServerError(502))
+        ));
+        assert!(matches!(
+            after(true, StatusCode::OK, DELETED),
+            GdprDeleteOutcome::Deleted(_)
+        ));
+        assert!(after(true, StatusCode::OK, "").is_unconfirmed());
+    }
+
+    /// MR-2483: on the retry, the guard's bare 401 led to a refresh. Only a
+    /// refresh the server refused with 401 (the token itself is dead) says
+    /// the session went with the account; nothing transient does, and a 403
+    /// says nothing about the account either.
+    #[test]
+    fn only_a_401_from_the_refresh_says_the_session_went_with_the_account() {
+        assert!(BirdoApi::refresh_says_gone(&ApiError::Unauthorized));
+        assert!(BirdoApi::refresh_says_gone(&ApiError::Rejected {
+            status: 401,
+            message: "Invalid refresh token".into(),
+        }));
+        for kept in [
+            ApiError::Forbidden,
+            ApiError::Rejected {
+                status: 403,
+                message: "Forbidden".into(),
+            },
+            ApiError::RateLimited {
+                retry_after_secs: Some(60),
+            },
+            ApiError::Held {
+                status: 429,
+                retry_after_secs: 30,
+            },
+            ApiError::ServerError(503),
+            ApiError::ServerBusy {
+                status: 503,
+                retry_after_secs: 10,
+            },
+            ApiError::Network("connection reset".into()),
+            ApiError::Parse("eof".into()),
+            ApiError::NotAuthenticated,
+        ] {
+            assert!(!BirdoApi::refresh_says_gone(&kept), "{kept:?}");
+        }
+    }
+
+    /// MR-2483, by behaviour: a signed-in client whose deletion got an
+    /// unreadable 2xx keeps its session and remembers it; the retry's 404
+    /// then signs it out, as a confirmed deletion does, and reports
+    /// `AlreadyDeleted`. On main the retry's 404 left it signed in to a
+    /// deleted account behind a generic error.
+    #[tokio::test]
+    async fn a_retry_that_finds_the_account_gone_signs_out() {
+        use super::super::client::AccountDeletion;
+        let api = BirdoApi::new();
+        api.set_tokens("access-1".into(), "refresh-1".into()).await;
+        assert!(!api.deletion_unconfirmed());
+
+        let first = BirdoApi::classify_gdpr_delete_response(StatusCode::OK, "");
+        assert!(matches!(
+            api.conclude_gdpr_delete(api.deletion_unconfirmed(), first)
+                .await,
+            Err(ApiError::Parse(_))
+        ));
+        assert!(
+            api.is_authenticated().await,
+            "the unreadable 2xx signed out"
+        );
+        assert!(api.deletion_unconfirmed());
+
+        let retry = BirdoApi::classify_gdpr_delete_response(StatusCode::NOT_FOUND, "");
+        assert!(matches!(
+            api.conclude_gdpr_delete(api.deletion_unconfirmed(), retry)
+                .await,
+            Ok(AccountDeletion::AlreadyDeleted)
+        ));
+        assert!(
+            !api.is_authenticated().await,
+            "still signed in to a deleted account"
+        );
+        assert!(!api.deletion_unconfirmed());
+    }
+
+    /// MR-2483: the memory of an unreadable 2xx is its session's. Without
+    /// it a 404 signs nobody out; a new sign-in and a sign-out forget it.
+    #[tokio::test]
+    async fn an_unreadable_2xx_is_remembered_for_its_session_only() {
+        let api = BirdoApi::new();
+        api.set_tokens("access-1".into(), "refresh-1".into()).await;
+        let not_found = || BirdoApi::classify_gdpr_delete_response(StatusCode::NOT_FOUND, "");
+        let unreadable = || BirdoApi::classify_gdpr_delete_response(StatusCode::OK, "{}");
+
+        assert!(matches!(
+            api.conclude_gdpr_delete(api.deletion_unconfirmed(), not_found())
+                .await,
+            Err(ApiError::NotFound)
+        ));
+        assert!(api.is_authenticated().await);
+
+        let _ = api
+            .conclude_gdpr_delete(api.deletion_unconfirmed(), unreadable())
+            .await;
+        assert!(api.deletion_unconfirmed());
+        api.set_tokens("access-2".into(), "refresh-2".into()).await;
+        assert!(!api.deletion_unconfirmed(), "a new sign-in inherited it");
+        assert!(matches!(
+            api.conclude_gdpr_delete(api.deletion_unconfirmed(), not_found())
+                .await,
+            Err(ApiError::NotFound)
+        ));
+        assert!(api.is_authenticated().await);
+
+        let _ = api
+            .conclude_gdpr_delete(api.deletion_unconfirmed(), unreadable())
+            .await;
+        assert!(api.deletion_unconfirmed());
+        api.clear_tokens().await;
+        assert!(!api.deletion_unconfirmed(), "a sign-out kept it");
+        api.set_tokens("access-3".into(), "refresh-3".into()).await;
+        let _ = api
+            .conclude_gdpr_delete(api.deletion_unconfirmed(), unreadable())
+            .await;
+        let expired = api.access_token_value().await;
+        assert!(api.clear_tokens_if(expired.as_deref()).await);
+        assert!(!api.deletion_unconfirmed(), "an expired session kept it");
+    }
+
+    /// MR-2483, the wiring `delete_account` cannot be driven through without
+    /// a server: the memory is read BEFORE the attempt, a refresh refused
+    /// after it ends as `AlreadyDeleted`, any other refresh failure still
+    /// answers through the session gate, and every answer is concluded
+    /// through `conclude_gdpr_delete`.
+    #[test]
+    fn delete_account_reads_the_unreadable_2xx_before_it_sends() {
+        const SOURCE: &str = include_str!("client.rs");
+        let start = SOURCE.find("pub async fn delete_account(").unwrap();
+        let body = &SOURCE[start..];
+        let body = &body[..body.find("\n    }").unwrap()];
+        let read = body
+            .find("let unconfirmed_before = self.deletion_unconfirmed();")
+            .expect("the memory is read");
+        let sent = body.find("self.send_gdpr_delete(").expect("the request");
+        assert!(read < sent, "read after the attempt that may set it");
+        assert!(body.contains("if unconfirmed_before && Self::refresh_says_gone(&refused) =>"));
+        assert!(body.contains(".finish_gdpr_delete(GdprDeleteOutcome::AlreadyDeleted)"));
+        assert!(body.contains("session_gate::error_after_failed_refresh(e)"));
+        assert!(body.contains("self.conclude_gdpr_delete(unconfirmed_before, outcome)"));
+    }
+
     /// The password check's 401 is the ANSWER and must reach the user
     /// verbatim; passport's bare "Unauthorized" is an expired token and must
     /// trigger a refresh instead.

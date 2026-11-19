@@ -56,7 +56,10 @@ vi.mock('framer-motion', () => ({
 const logout = vi.fn();
 const setAuthenticated = vi.fn();
 const setConnectionState = vi.fn();
+const setSessionEndedReason = vi.fn();
 const mockStoreState = {
+  isAuthenticated: true,
+  setSessionEndedReason,
   connectionState: 'connected' as ConnectionState,
   account: {
     email: 'user@example.com',
@@ -96,6 +99,8 @@ beforeEach(() => {
   logout.mockReset();
   setAuthenticated.mockReset();
   setConnectionState.mockReset();
+  setSessionEndedReason.mockReset();
+  mockStoreState.isAuthenticated = true;
   mockStoreState.connectionState = 'connected';
   deleteResult = () => Promise.resolve({ storeSubscriptionsStillBilling: [] });
   // Default: the preflight has nothing to say (an older backend answers 404).
@@ -200,6 +205,41 @@ describe('Delete account dialog', () => {
     await userEvent.click(retry);
     await waitFor(() => expect(logout).toHaveBeenCalled());
     expect(mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'delete_account')).toHaveLength(2);
+  });
+
+  it('a retry that finds the account already deleted signs out and says so, never "wrong password" (MR-2483)', async () => {
+    deleteResult = () =>
+      Promise.reject({
+        code: 'server_error',
+        message:
+          'Account deletion failed: Failed to parse response: an unreadable answer to the ' +
+          'deletion; nothing is assumed deleted',
+        retryable: true,
+        retry_after_secs: null,
+      });
+    await openAndConfirm();
+    await screen.findByText('Something went wrong on our side. Please try again in a moment.');
+    // The retry met an account that is gone (a 404, or a session that went
+    // with it): Rust cleared everything as for a confirmed deletion.
+    deleteResult = () =>
+      Promise.resolve({ storeSubscriptionsStillBilling: [], alreadyDeleted: true });
+    await userEvent.click(screen.getByRole('button', { name: /delete my account/i }));
+    await waitFor(() => expect(setSessionEndedReason).toHaveBeenCalledWith('deleted'));
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(setConnectionState).toHaveBeenCalledWith('disconnected');
+    expect(screen.queryByText(/incorrect password/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/session has expired/i)).not.toBeInTheDocument();
+    // Rust signed out already: Profile's onDeleted (a second `logout`) is not run.
+    expect(mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'logout')).toHaveLength(0);
+  });
+
+  it('a confirmed deletion is not reported as already deleted (MR-2483)', async () => {
+    deleteResult = () =>
+      Promise.resolve({ storeSubscriptionsStillBilling: [], alreadyDeleted: false });
+    await openAndConfirm();
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(setSessionEndedReason).not.toHaveBeenCalled();
+    expect(mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'logout')).toHaveLength(1);
   });
 
   it('lists store subscriptions still billing, and OK finishes the sign-out', async () => {

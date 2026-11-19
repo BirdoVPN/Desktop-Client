@@ -73,4 +73,37 @@ describe('ending a session clears the held deletion', () => {
     noteHeldDeletion(HOLD, { filedHere: true, generation: before });
     expect(getHeldDeletion()).toBeNull();
   });
+
+  it('an account a retried deletion found already deleted (endDeletedSession, MR-2483)', () => {
+    signedInWithAHold();
+    endDeletedSession();
+    expect(useAppStore.getState().isAuthenticated).toBe(false);
+    expect(useAppStore.getState().sessionEndedReason).toBe('deleted');
+    expect(getHeldDeletion()).toBeNull();
+    // Rust already signed out: no second command.
+    expect(vi.mocked(invoke)).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * MR-2483: the refresh that found the session gone with the account may also
+ * have sent `session-expired`, before or after the deletion's own answer.
+ * Login says "deleted" either way, never "your session expired".
+ */
+describe('an already-deleted account wins over session-expired, in either order', () => {
+  it('session-expired first', () => {
+    signedInWithAHold();
+    endSession('expired');
+    endDeletedSession();
+    expect(useAppStore.getState().isAuthenticated).toBe(false);
+    expect(useAppStore.getState().sessionEndedReason).toBe('deleted');
+  });
+
+  it('session-expired after', () => {
+    signedInWithAHold();
+    endDeletedSession();
+    endSession('expired');
+    expect(useAppStore.getState().isAuthenticated).toBe(false);
+    expect(useAppStore.getState().sessionEndedReason).toBe('deleted');
+  });
 });

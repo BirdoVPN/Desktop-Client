@@ -204,13 +204,19 @@ export interface Notice {
   onAction?: () => void;
 }
 
+/** Why the last session ended, for Login's banner. */
+export type SessionEndedReason = 'expired' | 'revoked' | 'deleted';
+
 export interface AppState {
   // Auth
   isAuthenticated: boolean;
   isLoading: boolean;
   userEmail: string | null;
-  /** Set when Rust (or a command) ended the session; Login shows why (W2-006). */
-  sessionEndedReason: 'expired' | 'revoked' | null;
+  /**
+   * Set when Rust (or a command) ended the session; Login shows why (W2-006).
+   * `deleted`: a retried deletion found the account already gone (MR-2483).
+   */
+  sessionEndedReason: SessionEndedReason | null;
 
   // Consent
   /**
@@ -389,7 +395,7 @@ export interface AppState {
   setAuthenticated: (auth: boolean) => void;
   setLoading: (loading: boolean) => void;
   setUserEmail: (email: string | null) => void;
-  setSessionEndedReason: (reason: 'expired' | 'revoked' | null) => void;
+  setSessionEndedReason: (reason: SessionEndedReason | null) => void;
   /** Accept the CURRENT consent text. */
   acceptConsent: () => void;
   setAccount: (account: Partial<AccountInfo>) => void;
