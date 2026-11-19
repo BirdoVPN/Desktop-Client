@@ -758,10 +758,12 @@ pub fn get_admin_status() -> bool {
 /// all live in `session::connect_session`. A `disconnect_vpn` while this is in
 /// flight makes it resolve with `cancelled` (contract §3.1).
 ///
-/// `origin` (MR-2390, optional): `"automatic"` when the UI's own best-server
-/// rule chose `serverId`, rather than the user. Absent (every other caller)
-/// it is the user's pick (`SelectionOrigin::from_ipc`). It decides how far
-/// the session may move if that server leaves the pool.
+/// `origin` (MR-2390, optional): who chose `serverId`. The UI sends it on
+/// every connect, as it records it (MR-2492): `"automatic"` when the client
+/// chose the server (its fastest-server rule, or a server Rust's quick
+/// connect picked), `"user"` otherwise. Anything but `"automatic"`, or
+/// nothing, is the user's pick (`SelectionOrigin::from_ipc`). It decides how
+/// far the session may move if that server leaves the pool.
 #[tauri::command]
 pub async fn connect_vpn(
     #[allow(non_snake_case)] serverId: String,

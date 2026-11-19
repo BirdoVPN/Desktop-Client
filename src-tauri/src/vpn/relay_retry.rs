@@ -40,8 +40,10 @@ use crate::api::types::VpnServer;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SelectionOrigin {
     /// The client chose it: quick connect's best-server pick when the user
-    /// has no usable server of their own, or the UI's fastest-server
-    /// fallback. Nobody asked for that location, so a move may leave it.
+    /// has no usable server of their own, or a server the UI records as the
+    /// client's (its fastest-server fallback, or a quick connect's pick that
+    /// Auto-Connect dials again). Nobody asked for that location, so a move
+    /// may leave it.
     Automatic,
     /// The user picked it, or anything other than the client's own pick set
     /// it. The safe default: a move never takes it out of its country.
@@ -50,9 +52,9 @@ pub enum SelectionOrigin {
 }
 
 impl SelectionOrigin {
-    /// The `origin` argument of `connect_vpn`. Only `"automatic"`, which the
-    /// UI sends for its own best-server pick, is the client's. Anything else,
-    /// or nothing, is the user's.
+    /// The `origin` argument of `connect_vpn`, which the UI sends on every
+    /// connect as it records it. Only `"automatic"` is the client's. Anything
+    /// else (`"user"`), or nothing, is the user's.
     pub fn from_ipc(origin: Option<&str>) -> Self {
         match origin {
             Some("automatic") => Self::Automatic,

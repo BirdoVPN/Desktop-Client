@@ -22,6 +22,7 @@ import {
   type ResumeTarget,
 } from '@/lib/ipc';
 import { isSilentError } from '@/lib/errors';
+import { nextServer, type SelectionOrigin } from '@/lib/server-choice';
 import { command } from '@/session/command';
 import { useAppStore, type PendingAction, type Server } from '@/store/app-store';
 import { selectDisplayState, selectTunnelActive } from '@/store/selectors';
@@ -79,20 +80,27 @@ export function findLiveServer(
 }
 
 /**
- * Who chose a connect's server (MR-2390): the user, or the client's own
- * fastest-server rule. If the server later leaves the pool (a drain), Rust
- * moves the session ONCE: an automatic pick to the best server anywhere, a
- * user's pick only within its country, and otherwise it says the location is
- * unavailable.
+ * `connect_vpn`'s arguments: the server, and who chose it, on EVERY connect
+ * (MR-2390). Rust keeps the origin with the session (`ReconnectInfo.origin`):
+ * if the server later leaves the pool (a drain), Rust moves an `automatic`
+ * pick to the best server anywhere and a `user` pick only within its country,
+ * else it says the location is unavailable. It is the origin this store
+ * records with the server (`lastServerOrigin`, MR-2492), so both sides read
+ * the session the same way. Rust maps exactly `'automatic'` to the client's
+ * pick and anything else to the user's (`SelectionOrigin::from_ipc`).
  */
-export type SelectionOrigin = 'user' | 'automatic';
+function connectArgs(serverId: string, origin: SelectionOrigin): { serverId: string; origin: SelectionOrigin } {
+  return { serverId, origin };
+}
 
+/**
+ * `origin`: who chose `server` (MR-2492), sent to Rust with the connect
+ * (MR-2390) and recorded with the server once connected.
+ */
 export async function connectToServer(server: Server, origin: SelectionOrigin = 'user'): Promise<boolean> {
   useAppStore.getState().setCurrentServer(server);
-  // Only the client's own pick says so; Rust reads anything else as the user's.
-  const args = origin === 'automatic' ? { serverId: server.id, origin } : { serverId: server.id };
-  const ok = await run('connecting', 'connect_vpn', args);
-  if (ok) useAppStore.getState().setLastServerId(server.id);
+  const ok = await run('connecting', 'connect_vpn', connectArgs(server.id, origin));
+  if (ok) useAppStore.getState().setLastServerId(server.id, origin);
   return ok;
 }
 
@@ -105,10 +113,11 @@ export async function connectToServer(server: Server, origin: SelectionOrigin = 
 export async function switchToServer(server: Server): Promise<boolean> {
   const before = useAppStore.getState().currentServer;
   useAppStore.getState().setCurrentServer(server);
-  const ok = await run('switching', 'connect_vpn', { serverId: server.id });
+  // A server picked on a live session is the user's.
+  const ok = await run('switching', 'connect_vpn', connectArgs(server.id, 'user'));
   const s = useAppStore.getState();
   if (ok) {
-    s.setLastServerId(server.id);
+    s.setLastServerId(server.id, 'user');
   } else {
     s.setCurrentServer(findLiveServer(s.servers, s.liveServerId, s.liveServerName) ?? before);
   }
@@ -135,36 +144,101 @@ export function readyMultiHopPair(): { entry: string; exit: string } | null {
   return { entry, exit };
 }
 
-type ConnectTargetState = Pick<ReturnType<typeof useAppStore.getState>, 'currentServer' | 'lastServerId' | 'servers'>;
+type ConnectState = Pick<
+  ReturnType<typeof useAppStore.getState>,
+  'currentServer' | 'lastServerId' | 'lastServerOrigin' | 'servers'
+>;
 
 /**
- * The server a plain "Connect" means: the one on the card, else the one the
- * user last connected to, else the fastest — the same rule for the Connect
- * button, auto-connect and the tray (W2-002, W2-028). The first two are the
- * user's; only the fastest is the client's own pick (MR-2390).
+ * Who chose `server` (MR-2492). The server on record keeps the origin it was
+ * recorded with; any other server on the card was put there by the user.
  */
-export function resolveConnectChoice(
-  state: ConnectTargetState = useAppStore.getState(),
-): { server: Server; origin: SelectionOrigin } | null {
-  const { currentServer, lastServerId, servers } = state;
-  if (usable(currentServer)) return { server: currentServer, origin: 'user' };
-  const remembered = servers.find((s) => s.id === lastServerId);
-  if (usable(remembered)) return { server: remembered, origin: 'user' };
-  const fastest = pickBestServer(servers);
-  return fastest ? { server: fastest, origin: 'automatic' } : null;
+function originOf(server: Server, state: ConnectState): SelectionOrigin {
+  return server.id === state.lastServerId ? state.lastServerOrigin : 'user';
 }
 
-/** The server of {@link resolveConnectChoice}. */
-export function resolveConnectTarget(state: ConnectTargetState = useAppStore.getState()): Server | null {
+/**
+ * The server a plain "Connect" means, and who chose it: the one on the card,
+ * else the one the user last connected to, else the fastest (the client's
+ * own pick). The same rule for the Connect button and the tray (W2-002,
+ * W2-028). A click goes where the card says, the fastest server included;
+ * Auto-Connect, which nobody clicks, follows `planUnattendedConnect`.
+ */
+export function resolveConnectChoice(
+  state: ConnectState = useAppStore.getState(),
+): { server: Server; origin: SelectionOrigin } | null {
+  const { currentServer, lastServerId, servers } = state;
+  if (usable(currentServer)) return { server: currentServer, origin: originOf(currentServer, state) };
+  const remembered = servers.find((s) => s.id === lastServerId);
+  if (usable(remembered)) return { server: remembered, origin: state.lastServerOrigin };
+  const best = pickBestServer(servers);
+  return best ? { server: best, origin: 'automatic' } : null;
+}
+
+/** The server of `resolveConnectChoice`: what the Connect card shows. */
+export function resolveConnectTarget(state: ConnectState = useAppStore.getState()): Server | null {
   return resolveConnectChoice(state)?.server ?? null;
 }
+
+/** What Auto-Connect does at launch (MR-2492, `planUnattendedConnect`). */
+export type UnattendedPlan =
+  | { kind: 'dial'; server: Server; origin: SelectionOrigin }
+  /** No server list to check it against: dial the user's server as recorded. */
+  | { kind: 'dialRecorded'; serverId: string }
+  /** No server list and no server the user chose: Rust picks (`quick_connect`). */
+  | { kind: 'quickConnect' }
+  /** The user's server cannot be used, nor another in its country. */
+  | { kind: 'held' }
+  /** No server this account can use at all. */
+  | { kind: 'none' };
+
+/**
+ * Where Auto-Connect goes with nobody clicking (MR-2492, the owner's rule for
+ * every client; iOS `RelayRetry`, Mobile #645). The server on record is
+ * dialled when it can be used. When it cannot (offline, out of the plan,
+ * gone), `nextServer` decides by who chose it: a server the client chose may
+ * go to the best one in any country; one the user chose stays in its country
+ * (the same city first), else nothing is dialled and the user is told. It
+ * used to go to the fastest server in any country either way. One move: a
+ * dial that then fails shows its error, as every connect does.
+ *
+ * With no server list (the fetch failed) nothing can say the user's server
+ * is gone, so it is dialled as recorded and Rust's connect answers for it,
+ * never `quick_connect`, which picks a server of its own in any country
+ * (MR-1932's rule for the resume after an update).
+ */
+export function planUnattendedConnect(state: ConnectState = useAppStore.getState()): UnattendedPlan {
+  const { currentServer, lastServerId, lastServerOrigin, servers } = state;
+  const chosenId = currentServer?.id ?? lastServerId;
+  const origin = currentServer ? originOf(currentServer, state) : lastServerOrigin;
+  if (servers.length === 0) {
+    return chosenId && origin === 'user' ? { kind: 'dialRecorded', serverId: chosenId } : { kind: 'quickConnect' };
+  }
+  if (chosenId) {
+    const chosen = servers.find((s) => s.id === chosenId);
+    if (usable(chosen)) return { kind: 'dial', server: chosen, origin };
+    const next = nextServer(chosenId, servers, origin);
+    if (next) return { kind: 'dial', server: next.server, origin };
+    if (origin === 'user') return { kind: 'held' };
+  }
+  const best = pickBestServer(servers);
+  return best ? { kind: 'dial', server: best, origin: 'automatic' } : { kind: 'none' };
+}
+
+/** MR-2492: Auto-Connect found the user's server unusable and stayed in its country. */
+export const AUTO_CONNECT_HELD_COPY =
+  "Your server isn't available now, and BirdoVPN doesn't move you to another country by itself. " +
+  'Choose a server to connect.';
+
+const NO_SERVERS_COPY = 'No accessible online servers are available for this account.';
 
 /**
  * Connect the way the user has set things up. A Multi-Hop route that is armed
  * but incomplete is NOT silently replaced by a single hop: the user paid for,
- * and chose, the separation.
+ * and chose, the separation. `unattended`: Auto-Connect, which nobody
+ * clicked (`planUnattendedConnect`).
  */
-export async function connectPreferred(): Promise<boolean> {
+export async function connectPreferred({ unattended = false } = {}): Promise<boolean> {
   const s = useAppStore.getState();
   if (s.settings.multiHopEnabled) {
     const pair = readyMultiHopPair();
@@ -174,18 +248,39 @@ export async function connectPreferred(): Promise<boolean> {
     }
     return connectMultiHop(pair.entry, pair.exit);
   }
+  if (unattended) return connectUnattended();
   const choice = resolveConnectChoice();
   if (choice) return connectToServer(choice.server, choice.origin);
   if (s.servers.length > 0) {
-    s.showNotice({
-      text: 'No accessible online servers are available for this account.',
-      tone: 'danger',
-    });
+    s.showNotice({ text: NO_SERVERS_COPY, tone: 'danger' });
     return false;
   }
   // The list has not loaded (offline start, slow backend): Rust has its own
   // copy and applies the same best-server rule.
   return run('connecting', 'quick_connect');
+}
+
+async function connectUnattended(): Promise<boolean> {
+  const s = useAppStore.getState();
+  const plan = planUnattendedConnect(s);
+  switch (plan.kind) {
+    case 'dial':
+      return connectToServer(plan.server, plan.origin);
+    case 'dialRecorded': {
+      // Only ever the user's server (`planUnattendedConnect`).
+      const ok = await run('connecting', 'connect_vpn', connectArgs(plan.serverId, 'user'));
+      if (ok) useAppStore.getState().setLastServerId(plan.serverId, 'user');
+      return ok;
+    }
+    case 'quickConnect':
+      return run('connecting', 'quick_connect');
+    case 'held':
+      s.showNotice({ text: AUTO_CONNECT_HELD_COPY, tone: 'danger' });
+      return false;
+    case 'none':
+      s.showNotice({ text: NO_SERVERS_COPY, tone: 'danger' });
+      return false;
+  }
 }
 
 /** MR-1861: shown while the session an update ended comes back. */
@@ -246,9 +341,11 @@ export async function resumeAfterUpdate(target: ResumeTarget): Promise<boolean> 
     return false;
   }
   s.showNotice({ text: RESUME_AFTER_UPDATE_COPY, tone: 'info' });
-  if (usable(server)) return connectToServer(server);
-  const ok = await run('connecting', 'connect_vpn', { serverId: target.serverId });
-  if (ok) useAppStore.getState().setLastServerId(target.serverId);
+  // The same server, so whoever chose it still has (MR-2492).
+  const origin: SelectionOrigin = s.lastServerId === target.serverId ? s.lastServerOrigin : 'user';
+  if (usable(server)) return connectToServer(server, origin);
+  const ok = await run('connecting', 'connect_vpn', connectArgs(target.serverId, origin));
+  if (ok) useAppStore.getState().setLastServerId(target.serverId, origin);
   return ok;
 }
 

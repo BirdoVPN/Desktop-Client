@@ -281,7 +281,8 @@ function useAutoConnectOnce(): void {
         void resumeAfterUpdate(resume);
         return;
       }
-      if (s.settings.autoConnect) void connectPreferred();
+      // Nobody clicked: a server the user chose stays in its country (MR-2492).
+      if (s.settings.autoConnect) void connectPreferred({ unattended: true });
     })();
   }, [hydrated, serversSettled]);
 }
@@ -369,7 +370,9 @@ function useSelectionFollowsTunnel(): void {
     const live = findLiveServer(servers, liveServerId, liveServerName);
     if (live && s.currentServer?.id !== live.id) {
       s.setCurrentServer(live);
-      s.setLastServerId(live.id);
+      // MR-2492: a server this store never recorded was Rust's own pick (the
+      // tray's Quick Connect, with the server on record unusable or unknown).
+      s.setLastServerId(live.id, live.id === s.lastServerId ? s.lastServerOrigin : 'automatic');
     }
   }, [liveServerId, liveServerName, servers, connected]);
 }

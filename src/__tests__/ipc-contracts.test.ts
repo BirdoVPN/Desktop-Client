@@ -226,14 +226,15 @@ const SERVER: Server = {
 const callsTo = (cmd: string) => mockedInvoke.mock.calls.filter(([c]) => c === cmd);
 
 describe('what the real actions send', () => {
-  it('connect_vpn { serverId }', async () => {
+  // MR-2390: every connect says who chose the server, as the store records
+  // it (MR-2492); the user's when the caller does not say.
+  it("connect_vpn { serverId, origin: 'user' }", async () => {
     await connectToServer(SERVER);
-    expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'de-fra-1' }]]);
+    expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'de-fra-1', origin: 'user' }]]);
   });
 
-  // MR-2390: only the UI's own fastest-server pick adds `origin`, and Rust's
-  // command takes it, optional, mapping exactly 'automatic' to the client's
-  // pick (anything else, or nothing, is the user's).
+  // Rust's command takes `origin`, optional, mapping exactly 'automatic' to
+  // the client's pick (anything else, or nothing, is the user's).
   it("connect_vpn { serverId, origin: 'automatic' } for the client's own pick", async () => {
     await connectToServer(SERVER, 'automatic');
     expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'de-fra-1', origin: 'automatic' }]]);
