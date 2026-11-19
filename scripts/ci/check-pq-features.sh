@@ -24,6 +24,8 @@
 # no equivalent.
 #
 # Run it from anywhere:  ./scripts/ci/check-pq-features.sh
+# Only the self-test of section 5's claim scan (no cargo needed):
+#                        ./scripts/ci/check-pq-features.sh --self-test
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -32,6 +34,55 @@ cd src-tauri
 fail=0
 err() { printf '::error::%s\n' "$*" >&2; fail=1; }
 ok() { printf '  OK   %s\n' "$*"; }
+
+# Section 5's claim scan. A file is joined into one line with each line's
+# comment leader (`//`, `///`, `//!`, a block comment's `*`) dropped first:
+# kept, the leader splits a claim wrapped across doc-comment lines ("falls
+# back to the /// classical PSK") and the scan walks past it (MR-2403).
+# A here-string, not `... | grep -q` (MR-2391): on a file larger than the
+# pipe buffer, grep -q's exit at an early match SIGPIPEs the producer,
+# pipefail makes the pipeline fail, and the claim is missed.
+downgrade_claim_re='fall(s|ing)? back to (the )?(server.provided )?classical|classical[ -]PSK (fallback|on every connect|for the rest)'
+claims_downgrade() { # claims_downgrade < file.rs : exit 0 if it makes the claim
+  grep -qiE "$downgrade_claim_re" <<<"$(sed -E 's#^[[:space:]]*(//[/!]?|/?[*]+/?)?##' | tr '\r\n' '  ' | tr -s ' ')"
+}
+
+# Self-test it first: a claim scan that quietly stopped matching passes
+# exactly the comment it exists to catch. `@N@` is a newline, `@R@` a CR.
+claim_must_flag=(
+  '/// An unusable identity key falls back to the classical PSK.'
+  '/// An unusable identity key falls back to the@N@/// classical PSK.'
+  '    //! so the client falls@N@    //! back to classical'
+  '// keeps a classical-PSK@N@// fallback for the rest of the session'
+  '/* the client falls back@N@ * to the server-provided@N@ * classical PSK */'
+  '/// falls back to the@R@@N@/// classical PSK@R@'
+)
+claim_must_pass=(
+  '/// A failed decapsulation aborts the connect; it never@N@/// takes the classical PSK.'
+  '/// The connect is aborted.@N@///@N@/// Classical X25519 still protects the outer leg.'
+  '    // 2) Fall back to the server'\''s classical preshared_key when present.'
+)
+claim_selftest_failed=0
+for c in "${claim_must_flag[@]}"; do
+  c="${c//@R@/$'\r'}" c="${c//@N@/$'\n'}"
+  if ! claims_downgrade <<<"$c"; then
+    printf '::error::claim-scan self-test: not caught: %s\n' "$c" >&2
+    claim_selftest_failed=1
+  fi
+done
+for c in "${claim_must_pass[@]}"; do
+  c="${c//@R@/$'\r'}" c="${c//@N@/$'\n'}"
+  if claims_downgrade <<<"$c"; then
+    printf '::error::claim-scan self-test: wrongly caught: %s\n' "$c" >&2
+    claim_selftest_failed=1
+  fi
+done
+if [ "$claim_selftest_failed" -ne 0 ]; then
+  printf '\n::error::PQ gate FAILED: the section-5 claim scan failed its own self-test\n' >&2
+  exit 1
+fi
+ok "section-5 claim scan self-test: ${#claim_must_flag[@]} caught, ${#claim_must_pass[@]} passed"
+if [ "${1:-}" = --self-test ]; then exit 0; fi
 
 # ── 1. The pin is exact, and it is the version we reviewed ────────────────────
 WANT_VERSION="0.3.4"
@@ -143,14 +194,11 @@ else
   ok "derive_quantum_psk still aborts the connect when BirdoPQ decapsulation fails"
 fi
 # File-level, not line-level: these claims are written in wrapped doc comments,
-# so a line-anchored grep walks straight past them.
+# so a line-anchored grep walks straight past them (claims_downgrade, above,
+# joins each file with its comment leaders dropped).
 downgrade_claims=""
 while IFS= read -r f; do
-  # A here-string, not `... | grep -q` (MR-2391): on a file larger than the
-  # pipe buffer, grep -q's exit at an early match SIGPIPEs tr, pipefail makes
-  # the pipeline fail, and the claim this check exists to catch is missed.
-  if grep -qiE 'fall(s|ing)? back to (the )?(server.provided )?classical|classical[ -]PSK (fallback|on every connect|for the rest)' \
-    <<<"$(tr '\n' ' ' < "$f" | tr -s ' ')"; then
+  if claims_downgrade <"$f"; then
     downgrade_claims="${downgrade_claims} ${f}"
   fi
 done < <(find src -name '*.rs')
