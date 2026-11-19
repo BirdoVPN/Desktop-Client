@@ -32,7 +32,8 @@
 set -euo pipefail
 
 case "${1:-}" in
-  '' | --self-test) cd "$(dirname "$0")/../../src-tauri" ;;
+  --self-test) ;; # section 5's built-in strings only: no tree, no cargo
+  '') cd "$(dirname "$0")/../../src-tauri" ;;
   *) cd "$1" ;;
 esac
 
