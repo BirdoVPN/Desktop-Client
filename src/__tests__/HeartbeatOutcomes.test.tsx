@@ -275,7 +275,7 @@ async function expectEnded(o: Ending) {
   expect(vpnErrorCopy(s.vpnError!, s.killSwitchBlocking)).toEqual(ui);
   await waitFor(() =>
     expect(sendNotification).toHaveBeenCalledWith({
-      title: 'BirdoVPN — Connection error',
+      title: 'Connection error',
       body: ui.message,
     }),
   );
