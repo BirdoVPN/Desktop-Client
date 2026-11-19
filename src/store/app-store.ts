@@ -3,6 +3,7 @@ import { persist } from 'zustand/middleware';
 import type { IpcError, LiveMultiHop, VpnPhase, VpnState, VpnStats, VpnStatus } from '@/lib/ipc';
 import { giveUpKind, type GiveUpKind } from '@/lib/errors';
 import type { PlanGates, PlanId, PlanPrice } from '@/lib/plan';
+import type { SelectionOrigin } from '@/lib/server-choice';
 import { CONSENT_VERSION } from '@/lib/consent';
 import { normalizeWireGuardPort } from '@/utils/helpers';
 
@@ -278,6 +279,15 @@ export interface AppState {
    * happens to sort first in the list.
    */
   lastServerId: string | null;
+  /**
+   * Who chose `lastServerId` (MR-2492): `automatic` when the client did (the
+   * fastest server, with nothing on record; or the tray's Quick Connect
+   * taking one by itself), `user` otherwise. Persisted with it. It decides
+   * how far Auto-Connect may go when that server cannot be used
+   * (`planUnattendedConnect`): a server the user chose never leaves its
+   * country without a click.
+   */
+  lastServerOrigin: SelectionOrigin;
 
   // Servers
   servers: Server[];
@@ -413,7 +423,8 @@ export interface AppState {
   setCommandError: (error: IpcError | null) => void;
   setLiveStats: (stats: VpnStats | null) => void;
   setCurrentServer: (server: Server | null) => void;
-  setLastServerId: (id: string | null) => void;
+  /** `origin` defaults to `user`, the safe reading (MR-2492). */
+  setLastServerId: (id: string | null, origin?: SelectionOrigin) => void;
   setServers: (servers: Server[]) => void;
   setServersStatus: (status: LoadStatus) => void;
   mergeServerPings: (pings: Record<string, number>) => void;
@@ -573,6 +584,7 @@ export const useAppStore = create<AppState>()(
 
       currentServer: null,
       lastServerId: null,
+      lastServerOrigin: 'user',
       servers: [],
       serversStatus: 'idle',
       serverPings: {},
@@ -666,7 +678,7 @@ export const useAppStore = create<AppState>()(
       setCommandError: (commandError) => set({ commandError }),
       setLiveStats: (liveStats) => set({ liveStats }),
       setCurrentServer: (currentServer) => set({ currentServer }),
-      setLastServerId: (lastServerId) => set({ lastServerId }),
+      setLastServerId: (lastServerId, lastServerOrigin = 'user') => set({ lastServerId, lastServerOrigin }),
 
       setServers: (servers) => set({ servers }),
       setServersStatus: (serversStatus) => set({ serversStatus }),
@@ -738,6 +750,7 @@ export const useAppStore = create<AppState>()(
           // boundaries (sign-out, deletion, an expired session — REVIEW-WIN-007,
           // REVIEW-WIN2-023).
           lastServerId: null,
+          lastServerOrigin: 'user',
           settings: {
             ...state.settings,
             preferredServerId: null,
@@ -770,6 +783,7 @@ export const useAppStore = create<AppState>()(
       partialize: (state) => ({
         favoriteServers: state.favoriteServers,
         lastServerId: state.lastServerId,
+        lastServerOrigin: state.lastServerOrigin,
         settings: state.settings,
         acceptedConsentVersion: state.acceptedConsentVersion,
         windowCorner: state.windowCorner,
@@ -792,7 +806,10 @@ export const useAppStore = create<AppState>()(
           customDnsEnabled:
             saved.customDnsEnabled ?? (Array.isArray(saved.customDns) && saved.customDns.length > 0),
         };
-        return { ...current, ...p, settings };
+        // MR-2492: anything but a recorded `automatic` reads as the user's
+        // choice, including a server saved before the origin was.
+        const lastServerOrigin: SelectionOrigin = p.lastServerOrigin === 'automatic' ? 'automatic' : 'user';
+        return { ...current, ...p, settings, lastServerOrigin };
       },
     },
   ),
