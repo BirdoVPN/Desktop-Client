@@ -88,11 +88,18 @@ pub struct DeleteAccountBody<'a> {
     pub step_up_method: Option<&'a str>,
 }
 
-/// Success body of `DELETE /api/v1/gdpr/delete`.
+/// Success body of `DELETE /api/v1/gdpr/delete`: birdo-web
+/// `GdprController.deleteData` answers `{ success: true, message,
+/// deletedItems, anonymizedItems, storeSubscriptionsStillBilling }`, and has
+/// sent `success: true` since the route's first version.
 ///
-/// Every field is optional: a deletion the server confirmed with a 2xx is a
-/// deletion, whatever the body looks like, so a parse failure must never turn
-/// it back into an error the user would retry against an erased account.
+/// MR-2370: only a body that says `success: true` confirms the deletion (see
+/// [`Self::confirmation`]). An empty, cut-off or foreign 2xx body (a proxy's
+/// page, a body the read lost) is not one: the app cannot tell it from a
+/// request that never reached the account, and wiping the sign-in on it
+/// would leave the user signed out of an account that may still exist. The
+/// caller reports it as an error the user can retry; if the account really
+/// is gone, the retry says so the ordinary way (the session has ended).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteAccountResponse {
@@ -104,6 +111,22 @@ pub struct DeleteAccountResponse {
     /// backend.
     #[serde(default)]
     pub store_subscriptions_still_billing: Option<serde_json::Value>,
+}
+
+impl DeleteAccountResponse {
+    /// MR-2370: the deletion confirmation a 2xx body carries, or `None` when
+    /// the body cannot be read as one. A JSON object whose `success` is the
+    /// boolean `true` confirms; anything else (no body, not JSON, not an
+    /// object, `success` missing, false or not a boolean) does not. The other
+    /// fields stay lenient: `storeSubscriptionsStillBilling` is read whatever
+    /// its shape.
+    pub fn confirmation(body: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        if value.get("success") != Some(&serde_json::Value::Bool(true)) {
+            return None;
+        }
+        serde_json::from_value(value).ok()
+    }
 }
 
 /// Body of `GET /api/v1/gdpr/delete/preflight` (second-pass #9): backend

@@ -1377,6 +1377,39 @@ fn key_gone(reason: &str) -> Value {
     })
 }
 
+/// MR-2334: a deactivated key's reply from the 60-second check-in cache
+/// (`VpnService.heartbeat`'s cached branch, birdo-web origin/main a5a4ad3b).
+/// `serverOnline` is the cached server status, NOT the `false` the database
+/// branch always sends; the revoked sentence is spread first and the offline
+/// one second, so for a server that is not ONLINE the offline sentence is
+/// the one that arrives, beside `reason: "revoked"`. No quota fields: only an
+/// active key is quota-checked.
+fn cached_revoked(server_online: bool) -> Value {
+    let mut reply = json!({
+        "valid": false,
+        "serverOnline": server_online,
+        "message": HB_REVOKED,
+    });
+    if !server_online {
+        reply["message"] = json!(HB_OFFLINE);
+    }
+    reply["reason"] = json!("revoked");
+    reply
+}
+
+/// The reply of the check-in that ended an over-cap Free session
+/// (`VpnService.quotaEndedResult`): `serverOnline` is its server's status at
+/// that moment, ONLINE or not (MR-2334: the not-ONLINE one).
+fn quota_ended(server_online: bool) -> Value {
+    json!({
+        "valid": false,
+        "serverOnline": server_online,
+        "quotaExceeded": true,
+        "reason": "quota_exceeded",
+        "message": HB_ENDED,
+    })
+}
+
 /// A live reply inside an over-cap Free session's grace window
 /// (`VpnService.withQuota`): the reason stays ok / server_offline, and the
 /// three quota fields announce the end.
@@ -1486,6 +1519,26 @@ fn heartbeat_cases() -> Vec<HeartbeatCase> {
             probe_alive: revoked,
             probe_not_alive: revoked,
         },
+        // MR-2334: the deactivated row as the check-in cache answers it.
+        // With its server ONLINE: serverOnline:true, and still the end.
+        HeartbeatCase {
+            reason: "revoked",
+            body: cached_revoked(true),
+            live: ended(HB_REVOKED),
+            probe_alive: revoked,
+            probe_not_alive: revoked,
+        },
+        // With its server not ONLINE: the offline sentence ("reconnect to a
+        // different server") beside `reason: "revoked"`. A revocation all the
+        // same: never a server going offline, never a re-dial; the UI words
+        // it by its code (`revoked`), not by that sentence.
+        HeartbeatCase {
+            reason: "revoked",
+            body: cached_revoked(false),
+            live: ended(HB_OFFLINE),
+            probe_alive: revoked,
+            probe_not_alive: revoked,
+        },
         // A newer connection took the slot: a re-dial would evict it back.
         // MR-2333: its own code and sentence (another device took over), not
         // the reply's not-found one; it still ends the session on both paths.
@@ -1509,13 +1562,17 @@ fn heartbeat_cases() -> Vec<HeartbeatCase> {
         // a later one finds: terminal, and not a revocation.
         HeartbeatCase {
             reason: "quota_exceeded",
-            body: json!({
-                "valid": false,
-                "serverOnline": true,
-                "quotaExceeded": true,
-                "reason": "quota_exceeded",
-                "message": HB_ENDED,
-            }),
+            body: quota_ended(true),
+            live: HeartbeatVerdict::End(quota_exceeded_error()),
+            probe_alive: quota,
+            probe_not_alive: quota,
+        },
+        // MR-2334: the same end while the session's server is not ONLINE
+        // (serverOnline:false): the quota end, never a server going offline
+        // or a drain to re-dial from.
+        HeartbeatCase {
+            reason: "quota_exceeded",
+            body: quota_ended(false),
             live: HeartbeatVerdict::End(quota_exceeded_error()),
             probe_alive: quota,
             probe_not_alive: quota,
@@ -1621,6 +1678,34 @@ fn each_heartbeat_body_is_the_contracts_shape_and_decides_as_listed() {
             (case.live, case.probe_alive, case.probe_not_alive),
             "{body}"
         );
+    }
+}
+
+/// MR-2334: the three server shapes the list once lacked are in it, and each
+/// ends the session as its reason says on both paths, whatever `serverOnline`
+/// or the sentence beside it: the check-in cache's two revocations (server
+/// ONLINE, and not ONLINE with the offline sentence) and a quota end while
+/// the server is not ONLINE.
+#[test]
+fn the_cache_revocations_and_an_offline_quota_end_are_decided() {
+    let cases = heartbeat_cases();
+    for (body, code) in [
+        (cached_revoked(true), IpcErrorCode::Revoked),
+        (cached_revoked(false), IpcErrorCode::Revoked),
+        (quota_ended(false), IpcErrorCode::QuotaExceeded),
+    ] {
+        assert!(
+            cases.iter().any(|c| c.body == body),
+            "{body} is not in heartbeat_cases"
+        );
+        assert_valid(HEARTBEAT, &body);
+        match heartbeat_decisions(&body) {
+            (HeartbeatVerdict::End(error), alive, not_alive) => {
+                assert_eq!(error.code, code, "{body}");
+                assert_eq!((alive, not_alive), (Some(code), Some(code)), "{body}");
+            }
+            (other, ..) => panic!("{body} decided {other:?} on a live check-in"),
+        }
     }
 }
 

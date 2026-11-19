@@ -643,8 +643,10 @@ impl BirdoApi {
     /// does; the second is the answer, and the user has to see it rather than a
     /// generic "Authentication failed" after a pointless token rotation.
     ///
-    /// Tokens are cleared ONLY on a 2xx: a refused deletion leaves the user
-    /// signed in to an account that still exists.
+    /// Tokens are cleared ONLY on a confirmed deletion (a 2xx other than the
+    /// hold's 202 whose body says `success: true`, MR-2370): a refused or
+    /// unreadable answer leaves the user signed in to an account that may
+    /// still exist.
     ///
     /// `around_the_tunnel`: the physical interface's address while a tunnel is
     /// up (REVIEW-WIN2-007). The server removes the account's WireGuard peers
@@ -907,8 +909,10 @@ impl BirdoApi {
 
     /// Decide what one deletion response means, from status and body alone.
     ///
-    /// - 2xx: deleted. The body is parsed leniently; an unreadable one is still
-    ///   a deletion (see [`DeleteAccountResponse`]).
+    /// - 202: the deletion is on hold (MR-2335), never a deletion.
+    /// - any other 2xx: deleted only when the body confirms it (`success:
+    ///   true`, MR-2370); an unreadable one is an error the user can retry,
+    ///   and nothing is wiped (see [`DeleteAccountResponse`]).
     /// - 401 whose message is passport's bare "Unauthorized" (or no message):
     ///   the access token expired — refresh and retry.
     /// - 401 with any other message: the password check refused; that message
@@ -949,9 +953,17 @@ impl BirdoApi {
                 "an unexpected answer to the deletion; nothing is assumed deleted".into(),
             ));
         }
+        // MR-2370: any other 2xx is a deletion only when its body confirms one
+        // (`success: true`, see `DeleteAccountResponse::confirmation`). An
+        // unreadable one is an error the user can retry, never a wipe: it
+        // cannot be told from an answer that never came from the account.
         if status.is_success() {
-            let parsed = serde_json::from_str::<DeleteAccountResponse>(body).unwrap_or_default();
-            return GdprDeleteOutcome::Deleted(parsed);
+            return match DeleteAccountResponse::confirmation(body) {
+                Some(confirmed) => GdprDeleteOutcome::Deleted(confirmed),
+                None => GdprDeleteOutcome::Refused(ApiError::Parse(
+                    "an unreadable answer to the deletion; nothing is assumed deleted".into(),
+                )),
+            };
         }
         // MR-2335: 409 `change_already_pending`: a deletion is on hold already.
         // Its `stepUp` is an OBJECT (every refusal's is the factor array, and
