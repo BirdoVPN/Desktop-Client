@@ -279,15 +279,38 @@ export const KILLSWITCH_HOLDING_COPY =
   'Disconnect to release it.';
 
 /**
+ * MR-2390: the server is unavailable while traffic is held. A drained server
+ * with nowhere to move the session to ends it as `server_unavailable`, and
+ * the always-on kill switch keeps its block (fail-closed, Rust's
+ * `give_up_keeps_block`, kept so on purpose). The plain copy said
+ * only "try another location" over a machine with no internet, which read as
+ * a fault. This one says the block is on purpose and what ends it; the
+ * banner's Choose server opens the picker, and a pick there connects
+ * (Dashboard). Without the block, the plain copy, which claims none.
+ */
+export const SERVER_UNAVAILABLE_BLOCKED_COPY =
+  "This server isn't available right now. Your internet is blocked on purpose by the always-on " +
+  'kill switch until you choose another server.';
+
+/** MR-2390: `server_unavailable` with traffic held: another server is the way out. */
+export function blockedUntilAnotherServer(error: IpcError | null | undefined, blocking: boolean): boolean {
+  return blocking && error?.code === 'server_unavailable';
+}
+
+/**
  * The connection error as the Home banner, the screen-reader announcement and
- * the error notification word it: `errorCopy(error, 'vpn')`, except for a
- * kill-switch failure while traffic is held (`blocking`, the
- * `kill_switch_blocking` bit), which says so and offers Disconnect instead of
- * Try again (MR-2111).
+ * the error notification word it: `errorCopy(error, 'vpn')`, except while
+ * traffic is held (`blocking`, the `kill_switch_blocking` bit): a kill-switch
+ * failure says so and offers Disconnect instead of Try again (MR-2111), and an
+ * unavailable server says the block is on purpose until another server is
+ * chosen (MR-2390).
  */
 export function vpnErrorCopy(error: IpcError, blocking: boolean): ErrorCopy {
   if (blocking && error.code === 'killswitch_failed') {
     return { message: KILLSWITCH_HOLDING_COPY, action: 'disconnect' };
+  }
+  if (blockedUntilAnotherServer(error, blocking)) {
+    return { message: SERVER_UNAVAILABLE_BLOCKED_COPY, action: 'choose_server' };
   }
   return errorCopy(error, 'vpn');
 }

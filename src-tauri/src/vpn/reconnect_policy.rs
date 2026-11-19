@@ -684,9 +684,16 @@ pub fn server_left(answer: Option<&HeartbeatResponse>) -> bool {
 /// move. No other server qualifies (a location the user picked with nothing
 /// else in its country, a Multi-Hop route, a server no longer listed), or
 /// the episode's one move is spent. The code is `server_unavailable`, the
-/// one the backend refuses a non-ONLINE server with. The UI then says the
-/// location is unavailable and offers another. It is not a revocation:
+/// one the backend refuses a non-ONLINE server with. It is not a revocation:
 /// nothing was revoked, and a connect elsewhere works.
+///
+/// It is not `server_ended`, so under the always-on kill switch the give-up
+/// keeps the block (`give_up_keeps_block`, fail-closed); otherwise it is
+/// released. This sentence claims neither, so it is true both ways. The UI
+/// words the ending by its code and the status's `kill_switch_blocking`
+/// (`vpnErrorCopy`): with the block held it says the internet is blocked on
+/// purpose until another server is chosen, and its Choose server opens the
+/// picker; without it, only that the location is unavailable.
 pub fn server_left_error() -> IpcError {
     IpcError::new(
         IpcErrorCode::ServerUnavailable,

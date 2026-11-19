@@ -24,7 +24,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Dashboard } from '@/components/Dashboard';
 import { connectCta, serverSubtitle, serverTitle, statusPill } from '@/lib/vpn-display';
 import { parseVpnStatus, type VpnState } from '@/lib/ipc';
-import { EVICTED_COPY, PQ_FAILED_COPY, REVOKED_COPY } from '@/lib/errors';
+import { EVICTED_COPY, PQ_FAILED_COPY, REVOKED_COPY, SERVER_UNAVAILABLE_BLOCKED_COPY } from '@/lib/errors';
 import { defaultSettings, useAppStore, type Server } from '@/store/app-store';
 
 vi.mock('@tauri-apps/api/core');
@@ -198,6 +198,45 @@ describe('Dashboard: errors with a way forward', () => {
       screen.getByText(/BirdoVPN stopped reconnecting after 10 attempts: the tunnel came up but never reached this server/),
     ).toBeInTheDocument();
     expect(screen.getByText(/The kill switch is still blocking traffic/)).toBeInTheDocument();
+  });
+
+  // MR-2390: the session's server was drained with nowhere to move it, and
+  // the always-on kill switch holds the block (fail-closed). The screen says
+  // the block is on purpose, Choose server opens the picker in one click, and
+  // the pick connects there (the block stays until the new tunnel is up).
+  describe('a drained server with nowhere to go, the block held', () => {
+    const left = { code: 'server_unavailable', message: 'This server was taken out of service.', retryable: false };
+
+    it('says the internet is blocked on purpose, and Choose server opens the picker in one click', async () => {
+      setStatus({ state: 'error', kill_switch_blocking: true, error: left });
+      render(<Dashboard />);
+      expect(screen.getByText(SERVER_UNAVAILABLE_BLOCKED_COPY)).toBeInTheDocument();
+      expect(screen.getByText('Kill Switch — all traffic blocked')).toBeInTheDocument();
+      expect(screen.queryByRole('dialog', { name: 'Choose a server' })).not.toBeInTheDocument();
+
+      const choose = screen.getAllByRole('button', { name: 'Choose server' });
+      expect(choose).toHaveLength(1);
+      await userEvent.click(choose[0]);
+      const sheet = await screen.findByRole('dialog', { name: 'Choose a server' });
+
+      await userEvent.click(within(sheet).getByRole('button', { name: /^Connect to Node b,/ }));
+      await waitFor(() =>
+        expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'b', origin: 'user' }]]),
+      );
+      expect(callsTo('disconnect_vpn')).toHaveLength(0);
+    });
+
+    it('without the block, the copy claims none and a pick only changes the card, as before', async () => {
+      setStatus({ state: 'error', error: left });
+      render(<Dashboard />);
+      expect(screen.queryByText(SERVER_UNAVAILABLE_BLOCKED_COPY)).not.toBeInTheDocument();
+      expect(screen.getByText("This server isn't available right now. Try another location.")).toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: 'Choose server' }));
+      const sheet = await screen.findByRole('dialog', { name: 'Choose a server' });
+      await userEvent.click(within(sheet).getByRole('button', { name: /^Connect to Node b,/ }));
+      await waitFor(() => expect(useAppStore.getState().currentServer?.id).toBe('b'));
+      expect(callsTo('connect_vpn')).toHaveLength(0);
+    });
   });
 
   it('"Kill Switch arms once connected" while it is on but idle (P1-parity-019)', () => {
