@@ -1437,14 +1437,17 @@ fn heartbeat_cases() -> Vec<HeartbeatCase> {
     // On a live session a valid:false ends it, in the server's words, except
     // reaped: MR-2369 rebuilds it quietly, QUIET_REBUILDS_PER_EPISODE (one)
     // time per episode, then ends the session with that same revocation
-    // (`rebuilt`). A drained server's server_offline still ends it: the
-    // contract says connect to a DIFFERENT server, and a re-dial goes to the
-    // same one. The answer is rare live: the server removes the node's peer
-    // BEFORE it answers and the check-in rides the tunnel, so it mostly
-    // arrives as the teardown probe's, which re-dials.
+    // (`rebuilt`). MR-2390: a drained server's server_offline is rebuilt on
+    // the same cap, on a DIFFERENT server, as the contract says
+    // (`moves`), and past the cap ends as unavailable. The answer is rare
+    // live: the server removes the node's peer BEFORE it answers and the
+    // check-in rides the tunnel, so it mostly arrives as the teardown probe's.
+    // That probe re-dials too, also on a different server
+    // (`reconnect_policy::server_left`, checked below for every case).
     let ended = |message: &str| HeartbeatVerdict::End(revoked_error(Some(message)));
     let rebuilt = |message: &str| HeartbeatVerdict::Rebuild {
         ending: revoked_error(Some(message)),
+        moves: false,
     };
     let ok = json!({ "valid": true, "serverOnline": true, "reason": "ok" });
     let offline = json!({
@@ -1491,11 +1494,15 @@ fn heartbeat_cases() -> Vec<HeartbeatCase> {
             probe_alive: None,
             probe_not_alive: None,
         },
-        // valid:false: the key went with a drained or deleted server.
+        // valid:false: the key went with a drained or deleted server. A
+        // quiet rebuild, on another server (MR-2390).
         HeartbeatCase {
             reason: "server_offline",
             body: key_gone("server_offline"),
-            live: ended(HB_NOT_FOUND),
+            live: HeartbeatVerdict::Rebuild {
+                ending: reconnect_policy::server_left_error(),
+                moves: true,
+            },
             probe_alive: None,
             probe_not_alive: None,
         },
@@ -1676,6 +1683,13 @@ fn each_heartbeat_body_is_the_contracts_shape_and_decides_as_listed() {
         assert_eq!(
             heartbeat_decisions(body),
             (case.live, case.probe_alive, case.probe_not_alive),
+            "{body}"
+        );
+        // MR-2390: the probe's re-dial goes to a DIFFERENT server exactly
+        // when the server left the pool, whether its key lives or not.
+        assert_eq!(
+            reconnect_policy::server_left(Some(&heartbeat_reply(body))),
+            case.reason == "server_offline",
             "{body}"
         );
     }

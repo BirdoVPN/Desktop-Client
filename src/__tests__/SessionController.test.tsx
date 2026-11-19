@@ -329,7 +329,10 @@ describe('Auto-Connect (W2-002)', () => {
   it('without a remembered server, picks the fastest (lowest load), the Rust/iOS rule', async () => {
     rustSettings = { ...rustSettings, auto_connect: true };
     render(<VpnSessionController />);
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'b' }]]));
+    // MR-2390: the client's own pick says so; the user's server above does not.
+    await waitFor(() =>
+      expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'b', origin: 'automatic' }]]),
+    );
   });
 
   // Round 7 (N3): a start-up that could not verify the file leaves the

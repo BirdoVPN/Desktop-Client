@@ -78,9 +78,20 @@ export function findLiveServer(
   return null;
 }
 
-export async function connectToServer(server: Server): Promise<boolean> {
+/**
+ * Who chose a connect's server (MR-2390): the user, or the client's own
+ * fastest-server rule. If the server later leaves the pool (a drain), Rust
+ * moves the session ONCE: an automatic pick to the best server anywhere, a
+ * user's pick only within its country, and otherwise it says the location is
+ * unavailable.
+ */
+export type SelectionOrigin = 'user' | 'automatic';
+
+export async function connectToServer(server: Server, origin: SelectionOrigin = 'user'): Promise<boolean> {
   useAppStore.getState().setCurrentServer(server);
-  const ok = await run('connecting', 'connect_vpn', { serverId: server.id });
+  // Only the client's own pick says so; Rust reads anything else as the user's.
+  const args = origin === 'automatic' ? { serverId: server.id, origin } : { serverId: server.id };
+  const ok = await run('connecting', 'connect_vpn', args);
   if (ok) useAppStore.getState().setLastServerId(server.id);
   return ok;
 }
@@ -124,19 +135,28 @@ export function readyMultiHopPair(): { entry: string; exit: string } | null {
   return { entry, exit };
 }
 
+type ConnectTargetState = Pick<ReturnType<typeof useAppStore.getState>, 'currentServer' | 'lastServerId' | 'servers'>;
+
 /**
  * The server a plain "Connect" means: the one on the card, else the one the
  * user last connected to, else the fastest — the same rule for the Connect
- * button, auto-connect and the tray (W2-002, W2-028).
+ * button, auto-connect and the tray (W2-002, W2-028). The first two are the
+ * user's; only the fastest is the client's own pick (MR-2390).
  */
-export function resolveConnectTarget(
-  state: Pick<ReturnType<typeof useAppStore.getState>, 'currentServer' | 'lastServerId' | 'servers'> = useAppStore.getState(),
-): Server | null {
+export function resolveConnectChoice(
+  state: ConnectTargetState = useAppStore.getState(),
+): { server: Server; origin: SelectionOrigin } | null {
   const { currentServer, lastServerId, servers } = state;
-  if (usable(currentServer)) return currentServer;
+  if (usable(currentServer)) return { server: currentServer, origin: 'user' };
   const remembered = servers.find((s) => s.id === lastServerId);
-  if (usable(remembered)) return remembered;
-  return pickBestServer(servers);
+  if (usable(remembered)) return { server: remembered, origin: 'user' };
+  const fastest = pickBestServer(servers);
+  return fastest ? { server: fastest, origin: 'automatic' } : null;
+}
+
+/** The server of {@link resolveConnectChoice}. */
+export function resolveConnectTarget(state: ConnectTargetState = useAppStore.getState()): Server | null {
+  return resolveConnectChoice(state)?.server ?? null;
 }
 
 /**
@@ -154,8 +174,8 @@ export async function connectPreferred(): Promise<boolean> {
     }
     return connectMultiHop(pair.entry, pair.exit);
   }
-  const target = resolveConnectTarget();
-  if (target) return connectToServer(target);
+  const choice = resolveConnectChoice();
+  if (choice) return connectToServer(choice.server, choice.origin);
   if (s.servers.length > 0) {
     s.showNotice({
       text: 'No accessible online servers are available for this account.',

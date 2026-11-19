@@ -231,6 +231,20 @@ describe('what the real actions send', () => {
     expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'de-fra-1' }]]);
   });
 
+  // MR-2390: only the UI's own fastest-server pick adds `origin`, and Rust's
+  // command takes it, optional, mapping exactly 'automatic' to the client's
+  // pick (anything else, or nothing, is the user's).
+  it("connect_vpn { serverId, origin: 'automatic' } for the client's own pick", async () => {
+    await connectToServer(SERVER, 'automatic');
+    expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'de-fra-1', origin: 'automatic' }]]);
+    const vpn = readFileSync(findUp('src-tauri/src/commands/vpn.rs'), 'utf8');
+    const command = vpn.slice(vpn.indexOf('pub async fn connect_vpn('));
+    expect(command.slice(0, command.indexOf('-> Result'))).toMatch(/\borigin: Option<String>,/);
+    expect(readFileSync(findUp('src-tauri/src/vpn/relay_retry.rs'), 'utf8')).toContain(
+      'Some("automatic") => Self::Automatic',
+    );
+  });
+
   it('connect_multi_hop { entryNodeId, exitNodeId }', async () => {
     await connectMultiHop('ch-1', 'de-fra-1');
     expect(callsTo('connect_multi_hop')).toEqual([

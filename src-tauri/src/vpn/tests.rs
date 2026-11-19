@@ -650,6 +650,7 @@ mod auto_reconnect_service_tests {
                 dns_filtering: true,
                 fallback_reason: None,
                 multi_hop: None,
+                origin: crate::vpn::relay_retry::SelectionOrigin::User,
             })
             .await;
         assert_eq!(
@@ -693,6 +694,7 @@ mod reconnect_request_mapping_tests {
                 exit_id: exit.to_string(),
                 exit_name: "Reykjavik".into(),
             }),
+            origin: crate::vpn::relay_retry::SelectionOrigin::User,
         }
     }
 

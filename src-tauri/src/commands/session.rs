@@ -35,6 +35,7 @@ use crate::vpn::birdo_pq::PqSession;
 use crate::vpn::manager::{
     ConnectPhase, ConnectionState, MultiHopStatus, SessionLabel, VpnManager,
 };
+use crate::vpn::relay_retry::SelectionOrigin;
 use crate::vpn::xray::XrayManager;
 use crate::vpn::AutoReconnectService;
 
@@ -63,12 +64,19 @@ pub(crate) async fn ensure_signed_in(
 /// Where a user connect goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConnectTarget {
-    SingleHop { server_id: String },
+    /// `origin`: who chose the server (MR-2390). It decides how far the
+    /// session may move if that server leaves the pool.
+    SingleHop {
+        server_id: String,
+        origin: SelectionOrigin,
+    },
+    /// Always the user's own pair of locations: it never moves.
     MultiHop { entry_id: String, exit_id: String },
 }
 
 impl ConnectTarget {
-    /// The target a live session was built for (settings reapply).
+    /// The target a live session was built for (settings reapply). Its
+    /// origin goes with it.
     pub(crate) fn of(info: &ReconnectInfo) -> Self {
         match &info.multi_hop {
             Some(route) => ConnectTarget::MultiHop {
@@ -77,7 +85,16 @@ impl ConnectTarget {
             },
             None => ConnectTarget::SingleHop {
                 server_id: info.server_id.clone(),
+                origin: info.origin,
             },
+        }
+    }
+
+    /// Who chose where this connect goes (MR-2390).
+    fn origin(&self) -> SelectionOrigin {
+        match self {
+            ConnectTarget::SingleHop { origin, .. } => *origin,
+            ConnectTarget::MultiHop { .. } => SelectionOrigin::User,
         }
     }
 }
@@ -434,7 +451,7 @@ async fn attempt(
         let (private_key, client_public_key) = generate_wireguard_keypair();
         let asked: Result<(ConnectResponse, Option<MultiHopStatus>, &str), IpcError> = async {
             match target {
-                ConnectTarget::SingleHop { server_id } => {
+                ConnectTarget::SingleHop { server_id, .. } => {
                     let response = vm
                         .run_cancellable(
                             ctx.epoch,
@@ -642,6 +659,7 @@ async fn attempt(
         dns_filtering: settings.dns_filtering,
         fallback_reason: fallback_reason.map(str::to_string),
         multi_hop,
+        origin: target.origin(),
     })
     .await;
     if let Err(e) = ar.start().await {
@@ -1625,7 +1643,7 @@ mod lifecycle_tests {
     /// the connect failed; the retry over Xray now goes ahead.
     #[test]
     fn the_stealth_retry_follows_what_the_failed_attempt_asked_for() {
-        use super::{fallback_reason_for, AttemptContext, ConnectTarget};
+        use super::{fallback_reason_for, AttemptContext, ConnectTarget, SelectionOrigin};
         use crate::commands::ipc_error::IpcError;
         use crate::commands::settings::AppSettings;
         use crate::commands::vpn::FALLBACK_HANDSHAKE_TIMEOUT;
@@ -1647,6 +1665,7 @@ mod lifecycle_tests {
 
         let single_hop = ConnectTarget::SingleHop {
             server_id: "node-1".into(),
+            origin: SelectionOrigin::User,
         };
         let unanswered = IpcError::from_tunnel_failure(&format!(
             "Failed to start tunnel: Handshake failed after 3 attempts: {}",

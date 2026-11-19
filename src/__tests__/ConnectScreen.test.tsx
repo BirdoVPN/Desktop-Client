@@ -152,7 +152,10 @@ describe('Dashboard: Disconnect is always reachable', () => {
     render(<Dashboard />);
     expect(screen.getByText('Fastest server')).toBeInTheDocument();
     await userEvent.click(cta());
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'b' }]]));
+    // MR-2390: the fastest server is the client's pick, and Rust is told so.
+    await waitFor(() =>
+      expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'b', origin: 'automatic' }]]),
+    );
   });
 });
 

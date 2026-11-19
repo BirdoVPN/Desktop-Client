@@ -120,7 +120,7 @@ pub enum ResumeTarget {
 impl ResumeTarget {
     pub(crate) fn of(target: &ConnectTarget) -> Self {
         match target {
-            ConnectTarget::SingleHop { server_id } => Self::SingleHop {
+            ConnectTarget::SingleHop { server_id, .. } => Self::SingleHop {
                 server_id: server_id.clone(),
             },
             ConnectTarget::MultiHop { entry_id, exit_id } => Self::MultiHop {
