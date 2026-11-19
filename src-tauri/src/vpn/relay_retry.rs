@@ -27,11 +27,21 @@
 //!   * the log gives the origin and how far the move went, never a server's
 //!     id, name, city, country or address ([`log_line`]).
 //!
+//! A DELETED server (owner, 2026-11-19, every client) moves by the same
+//! rule. It is gone from the list the move fetches, so where it was comes
+//! from the lists the app fetched before ([`known_location`]): an automatic
+//! pick still goes to the best server anywhere, and a user's pick only to
+//! another server in its country, else nowhere (unavailable). It used to
+//! move nowhere, whoever chose it.
+//!
 //! A Multi-Hop route is the user's own pair of locations, so it never moves.
 //! A route whose server left ends like a user's pick with nowhere to go.
 //!
-//! Pure, so the tests below pin the choice. `auto_reconnect` fetches the list
-//! and applies the choice.
+//! The choice is pure, so the tests below pin it. `auto_reconnect` fetches
+//! the list and applies the choice.
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use crate::api::types::VpnServer;
 
@@ -96,6 +106,45 @@ pub struct Choice {
     pub reach: Reach,
 }
 
+/// Where a server is: its country code and city, as `/vpn/servers` lists it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Location {
+    pub country_code: String,
+    pub city: String,
+}
+
+impl Location {
+    pub fn of(server: &VpnServer) -> Self {
+        Self {
+            country_code: server.country_code.clone(),
+            city: server.city.clone(),
+        }
+    }
+}
+
+/// Where each server a list has named this run is ([`remember`]). Never
+/// pruned: a deleted server is gone from the next list, and its place is
+/// what a move needs. In memory only, and never logged.
+static KNOWN: Mutex<BTreeMap<String, Location>> = Mutex::new(BTreeMap::new());
+
+/// Keep where each server in `list` is: every list the app fetches (the
+/// UI's server list, quick connect's, a move's own).
+pub fn remember(list: &[VpnServer]) {
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    for server in list {
+        known.insert(server.id.clone(), Location::of(server));
+    }
+}
+
+/// Where `id` was when a list last named it this run, if one did.
+pub fn known_location(id: &str) -> Option<Location> {
+    KNOWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .cloned()
+}
+
 /// The server to move to after `left` left the pool, or `None`. The first
 /// rule that applies wins:
 ///   1. another server in the SAME city and country;
@@ -105,14 +154,25 @@ pub struct Choice {
 ///   4. nothing. The caller then says the location is unavailable.
 ///
 /// "Best" is the best-server rule: online, open to this plan, least loaded,
-/// then name and id. `None` when `left` is not in `list` (a deleted server):
-/// without its country a user's choice cannot be kept, so nothing moves. iOS
-/// applies that to every origin, and so does this.
-pub fn next(left: &str, list: &[VpnServer], origin: SelectionOrigin) -> Option<Choice> {
-    let failed = list.iter().find(|s| s.id == left)?;
+/// then name and id. The server that left is never chosen.
+///
+/// Where `left` was: its own entry while `list` still has it (drained), else
+/// `last_known` (deleted; [`known_location`]). With neither, its country is
+/// unknown: a user's choice cannot be kept, so it does not move, and an
+/// automatic one still goes to the best server anywhere (owner, 2026-11-19).
+pub fn next(
+    left: &str,
+    list: &[VpnServer],
+    origin: SelectionOrigin,
+    last_known: Option<&Location>,
+) -> Option<Choice> {
+    let home = match list.iter().find(|s| s.id == left) {
+        Some(listed) => Location::of(listed),
+        None => last_known.cloned().unwrap_or_default(),
+    };
     let others = || list.iter().filter(|s| s.id != left);
-    let country = normalized(&failed.country_code);
-    let city = normalized(&failed.city);
+    let country = normalized(&home.country_code);
+    let city = normalized(&home.city);
     if !country.is_empty() && !city.is_empty() {
         let same_city = others()
             .filter(|s| normalized(&s.country_code) == country && normalized(&s.city) == city);
@@ -126,7 +186,7 @@ pub fn next(left: &str, list: &[VpnServer], origin: SelectionOrigin) -> Option<C
     match origin {
         SelectionOrigin::Automatic => {
             let server = best(others())?;
-            let reach = reach(failed, &server);
+            let reach = reach(&home, &server);
             Some(Choice { server, reach })
         }
         SelectionOrigin::User => {
@@ -166,7 +226,7 @@ fn best<'a>(candidates: impl Iterator<Item = &'a VpnServer>) -> Option<VpnServer
     crate::commands::vpn::pick_quick_connect_server(candidates.cloned().collect(), None)
 }
 
-fn reach(from: &VpnServer, to: &VpnServer) -> Reach {
+fn reach(from: &Location, to: &VpnServer) -> Reach {
     let country = normalized(&from.country_code);
     if country.is_empty() || country != normalized(&to.country_code) {
         return Reach::OtherCountry;
@@ -232,7 +292,7 @@ mod tests {
     #[test]
     fn an_automatic_pick_moves_to_the_best_server_in_any_country() {
         assert_eq!(
-            picked(next("drained", &fleet(), SelectionOrigin::Automatic)),
+            picked(next("drained", &fleet(), SelectionOrigin::Automatic, None)),
             Some(("nl-ams".into(), Reach::OtherCountry))
         );
     }
@@ -242,7 +302,7 @@ mod tests {
     #[test]
     fn a_users_pick_stays_in_its_country() {
         assert_eq!(
-            picked(next("drained", &fleet(), SelectionOrigin::User)),
+            picked(next("drained", &fleet(), SelectionOrigin::User, None)),
             Some(("de-ber".into(), Reach::SameCountry))
         );
     }
@@ -254,7 +314,7 @@ mod tests {
         list.push(server("de-fra-2", " de ", "FRANKFURT ", 90, true, true));
         for origin in [SelectionOrigin::Automatic, SelectionOrigin::User] {
             assert_eq!(
-                picked(next("drained", &list, origin)),
+                picked(next("drained", &list, origin, None)),
                 Some(("de-fra-2".into(), Reach::SameCity)),
                 "{origin:?}"
             );
@@ -275,9 +335,9 @@ mod tests {
                 s
             })
             .collect();
-        assert!(next("drained", &list, SelectionOrigin::User).is_none());
+        assert!(next("drained", &list, SelectionOrigin::User, None).is_none());
         assert_eq!(
-            picked(next("drained", &list, SelectionOrigin::Automatic)),
+            picked(next("drained", &list, SelectionOrigin::Automatic, None)),
             Some(("nl-ams".into(), Reach::OtherCountry))
         );
         let offline_too: Vec<_> = list
@@ -287,7 +347,7 @@ mod tests {
                 s
             })
             .collect();
-        assert!(next("drained", &offline_too, SelectionOrigin::Automatic).is_none());
+        assert!(next("drained", &offline_too, SelectionOrigin::Automatic, None).is_none());
     }
 
     /// Only servers online AND open to the plan qualify, and the one that
@@ -300,24 +360,100 @@ mod tests {
             server("de-mun", "DE", "Munich", 50, true, false),
         ];
         for origin in [SelectionOrigin::Automatic, SelectionOrigin::User] {
-            assert!(next("drained", &list, origin).is_none(), "{origin:?}");
+            assert!(next("drained", &list, origin, None).is_none(), "{origin:?}");
         }
     }
 
-    /// A server the list no longer has (deleted) leaves no country to keep,
-    /// so nothing moves, whoever chose it (iOS's rule). Nor does a user's
-    /// pick whose country the list does not say.
+    /// A user's pick whose country is unknown does not move: neither a
+    /// deleted server no earlier list named, nor one the list names with no
+    /// country. An automatic pick still goes anywhere.
     #[test]
-    fn a_server_the_list_does_not_have_moves_nowhere() {
-        for origin in [SelectionOrigin::Automatic, SelectionOrigin::User] {
-            assert!(next("deleted", &fleet(), origin).is_none(), "{origin:?}");
-        }
+    fn a_users_pick_whose_country_is_unknown_moves_nowhere() {
+        assert!(next("deleted", &fleet(), SelectionOrigin::User, None).is_none());
+        assert_eq!(
+            picked(next("deleted", &fleet(), SelectionOrigin::Automatic, None)),
+            Some(("nl-ams".into(), Reach::OtherCountry))
+        );
         let mut list = fleet();
         list[0].country_code = "  ".into();
-        assert!(next("drained", &list, SelectionOrigin::User).is_none());
+        assert!(next("drained", &list, SelectionOrigin::User, None).is_none());
         assert_eq!(
-            picked(next("drained", &list, SelectionOrigin::Automatic)),
+            picked(next("drained", &list, SelectionOrigin::Automatic, None)),
             Some(("nl-ams".into(), Reach::OtherCountry))
+        );
+    }
+
+    /// A DELETED server (owner, 2026-11-19): gone from the list, so where it
+    /// was comes from an earlier one. An automatic pick moves to the best
+    /// server anywhere, another country when its own has none. A user's pick
+    /// moves within its country, the same city first, else nowhere. The
+    /// deleted server is never chosen.
+    #[test]
+    fn a_deleted_server_moves_by_where_it_was() {
+        let frankfurt = Location {
+            country_code: "DE".into(),
+            city: "Frankfurt".into(),
+        };
+        let list: Vec<_> = fleet().into_iter().filter(|s| s.id != "drained").collect();
+        assert_eq!(
+            picked(next(
+                "drained",
+                &list,
+                SelectionOrigin::User,
+                Some(&frankfurt)
+            )),
+            Some(("de-ber".into(), Reach::SameCountry))
+        );
+        let abroad_only: Vec<_> = list.iter().filter(|s| s.id != "de-ber").cloned().collect();
+        assert!(next(
+            "drained",
+            &abroad_only,
+            SelectionOrigin::User,
+            Some(&frankfurt)
+        )
+        .is_none());
+        for last_known in [Some(&frankfurt), None] {
+            assert_eq!(
+                picked(next(
+                    "drained",
+                    &abroad_only,
+                    SelectionOrigin::Automatic,
+                    last_known
+                )),
+                Some(("nl-ams".into(), Reach::OtherCountry)),
+                "{last_known:?}"
+            );
+        }
+        let mut list = list;
+        list.push(server("de-fra-2", "DE", "Frankfurt", 90, true, true));
+        for origin in [SelectionOrigin::Automatic, SelectionOrigin::User] {
+            assert_eq!(
+                picked(next("drained", &list, origin, Some(&frankfurt))),
+                Some(("de-fra-2".into(), Reach::SameCity)),
+                "{origin:?}"
+            );
+        }
+        // Never the deleted server, even with an earlier list naming it.
+        remember(&[server("mr2390-deleted", "DE", "Frankfurt", 0, true, true)]);
+        let home = known_location("mr2390-deleted");
+        for origin in [SelectionOrigin::Automatic, SelectionOrigin::User] {
+            let choice = next("mr2390-deleted", &list, origin, home.as_ref()).unwrap();
+            assert_ne!(choice.server.id, "mr2390-deleted", "{origin:?}");
+        }
+    }
+
+    /// Where a server was outlives the lists that no longer name it.
+    #[test]
+    fn where_a_server_was_outlives_the_lists_without_it() {
+        assert_eq!(known_location("mr2390-known"), None);
+        remember(&[server("mr2390-known", "DE", "Frankfurt", 5, true, true)]);
+        remember(&[server("mr2390-other", "NL", "Amsterdam", 5, true, true)]);
+        assert_eq!(
+            known_location("mr2390-known"),
+            Some(Location {
+                country_code: "DE".into(),
+                city: "Frankfurt".into(),
+            })
         );
     }
 
@@ -330,10 +466,10 @@ mod tests {
             server("b", "FR", "Paris", 7, true, true),
             server("a", "GB", "London", 7, true, true),
         ];
-        let first = picked(next("drained", &list, SelectionOrigin::Automatic));
+        let first = picked(next("drained", &list, SelectionOrigin::Automatic, None));
         list.reverse();
         assert_eq!(
-            picked(next("drained", &list, SelectionOrigin::Automatic)),
+            picked(next("drained", &list, SelectionOrigin::Automatic, None)),
             first
         );
         assert_eq!(first, Some(("a".into(), Reach::OtherCountry)));
@@ -369,7 +505,7 @@ mod tests {
     fn the_log_line_names_no_server() {
         let list = fleet();
         for origin in [SelectionOrigin::Automatic, SelectionOrigin::User] {
-            let choice = next("drained", &list, origin);
+            let choice = next("drained", &list, origin, None);
             let line = log_line(choice.as_ref(), origin);
             assert!(line.contains("move 1 of 1"), "{line}");
             for s in &list {

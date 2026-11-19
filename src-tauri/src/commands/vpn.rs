@@ -1008,6 +1008,8 @@ async fn quick_connect_target(
     }
 
     let servers = api.get_servers().await.map_err(IpcError::from)?;
+    // MR-2390: where each server is, for a move off one deleted later.
+    crate::vpn::relay_retry::remember(&servers);
     let best_server = pick_quick_connect_server(servers, settings.preferred_server_id.as_deref())
         .ok_or_else(|| {
         IpcError::new(

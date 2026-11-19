@@ -682,8 +682,8 @@ pub fn server_left(answer: Option<&HeartbeatResponse>) -> bool {
 
 /// MR-2390: how a session ends when its server left the pool and it cannot
 /// move. No other server qualifies (a location the user picked with nothing
-/// else in its country, a Multi-Hop route, a server no longer listed), or
-/// the episode's one move is spent. The code is `server_unavailable`, the
+/// else in its country, or deleted with no list ever naming its country; a
+/// Multi-Hop route), or the episode's one move is spent. The code is `server_unavailable`, the
 /// one the backend refuses a non-ONLINE server with. It is not a revocation:
 /// nothing was revoked, and a connect elsewhere works.
 ///

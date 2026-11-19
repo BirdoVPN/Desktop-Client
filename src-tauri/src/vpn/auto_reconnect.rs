@@ -1675,8 +1675,8 @@ impl ReconnectLoop {
         .await
     }
 
-    /// MR-2390: the session's server left the pool (a drain, seen at a
-    /// check-in or in the old key's answer), and the cap allowed the
+    /// MR-2390: the session's server left the pool (drained or deleted, seen
+    /// at a check-in or in the old key's answer), and the cap allowed the
     /// episode's one move. Before the re-dial goes out, this fetches the
     /// server list on connections of its own (like the re-dial) and puts the
     /// server it chooses on record ([`move_record`]). The re-dial and its
@@ -1723,10 +1723,15 @@ impl ReconnectLoop {
         };
         // The move is decided now, whatever it comes to.
         self.quiet_rebuilds.with(QuietRebuilds::left);
+        // A deleted server is gone from this list: where it was comes from
+        // the lists fetched before it (owner, 2026-11-19).
+        let last_known = relay_retry::known_location(&leaving);
+        relay_retry::remember(&servers);
         let moved = move_record(
             &mut *self.last_reconnect_info.write().await,
             &leaving,
             &servers,
+            last_known.as_ref(),
         );
         match moved {
             Ok(()) => None,
@@ -2158,18 +2163,24 @@ fn probe_verdict<'r>(
 /// `Ok`: the record names the new server, or there was nothing to move (no
 /// session on record, or one that is not on that server). `Err`: no server
 /// qualifies, so the session ends with this error. That covers a location
-/// the user picked with nothing else in its country, and a Multi-Hop route,
-/// which is the user's own pair of locations and never moves.
+/// the user picked with nothing else in its country (or, deleted, no country
+/// known), and a Multi-Hop route, which is the user's own pair of locations
+/// and never moves.
+///
+/// `last_known`: where `leaving` was when an earlier list named it
+/// (`relay_retry::known_location`), for a deleted server `servers` no longer
+/// has.
 fn move_record(
     record: &mut Option<ReconnectInfo>,
     leaving: &str,
     servers: &[crate::api::types::VpnServer],
+    last_known: Option<&relay_retry::Location>,
 ) -> Result<(), IpcError> {
     let Some(info) = record.as_mut().filter(|info| info.server_id == leaving) else {
         return Ok(());
     };
     let choice = match info.multi_hop {
-        None => relay_retry::next(leaving, servers, info.origin),
+        None => relay_retry::next(leaving, servers, info.origin, last_known),
         Some(_) => None,
     };
     tracing::warn!("{}", relay_retry::log_line(choice.as_ref(), info.origin));
@@ -3498,7 +3509,8 @@ mod tests {
             move_record(
                 &mut *lp.last_reconnect_info.write().await,
                 "node-1",
-                &drained_fleet()
+                &drained_fleet(),
+                None
             ),
             Ok(())
         );
@@ -3622,7 +3634,7 @@ mod tests {
     fn the_session_on_record_moves_by_its_origin() {
         let fleet = drained_fleet();
         let mut record = on_record(SelectionOrigin::Automatic);
-        assert_eq!(move_record(&mut record, "node-1", &fleet), Ok(()));
+        assert_eq!(move_record(&mut record, "node-1", &fleet, None), Ok(()));
         let moved = record.unwrap();
         assert_eq!(
             (moved.server_id.as_str(), moved.server_name.as_str()),
@@ -3631,13 +3643,13 @@ mod tests {
         assert_eq!(moved.origin, SelectionOrigin::Automatic);
 
         let mut record = on_record(SelectionOrigin::User);
-        assert_eq!(move_record(&mut record, "node-1", &fleet), Ok(()));
+        assert_eq!(move_record(&mut record, "node-1", &fleet, None), Ok(()));
         assert_eq!(record.unwrap().server_id, "de-ber", "never abroad");
 
         let abroad_only: Vec<_> = fleet.iter().filter(|s| s.id != "de-ber").cloned().collect();
         let mut record = on_record(SelectionOrigin::User);
         assert_eq!(
-            move_record(&mut record, "node-1", &abroad_only),
+            move_record(&mut record, "node-1", &abroad_only, None),
             Err(reconnect_policy::server_left_error())
         );
         assert_eq!(record.unwrap().server_id, "node-1", "not moved");
@@ -3652,7 +3664,7 @@ mod tests {
             });
         }
         assert_eq!(
-            move_record(&mut record, "node-1", &fleet),
+            move_record(&mut record, "node-1", &fleet, None),
             Err(reconnect_policy::server_left_error()),
             "a Multi-Hop route is never moved"
         );
@@ -3660,10 +3672,97 @@ mod tests {
         // Nothing on record, or a session that is not on that server:
         // nothing to move.
         let mut none = None;
-        assert_eq!(move_record(&mut none, "node-1", &fleet), Ok(()));
+        assert_eq!(move_record(&mut none, "node-1", &fleet, None), Ok(()));
         let mut elsewhere = on_record(SelectionOrigin::Automatic);
-        assert_eq!(move_record(&mut elsewhere, "other", &fleet), Ok(()));
+        assert_eq!(move_record(&mut elsewhere, "other", &fleet, None), Ok(()));
         assert_eq!(elsewhere.unwrap().server_id, "node-1");
+    }
+
+    /// MR-2390, a DELETED server (owner, 2026-11-19, every client): gone from
+    /// the list the move fetches, so where it was comes from the lists
+    /// fetched before (`relay_retry::known_location`). A server the client
+    /// chose moves to the best server anywhere, another country when its own
+    /// has none. One the user picked moves only within its country. With
+    /// nothing there, or its country unknown, it does not move: the session
+    /// ends as unavailable, and the always-on kill switch keeps its block
+    /// (the UI then says the block is on purpose, `vpnErrorCopy`). The
+    /// deleted server is never picked, and the episode has one move.
+    #[test]
+    fn a_deleted_server_moves_by_its_origin_from_where_it_was() {
+        let frankfurt = relay_retry::Location {
+            country_code: "DE".into(),
+            city: "Frankfurt".into(),
+        };
+        // node-1 (DE, Frankfurt) is deleted: the list no longer has it.
+        let listed: Vec<_> = drained_fleet()
+            .into_iter()
+            .filter(|s| s.id != "node-1")
+            .collect();
+        let abroad_only: Vec<_> = listed
+            .iter()
+            .filter(|s| s.id != "de-ber")
+            .cloned()
+            .collect();
+
+        // The client's pick: another country when its own has none, and
+        // anywhere when where it was is not known.
+        for last_known in [Some(&frankfurt), None] {
+            let mut record = on_record(SelectionOrigin::Automatic);
+            assert_eq!(
+                move_record(&mut record, "node-1", &abroad_only, last_known),
+                Ok(())
+            );
+            let moved = record.unwrap();
+            assert_eq!(
+                (moved.server_id.as_str(), moved.origin),
+                ("nl-ams", SelectionOrigin::Automatic),
+                "{last_known:?}"
+            );
+        }
+
+        // The user's pick: within its country when a server is there.
+        let mut record = on_record(SelectionOrigin::User);
+        assert_eq!(
+            move_record(&mut record, "node-1", &listed, Some(&frankfurt)),
+            Ok(())
+        );
+        let moved = record.unwrap();
+        assert_eq!(
+            (moved.server_id.as_str(), moved.server_name.as_str()),
+            ("de-ber", "Name de-ber")
+        );
+        assert_eq!(moved.origin, SelectionOrigin::User);
+
+        // Nothing in its country, or its country unknown: no move, and the
+        // session ends as unavailable, the block held under always-on only.
+        for last_known in [Some(&frankfurt), None] {
+            let mut record = on_record(SelectionOrigin::User);
+            let ending = move_record(&mut record, "node-1", &abroad_only, last_known).unwrap_err();
+            assert_eq!(ending, reconnect_policy::server_left_error());
+            assert_eq!(ending.code, IpcErrorCode::ServerUnavailable);
+            assert!(reconnect_policy::give_up_keeps_block(ending.code, true));
+            assert!(!reconnect_policy::give_up_keeps_block(ending.code, false));
+            assert_eq!(record.unwrap().server_id, "node-1", "not moved");
+        }
+
+        // The deleted server is never picked, whatever an earlier list said
+        // of it.
+        for origin in [SelectionOrigin::Automatic, SelectionOrigin::User] {
+            let mut record = on_record(origin);
+            let _ = move_record(&mut record, "node-1", &listed, Some(&frankfurt));
+            assert_ne!(record.unwrap().server_id, "node-1", "{origin:?}");
+        }
+
+        // One move per episode: the server it moved to is deleted too, and
+        // the cap ends the session instead of moving it again.
+        let mut cap = QuietRebuilds::default();
+        assert_eq!(
+            cap.on_server_left(false, Some("node-1")),
+            OnRelease::Rebuild
+        );
+        cap.left();
+        assert_eq!(cap.on_server_left(false, Some("de-ber")), OnRelease::End);
+        assert_eq!(cap.spent(), 1);
     }
 
     /// MR-2390, the wiring of the move (the choice and the record are driven
@@ -3706,6 +3805,8 @@ mod tests {
                 ".run_cancellable(epoch, timeout(SERVER_LIST_TIMEOUT, api.get_servers()))",
                 "self.policy.on_dial_failed(error.clone());",
                 "self.quiet_rebuilds.with(QuietRebuilds::left);",
+                "relay_retry::known_location(&leaving)",
+                "relay_retry::remember(&servers);",
                 "move_record(",
                 "self.end_by_server(ending).await",
             ],
