@@ -14,26 +14,65 @@
 #
 # Scans every YAML file under .github/ (each bash step runs under pipefail)
 # and every tracked shell script that sets pipefail. Comment lines are skipped.
+# A command continued onto the next line - a trailing `\`, or a trailing `|` /
+# `|&` with only blank or comment lines before the next command - is joined
+# first and reported at its first line (MR-2403: a line-by-line scan walked
+# past `producer |` + `grep -q pat` on the line below).
 # Run: bash .github/scripts/check-no-pipe-into-grep-q.sh   (exit 0 = clean)
+# Its test: bash .github/scripts/check-no-pipe-into-grep-q-test.sh
 set -euo pipefail
 
-# A `|` that is not half of `||`, optional VAR=value prefixes, grep / egrep /
-# fgrep, then - before a `|`, `;`, `&` or `)` ends that command - a short-option
-# cluster holding q (-q, -qE, -Eq, -qxF, -iqE ...) or --quiet / --silent.
-re='(^|[^|])[|][[:space:]]*([[:alpha:]_][[:alnum:]_]*=[^[:space:]]*[[:space:]]+)*(grep|egrep|fgrep)([[:space:]]+[^|;&)[:space:]]+)*[[:space:]]+(-[[:alpha:]]*q[[:alpha:]]*|--quiet|--silent)([[:space:]]|$)'
+# A `|` or `|&` that is not half of `||`; then any `{` / `(` group openers,
+# VAR=value prefixes and wrappers that run their argument as a command
+# (command, env, exec, nice, nohup, stdbuf, sudo, time, timeout, xargs - with
+# their own options); then grep / egrep / fgrep, also as \grep or by path
+# (/usr/bin/grep); then - before a `|`, `;`, `&`, `)` or backtick ends that
+# command - an option that turns quiet mode on: a short-option cluster holding
+# q after no option that takes an argument (-q, -qE, -Eq, -iqF, -qm1; not the
+# pattern `q` of -eq), or --quiet / --silent or a prefix of one (--qui).
+assign='[[:alpha:]_][[:alnum:]_]*=[^[:space:]]*'
+wrapper='(command|env|exec|nice|nohup|stdbuf|sudo|time|timeout|xargs)([[:space:]]+(-[^[:space:]]*|[0-9][^[:space:]]*|'"$assign"'))*'
+re='(^|[^|])[|]&?[[:space:]]*([{(][[:space:]]*|'"$assign"'[[:space:]]+|'"$wrapper"'[[:space:]]+)*'
+re+='\\?([^[:space:]|;&()<>`]*/)?(grep|egrep|fgrep)([[:space:]]+[^|;&)`[:space:]]+)*'
+re+='[[:space:]]+(-[abcghijklnopqrstuvwxyzEFGHIJKLMNOPQRSTUVWXYZ]*q[^|;&)`[:space:]]*|--(q(u(i(e(t)?)?)?)?|s(i(l(e(n(t)?)?)?)?)?))([[:space:];&|)`]|$)'
 
-scan() { # scan <name> < text : print "<name>:<line>: <text>" for each offending line
-  local name="$1" n=0 line
+# A physical line continues the command when it ends in an odd run of
+# backslashes, or in a pipe (then optionally a comment). The `|` of a YAML
+# block scalar (`run: |`, `- |-`) is not a pipe: it opens the script.
+cont_backslash='(^|[^\\])(\\\\)*\\$'
+cont_pipe='(^|[^|])[|]&?[[:space:]]*([[:space:]]#.*)?$'
+yaml_block='(:|^[[:space:]]*-)[[:space:]]+[|][-+0-9]*[[:space:]]*([[:space:]]#.*)?$'
+blank_or_comment='^[[:space:]]*(#.*)?$'
+
+scan() { # scan <name> < text : print "<name>:<line>: <command>" for each offending command
+  local name="$1" n=0 start=0 line cmd="" cont=""
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
-    if [[ $line =~ ^[[:space:]]*# ]]; then continue; fi
-    if [[ $line =~ $re ]]; then printf '%s:%s: %s\n' "$name" "$n" "$line"; fi
+    line="${line%$'\r'}"
+    if [ "$cont" = pipe ] && [[ $line =~ $blank_or_comment ]]; then continue; fi
+    if [ -n "$cont" ]; then
+      cmd+=" $line"
+    elif [[ $line =~ ^[[:space:]]*# ]]; then
+      continue
+    else
+      cmd="$line" start=$n
+    fi
+    if [[ $line =~ $cont_backslash ]]; then
+      cmd="${cmd%\\}" cont=backslash
+    elif ! [[ $line =~ $yaml_block ]] && [[ $line =~ $cont_pipe ]]; then
+      cmd="${cmd%"${BASH_REMATCH[2]}"}" cont=pipe # drop a trailing comment
+    else
+      cont=""
+      if [[ $cmd =~ $re ]]; then printf '%s:%s: %s\n' "$name" "$start" "$cmd"; fi
+    fi
   done
+  if [ -n "$cont" ] && [[ $cmd =~ $re ]]; then printf '%s:%s: %s\n' "$name" "$start" "$cmd"; fi
 }
 
 # Self-test first: a guard whose pattern quietly stopped matching is a green
 # light for exactly the flake it exists to stop. `@P@` stands for the pipe
-# character so this file does not trip its own scan.
+# character and `@N@` for a newline, so this file does not trip its own scan.
+# The full fixture matrix, run end to end, is check-no-pipe-into-grep-q-test.sh.
 must_flag=(
   '          if ! echo "$out" @P@ grep -qE '\''test result: ok\. 5 passed'\''; then'
   'if printf '\''%s'\'' "$message" @P@ grep -qxE '\''release:[[:space:]]*draft'\''; then'
@@ -45,6 +84,18 @@ must_flag=(
   'x @P@ grep -F --silent foo'
   'x @P@ LC_ALL=C grep -qF -- "$y"'
   'x @P@ grep -qv foo && echo ok'
+  'x \@N@  @P@ grep -q foo'
+  'x @P@ \@N@  grep -q foo'
+  'x @P@@N@  grep -q foo'
+  'x @P@ # why@N@@N@  # and why not@N@  grep -q foo'
+  'x @P@& grep -q foo'
+  'x @P@ command grep -q foo'
+  'x @P@ \grep -q foo'
+  'x @P@ /usr/bin/grep -q foo'
+  'x @P@ { grep -q foo; }'
+  'x @P@ xargs -r grep -q foo'
+  'x @P@ grep --qui foo'
+  'x @P@ grep -qm1 foo'
 )
 must_pass=(
   'if ! grep -qE '\''test result: ok\. 5 passed'\'' <<<"$out"; then'
@@ -56,17 +107,26 @@ must_pass=(
   'x @P@ grep foo && [ "$a" -eq 1 ]'
   'x @P@ grep -oE foo; [ "$a" -eq 1 ]'
   '          # never echo "$out" @P@ grep -q foo'
+  '[ `x @P@ grep -c foo` -eq 0 ]'
+  'x @P@ grep -e q foo'
+  'grep -q foo < <(x)'
+  'x @P@@P@ \@N@  grep -q foo file'
+  '# see x @P@@N@grep -q foo file'
+  '      - run: @P@@N@          grep -q foo file'
+  '  - @P@-@N@    grep -q foo file'
 )
 selftest_failed=0
 for c in "${must_flag[@]}"; do
-  if [ -z "$(scan case <<<"${c//@P@/|}")" ]; then
-    echo "self-test FAIL: not flagged: ${c//@P@/|}"
+  c="${c//@P@/|}" c="${c//@N@/$'\n'}"
+  if [ -z "$(scan case <<<"$c")" ]; then
+    echo "self-test FAIL: not flagged: $c"
     selftest_failed=1
   fi
 done
 for c in "${must_pass[@]}"; do
-  if [ -n "$(scan case <<<"${c//@P@/|}")" ]; then
-    echo "self-test FAIL: wrongly flagged: ${c//@P@/|}"
+  c="${c//@P@/|}" c="${c//@N@/$'\n'}"
+  if [ -n "$(scan case <<<"$c")" ]; then
+    echo "self-test FAIL: wrongly flagged: $c"
     selftest_failed=1
   fi
 done
