@@ -13,7 +13,8 @@
  *    to Login with a reason;
  *  - tray Disconnect acts in `reconnecting` (it used to act only in
  *    `connected`), tray Quick Connect dials the user's own server;
- *  - Auto-Connect runs once per session, to the user's server;
+ *  - Auto-Connect runs once per session, to the user's server, and never
+ *    takes a server the user chose out of its country (MR-2492);
  *  - and the controller keeps working under the biometric cover (App-level).
  *
  * Run: npx vitest run src/__tests__/SessionController.test.tsx
@@ -417,6 +418,155 @@ describe('Auto-Connect (W2-002)', () => {
     await act(async () => {});
     expect(callsTo('record_consent')).toHaveLength(0);
     expect(useAppStore.getState().notice).toBeNull();
+  });
+});
+
+/**
+ * MR-2492 [RETRY-RULE-PARITY]. The owner's rule for every client (2026-11-19,
+ * MR-2212 Q2 + Q6; iOS: Mobile #645, `RelayRetry.swift`): a server the CLIENT
+ * chose may move to another country, once; a location the USER chose never
+ * leaves its country without a click. Auto-Connect is the one desktop dial
+ * with no click that can land on a server other than the one on record: at
+ * launch, when that server is offline, out of the plan or gone. It used to
+ * fall back to the fastest server in any country.
+ */
+describe("Auto-Connect keeps the user's server in its country (MR-2492)", () => {
+  const HELD_COPY =
+    "Your server isn't available now, and BirdoVPN doesn't move you to another country by itself. " +
+    'Choose a server to connect.';
+
+  /** One server per city, as the fleet is; the United States has two. */
+  const fleet = () => [
+    server('fra', 10, { country: 'Germany', countryCode: 'DE', city: 'Frankfurt' }),
+    server('ams', 30, { country: 'Netherlands', countryCode: 'NL', city: 'Amsterdam' }),
+    server('sto', 20, { country: 'Sweden', countryCode: 'SE', city: 'Stockholm' }),
+    server('nyc', 15, { country: 'United States', countryCode: 'US', city: 'New York' }),
+    server('lax', 40, { country: 'United States', countryCode: 'US', city: 'Los Angeles' }),
+    server('yyz', 55, { country: 'Canada', countryCode: 'CA', city: 'Toronto' }),
+  ];
+  const fleetWith = (id: string, patch: Record<string, unknown>) =>
+    fleet().map((s) => (s.id === id ? { ...s, ...patch } : s));
+
+  /** A new start of the app: what is persisted stays, the rest starts over. */
+  function relaunch() {
+    useAppStore.setState({
+      connectionState: 'disconnected',
+      liveServerId: null,
+      liveServerName: null,
+      statusSeq: -1,
+      pendingAction: null,
+      currentServer: null,
+      servers: [],
+      serversStatus: 'idle',
+      settingsHydrated: false,
+      notice: null,
+    });
+    status = { state: 'disconnected', seq: 1, kill_switch_blocking: false, error: null };
+    mockedInvoke.mockClear();
+  }
+
+  beforeEach(() => {
+    rustSettings = { ...rustSettings, auto_connect: true };
+    servers = fleet();
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ['is offline', { isOnline: false }],
+    ['is out of the plan', { accessible: false }],
+  ])("the user's server %s and its country has no other: no other country, and the user is told", async (_, patch) => {
+    servers = fleetWith('fra', patch);
+    useAppStore.setState({ lastServerId: 'fra' });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().notice?.text).toBe(HELD_COPY));
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+    expect(callsTo('quick_connect')).toHaveLength(0);
+  });
+
+  it('a server gone from the list is not replaced either: its country is unknown', async () => {
+    useAppStore.setState({ lastServerId: 'retired' });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().notice?.text).toBe(HELD_COPY));
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+    expect(callsTo('quick_connect')).toHaveLength(0);
+  });
+
+  it('it may move within its country: the same city first', async () => {
+    servers = [
+      server('fra', 10, { countryCode: 'DE', city: 'Frankfurt', isOnline: false }),
+      server('fra2', 80, { countryCode: 'DE', city: 'Frankfurt' }),
+      server('ber', 0, { countryCode: 'DE', city: 'Berlin' }),
+      server('ams', 0, { countryCode: 'NL', city: 'Amsterdam' }),
+    ];
+    useAppStore.setState({ lastServerId: 'fra' });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'fra2' }]]));
+    expect(callsTo('quick_connect')).toHaveLength(0);
+  });
+
+  it('then another server in its country, never an emptier one abroad', async () => {
+    servers = fleetWith('nyc', { isOnline: false }).map((s) => (s.id === 'yyz' ? { ...s, load: 0 } : s));
+    useAppStore.setState({ lastServerId: 'nyc' });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'lax' }]]));
+    expect(callsTo('quick_connect')).toHaveLength(0);
+  });
+
+  it("with no server list (the fetch failed), the user's server is dialled as recorded, never quick_connect", async () => {
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'get_servers') throw { code: 'network_offline', message: 'offline', retryable: true };
+      return scripted?.(cmd, args, options);
+    });
+    useAppStore.setState({ lastServerId: 'fra' });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'fra' }]]));
+    expect(useAppStore.getState().servers).toHaveLength(0);
+    expect(callsTo('quick_connect')).toHaveLength(0);
+  });
+
+  it('with no server list and no server on record, Rust picks (quick_connect), as before', async () => {
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'get_servers') throw { code: 'network_offline', message: 'offline', retryable: true };
+      return scripted?.(cmd, args, options);
+    });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('quick_connect')).toHaveLength(1));
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+  });
+
+  // The other half of the rule: the client's own pick may still move.
+  it("the client's own pick (no server on record) may move to another country at the next launch", async () => {
+    const first = render(<VpnSessionController />);
+    // Nothing on record: Auto-Connect takes the fastest server.
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'fra' }]]));
+    await waitFor(() => expect(useAppStore.getState().lastServerId).toBe('fra'));
+    first.unmount();
+
+    // Frankfurt is offline at the next start, and Germany has no other server.
+    relaunch();
+    servers = fleetWith('fra', { isOnline: false });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'nyc' }]]));
+    expect(useAppStore.getState().notice?.text).not.toBe(HELD_COPY);
+  });
+
+  it("a server the tray's Quick Connect chose by itself counts as the client's pick", async () => {
+    rustSettings = { ...rustSettings, auto_connect: false };
+    useAppStore.setState({ lastServerId: 'fra' });
+    const first = render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));
+    // Rust's Quick Connect found Frankfurt unusable and took Stockholm.
+    emit('vpn-status-changed', { state: 'connected', seq: 5, server_id: 'sto', error: null });
+    await waitFor(() => expect(useAppStore.getState().lastServerId).toBe('sto'));
+    first.unmount();
+
+    relaunch();
+    rustSettings = { ...rustSettings, auto_connect: true };
+    servers = fleetWith('sto', { isOnline: false });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'fra' }]]));
+    expect(useAppStore.getState().notice?.text).not.toBe(HELD_COPY);
   });
 });
 
