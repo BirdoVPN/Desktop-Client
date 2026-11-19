@@ -711,28 +711,23 @@ mod tests {
             super::super::endpoints::auth::REFRESH,
         );
         let t0 = Instant::now();
-        fn floor() -> ApiError {
-            ApiError::UpgradeRequired(RequiredUpdate {
+        // By label: ApiError is not `Clone`.
+        let error = |case: &str| match case {
+            "426" => ApiError::UpgradeRequired(RequiredUpdate {
                 required_version: None,
                 download_url: None,
                 message: None,
-            })
-        }
-        fn pin() -> ApiError {
-            ApiError::CertificatePinningFailed("x".into())
-        }
-        fn unreadable() -> ApiError {
-            ApiError::Parse("eof".into())
-        }
-        let cases: [(&str, fn() -> ApiError); 3] =
-            [("426", floor), ("pin", pin), ("unreadable 2xx", unreadable)];
-        for (case, error) in cases {
+            }),
+            "pin" => ApiError::CertificatePinningFailed("x".into()),
+            _ => ApiError::Parse("eof".into()),
+        };
+        for case in ["426", "pin", "unreadable 2xx"] {
             let gate = RetryGate::default();
             let mut last = 0;
             for flight in 0..8u32 {
                 let now = t0 + s(1000 * u64::from(flight));
                 assert!(
-                    gate.refresh_failed(&refresh, &error(), now, 0.5),
+                    gate.refresh_failed(&refresh, &error(case), now, 0.5),
                     "{case}: not held at flight {flight}"
                 );
                 let secs = whole_secs_left(backoff(flight + 1, 0.5));
