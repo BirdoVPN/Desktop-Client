@@ -174,7 +174,21 @@ pub const RETRY_AFTER_MAX_SECS: u64 = 60;
 /// non-negative number: the refusal stays retryable, just without a wait.
 /// A 0 reads as 1 so a retry can never spin.
 pub fn retry_after_secs(details: Option<&serde_json::Value>) -> Option<u64> {
-    let value = details?.get("retryAfterSeconds")?;
+    details_wait(details, "retryAfterSeconds")
+}
+
+/// MR-1771: `details.retryAfter` of a 429, in whole seconds, clamped exactly
+/// like [`retry_after_secs`]. birdo-web's `refusal()` names the wait so
+/// (`{"code": "rate_limited", "retryAfter": N}`, on every refresh 429 since
+/// birdo-web #912); the connect refusals call it `retryAfterSeconds`. Read
+/// only when the response carried no readable `Retry-After`: the header wins.
+pub fn retry_after_detail(details: Option<&serde_json::Value>) -> Option<u64> {
+    details_wait(details, "retryAfter")
+}
+
+/// The wait `details.<field>` names: see [`retry_after_secs`].
+fn details_wait(details: Option<&serde_json::Value>, field: &str) -> Option<u64> {
+    let value = details?.get(field)?;
     let secs = match value.as_u64() {
         Some(secs) => secs,
         // The contract says integer; a `30.0` is read, rounded up.
@@ -215,6 +229,22 @@ pub fn retry_after_header(value: &str, now: std::time::SystemTime) -> Option<u64
         u64::try_from(millis).map_or(0, |ms| ms.div_ceil(1000))
     };
     Some(secs.clamp(1, RETRY_AFTER_MAX_SECS))
+}
+
+/// MR-2500 / MR-1771: the token refresh's `Retry-After`, by the one timing
+/// table both clients keep (lead 2026-11-19 21:39Z): delta-seconds only,
+/// clamped like [`retry_after_header`] (a `0` is 1 s, at most
+/// `RETRY_AFTER_MAX_SECS`). An HTTP-date names no wait here, as on Mobile
+/// #653, so a refresh 429 that sent one holds the body's
+/// `details.retryAfter`, else 60 s (`refresh_policy::RATE_LIMIT_DEFAULT_WAIT`),
+/// and a 5xx backs off. Every other request still reads the date
+/// ([`retry_after_header`], MR-1808).
+pub fn retry_after_delta(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    retry_after_header(value, std::time::SystemTime::UNIX_EPOCH)
 }
 
 /// An HTTP-date in any of its three forms, in UTC.
@@ -388,5 +418,49 @@ mod tests {
         ] {
             assert_eq!(retry_after_header(junk, now()), None, "{junk:?}");
         }
+    }
+
+    /// MR-2500 / MR-1771, the one timing table (lead 2026-11-19 21:39Z): a
+    /// server-named wait for the refresh is clamped to 60 s and a `0` reads
+    /// as 1 s; junk, a negative, a non-number and (for the header) an
+    /// HTTP-date name no wait, so the refresh 429 falls back to the next
+    /// source, then 60 s (`refresh_policy`). Header and body alike.
+    #[test]
+    fn the_refresh_reads_the_one_table() {
+        for (header, wait) in [
+            ("0", Some(1)),
+            (" 7 ", Some(7)),
+            ("60", Some(60)),
+            ("61", Some(RETRY_AFTER_MAX_SECS)),
+            ("99999999999999999999999", Some(RETRY_AFTER_MAX_SECS)),
+            ("", None),
+            ("-5", None),
+            ("1.5", None),
+            ("NaN", None),
+            ("soon", None),
+            ("Sun, 06 Nov 1994 08:50:22 GMT", None),
+            ("Sunday, 06-Nov-94 08:50:22 GMT", None),
+            ("Sun Nov  6 08:50:22 1994", None),
+        ] {
+            assert_eq!(retry_after_delta(header), wait, "{header}");
+        }
+        for (body, wait) in [
+            (r#"{"retryAfter":0}"#, Some(1)),
+            (r#"{"retryAfter":17}"#, Some(17)),
+            (r#"{"retryAfter":1.2}"#, Some(2)),
+            (r#"{"retryAfter":900}"#, Some(RETRY_AFTER_MAX_SECS)),
+            (r#"{"retryAfter":1e300}"#, Some(RETRY_AFTER_MAX_SECS)),
+            (r#"{"retryAfter":-1}"#, None),
+            (r#"{"retryAfter":-0.5}"#, None),
+            (r#"{"retryAfter":"NaN"}"#, None),
+            (r#"{"retryAfter":"30"}"#, None),
+            (r#"{"retryAfter":null}"#, None),
+            (r#"{"retryAfter":"Sun, 06 Nov 1994 08:50:22 GMT"}"#, None),
+            ("{}", None),
+        ] {
+            let details: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(retry_after_detail(Some(&details)), wait, "{body}");
+        }
+        assert_eq!(RETRY_AFTER_MAX_SECS, 60);
     }
 }

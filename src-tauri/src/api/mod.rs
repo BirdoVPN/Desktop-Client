@@ -9,6 +9,7 @@ pub mod doh_resolver;
 pub mod endpoints;
 pub mod error;
 pub mod pow;
+mod refresh_policy;
 mod retry_gate;
 pub mod session_gate;
 pub mod types;

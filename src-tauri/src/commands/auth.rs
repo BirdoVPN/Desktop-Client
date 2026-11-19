@@ -938,11 +938,13 @@ pub async fn get_auth_state(
                         // The session gate decides (REVIEW-WIN2-003, Android/iOS
                         // `RefreshOutcome` parity): a 401 means the server rejected
                         // the refresh token — it will never work again, so clearing
-                        // is right; a 403 ends the session but keeps the stored
-                        // tokens. Everything else (Network, ServerError,
-                        // RateLimited, CertificatePinningFailed, Parse) may well
-                        // succeed on the next attempt, so the session is kept and
-                        // reported as signed-in-with-unknown-identity, exactly as the
+                        // is right, and it is the only answer that does (MR-2500 /
+                        // MR-1771). Everything else (Network, ServerError, a 503
+                        // that put back a token whose rotation failed, RateLimited,
+                        // a 403 from in front of the backend,
+                        // CertificatePinningFailed, Parse) may well succeed on the
+                        // next attempt, so the session is kept and reported as
+                        // signed-in-with-unknown-identity, exactly as the
                         // profile-fetch failure above already does.
                         //
                         // NOTE: this distinction only became reliable once

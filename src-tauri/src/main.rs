@@ -903,6 +903,25 @@ fn main() {
                 let _ = window.emit("app-hidden", ());
                 api.prevent_close();
             }
+            // MR-2500 / MR-1771 (lead decision 2026-11-19, as Mobile #653): a
+            // token refresh that a failed answer left held is retried when the
+            // window comes to the foreground, once its hold is over, through
+            // the same single flight a 401's refresh takes. Nothing retries
+            // it on a timer: an app nobody looks at sends nothing.
+            if let WindowEvent::Focused(true) = event {
+                if let Some(birdo) = window.try_state::<BirdoApi>() {
+                    if birdo.refresh_retry_due() {
+                        let birdo = birdo.inner().clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Some(Err(_)) = birdo.retry_held_refresh().await {
+                                info!(
+                                    "The token refresh retried on focus did not renew the session"
+                                );
+                            }
+                        });
+                    }
+                }
+            }
         })
         .invoke_handler(ipc_handler())
         .build(tauri::generate_context!())
