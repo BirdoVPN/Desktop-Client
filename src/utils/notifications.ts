@@ -3,10 +3,16 @@
  *
  * Sends native desktop notifications for VPN connection events, gated behind
  * the user's notification preference. Copy is the canonical set (P1-parity-028):
- * "BirdoVPN — Protected / Reconnecting… / Not connected / Connection error /
+ * "Protected / Reconnecting… / Not connected / Connection error /
  * Kill Switch — all traffic blocked", body "via {server}[ · location][ · IP]" —
  * one word per event on every client, where this used to say "Connected",
  * "Secured" and "Connection Lost" for what the phones call "Protected".
+ *
+ * No "BirdoVPN — " title prefix (MR-1514, owner decision: drop, as Android did
+ * in Mobile #471): the OS already shows the app's name and icon on every
+ * notification, so the prefix only pushed the state word out of view.
+ * NOTIFICATION_TITLES is the one list of titles, and its test pins that none
+ * starts with the app name.
  */
 
 import {
@@ -15,6 +21,19 @@ import {
   sendNotification,
 } from '@tauri-apps/plugin-notification';
 import { useAppStore, type ConnectionState } from '@/store/app-store';
+
+/**
+ * Every connection notification's title (MR-1514: no "BirdoVPN — " prefix).
+ * The update notice's "BirdoVPN update available" is a sentence, not a prefix.
+ */
+export const NOTIFICATION_TITLES = {
+  protected: 'Protected',
+  notConnected: 'Not connected',
+  reconnecting: 'Reconnecting…',
+  connectionError: 'Connection error',
+  quotaGrace: 'Free data allowance used',
+  killSwitch: 'Kill Switch — all traffic blocked',
+} as const;
 
 let permissionReady = false;
 
@@ -68,32 +87,32 @@ function connectionBody(prefix: string, serverName: string, details?: Connection
 }
 
 export function notifyConnected(serverName: string, details?: ConnectionDetails): void {
-  notify('BirdoVPN — Protected', connectionBody('via', serverName, details));
+  notify(NOTIFICATION_TITLES.protected, connectionBody('via', serverName, details));
 }
 
 export function notifyReconnected(serverName: string, details?: ConnectionDetails): void {
-  notify('BirdoVPN — Protected', connectionBody('Reconnected via', serverName, details));
+  notify(NOTIFICATION_TITLES.protected, connectionBody('Reconnected via', serverName, details));
 }
 
 export function notifyDisconnected(): void {
-  notify('BirdoVPN — Not connected', 'Your connection is no longer protected.');
+  notify(NOTIFICATION_TITLES.notConnected, 'Your connection is no longer protected.');
 }
 
 export function notifyConnectionLost(): void {
-  notify('BirdoVPN — Reconnecting…', 'The connection dropped. BirdoVPN is restoring it.');
+  notify(NOTIFICATION_TITLES.reconnecting, 'The connection dropped. BirdoVPN is restoring it.');
 }
 
 export function notifyConnectionError(message: string): void {
-  notify('BirdoVPN — Connection error', message);
+  notify(NOTIFICATION_TITLES.connectionError, message);
 }
 
 export function notifyQuotaGrace(message: string): void {
-  notify('BirdoVPN — Free data allowance used', message);
+  notify(NOTIFICATION_TITLES.quotaGrace, message);
 }
 
 export function notifyKillSwitchActive(): void {
   notify(
-    'BirdoVPN — Kill Switch — all traffic blocked',
+    NOTIFICATION_TITLES.killSwitch,
     'Traffic is held until the VPN reconnects. Open BirdoVPN to disconnect.',
   );
 }
