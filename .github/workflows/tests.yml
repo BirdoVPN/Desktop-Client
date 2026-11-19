@@ -1348,6 +1348,57 @@ jobs:
           console.log('OK - every Tauri crate/npm pair shares major.minor');
           EOF
 
+      # MR-2410: rolldown 1.2.18's linux-x64-gnu binding executes BMI2
+      # instructions, so `vite build` dies with SIGILL on x86-64 CPUs without
+      # them - pre-Haswell Intel, some Atom/Celeron, and the qemu64/kvm64 CPU
+      # models many VMs default to (rolldown#11607, #11635). 1.2.19 fixed it.
+      # rolldown is not our dependency but vite's, under a tilde range (vite
+      # 8.3.7 and 8.3.8 both declare ~1.2.18), so a regenerated or rolled-back
+      # lockfile can land on 1.2.18 again, and GitHub's runners have BMI2, so
+      # no other job would notice. A floor, not a pin: raise it if a later
+      # release regresses; it fails if rolldown ever leaves the lockfile, so
+      # the step is removed then rather than silently matching nothing.
+      - name: Assert the lockfile's rolldown is at least 1.2.19 (no SIGILL without BMI2)
+        run: |
+          node <<'EOF'
+          const fs = require('fs');
+          const npm = JSON.parse(fs.readFileSync('package-lock.json', 'utf8')).packages;
+
+          const FLOOR = [1, 2, 19];
+          // A prerelease of the floor itself (1.2.19-rc.1) precedes it; an
+          // unparseable version fails closed.
+          const below = (v) => {
+            const m = /^(\d+)\.(\d+)\.(\d+)(-[^+]*)?(\+.*)?$/.exec(String(v));
+            if (!m) return true;
+            for (let i = 0; i < 3; i++) {
+              if (Number(m[i + 1]) !== FLOOR[i]) return Number(m[i + 1]) < FLOOR[i];
+            }
+            return Boolean(m[4]);
+          };
+
+          const rows = [];
+          let bad = 0;
+          let found = 0;
+          for (const [key, entry] of Object.entries(npm)) {
+            const m = /(?:^|\/)node_modules\/(rolldown|@rolldown\/binding-[^/]+)$/.exec(key);
+            if (!m) continue;
+            if (m[1] === 'rolldown') found++;
+            const low = below(entry.version);
+            if (low) bad++;
+            rows.push(`${key} ${entry.version}  ${low ? 'BELOW ' + FLOOR.join('.') : 'OK'}`);
+          }
+          console.log(rows.join('\n'));
+          if (!found) {
+            console.error('::error::no rolldown in package-lock.json - vite no longer uses it; remove this step (MR-2410).');
+            process.exit(1);
+          }
+          if (bad) {
+            console.error(`::error::${bad} rolldown package(s) below ${FLOOR.join('.')}, whose linux-x64-gnu binding crashes with SIGILL on CPUs without BMI2 (MR-2410). Run \`npm update rolldown --package-lock-only\` (npm 11.19.0).`);
+            process.exit(1);
+          }
+          console.log(`OK - every rolldown package is at least ${FLOOR.join('.')}`);
+          EOF
+
   # MR-2059: the ONE check branch protection should require from this
   # workflow, in place of the job names. Two of those carry a runner image
   # ("Cross-platform compile check (ubuntu-24.04, linux)", "(macos-26,
