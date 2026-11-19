@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { DNS_DEGRADED_COPY, HomeBanners } from '@/components/home/HomeBanners';
-import { KILLSWITCH_HOLDING_COPY } from '@/lib/errors';
+import { KILLSWITCH_HOLDING_COPY, SERVER_UNAVAILABLE_BLOCKED_COPY } from '@/lib/errors';
 import type { IpcError } from '@/lib/ipc';
 import { useAppStore } from '@/store/app-store';
 
@@ -103,5 +103,46 @@ describe('the kill-switch error while traffic is held', () => {
     expect(screen.queryByText(KILLSWITCH_HOLDING_COPY)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Disconnect' })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * MR-2390: the session's server was drained and there was nowhere to move it.
+ * Rust ends it as `server_unavailable`; under the always-on kill switch the
+ * block stays (fail-closed). The banner says the block is on purpose and
+ * offers one Choose server; without the block it claims none.
+ */
+describe('an unavailable server while traffic is held', () => {
+  // `reconnect_policy::server_left_error` as Rust sends it; the banner words it by code.
+  const LEFT: IpcError = {
+    code: 'server_unavailable',
+    message: 'This server was taken out of service. Choose another location to connect.',
+    retryable: false,
+    retry_after_secs: null,
+  };
+
+  it('says the internet is blocked on purpose, with one Choose server', async () => {
+    useAppStore.setState({ connectionState: 'error', vpnError: LEFT, killSwitchBlocking: true });
+    const onAction = vi.fn();
+    render(<HomeBanners onAction={onAction} />);
+
+    expect(screen.getByText(SERVER_UNAVAILABLE_BLOCKED_COPY)).toBeInTheDocument();
+    expect(document.body.textContent).toMatch(/blocked on purpose by the always-on kill switch/);
+    expect(document.body.textContent).not.toContain('taken out of service. Choose another location');
+    const choose = screen.getAllByRole('button', { name: 'Choose server' });
+    expect(choose).toHaveLength(1);
+    expect(screen.getAllByRole('button')).toHaveLength(1);
+
+    await userEvent.click(choose[0]);
+    expect(onAction).toHaveBeenCalledTimes(1);
+    expect(onAction).toHaveBeenCalledWith('choose_server');
+  });
+
+  it('claims no block when nothing is held, and still offers Choose server', () => {
+    useAppStore.setState({ connectionState: 'error', vpnError: LEFT, killSwitchBlocking: false });
+    render(<HomeBanners onAction={() => {}} />);
+    expect(screen.queryByText(SERVER_UNAVAILABLE_BLOCKED_COPY)).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/block/i);
+    expect(screen.getByRole('button', { name: 'Choose server' })).toBeInTheDocument();
   });
 });

@@ -11,6 +11,7 @@ pub mod doh; // DNS-over-HTTPS resolver for SEC-002
 pub mod manager;
 pub mod network_events; // OS route/resume signals for reconnect — zero packets (W1-011)
 pub mod reconnect_policy; // Pure auto-reconnect decisions + circuit breaker (W1-029)
+pub mod relay_retry; // Where a session moves when its server leaves the pool (MR-2390)
 pub mod speed_test; // On-device speed test (P3-26)
 pub mod xray; // Xray Reality stealth tunnel (matching Android XrayManager)
 

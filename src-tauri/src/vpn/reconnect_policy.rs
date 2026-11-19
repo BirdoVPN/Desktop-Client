@@ -367,27 +367,28 @@ pub enum HeartbeatVerdict {
     /// the contract: "one quiet rebuild is safe"). Tear down and re-dial with
     /// a new key, at most [`QUIET_REBUILDS_PER_EPISODE`] times per episode
     /// ([`QuietRebuilds`]). `ending` is how the session ends once that is
-    /// spent: the ending this answer had before MR-2369, a revocation in the
-    /// server's words.
+    /// spent: for a reap, the ending this answer had before MR-2369, a
+    /// revocation in the server's words.
     ///
-    /// NOT for `server_offline` with `valid:false` (a drained or deleted
-    /// server): the contract says "connect to a DIFFERENT server", and a
-    /// re-dial goes to the session's own `server_id`, which the backend
-    /// refuses while it is not ONLINE (`server_unavailable`, retryable): ten
-    /// refused dials, a give-up, and under always-on a machine left blocked.
-    /// It ends at once instead, as before; a rebuild for it needs a dial path
-    /// that picks another server.
+    /// MR-2390: `moves` when the server left the pool (`server_offline`
+    /// with `valid:false`: drained or deleted). The contract says "connect to
+    /// a DIFFERENT server", and the backend refuses a connect to a server
+    /// that is not ONLINE (`server_unavailable`), so the rebuild's re-dial
+    /// moves off it (`relay_retry`) and never goes back. Its `ending` is
+    /// [`server_left_error`].
     Rebuild {
         ending: IpcError,
+        moves: bool,
     },
 }
 
 /// The heartbeat's answer, decided. `valid:false` ends the session: with the
 /// quota mark it is `quota_exceeded`, with `reason: "evicted"` it is
 /// `evicted` (another device took the slot, MR-2333), with `reaped` it is a
-/// quiet rebuild (MR-2369, capped), otherwise a revocation. `valid:true` with
-/// the quota mark is the grace window. An older server sends neither mark nor
-/// reason, and everything behaves as before.
+/// quiet rebuild (MR-2369, capped), with `server_offline` a quiet rebuild on
+/// another server (MR-2390, the same cap), otherwise a revocation.
+/// `valid:true` with the quota mark is the grace window. An older server
+/// sends neither mark nor reason, and everything behaves as before.
 pub fn heartbeat_verdict(resp: &HeartbeatResponse) -> HeartbeatVerdict {
     let quota = resp.quota_exceeded || resp.reason.as_deref() == Some("quota_exceeded");
     if !resp.valid {
@@ -399,6 +400,12 @@ pub fn heartbeat_verdict(resp: &HeartbeatResponse) -> HeartbeatVerdict {
             // MR-2369: housekeeping's release only (see `Rebuild`).
             Some("reaped") => HeartbeatVerdict::Rebuild {
                 ending: revoked_error(resp.message.as_deref()),
+                moves: false,
+            },
+            // MR-2390: drained or deleted: rebuilt on a DIFFERENT server.
+            Some("server_offline") => HeartbeatVerdict::Rebuild {
+                ending: server_left_error(),
+                moves: true,
             },
             _ => HeartbeatVerdict::End(revoked_error(resp.message.as_deref())),
         };
@@ -502,6 +509,11 @@ pub fn release_look(due: Instant, now: Instant, upgrade_blocked: bool) -> Releas
 pub struct QuietRebuilds {
     spent: u32,
     run: Option<(Instant, Instant)>,
+    /// MR-2390: the server the rebuild the cap allowed must move off,
+    /// because it left the pool. Kept until the move is decided, so a dial
+    /// whose server list did not arrive, or a restarted loop, never goes
+    /// back to it.
+    leaving: Option<String>,
 }
 
 impl QuietRebuilds {
@@ -549,6 +561,39 @@ impl QuietRebuilds {
         }
         self.spent += 1;
         OnRelease::Rebuild
+    }
+
+    /// MR-2390: the session's server left the pool (`server_offline`).
+    /// The same cap as a release ([`on_release`](Self::on_release)), so one
+    /// episode gets ONE quiet rebuild whichever came first. A rebuild it
+    /// allows must move off `on_record`, the server the session on record
+    /// was dialled to (`None`: there is none).
+    ///
+    /// The same server reported again before its move is decided is the
+    /// same event, and it spends nothing more. A check-in says so, then the
+    /// tunnel dies before the rebuild's random wait has run out, and the old
+    /// key's answer says so again.
+    pub fn on_server_left(&mut self, stopping: bool, on_record: Option<&str>) -> OnRelease {
+        if !stopping && on_record.is_some() && self.leaving.as_deref() == on_record {
+            self.run = None;
+            return OnRelease::Rebuild;
+        }
+        let verdict = self.on_release(stopping, on_record.is_some());
+        if verdict == OnRelease::Rebuild {
+            self.leaving = on_record.map(str::to_string);
+        }
+        verdict
+    }
+
+    /// MR-2390: the server the next re-dial must move off, if any.
+    pub fn leaving(&self) -> Option<&str> {
+        self.leaving.as_deref()
+    }
+
+    /// MR-2390: the move is decided (the session on record now names
+    /// another server), or there is nothing left to move.
+    pub fn left(&mut self) {
+        self.leaving = None;
     }
 
     /// Quiet rebuilds spent in the current episode.
@@ -599,11 +644,12 @@ pub fn asks_the_old_key(cause: DropCause) -> bool {
 ///
 /// | reply | verdict |
 /// |---|---|
-/// | none, or `valid:true` (`ok`, a server going offline, the quota grace) | re-dial |
+/// | none, or `valid:true` (`ok`, the quota grace) | re-dial |
 /// | `quota_exceeded` | end: `quota_exceeded` |
 /// | `evicted` | end: `evicted` (MR-2333) |
 /// | `revoked` | end: `revoked` |
-/// | `reaped`, `server_offline` (a drain) | re-dial |
+/// | `reaped` | re-dial |
+/// | `server_offline`, `valid` either way (drained, deleted, not ONLINE) | re-dial, on ANOTHER server ([`server_left`], MR-2390) |
 /// | `not_found`, no `reason` (a server before WEB-HB), anything newer | end as `revoked` if recently alive, else re-dial (WEB-HB's client table) |
 pub fn after_teardown(
     answer: Option<&HeartbeatResponse>,
@@ -622,6 +668,37 @@ pub fn after_teardown(
         Some("reaped" | "server_offline") => None,
         _ => recently_alive.then(|| revoked_error(resp.message.as_deref())),
     }
+}
+
+/// MR-2390: whether the old key's answer says its server left the pool
+/// (`server_offline`: drained or deleted with `valid:false`, still listed but
+/// not ONLINE with `valid:true`). Asked when [`after_teardown`] re-dials:
+/// the re-dial must then go to a DIFFERENT server, as the contract says.
+/// The backend refuses a connect to a server that is not ONLINE, so going
+/// back to the same one was ten refused dials and a give-up.
+pub fn server_left(answer: Option<&HeartbeatResponse>) -> bool {
+    answer.is_some_and(|resp| resp.reason.as_deref() == Some("server_offline"))
+}
+
+/// MR-2390: how a session ends when its server left the pool and it cannot
+/// move. No other server qualifies (a location the user picked with nothing
+/// else in its country, or deleted with no list ever naming its country; a
+/// Multi-Hop route), or the episode's one move is spent. The code is `server_unavailable`, the
+/// one the backend refuses a non-ONLINE server with. It is not a revocation:
+/// nothing was revoked, and a connect elsewhere works.
+///
+/// It is not `server_ended`, so under the always-on kill switch the give-up
+/// keeps the block (`give_up_keeps_block`, fail-closed); otherwise it is
+/// released. This sentence claims neither, so it is true both ways. The UI
+/// words the ending by its code and the status's `kill_switch_blocking`
+/// (`vpnErrorCopy`): with the block held it says the internet is blocked on
+/// purpose until another server is chosen, and its Choose server opens the
+/// picker; without it, only that the location is unavailable.
+pub fn server_left_error() -> IpcError {
+    IpcError::new(
+        IpcErrorCode::ServerUnavailable,
+        "This server was taken out of service. Choose another location to connect.",
+    )
 }
 
 /// The error for a session the server ended over the Free allowance. The UI
@@ -1896,21 +1973,26 @@ mod tests {
             heartbeat_verdict(&reaped),
             HeartbeatVerdict::Rebuild {
                 ending: revoked_error(Some("Connection not found. Please reconnect.")),
+                moves: false,
             }
         );
         assert_eq!(after_teardown(Some(&reaped), true), None);
-        // A drained server's `server_offline` is NOT rebuilt live: a re-dial
-        // goes to the same server, which refuses it while not ONLINE. It
-        // ends at once, as before MR-2369.
+        assert!(
+            !server_left(Some(&reaped)),
+            "a reap re-dials the same server"
+        );
+        // MR-2390: a drained server's `server_offline` is rebuilt quietly
+        // too, on the same cap, but on ANOTHER server: the backend refuses a
+        // connect to it while it is not ONLINE. Past the cap it ends as
+        // unavailable, not as a revocation, and not as a give-up.
         match heartbeat_verdict(&heartbeat(DRAINED_REPLY)) {
-            HeartbeatVerdict::End(e) => {
-                assert_eq!(
-                    e,
-                    revoked_error(Some("Connection not found. Please reconnect."))
-                );
-                assert!(!give_up_keeps_block(e.code, true));
+            HeartbeatVerdict::Rebuild { ending, moves } => {
+                assert!(moves, "the rebuild moves off the drained server");
+                assert_eq!(ending, server_left_error());
+                assert_eq!(ending.code, IpcErrorCode::ServerUnavailable);
+                assert!(!ending.code.is_hard_refusal());
             }
-            other => panic!("a drained server's key was not ended: {other:?}"),
+            other => panic!("a drained server's key was not rebuilt elsewhere: {other:?}"),
         }
         // `revoked` keeps its code and the server's sentence.
         match heartbeat_verdict(&heartbeat(
@@ -2001,6 +2083,28 @@ mod tests {
             r#"{"valid":false,"serverOnline":false,"reason":"server_offline"}"#,
         ] {
             assert_eq!(ends(redial, true), None, "{redial}");
+        }
+        // MR-2390: ...and when the server left the pool (drained, deleted,
+        // or still listed but not ONLINE), on ANOTHER server. Every other
+        // answer, and no answer, re-dials the same one.
+        let left = |json: &str| server_left(Some(&heartbeat(json)));
+        for gone in [
+            r#"{"valid":false,"serverOnline":false,"reason":"server_offline"}"#,
+            r#"{"valid":true,"serverOnline":false,"reason":"server_offline"}"#,
+            r#"{"valid":true,"quotaExceeded":true,"quotaGraceSecondsRemaining":60,"reason":"server_offline"}"#,
+        ] {
+            assert!(left(gone), "{gone}");
+            assert_eq!(ends(gone, true), None, "{gone}");
+        }
+        assert!(!server_left(None));
+        for stays in [
+            r#"{"valid":true,"serverOnline":true,"reason":"ok"}"#,
+            r#"{"valid":true,"serverOnline":false}"#,
+            r#"{"valid":false,"serverOnline":false,"reason":"reaped"}"#,
+            r#"{"valid":false,"serverOnline":false,"reason":"not_found"}"#,
+            r#"{"valid":false,"serverOnline":false,"message":"Connection not found. Please reconnect."}"#,
+        ] {
+            assert!(!left(stays), "{stays}");
         }
         // Not found — and today's server, which says only "not found": taken
         // from a device that was just checking in, reaped from one that was
@@ -2188,7 +2292,10 @@ mod tests {
     #[test]
     fn quiet_rebuilds_are_capped_per_episode() {
         assert_eq!(QUIET_REBUILDS_PER_EPISODE, 1, "the contract: one");
-        let HeartbeatVerdict::Rebuild { ending } = heartbeat_verdict(&heartbeat(REAPED_REPLY))
+        let HeartbeatVerdict::Rebuild {
+            ending,
+            moves: false,
+        } = heartbeat_verdict(&heartbeat(REAPED_REPLY))
         else {
             panic!("reaped is not a rebuild");
         };
@@ -2379,6 +2486,82 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(p.decide(&disconnected), Action::Idle);
         }
+    }
+
+    /// MR-2390: a server that left the pool gets the episode's ONE quiet
+    /// rebuild, the same one a reap spends, and the rebuild names the server
+    /// to move off until the move is decided. A second drain, or a drain
+    /// after a reap, in the same episode ends. A drain while the user is
+    /// ending the session, or with nothing on record, moves nothing.
+    #[test]
+    fn a_drain_spends_the_one_quiet_rebuild_and_names_the_server_to_leave() {
+        let mut cap = QuietRebuilds::default();
+        assert_eq!(cap.leaving(), None);
+        assert_eq!(
+            cap.on_server_left(false, Some("node-1")),
+            OnRelease::Rebuild
+        );
+        assert_eq!(cap.leaving(), Some("node-1"));
+        assert_eq!(cap.spent(), 1);
+        // The same drain again before the move is decided (a check-in, then
+        // the old key's answer after the tunnel died): the same event, so
+        // the same rebuild, and nothing more is spent. Not while the user is
+        // ending the session.
+        assert_eq!(
+            cap.on_server_left(false, Some("node-1")),
+            OnRelease::Rebuild
+        );
+        assert_eq!((cap.leaving(), cap.spent()), (Some("node-1"), 1));
+        assert_eq!(
+            cap.on_server_left(true, Some("node-1")),
+            OnRelease::StandDown
+        );
+        // The move was decided: the next drain (on the server it moved to)
+        // finds the episode's rebuild spent.
+        cap.left();
+        assert_eq!(cap.leaving(), None);
+        assert_eq!(cap.on_server_left(false, Some("node-2")), OnRelease::End);
+        assert_eq!(cap.leaving(), None, "an ending names nothing to leave");
+        assert_eq!(cap.spent(), 1, "one move per episode");
+
+        // A reap spent it first: the drain ends.
+        let mut cap = QuietRebuilds::default();
+        assert_eq!(cap.on_release(false, true), OnRelease::Rebuild);
+        assert_eq!(cap.on_server_left(false, Some("node-1")), OnRelease::End);
+        assert_eq!(cap.leaving(), None);
+        // ...and a drain spent it first: the reap ends.
+        let mut cap = QuietRebuilds::default();
+        assert_eq!(
+            cap.on_server_left(false, Some("node-1")),
+            OnRelease::Rebuild
+        );
+        assert_eq!(cap.on_release(false, true), OnRelease::End);
+        assert_eq!(cap.leaving(), Some("node-1"), "the move is still due");
+
+        // The user is ending it, or nothing is on record: nothing to move.
+        let mut cap = QuietRebuilds::default();
+        assert_eq!(
+            cap.on_server_left(true, Some("node-1")),
+            OnRelease::StandDown
+        );
+        assert_eq!(cap.on_server_left(false, None), OnRelease::End);
+        assert_eq!((cap.leaving(), cap.spent()), (None, 0));
+
+        // Ten healthy minutes give the move back, like a reap's rebuild.
+        let mut cap = QuietRebuilds::default();
+        assert_eq!(
+            cap.on_server_left(false, Some("node-1")),
+            OnRelease::Rebuild
+        );
+        cap.left();
+        let t0 = Instant::now();
+        for k in 0..=20u64 {
+            cap.healthy(t0 + Duration::from_secs(30 * k));
+        }
+        assert_eq!(
+            cap.on_server_left(false, Some("node-2")),
+            OnRelease::Rebuild
+        );
     }
 
     /// MR-2369 (review): a quiet rebuild waits a random part of

@@ -22,6 +22,7 @@ use crate::commands::settings::{
 use crate::storage::CredentialStore;
 use crate::vpn::auto_reconnect::ReconnectInfo;
 use crate::vpn::manager::{ConnectPhase, ConnectionState, GaveUp, MultiHopStatus, VpnManager};
+use crate::vpn::relay_retry::SelectionOrigin;
 use crate::vpn::xray::XrayManager;
 use crate::vpn::AutoReconnectService;
 use crate::vpn::WgPrivateKey;
@@ -756,15 +757,24 @@ pub fn get_admin_status() -> bool {
 /// ADAPTIVE TRANSPORT, cancellation, the switch guard and the failure states
 /// all live in `session::connect_session`. A `disconnect_vpn` while this is in
 /// flight makes it resolve with `cancelled` (contract §3.1).
+///
+/// `origin` (MR-2390, optional): who chose `serverId`. The UI sends it on
+/// every connect, as it records it (MR-2492): `"automatic"` when the client
+/// chose the server (its fastest-server rule, or a server Rust's quick
+/// connect picked), `"user"` otherwise. Anything but `"automatic"`, or
+/// nothing, is the user's pick (`SelectionOrigin::from_ipc`). It decides how
+/// far the session may move if that server leaves the pool.
 #[tauri::command]
 pub async fn connect_vpn(
     #[allow(non_snake_case)] serverId: String,
+    origin: Option<String>,
     app: AppHandle,
 ) -> Result<bool, IpcError> {
     connect_session(
         &app,
         ConnectTarget::SingleHop {
             server_id: serverId,
+            origin: SelectionOrigin::from_ipc(origin.as_deref()),
         },
     )
     .await
@@ -998,6 +1008,8 @@ async fn quick_connect_target(
     }
 
     let servers = api.get_servers().await.map_err(IpcError::from)?;
+    // MR-2390: where each server is, for a move off one deleted later.
+    crate::vpn::relay_retry::remember(&servers);
     let best_server = pick_quick_connect_server(servers, settings.preferred_server_id.as_deref())
         .ok_or_else(|| {
         IpcError::new(
@@ -1014,9 +1026,22 @@ async fn quick_connect_target(
         best_server.name,
         best_server.id
     );
+    let origin = quick_connect_origin(settings.preferred_server_id.as_deref(), &best_server.id);
     Ok(ConnectTarget::SingleHop {
         server_id: best_server.id,
+        origin,
     })
+}
+
+/// Who chose quick connect's server (MR-2390): the user when it is their own
+/// server (`preferred`, which the best-server rule keeps while it is
+/// usable), the client otherwise.
+pub(crate) fn quick_connect_origin(preferred: Option<&str>, picked: &str) -> SelectionOrigin {
+    if preferred == Some(picked) {
+        SelectionOrigin::User
+    } else {
+        SelectionOrigin::Automatic
+    }
 }
 
 /// Quick-connect node choice (OPEN-WORK K10): the least-loaded node the user
@@ -2307,6 +2332,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(picked.id, "B");
+        // MR-2390: the user's own server is the user's pick, so it never
+        // moves abroad when it leaves the pool. With no server of their own,
+        // the best-server rule's pick is the client's.
+        assert_eq!(
+            quick_connect_origin(Some("B"), &picked.id),
+            SelectionOrigin::User
+        );
+        assert_eq!(quick_connect_origin(None, "A"), SelectionOrigin::Automatic);
     }
 
     /// A preferred node that went offline, lost plan access or vanished falls
@@ -2325,6 +2358,12 @@ mod tests {
             )
             .unwrap();
             assert_eq!(picked.id, "B", "preferred {preferred}");
+            // MR-2390: that fallback is the client's pick, not the user's.
+            assert_eq!(
+                quick_connect_origin(Some(preferred), &picked.id),
+                SelectionOrigin::Automatic,
+                "preferred {preferred}"
+            );
         }
     }
 
@@ -2387,6 +2426,7 @@ mod tests {
             dns_filtering,
             fallback_reason: None,
             multi_hop: None,
+            origin: SelectionOrigin::User,
         }
     }
 

@@ -55,6 +55,9 @@ pub async fn get_servers(
     })?;
 
     tracing::trace!("Got {} servers from API", servers.len());
+    // MR-2390: the list the app holds. If the session's server is later
+    // deleted, a move reads where it was from here.
+    crate::vpn::relay_retry::remember(&servers);
 
     Ok(servers
         .into_iter()

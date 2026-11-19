@@ -23,6 +23,7 @@ import {
   quotaGraceMessage,
   REVOKED_COPY,
   EVICTED_COPY,
+  SERVER_UNAVAILABLE_BLOCKED_COPY,
   SESSION_EXPIRED_COPY,
   STEALTH_FAILED_COPY,
   UPDATE_REQUIRED_COPY,
@@ -239,6 +240,25 @@ describe('vpnErrorCopy', () => {
     expect(KILLSWITCH_HOLDING_COPY).toMatch(/traffic is held/);
     expect(KILLSWITCH_HOLDING_COPY).toMatch(/Disconnect/);
     expect(KILLSWITCH_HOLDING_COPY).not.toMatch(/try again/i);
+  });
+
+  // MR-2390: a drained server with nowhere to go, under the always-on kill
+  // switch: the block is held on purpose, and another server ends it.
+  it('says the block is on purpose, with Choose server, for an unavailable server while blocking', () => {
+    expect(vpnErrorCopy(err('server_unavailable'), true)).toEqual({
+      message: SERVER_UNAVAILABLE_BLOCKED_COPY,
+      action: 'choose_server',
+    });
+    expect(SERVER_UNAVAILABLE_BLOCKED_COPY).toMatch(/internet is blocked on purpose/);
+    expect(SERVER_UNAVAILABLE_BLOCKED_COPY).toMatch(/always-on kill switch/);
+    expect(SERVER_UNAVAILABLE_BLOCKED_COPY).toMatch(/until you choose another server/);
+  });
+
+  it('claims no block for an unavailable server when nothing is held', () => {
+    const plain = vpnErrorCopy(err('server_unavailable'), false);
+    expect(plain).toEqual(errorCopy(err('server_unavailable'), 'vpn'));
+    expect(plain.action).toBe('choose_server');
+    expect(plain.message).not.toMatch(/block/i);
   });
 
   it('is errorCopy for everything else', () => {
