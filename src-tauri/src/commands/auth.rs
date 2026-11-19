@@ -1757,6 +1757,39 @@ mod account_boundary_tests {
         }
     }
 
+    /// MR-2483 review L1: after an unreadable 2xx, a 404 that is not the
+    /// API's own (an HTML page, an empty body, another responder's JSON) is no
+    /// deletion. `delete_account` returns it as an error before anything local
+    /// is touched (never `Ok` with `alreadyDeleted`, so the dialog never says
+    /// "deleted"), and the dialog offers to retry it (`server_unavailable`,
+    /// "Couldn't delete your account. Please try again.").
+    #[test]
+    fn a_404_that_is_not_the_apis_after_an_unreadable_2xx_reaches_the_dialog_as_a_retry() {
+        use crate::api::client::{BirdoApi, GdprDeleteOutcome};
+        use reqwest::StatusCode;
+        for body in [
+            "",
+            "<html><body><h1>404 Not Found</h1></body></html>",
+            "{}",
+            r#"{"message":"Not Found"}"#,
+        ] {
+            let outcome = BirdoApi::after_unconfirmed(
+                true,
+                BirdoApi::classify_gdpr_delete_response(StatusCode::NOT_FOUND, body),
+            );
+            let GdprDeleteOutcome::Refused(error) = outcome else {
+                panic!("{body:?} was not read as a refusal");
+            };
+            let shown = super::delete_failure_message(&error);
+            assert_eq!(
+                shown.code,
+                super::IpcErrorCode::ServerUnavailable,
+                "{body:?}"
+            );
+            assert!(shown.retryable, "{body:?}");
+        }
+    }
+
     /// MR-2483: a retry that found the account already deleted reaches the
     /// dialog as a deletion (`Ok`), flagged `alreadyDeleted`, with no store
     /// list (it rode on the answer that was lost). `delete_account` clears

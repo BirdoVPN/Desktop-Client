@@ -128,6 +128,13 @@ pub(crate) enum GdprDeleteOutcome {
     /// Anything else, carrying the error to show (the password check's 401
     /// message included).
     Refused(ApiError),
+    /// MR-2483 (review L1): a 404 in the API's own JSON error shape
+    /// ([`is_api_not_found`]), carrying the error it has always been. Only
+    /// [`BirdoApi::after_unconfirmed`] tells it apart from `Refused`: after an
+    /// unreadable 2xx it is [`Self::AlreadyDeleted`], otherwise exactly that
+    /// `Refused`. A 404 in any other shape (an HTML page, an empty body, JSON
+    /// that is not the API's) is a plain `Refused` whatever came before it.
+    ApiNotFound(ApiError),
     /// MR-2483: a retry after an unreadable 2xx (MR-2370) found the account
     /// gone. Never classified from one response: `delete_account` reaches it
     /// only when this session's last attempt was that 2xx (see
@@ -153,6 +160,28 @@ pub(crate) const UNREADABLE_DELETION: &str =
 /// when it finds no account to check the request against. Its guard admitted
 /// the token, so the access token was not the problem: the account was.
 const IDENTITY_UNVERIFIED: &str = "Unable to verify identity";
+
+/// MR-2483 (review L1): whether a 404's body is the API's own JSON error, the
+/// shape birdo-web's `GlobalExceptionFilter` writes for every error
+/// (`{statusCode, message, error, timestamp, path}`): an object whose
+/// `statusCode` is the number 404 and whose `message` is a non-empty string.
+///
+/// The unreadable 2xx that leaves a deletion unconfirmed is exactly what a
+/// Cloudflare challenge, an HTML page or a response misrouted during a deploy
+/// produces, and the same responder can answer the retry with a 404. Only the
+/// API's own 404 says the account is gone; an HTML page, an empty body or
+/// another responder's JSON says nothing about it.
+pub(crate) fn is_api_not_found(body: &str) -> bool {
+    let Ok(serde_json::Value::Object(body)) = serde_json::from_str::<serde_json::Value>(body)
+    else {
+        return false;
+    };
+    body.get("statusCode").and_then(serde_json::Value::as_u64) == Some(404)
+        && body
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|m| !m.trim().is_empty())
+}
 
 /// What a deletion that ended the account came to (`delete_account`).
 #[derive(Debug)]
@@ -783,28 +812,33 @@ impl BirdoApi {
     /// the deletion most likely happened and only its body was lost. A retry
     /// then meets an account that is gone, which reads as:
     ///
-    /// - a 404: nothing left to delete;
+    /// - the API's own 404 ([`GdprDeleteOutcome::ApiNotFound`]): nothing left
+    ///   to delete;
     /// - the handler's 401 [`IDENTITY_UNVERIFIED`]: its guard admitted the
     ///   token (a session key that outlived the erasure, a user row cached for
     ///   up to 30 s) but it found no account to check.
     ///
     /// Both are [`GdprDeleteOutcome::AlreadyDeleted`], never "wrong password".
+    /// A 404 in any other shape (review L1: an HTML page, an empty body,
+    /// another responder's JSON) is no proof: the unreadable 2xx may have come
+    /// from that same responder, so it stays the error the user can retry.
     /// The password check's own 401s ("Incorrect password", "Password
     /// confirmation is required…") stay the answer: they read the account's
     /// password, so the account exists. The guard's bare 401 is decided after
     /// the refresh ([`Self::refresh_says_gone`]). Without an unconfirmed 2xx
-    /// before, nothing changes.
+    /// before, nothing changes: the API's 404 is the `Refused` it always was.
     pub(crate) fn after_unconfirmed(
         unconfirmed_before: bool,
         outcome: GdprDeleteOutcome,
     ) -> GdprDeleteOutcome {
         if !unconfirmed_before {
-            return outcome;
+            return match outcome {
+                GdprDeleteOutcome::ApiNotFound(error) => GdprDeleteOutcome::Refused(error),
+                other => other,
+            };
         }
         match outcome {
-            GdprDeleteOutcome::Refused(
-                ApiError::NotFound | ApiError::Rejected { status: 404, .. },
-            ) => GdprDeleteOutcome::AlreadyDeleted,
+            GdprDeleteOutcome::ApiNotFound(_) => GdprDeleteOutcome::AlreadyDeleted,
             GdprDeleteOutcome::Refused(ApiError::Rejected {
                 status: 401,
                 ref message,
@@ -849,7 +883,9 @@ impl BirdoApi {
             GdprDeleteOutcome::Held(_) => Err(ApiError::Parse(
                 "the server put the deletion on hold instead of deleting the account".into(),
             )),
-            GdprDeleteOutcome::Refused(error) => Err(error),
+            // `after_unconfirmed` has already made the API's 404 `Refused`
+            // or `AlreadyDeleted`; were it to arrive here, it is its error.
+            GdprDeleteOutcome::Refused(error) | GdprDeleteOutcome::ApiNotFound(error) => Err(error),
             GdprDeleteOutcome::SessionExpired => Err(ApiError::Unauthorized),
         }
     }
@@ -926,7 +962,8 @@ impl BirdoApi {
                     "an unexpected answer to the hold request; nothing is assumed deleted".into(),
                 ))
             }
-            GdprDeleteOutcome::Refused(error) => Err(error),
+            // A hold request's 404 is the error it always was, whatever its shape.
+            GdprDeleteOutcome::Refused(error) | GdprDeleteOutcome::ApiNotFound(error) => Err(error),
             GdprDeleteOutcome::SessionExpired => Err(ApiError::Unauthorized),
         }
     }
@@ -1065,6 +1102,9 @@ impl BirdoApi {
     /// - 401 with any other message: the password check refused; that message
     ///   is the answer.
     /// - anything else: the normal mapping, which keeps the backend's message.
+    ///   A 404 in the API's own JSON error shape comes back as
+    ///   [`GdprDeleteOutcome::ApiNotFound`] carrying that same error (MR-2483,
+    ///   review L1).
     #[cfg(test)]
     pub(crate) fn classify_gdpr_delete_response(
         status: StatusCode,
@@ -1147,11 +1187,20 @@ impl BirdoApi {
                 _ => GdprDeleteOutcome::SessionExpired,
             };
         }
-        GdprDeleteOutcome::Refused(Self::classify_error_response_after(
-            status,
-            body,
-            retry_after,
-        ))
+        let refused = Self::classify_error_response_after(status, body, retry_after);
+        // MR-2483 (review L1): the API's own 404 is told apart from any other
+        // (`is_api_not_found`); the error it carries is unchanged. Only
+        // `after_unconfirmed` reads the difference.
+        if status == StatusCode::NOT_FOUND
+            && is_api_not_found(body)
+            && matches!(
+                refused,
+                ApiError::NotFound | ApiError::Rejected { status: 404, .. }
+            )
+        {
+            return GdprDeleteOutcome::ApiNotFound(refused);
+        }
+        GdprDeleteOutcome::Refused(refused)
     }
 
     /// MR-2335: a hold request's 429 keeps the server's sentence. Its `error`

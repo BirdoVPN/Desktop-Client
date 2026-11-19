@@ -219,8 +219,8 @@ describe('Delete account dialog', () => {
       });
     await openAndConfirm();
     await screen.findByText('Something went wrong on our side. Please try again in a moment.');
-    // The retry met an account that is gone (a 404, or a session that went
-    // with it): Rust cleared everything as for a confirmed deletion.
+    // The retry met an account that is gone (the API's own 404, or a session
+    // that went with it): Rust cleared everything as for a confirmed deletion.
     deleteResult = () =>
       Promise.resolve({ storeSubscriptionsStillBilling: [], alreadyDeleted: true });
     await userEvent.click(screen.getByRole('button', { name: /delete my account/i }));
@@ -231,6 +231,40 @@ describe('Delete account dialog', () => {
     expect(screen.queryByText(/session has expired/i)).not.toBeInTheDocument();
     // Rust signed out already: Profile's onDeleted (a second `logout`) is not run.
     expect(mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'logout')).toHaveLength(0);
+  });
+
+  it('a retry that meets a 404 not from the API stays a retry, never "deleted" (MR-2483 review L1)', async () => {
+    deleteResult = () =>
+      Promise.reject({
+        code: 'server_error',
+        message:
+          'Account deletion failed: Failed to parse response: an unreadable answer to the ' +
+          'deletion; nothing is assumed deleted',
+        retryable: true,
+        retry_after_secs: null,
+      });
+    await openAndConfirm();
+    await screen.findByText('Something went wrong on our side. Please try again in a moment.');
+    // The retry met an HTML or empty 404 (the same responder as the unreadable
+    // 2xx, not the API): Rust answers with an error and has touched nothing.
+    deleteResult = () =>
+      Promise.reject({
+        code: 'server_unavailable',
+        message: 'Account deletion failed: Not found',
+        retryable: true,
+        retry_after_secs: null,
+      });
+    await userEvent.click(screen.getByRole('button', { name: /delete my account/i }));
+    expect(
+      await screen.findByText("Couldn't delete your account. Please try again."),
+    ).toBeInTheDocument();
+    expect(setSessionEndedReason).not.toHaveBeenCalled();
+    expect(logout).not.toHaveBeenCalled();
+    expect(setConnectionState).not.toHaveBeenCalled();
+    expect(calls()).not.toContain('logout');
+    // Still open, password kept: the next retry is one click.
+    expect(screen.getByRole('button', { name: /delete my account/i })).toBeEnabled();
+    expect(mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'delete_account')).toHaveLength(2);
   });
 
   it('a confirmed deletion is not reported as already deleted (MR-2483)', async () => {

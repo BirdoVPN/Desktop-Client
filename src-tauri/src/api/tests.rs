@@ -430,6 +430,7 @@ mod gdpr_request_tests {
             (StatusCode::OK, r#"{"success":true,"pending":true}"#),
             (StatusCode::OK, r#"{"code":"change_pending"}"#),
             (StatusCode::NOT_FOUND, ""),
+            (StatusCode::NOT_FOUND, API_NOT_FOUND),
             (StatusCode::UNAUTHORIZED, IDENTITY_UNVERIFIED),
             (StatusCode::INTERNAL_SERVER_ERROR, ""),
             (StatusCode::TOO_MANY_REQUESTS, ""),
@@ -441,16 +442,90 @@ mod gdpr_request_tests {
         }
     }
 
+    /// birdo-web's `GlobalExceptionFilter` body for a 404, every field it
+    /// writes (origin/main a5a4ad3b).
+    const API_NOT_FOUND: &str = r#"{"statusCode":404,"message":"User not found","error":"Not Found","timestamp":"2026-11-19T21:00:00.000Z","path":"/api/v1/gdpr/delete"}"#;
+
+    /// 404s that are not the API's own: what a Cloudflare challenge, an HTML
+    /// error page, an empty answer or another responder's JSON looks like
+    /// (MR-2483 review L1). None of them says the account is gone.
+    const FOREIGN_404: &[&str] = &[
+        "",
+        "   ",
+        "<!DOCTYPE html><html><head><title>Just a moment...</title></head><body></body></html>",
+        "<html><body><h1>404 Not Found</h1></body></html>",
+        "not json",
+        "null",
+        "[]",
+        "{}",
+        r#"{"message":"Not Found"}"#,
+        r#"{"error":"Not Found"}"#,
+        r#"{"statusCode":404}"#,
+        r#"{"statusCode":404,"message":""}"#,
+        r#"{"statusCode":404,"message":"  "}"#,
+        r#"{"statusCode":404,"message":null}"#,
+        r#"{"statusCode":"404","message":"Not Found"}"#,
+        r#"{"statusCode":404.5,"message":"Not Found"}"#,
+        r#"{"statusCode":200,"message":"Not Found"}"#,
+        r#"[{"statusCode":404,"message":"Not Found"}]"#,
+        r#"{"success":false,"errors":[{"code":1000,"message":"Not Found"}]}"#,
+    ];
+
+    /// The 404 a deletion meets, as `ApiError`: the generic mapping's
+    /// `NotFound`, or `Rejected` with the body's sentence.
+    fn is_plain_404(error: &ApiError) -> bool {
+        matches!(
+            error,
+            ApiError::NotFound | ApiError::Rejected { status: 404, .. }
+        )
+    }
+
+    /// The same 404 error: variant, status and sentence.
+    fn same_404(a: &ApiError, b: &ApiError) -> bool {
+        match (a, b) {
+            (ApiError::NotFound, ApiError::NotFound) => true,
+            (
+                ApiError::Rejected {
+                    status: s1,
+                    message: m1,
+                },
+                ApiError::Rejected {
+                    status: s2,
+                    message: m2,
+                },
+            ) => s1 == s2 && m1 == m2,
+            _ => false,
+        }
+    }
+
+    /// MR-2483 review L1: the API's own 404 is the `GlobalExceptionFilter`
+    /// shape, `statusCode` 404 and a `message`; nothing else is.
+    #[test]
+    fn only_the_apis_error_shape_is_its_404() {
+        use super::super::client::is_api_not_found;
+        for body in [
+            API_NOT_FOUND,
+            r#"{"statusCode":404,"message":"User not found","error":"Not Found"}"#,
+            r#"{"statusCode":404,"message":"Cannot DELETE /api/v1/gdpr/delete"}"#,
+            r#" {"message":"Not Found","statusCode":404} "#,
+        ] {
+            assert!(is_api_not_found(body), "{body}");
+        }
+        for body in FOREIGN_404 {
+            assert!(!is_api_not_found(body), "{body:?}");
+        }
+    }
+
     /// MR-2483: after an unreadable 2xx, a retry that meets an account that
-    /// is gone (a 404, or the handler's "Unable to verify identity" 401) is
-    /// the deletion: `AlreadyDeleted`. On main it was `NotFound` (a generic
-    /// error) or `Rejected { 401 }`, which the dialog words as a WRONG
-    /// PASSWORD (`invalid_credentials`).
+    /// is gone (the API's own 404, or the handler's "Unable to verify
+    /// identity" 401) is the deletion: `AlreadyDeleted`. On main it was a
+    /// generic 404 error or `Rejected { 401 }`, which the dialog words as a
+    /// WRONG PASSWORD (`invalid_credentials`).
     #[test]
     fn after_an_unreadable_2xx_a_gone_account_is_already_deleted() {
         let not_found = r#"{"statusCode":404,"message":"User not found","error":"Not Found"}"#;
         for (status, body) in [
-            (StatusCode::NOT_FOUND, ""),
+            (StatusCode::NOT_FOUND, API_NOT_FOUND),
             (StatusCode::NOT_FOUND, not_found),
             (StatusCode::UNAUTHORIZED, IDENTITY_UNVERIFIED),
             (
@@ -468,6 +543,62 @@ mod gdpr_request_tests {
                 "{status} {body}"
             );
         }
+    }
+
+    /// MR-2483 review L1: the unreadable 2xx is exactly what a Cloudflare
+    /// challenge, an HTML page or a misrouted response produces, and the same
+    /// responder can answer the retry with a 404. A 404 that is not the API's
+    /// own stays the error it always was, which the dialog offers to retry
+    /// (`server_unavailable`): never `AlreadyDeleted`, and it does not mark
+    /// the deletion unconfirmed either.
+    #[test]
+    fn after_an_unreadable_2xx_a_404_that_is_not_the_apis_stays_an_error() {
+        for body in FOREIGN_404 {
+            let outcome = after(true, StatusCode::NOT_FOUND, body);
+            assert!(!outcome.is_unconfirmed(), "{body:?}");
+            match outcome {
+                GdprDeleteOutcome::Refused(error) => {
+                    assert!(is_plain_404(&error), "{body:?} is not a 404 error");
+                    let GdprDeleteOutcome::Refused(before) =
+                        after(false, StatusCode::NOT_FOUND, body)
+                    else {
+                        panic!("{body:?} without an unreadable 2xx is no refusal");
+                    };
+                    assert!(same_404(&error, &before), "{body:?} changed");
+                }
+                GdprDeleteOutcome::AlreadyDeleted => panic!("{body:?} read as deleted"),
+                _ => panic!("{body:?} is no refusal"),
+            }
+        }
+    }
+
+    /// MR-2483 review L1: without an unreadable 2xx before, every 404 (the
+    /// API's own included) is exactly what it was before MR-2483: the generic
+    /// mapping (`classify_error_response`), `Refused`.
+    #[test]
+    fn without_an_unreadable_2xx_a_404_is_what_it_always_was() {
+        for body in FOREIGN_404.iter().copied().chain([API_NOT_FOUND]) {
+            let GdprDeleteOutcome::Refused(now) = after(false, StatusCode::NOT_FOUND, body) else {
+                panic!("{body:?} is no refusal");
+            };
+            let generic = BirdoApi::classify_error_response(StatusCode::NOT_FOUND, body);
+            assert!(same_404(&now, &generic), "{body:?} changed");
+        }
+        match after(false, StatusCode::NOT_FOUND, API_NOT_FOUND) {
+            GdprDeleteOutcome::Refused(ApiError::Rejected { status, message }) => {
+                assert_eq!(status, 404);
+                assert_eq!(message, "User not found");
+            }
+            _ => panic!("the API's 404 is no longer its sentence"),
+        }
+        // A hold request reads it as the error it always was, too.
+        assert!(matches!(
+            BirdoApi::deletion_hold_from(BirdoApi::classify_gdpr_delete_response(
+                StatusCode::NOT_FOUND,
+                API_NOT_FOUND
+            )),
+            Err(ApiError::Rejected { status: 404, .. })
+        ));
     }
 
     /// MR-2483: everything else keeps its meaning after an unreadable 2xx.
@@ -558,9 +689,9 @@ mod gdpr_request_tests {
 
     /// MR-2483, by behaviour: a signed-in client whose deletion got an
     /// unreadable 2xx keeps its session and remembers it; the retry's 404
-    /// then signs it out, as a confirmed deletion does, and reports
-    /// `AlreadyDeleted`. On main the retry's 404 left it signed in to a
-    /// deleted account behind a generic error.
+    /// (the API's own) then signs it out, as a confirmed deletion does, and
+    /// reports `AlreadyDeleted`. On main the retry's 404 left it signed in to
+    /// a deleted account behind a generic error.
     #[tokio::test]
     async fn a_retry_that_finds_the_account_gone_signs_out() {
         use super::super::client::AccountDeletion;
@@ -580,7 +711,7 @@ mod gdpr_request_tests {
         );
         assert!(api.deletion_unconfirmed());
 
-        let retry = BirdoApi::classify_gdpr_delete_response(StatusCode::NOT_FOUND, "");
+        let retry = BirdoApi::classify_gdpr_delete_response(StatusCode::NOT_FOUND, API_NOT_FOUND);
         assert!(matches!(
             api.conclude_gdpr_delete(api.deletion_unconfirmed(), retry)
                 .await,
@@ -593,19 +724,64 @@ mod gdpr_request_tests {
         assert!(!api.deletion_unconfirmed());
     }
 
+    /// MR-2483 review L1, by behaviour: after an unreadable 2xx (here the
+    /// HTML a Cloudflare challenge answers with), a 404 that is not the API's
+    /// own (HTML, empty, foreign JSON) is the error it always was: the user
+    /// stays signed in, nothing is cleared, and the deletion stays
+    /// unconfirmed, so the user can retry. Only the API's own 404 then ends
+    /// it as `AlreadyDeleted`.
+    #[tokio::test]
+    async fn after_an_unreadable_2xx_only_the_apis_404_signs_out() {
+        use super::super::client::AccountDeletion;
+        let api = BirdoApi::new();
+        api.set_tokens("access-1".into(), "refresh-1".into()).await;
+        let challenge = "<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>";
+        let first = BirdoApi::classify_gdpr_delete_response(StatusCode::OK, challenge);
+        assert!(matches!(
+            api.conclude_gdpr_delete(api.deletion_unconfirmed(), first)
+                .await,
+            Err(ApiError::Parse(_))
+        ));
+        assert!(api.deletion_unconfirmed());
+
+        for body in FOREIGN_404 {
+            let retry = BirdoApi::classify_gdpr_delete_response(StatusCode::NOT_FOUND, body);
+            let ended = api
+                .conclude_gdpr_delete(api.deletion_unconfirmed(), retry)
+                .await;
+            match ended {
+                Err(error) => assert!(is_plain_404(&error), "{body:?} is not a 404 error"),
+                Ok(_) => panic!("{body:?} ended the account"),
+            }
+            assert!(api.is_authenticated().await, "{body:?} signed out");
+            assert!(api.deletion_unconfirmed(), "{body:?} forgot the 2xx");
+        }
+
+        let retry = BirdoApi::classify_gdpr_delete_response(StatusCode::NOT_FOUND, API_NOT_FOUND);
+        assert!(matches!(
+            api.conclude_gdpr_delete(api.deletion_unconfirmed(), retry)
+                .await,
+            Ok(AccountDeletion::AlreadyDeleted)
+        ));
+        assert!(!api.is_authenticated().await);
+        assert!(!api.deletion_unconfirmed());
+    }
+
     /// MR-2483: the memory of an unreadable 2xx is its session's. Without
-    /// it a 404 signs nobody out; a new sign-in and a sign-out forget it.
+    /// it a 404, even the API's own, signs nobody out; a new sign-in and a
+    /// sign-out forget it.
     #[tokio::test]
     async fn an_unreadable_2xx_is_remembered_for_its_session_only() {
         let api = BirdoApi::new();
         api.set_tokens("access-1".into(), "refresh-1".into()).await;
-        let not_found = || BirdoApi::classify_gdpr_delete_response(StatusCode::NOT_FOUND, "");
+        let not_found =
+            || BirdoApi::classify_gdpr_delete_response(StatusCode::NOT_FOUND, API_NOT_FOUND);
         let unreadable = || BirdoApi::classify_gdpr_delete_response(StatusCode::OK, "{}");
 
         assert!(matches!(
             api.conclude_gdpr_delete(api.deletion_unconfirmed(), not_found())
                 .await,
-            Err(ApiError::NotFound)
+            Err(ApiError::Rejected { status: 404, .. })
         ));
         assert!(api.is_authenticated().await);
 
@@ -618,7 +794,7 @@ mod gdpr_request_tests {
         assert!(matches!(
             api.conclude_gdpr_delete(api.deletion_unconfirmed(), not_found())
                 .await,
-            Err(ApiError::NotFound)
+            Err(ApiError::Rejected { status: 404, .. })
         ));
         assert!(api.is_authenticated().await);
 

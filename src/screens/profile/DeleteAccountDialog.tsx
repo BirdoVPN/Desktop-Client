@@ -437,7 +437,8 @@ export function DeleteAccountDialog({
       ns.setCurrentServer(null);
       if (result?.alreadyDeleted === true) {
         // MR-2483: the last try's answer was lost, and this retry met an
-        // account that is gone (a 404, or a session that went with it). Not
+        // account that is gone (the API's own 404, or a session that went
+        // with it; any other 404 comes back as an error to retry). Not
         // "wrong password", not "sign in again": Rust has signed out and
         // cleared everything, and Login says the account is deleted.
         endDeletedSession();
