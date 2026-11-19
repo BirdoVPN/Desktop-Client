@@ -3,17 +3,20 @@ name: Workflow lint
 # Lints this repo's GitHub Actions workflows with actionlint (with shellcheck, which ships on ubuntu runners)
 # and zizmor (security audit). Both are pinned to a version and verified by SHA-256, so the gate is the same
 # on every run; bump them deliberately (versions + hashes together).
-# Shell scripts are a path too: the no-pipe-into-grep-q guard (MR-2391) scans every one that sets pipefail.
+# Shell scripts are a path too: the no-pipe-into-grep-q guard (MR-2391) scans every *.sh / *.bash that sets
+# pipefail, so both extensions trigger this workflow (MR-2403: *.bash was scanned but never triggered it).
 on:
   pull_request:
     paths:
       - ".github/**"
       - "**/*.sh"
+      - "**/*.bash"
   push:
     branches: [main]
     paths:
       - ".github/**"
       - "**/*.sh"
+      - "**/*.bash"
   workflow_dispatch:
 
 permissions: {}
@@ -63,10 +66,19 @@ jobs:
       # MR-2391: `producer | grep -q` under pipefail (every bash step's default)
       # fails at random - grep -q exits at its first match, a producer still
       # writing dies of SIGPIPE, and pipefail reports the match as a miss.
-      # Rejects that form in every workflow and every pipefail shell script;
-      # the script self-tests its pattern before it scans.
+      # Rejects that form in every workflow and every pipefail shell script,
+      # with continued lines joined first (MR-2403); the script self-tests its
+      # pattern before it scans.
       - name: No pipe into grep -q under pipefail
         run: bash .github/scripts/check-no-pipe-into-grep-q.sh
+
+      # The guard's own test (MR-2403): fixture workflows and pipefail scripts in
+      # throwaway repos - continuation-split pipes, every -q spelling, |&, grep
+      # behind command / \ / a path / { } / xargs, negated forms - must be
+      # flagged at the right line; here-strings, file input, comments and YAML
+      # block scalars must pass.
+      - name: No-pipe-into-grep-q guard test
+        run: bash .github/scripts/check-no-pipe-into-grep-q-test.sh
 
       # The tag-on-main release gate (require-tag-on-main.sh) fails closed, so its
       # own test must stay green: it builds throwaway git repos, needs no history.
