@@ -12,6 +12,11 @@ import {
   connectionNotification,
   initNotifications,
   notifyConnected,
+  notifyConnectionError,
+  notifyConnectionLost,
+  notifyDisconnected,
+  notifyKillSwitchActive,
+  notifyQuotaGrace,
   notifyReconnected,
 } from './notifications';
 import { useAppStore } from '@/store/app-store';
@@ -44,8 +49,31 @@ describe('notifications — detail toggles + gating', () => {
     expect(sendNotification).toHaveBeenCalledTimes(1);
     const body = sendNotification.mock.calls[0][0].body as string;
     expect(body).toBe('via Frankfurt');
-    // The canonical title, the same word the pill uses (P1-parity-028).
-    expect(sendNotification.mock.calls[0][0].title).toBe('BirdoVPN — Protected');
+    // The canonical title, the same word the pill uses (P1-parity-028), with
+    // no "BirdoVPN — " prefix (MR-1514).
+    expect(sendNotification.mock.calls[0][0].title).toBe('Protected');
+  });
+
+  it('no notification title carries the "BirdoVPN" prefix (MR-1514, owner decision: drop)', () => {
+    setNotificationSettings({ notifications: true, showIp: false, showLocation: false });
+    notifyConnected('Frankfurt');
+    notifyReconnected('Frankfurt');
+    notifyDisconnected();
+    notifyConnectionLost();
+    notifyConnectionError('Something went wrong');
+    notifyQuotaGrace('You have used your free data allowance.');
+    notifyKillSwitchActive();
+    const titles = sendNotification.mock.calls.map((call) => call[0].title as string);
+    expect(titles).toEqual([
+      'Protected',
+      'Protected',
+      'Not connected',
+      'Reconnecting…',
+      'Connection error',
+      'Free data allowance used',
+      'Kill Switch — all traffic blocked',
+    ]);
+    for (const title of titles) expect(title.startsWith('BirdoVPN')).toBe(false);
   });
 
   it('appends location then IP, in that order, when both toggles are on', () => {
