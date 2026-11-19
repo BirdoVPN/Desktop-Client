@@ -2246,6 +2246,11 @@ async fn flush_dns_cache() {
 /// Whether a failed heartbeat failed on the NETWORK — no connection, no
 /// answer — rather than with an answer (a status, an unreadable body), which
 /// had to cross the tunnel to arrive. (Windows only; see `SessionWatch`.)
+///
+/// A certificate the pin refused (`CertificatePinningFailed`, MR-2537) is an
+/// answer too: the server's certificate crossed the tunnel to be refused. It
+/// used to arrive as `Network` and count as a miss, which could only open a
+/// re-prove the relay then answers; it resets the run now, like a status.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn heartbeat_missed_the_network(e: &crate::api::ApiError) -> bool {
     matches!(e, crate::api::ApiError::Network(_))
@@ -2366,6 +2371,19 @@ mod tests {
             heartbeat_failure(&held),
             "not sent (waiting out HTTP 429's Retry-After)"
         );
+    }
+
+    /// MR-2537: a heartbeat whose certificate the pin refused was answered,
+    /// through the tunnel, so it is no network miss: it resets the run like
+    /// a status (it used to arrive as `Network` and add one). Its log line
+    /// says what it was.
+    #[test]
+    fn a_pin_refusal_is_an_answer_not_a_missed_heartbeat() {
+        use crate::api::ApiError;
+        let pin = ApiError::CertificatePinningFailed("certificate SPKI pin mismatch".into());
+        assert!(!heartbeat_missed_the_network(&pin), "pin");
+        assert_eq!(misses_after_failure(2, &pin), 0, "pin");
+        assert_eq!(heartbeat_failure(&pin), "certificate pin mismatch");
     }
 
     /// MR-946: the first heartbeat goes out as soon as the session is seen

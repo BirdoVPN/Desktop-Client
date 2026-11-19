@@ -20,9 +20,12 @@
 //!   for the same backoff as a 5xx (the one timing table, lead 2026-11-19
 //!   21:39Z: Desktop's numbers, Mobile #653's hold). Unlike the answers
 //!   above, the call that met one is told it as it is ([`told`]): the
-//!   version floor (the upgrade gate's own screen), the pin failure ("this
-//!   network may be intercepting"), the unreadable answer. The calls after it
-//!   inside the hold get the hold (`ApiError::Held` 503) and send nothing.
+//!   version floor (the upgrade gate's own screen), the pin failure ("could
+//!   not verify it is talking to its own servers"), the unreadable answer.
+//!   The calls after it inside the hold get the hold (`ApiError::Held` 503)
+//!   and send nothing. (MR-2537: a real pin failure reaches this rule as
+//!   `CertificatePinningFailed` since `client::send_failed`; it used to
+//!   arrive as `Network` and was told as no network.)
 //!
 //! The one timing table (both clients):
 //! - backoff: [`BACKOFF_BASE`] 1 s doubling to [`BACKOFF_CAP`] 30 s, equal
@@ -110,8 +113,9 @@ pub(crate) fn after_failure(error: &ApiError, step: u32, unit: f64) -> Next {
 /// The answers a refresh is held for that the call which met them is told as
 /// they are, never as the hold (see [`told`]): the version floor (426), a TLS
 /// pin failure and an unreadable 2xx. Each says something the user has to
-/// see (update the app; this network may be intercepting; the answer was
-/// unreadable), and none of them reads as a reason to change server.
+/// see (update the app; the app could not verify its own servers, so get the
+/// latest version or try another network; the answer was unreadable), and
+/// none of them reads as a reason to change server.
 pub(crate) fn told_as_it_is(error: &ApiError) -> bool {
     matches!(
         error,
