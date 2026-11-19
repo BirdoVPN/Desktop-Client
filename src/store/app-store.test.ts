@@ -512,6 +512,42 @@ describe('useAppStore', () => {
       expect(migratePersistedState({ acceptedConsentVersion: 2 }, 1)).toEqual({ acceptedConsentVersion: 2 })
     })
 
+    // MR-2492: who chose the server on record is saved with it. A server an
+    // older build saved, or an origin that is neither of the two, reads as
+    // the user's: the reading that never takes it out of its country.
+    it('keeps who chose the server on record, and reads anything unknown as the user', async () => {
+      useAppStore.getState().setLastServerId('fra-1', 'automatic')
+      const stored = JSON.parse(localStorage.getItem('birdo-vpn-storage') ?? '{}')
+      expect(stored.state.lastServerId).toBe('fra-1')
+      expect(stored.state.lastServerOrigin).toBe('automatic')
+
+      const cases = [
+        [{ lastServerId: 'fra-1' }, 'user'],
+        [{ lastServerId: 'fra-1', lastServerOrigin: 'automatic' }, 'automatic'],
+        [{ lastServerId: 'fra-1', lastServerOrigin: 'bogus' }, 'user'],
+      ] as const
+      for (const [saved, read] of cases) {
+        useAppStore.setState({ lastServerOrigin: read === 'user' ? 'automatic' : 'user' })
+        localStorage.setItem('birdo-vpn-storage', JSON.stringify({ state: saved, version: 2 }))
+        await useAppStore.persist.rehydrate()
+        expect(useAppStore.getState().lastServerOrigin, JSON.stringify(saved)).toBe(read)
+      }
+      localStorage.removeItem('birdo-vpn-storage')
+    })
+
+    it('a sign-out forgets who chose the server, with the server', () => {
+      useAppStore.getState().setLastServerId('fra-1', 'automatic')
+      useAppStore.getState().logout()
+      expect(useAppStore.getState().lastServerId).toBeNull()
+      expect(useAppStore.getState().lastServerOrigin).toBe('user')
+    })
+
+    it('a server recorded with no origin given is the user\'s', () => {
+      useAppStore.getState().setLastServerId('fra-1', 'automatic')
+      useAppStore.getState().setLastServerId('ams-1')
+      expect(useAppStore.getState().lastServerOrigin).toBe('user')
+    })
+
     // WIN-FIX-3: no relay answers WireGuard on 53 or a custom port, so a
     // saved one becomes "auto" once; the two real choices are kept.
     it('a dead WireGuard port is migrated to auto (1 → 2)', () => {
