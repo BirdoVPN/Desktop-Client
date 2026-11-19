@@ -49,6 +49,13 @@ export const EVICTED_COPY =
 export const QUOTA_EXCEEDED_COPY =
   "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.";
 export const SESSION_EXPIRED_COPY = 'Your session has expired. Sign in again.';
+/**
+ * MR-2483: a retried deletion found the account already gone (the first
+ * try's answer was lost on the way back). Not "sign in again": there is no
+ * account to sign in to.
+ */
+export const ACCOUNT_ALREADY_DELETED_COPY =
+  'Your account has already been deleted, so you have been signed out.';
 export const UPDATE_REQUIRED_COPY =
   'This version of BirdoVPN is no longer supported. Update to keep connecting.';
 export const DEVICE_LIMIT_COPY =

@@ -9,7 +9,7 @@ import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { Login } from '@/components/Login';
 import { useAppStore } from '@/store/app-store';
-import { SESSION_EXPIRED_COPY } from '@/lib/errors';
+import { ACCOUNT_ALREADY_DELETED_COPY, SESSION_EXPIRED_COPY } from '@/lib/errors';
 
 vi.mock('@tauri-apps/api/core');
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn().mockResolvedValue(undefined) }));
@@ -84,6 +84,13 @@ describe('Email sign-in', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Sign in' }));
     await waitFor(() => expect(useAppStore.getState().isAuthenticated).toBe(true));
     expect(useAppStore.getState().sessionEndedReason).toBeNull();
+  });
+
+  it('says the account is deleted when a retried deletion found it gone, not "sign in again" (MR-2483)', () => {
+    useAppStore.setState({ sessionEndedReason: 'deleted' });
+    render(<Login />);
+    expect(screen.getByText(ACCOUNT_ALREADY_DELETED_COPY)).toBeInTheDocument();
+    expect(screen.queryByText(SESSION_EXPIRED_COPY)).not.toBeInTheDocument();
   });
 });
 

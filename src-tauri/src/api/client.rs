@@ -128,6 +128,70 @@ pub(crate) enum GdprDeleteOutcome {
     /// Anything else, carrying the error to show (the password check's 401
     /// message included).
     Refused(ApiError),
+    /// MR-2483 (review L1): a 404 in the API's own JSON error shape
+    /// ([`is_api_not_found`]), carrying the error it has always been. Only
+    /// [`BirdoApi::after_unconfirmed`] tells it apart from `Refused`: after an
+    /// unreadable 2xx it is [`Self::AlreadyDeleted`], otherwise exactly that
+    /// `Refused`. A 404 in any other shape (an HTML page, an empty body, JSON
+    /// that is not the API's) is a plain `Refused` whatever came before it.
+    ApiNotFound(ApiError),
+    /// MR-2483: a retry after an unreadable 2xx (MR-2370) found the account
+    /// gone. Never classified from one response: `delete_account` reaches it
+    /// only when this session's last attempt was that 2xx (see
+    /// `BirdoApi::after_unconfirmed`).
+    AlreadyDeleted,
+}
+
+impl GdprDeleteOutcome {
+    /// MR-2370's answer: a 2xx (not the hold's 202) whose body did not
+    /// confirm the deletion. The deletion may well have happened, its body
+    /// lost on the way (MR-2483).
+    pub(crate) fn is_unconfirmed(&self) -> bool {
+        matches!(self, Self::Refused(ApiError::Parse(why)) if why == UNREADABLE_DELETION)
+    }
+}
+
+/// MR-2370: the error a 2xx deletion answer whose body did not confirm the
+/// deletion becomes (`ApiError::Parse`, worded `server_error` by the dialog).
+pub(crate) const UNREADABLE_DELETION: &str =
+    "an unreadable answer to the deletion; nothing is assumed deleted";
+
+/// MR-2483: the sentence birdo-web `GdprController.deleteData` answers (401)
+/// when it finds no account to check the request against. Its guard admitted
+/// the token, so the access token was not the problem: the account was.
+const IDENTITY_UNVERIFIED: &str = "Unable to verify identity";
+
+/// MR-2483 (review L1): whether a 404's body is the API's own JSON error, the
+/// shape birdo-web's `GlobalExceptionFilter` writes for every error
+/// (`{statusCode, message, error, timestamp, path}`): an object whose
+/// `statusCode` is the number 404 and whose `message` is a non-empty string.
+///
+/// The unreadable 2xx that leaves a deletion unconfirmed is exactly what a
+/// Cloudflare challenge, an HTML page or a response misrouted during a deploy
+/// produces, and the same responder can answer the retry with a 404. Only the
+/// API's own 404 says the account is gone; an HTML page, an empty body or
+/// another responder's JSON says nothing about it.
+pub(crate) fn is_api_not_found(body: &str) -> bool {
+    let Ok(serde_json::Value::Object(body)) = serde_json::from_str::<serde_json::Value>(body)
+    else {
+        return false;
+    };
+    body.get("statusCode").and_then(serde_json::Value::as_u64) == Some(404)
+        && body
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|m| !m.trim().is_empty())
+}
+
+/// What a deletion that ended the account came to (`delete_account`).
+#[derive(Debug)]
+pub enum AccountDeletion {
+    /// The server confirmed it now (`success: true`).
+    Deleted(DeleteAccountResponse),
+    /// MR-2483: a retry after an unreadable 2xx (MR-2370) found the account
+    /// already gone. The earlier answer was the deletion; its confirmation
+    /// was lost, store-subscription list and all.
+    AlreadyDeleted,
 }
 
 /// What one proof-checked POST response means (MR-1707, the number
@@ -262,6 +326,10 @@ pub struct BirdoApi {
     /// MR-1808: the requests the server asked to hold (`Retry-After`), shared
     /// by every client built from this one so none of them sends early.
     retry_gate: Arc<super::retry_gate::RetryGate>,
+    /// MR-2483: this session's last deletion attempt was answered with a 2xx
+    /// whose body did not confirm it (MR-2370), so the account may already be
+    /// gone. Forgotten whenever the session changes or ends.
+    deletion_unconfirmed: Arc<AtomicBool>,
 }
 
 /// The ONE builder every control-plane client starts from, so a second client
@@ -373,6 +441,7 @@ impl BirdoApi {
             refresh_token: Arc::new(RwLock::new(None)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             retry_gate: Arc::default(),
+            deletion_unconfirmed: Arc::default(),
         }
     }
 
@@ -401,6 +470,7 @@ impl BirdoApi {
             refresh_token: Arc::clone(&self.refresh_token),
             refresh_lock: Arc::clone(&self.refresh_lock),
             retry_gate: Arc::clone(&self.retry_gate),
+            deletion_unconfirmed: Arc::clone(&self.deletion_unconfirmed),
         })
     }
 
@@ -408,6 +478,8 @@ impl BirdoApi {
     pub async fn set_tokens(&self, access: String, refresh: String) {
         *self.access_token.write().await = Some(Zeroizing::new(access));
         *self.refresh_token.write().await = Some(Zeroizing::new(refresh));
+        // MR-2483: a new session; the last one's unconfirmed deletion is not its.
+        self.deletion_unconfirmed.store(false, Ordering::SeqCst);
     }
 
     /// Fill the in-memory session from the keystore — ONLY if there is none.
@@ -435,6 +507,7 @@ impl BirdoApi {
         *self.access_token.write().await = None;
         *self.refresh_token.write().await = None;
         self.retry_gate.forget_session();
+        self.deletion_unconfirmed.store(false, Ordering::SeqCst);
     }
 
     /// Clear the tokens only while the session in memory is still the one
@@ -452,6 +525,7 @@ impl BirdoApi {
         *access = None;
         *self.refresh_token.write().await = None;
         self.retry_gate.forget_session();
+        self.deletion_unconfirmed.store(false, Ordering::SeqCst);
         true
     }
 
@@ -648,6 +722,13 @@ impl BirdoApi {
     /// unreadable answer leaves the user signed in to an account that may
     /// still exist.
     ///
+    /// MR-2483: the retry after such an unreadable 2xx. That answer may well
+    /// have been the deletion, its body lost; the retry then meets an account
+    /// that is gone, and that is what it says ([`AccountDeletion::AlreadyDeleted`],
+    /// local state cleared as for a confirmed deletion), never "wrong
+    /// password" and never "sign in again, then retry". See
+    /// [`Self::after_unconfirmed`] and [`Self::refresh_says_gone`].
+    ///
     /// `around_the_tunnel`: the physical interface's address while a tunnel is
     /// up (REVIEW-WIN2-007). The server removes the account's WireGuard peers
     /// BEFORE it answers, so an answer through the tunnel was dropped at the
@@ -661,7 +742,7 @@ impl BirdoApi {
         account_number: Option<&str>,
         email_code: Option<&str>,
         around_the_tunnel: Option<std::net::IpAddr>,
-    ) -> Result<DeleteAccountResponse, ApiError> {
+    ) -> Result<AccountDeletion, ApiError> {
         let body = DeleteAccountBody {
             password,
             two_factor_code,
@@ -669,6 +750,8 @@ impl BirdoApi {
             email_code,
             step_up_method: None,
         };
+        // MR-2483: read before this attempt, which may set it again.
+        let unconfirmed_before = self.deletion_unconfirmed();
         let token_before = self.access_token_value().await;
         let outcome = match self.send_gdpr_delete(&body, around_the_tunnel).await? {
             GdprDeleteOutcome::SessionExpired => {
@@ -677,28 +760,122 @@ impl BirdoApi {
                     // nobody else already did while we waited for the lock.
                     let lock = Arc::clone(&self.refresh_lock).lock_owned().await;
                     if self.access_token_value().await == token_before {
-                        self.refresh_detached(lock)
-                            .await
-                            .map_err(super::session_gate::error_after_failed_refresh)?;
+                        match self.refresh_detached(lock).await {
+                            Ok(()) => {}
+                            // MR-2483: the session went with the account. The
+                            // session gate has ended it as well (the refresh
+                            // reports itself); this says why.
+                            Err(refused)
+                                if unconfirmed_before && Self::refresh_says_gone(&refused) =>
+                            {
+                                return self
+                                    .finish_gdpr_delete(GdprDeleteOutcome::AlreadyDeleted)
+                                    .await;
+                            }
+                            Err(e) => {
+                                return Err(super::session_gate::error_after_failed_refresh(e))
+                            }
+                        }
                     }
                 }
                 self.send_gdpr_delete(&body, around_the_tunnel).await?
             }
             other => other,
         };
+        self.conclude_gdpr_delete(unconfirmed_before, outcome).await
+    }
+
+    /// MR-2483: whether this session's last deletion attempt was answered
+    /// with a 2xx whose body did not confirm it (MR-2370).
+    pub(crate) fn deletion_unconfirmed(&self) -> bool {
+        self.deletion_unconfirmed.load(Ordering::SeqCst)
+    }
+
+    /// The end of a deletion attempt, once its answer is known: read in the
+    /// light of an unreadable 2xx before it ([`Self::after_unconfirmed`]),
+    /// remembered when it is one itself, then finished.
+    pub(crate) async fn conclude_gdpr_delete(
+        &self,
+        unconfirmed_before: bool,
+        outcome: GdprDeleteOutcome,
+    ) -> Result<AccountDeletion, ApiError> {
+        let outcome = Self::after_unconfirmed(unconfirmed_before, outcome);
+        if outcome.is_unconfirmed() {
+            self.deletion_unconfirmed.store(true, Ordering::SeqCst);
+        }
         self.finish_gdpr_delete(outcome).await
     }
 
+    /// MR-2483: what a deletion answer means when this session's last attempt
+    /// was answered with a 2xx that did not confirm the deletion (MR-2370;
+    /// `unconfirmed_before`). That 2xx came from the pinned control plane, so
+    /// the deletion most likely happened and only its body was lost. A retry
+    /// then meets an account that is gone, which reads as:
+    ///
+    /// - the API's own 404 ([`GdprDeleteOutcome::ApiNotFound`]): nothing left
+    ///   to delete;
+    /// - the handler's 401 [`IDENTITY_UNVERIFIED`]: its guard admitted the
+    ///   token (a session key that outlived the erasure, a user row cached for
+    ///   up to 30 s) but it found no account to check.
+    ///
+    /// Both are [`GdprDeleteOutcome::AlreadyDeleted`], never "wrong password".
+    /// A 404 in any other shape (review L1: an HTML page, an empty body,
+    /// another responder's JSON) is no proof: the unreadable 2xx may have come
+    /// from that same responder, so it stays the error the user can retry.
+    /// The password check's own 401s ("Incorrect password", "Password
+    /// confirmation is required…") stay the answer: they read the account's
+    /// password, so the account exists. The guard's bare 401 is decided after
+    /// the refresh ([`Self::refresh_says_gone`]). Without an unconfirmed 2xx
+    /// before, nothing changes: the API's 404 is the `Refused` it always was.
+    pub(crate) fn after_unconfirmed(
+        unconfirmed_before: bool,
+        outcome: GdprDeleteOutcome,
+    ) -> GdprDeleteOutcome {
+        if !unconfirmed_before {
+            return match outcome {
+                GdprDeleteOutcome::ApiNotFound(error) => GdprDeleteOutcome::Refused(error),
+                other => other,
+            };
+        }
+        match outcome {
+            GdprDeleteOutcome::ApiNotFound(_) => GdprDeleteOutcome::AlreadyDeleted,
+            GdprDeleteOutcome::Refused(ApiError::Rejected {
+                status: 401,
+                ref message,
+            }) if message.trim().eq_ignore_ascii_case(IDENTITY_UNVERIFIED) => {
+                GdprDeleteOutcome::AlreadyDeleted
+            }
+            other => other,
+        }
+    }
+
+    /// MR-2483: after an unreadable 2xx, the guard's bare 401 on the retry and
+    /// a refresh the server refused with 401 (the refresh token itself is dead,
+    /// `session_gate::StoredSession::Discard`) mean the session went with the
+    /// account: the erasure deletes every session. A 403, a 429, a 5xx or no
+    /// answer say nothing about the account and keep their own meaning.
+    pub(crate) fn refresh_says_gone(refused: &ApiError) -> bool {
+        matches!(
+            refused,
+            ApiError::Unauthorized | ApiError::Rejected { status: 401, .. }
+        )
+    }
+
     /// What `delete_account` does with its classified answer. The tokens are
-    /// cleared for a confirmed deletion and for nothing else.
+    /// cleared for a confirmed deletion, and for an account a retry found
+    /// already deleted (MR-2483), and for nothing else.
     pub(crate) async fn finish_gdpr_delete(
         &self,
         outcome: GdprDeleteOutcome,
-    ) -> Result<DeleteAccountResponse, ApiError> {
+    ) -> Result<AccountDeletion, ApiError> {
         match outcome {
             GdprDeleteOutcome::Deleted(response) => {
                 self.clear_tokens().await;
-                Ok(response)
+                Ok(AccountDeletion::Deleted(response))
+            }
+            GdprDeleteOutcome::AlreadyDeleted => {
+                self.clear_tokens().await;
+                Ok(AccountDeletion::AlreadyDeleted)
             }
             // MR-2335: never sent without `stepUpMethod: "hold"`, but a held
             // deletion is not a deletion whatever asked for it: the account and
@@ -706,7 +883,9 @@ impl BirdoApi {
             GdprDeleteOutcome::Held(_) => Err(ApiError::Parse(
                 "the server put the deletion on hold instead of deleting the account".into(),
             )),
-            GdprDeleteOutcome::Refused(error) => Err(error),
+            // `after_unconfirmed` has already made the API's 404 `Refused`
+            // or `AlreadyDeleted`; were it to arrive here, it is its error.
+            GdprDeleteOutcome::Refused(error) | GdprDeleteOutcome::ApiNotFound(error) => Err(error),
             GdprDeleteOutcome::SessionExpired => Err(ApiError::Unauthorized),
         }
     }
@@ -776,10 +955,15 @@ impl BirdoApi {
     pub(crate) fn deletion_hold_from(outcome: GdprDeleteOutcome) -> Result<DeletionHold, ApiError> {
         match outcome {
             GdprDeleteOutcome::Held(hold) => Ok(hold),
-            GdprDeleteOutcome::Deleted(_) => Err(ApiError::Parse(
-                "an unexpected answer to the hold request; nothing is assumed deleted".into(),
-            )),
-            GdprDeleteOutcome::Refused(error) => Err(error),
+            // `AlreadyDeleted` is only ever `delete_account`'s; were it to
+            // reach a hold request, it is no hold either.
+            GdprDeleteOutcome::Deleted(_) | GdprDeleteOutcome::AlreadyDeleted => {
+                Err(ApiError::Parse(
+                    "an unexpected answer to the hold request; nothing is assumed deleted".into(),
+                ))
+            }
+            // A hold request's 404 is the error it always was, whatever its shape.
+            GdprDeleteOutcome::Refused(error) | GdprDeleteOutcome::ApiNotFound(error) => Err(error),
             GdprDeleteOutcome::SessionExpired => Err(ApiError::Unauthorized),
         }
     }
@@ -918,6 +1102,9 @@ impl BirdoApi {
     /// - 401 with any other message: the password check refused; that message
     ///   is the answer.
     /// - anything else: the normal mapping, which keeps the backend's message.
+    ///   A 404 in the API's own JSON error shape comes back as
+    ///   [`GdprDeleteOutcome::ApiNotFound`] carrying that same error (MR-2483,
+    ///   review L1).
     #[cfg(test)]
     pub(crate) fn classify_gdpr_delete_response(
         status: StatusCode,
@@ -960,9 +1147,7 @@ impl BirdoApi {
         if status.is_success() {
             return match DeleteAccountResponse::confirmation(body) {
                 Some(confirmed) => GdprDeleteOutcome::Deleted(confirmed),
-                None => GdprDeleteOutcome::Refused(ApiError::Parse(
-                    "an unreadable answer to the deletion; nothing is assumed deleted".into(),
-                )),
+                None => GdprDeleteOutcome::Refused(ApiError::Parse(UNREADABLE_DELETION.into())),
             };
         }
         // MR-2335: 409 `change_already_pending`: a deletion is on hold already.
@@ -1002,11 +1187,20 @@ impl BirdoApi {
                 _ => GdprDeleteOutcome::SessionExpired,
             };
         }
-        GdprDeleteOutcome::Refused(Self::classify_error_response_after(
-            status,
-            body,
-            retry_after,
-        ))
+        let refused = Self::classify_error_response_after(status, body, retry_after);
+        // MR-2483 (review L1): the API's own 404 is told apart from any other
+        // (`is_api_not_found`); the error it carries is unchanged. Only
+        // `after_unconfirmed` reads the difference.
+        if status == StatusCode::NOT_FOUND
+            && is_api_not_found(body)
+            && matches!(
+                refused,
+                ApiError::NotFound | ApiError::Rejected { status: 404, .. }
+            )
+        {
+            return GdprDeleteOutcome::ApiNotFound(refused);
+        }
+        GdprDeleteOutcome::Refused(refused)
     }
 
     /// MR-2335: a hold request's 429 keeps the server's sentence. Its `error`
@@ -2237,6 +2431,7 @@ impl Clone for BirdoApi {
             refresh_token: Arc::clone(&self.refresh_token),
             refresh_lock: Arc::clone(&self.refresh_lock),
             retry_gate: Arc::clone(&self.retry_gate),
+            deletion_unconfirmed: Arc::clone(&self.deletion_unconfirmed),
         }
     }
 }
