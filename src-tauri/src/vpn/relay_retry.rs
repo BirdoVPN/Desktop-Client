@@ -239,21 +239,33 @@ pub fn log_line(choice: Option<&Choice>, origin: SelectionOrigin) -> String {
 /// a click (the owner's rule, 2026-11-19): `None`, and the connect shows its
 /// error.
 pub fn after_no_handshake(
-    _failed: &str,
-    _list: &[VpnServer],
-    _origin: SelectionOrigin,
-    _last_known: Option<&Location>,
+    failed: &str,
+    list: &[VpnServer],
+    origin: SelectionOrigin,
+    last_known: Option<&Location>,
 ) -> Option<Choice> {
-    // SPEC-FIRST (MR-2514): main has no retry after an unanswered handshake.
-    None
+    match origin {
+        SelectionOrigin::Automatic => next(failed, list, origin, last_known),
+        SelectionOrigin::User => None,
+    }
 }
 
 /// The log line for the retry decision after an unanswered first handshake:
 /// the origin, the count and how far the retry goes. Like [`log_line`], it
 /// takes the whole choice and never names a server.
-pub fn no_handshake_line(_choice: Option<&Choice>, _origin: SelectionOrigin) -> String {
-    // SPEC-FIRST (MR-2514): main logs nothing.
-    String::new()
+pub fn no_handshake_line(choice: Option<&Choice>, origin: SelectionOrigin) -> String {
+    match choice {
+        Some(choice) => format!(
+            "No handshake from the server: automatic retry 1 of 1 on another server ({} pick, \
+             {})",
+            origin.as_str(),
+            choice.reach.as_str()
+        ),
+        None => format!(
+            "No handshake from the server: no automatic retry ({} pick, retry 0 of 1)",
+            origin.as_str()
+        ),
+    }
 }
 
 /// This run's automatic retries after an unanswered first handshake.
@@ -263,16 +275,34 @@ pub struct RetryCounts {
     pub connected: u64,
 }
 
+/// In memory only. The log is the only reader ([`retry_outcome_line`]).
+static RETRIES: Mutex<RetryCounts> = Mutex::new(RetryCounts {
+    attempted: 0,
+    connected: 0,
+});
+
 /// Count one retry that ran, and whether it connected. This run's totals.
-pub fn count_retry(_connected: bool) -> RetryCounts {
-    // SPEC-FIRST (MR-2514): main counts nothing.
-    RetryCounts::default()
+pub fn count_retry(connected: bool) -> RetryCounts {
+    let mut counts = RETRIES.lock().unwrap_or_else(|e| e.into_inner());
+    counts.attempted += 1;
+    if connected {
+        counts.connected += 1;
+    }
+    *counts
 }
 
 /// The log line for how the one retry ended, with this run's counts.
-pub fn retry_outcome_line(_connected: bool, _counts: RetryCounts) -> String {
-    // SPEC-FIRST (MR-2514): main logs nothing.
-    String::new()
+pub fn retry_outcome_line(connected: bool, counts: RetryCounts) -> String {
+    let outcome = if connected {
+        "connected"
+    } else {
+        "failed too, and is not retried again"
+    };
+    format!(
+        "The automatic retry after no handshake {outcome} (this run: {} attempted, {} \
+         connected)",
+        counts.attempted, counts.connected
+    )
 }
 
 fn best<'a>(candidates: impl Iterator<Item = &'a VpnServer>) -> Option<VpnServer> {

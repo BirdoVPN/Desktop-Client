@@ -472,6 +472,29 @@ function useStealthFallbackNotice(): void {
   );
 }
 
+/** MR-2514: what the user is told while Rust retries the client's pick elsewhere. */
+const RELAY_RETRY_COPY =
+  "That server didn't answer, so BirdoVPN is trying the best other server, " +
+  'which may be in another country.';
+
+/**
+ * MR-2514: a server the client chose never answered its first handshake, so
+ * Rust is retrying the connect ONCE on the best other server (the owner's
+ * rule: an automatic pick may move country once; a user's pick never moves).
+ * Said once, as information: the card follows the tunnel. Never red.
+ */
+function useRelayRetryNotice(): void {
+  useEffect(
+    () =>
+      unlistenLater(
+        listen('relay-retry', () => {
+          useAppStore.getState().showNotice({ text: RELAY_RETRY_COPY, tone: 'info' });
+        }),
+      ),
+    [],
+  );
+}
+
 /**
  * The Free allowance is used up and the server ends the session when its grace
  * window closes (birdo-web #590). Rust sends this once per session; the
@@ -542,6 +565,7 @@ export function VpnSessionController(): null {
   useDeepLinkConnect();
   useMultiHopPrune();
   useStealthFallbackNotice();
+  useRelayRetryNotice();
   useQuotaWarning();
   useDeviceNotice();
   useKillSwitchAcrossDials();

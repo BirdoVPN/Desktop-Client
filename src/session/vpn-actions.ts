@@ -100,7 +100,16 @@ function connectArgs(serverId: string, origin: SelectionOrigin): { serverId: str
 export async function connectToServer(server: Server, origin: SelectionOrigin = 'user'): Promise<boolean> {
   useAppStore.getState().setCurrentServer(server);
   const ok = await run('connecting', 'connect_vpn', connectArgs(server.id, origin));
-  if (ok) useAppStore.getState().setLastServerId(server.id, origin);
+  if (ok) {
+    const s = useAppStore.getState();
+    // MR-2514: a server the client chose that never answered its first
+    // handshake is retried once by Rust on the best other server, maybe in
+    // another country. The card and the record follow the tunnel, and the
+    // client chose that server too. A user's pick is never moved.
+    const landed = origin === 'automatic' ? findLiveServer(s.servers, s.liveServerId, null) : null;
+    if (landed && landed.id !== server.id) s.setCurrentServer(landed);
+    s.setLastServerId(landed?.id ?? server.id, origin);
+  }
   return ok;
 }
 
@@ -200,7 +209,9 @@ export type UnattendedPlan =
  * go to the best one in any country; one the user chose stays in its country
  * (the same city first), else nothing is dialled and the user is told. It
  * used to go to the fastest server in any country either way. One move: a
- * dial that then fails shows its error, as every connect does.
+ * dial that then fails shows its error, as every connect does (a server the
+ * client chose whose first handshake never comes gets Rust's one retry on
+ * another server first, MR-2514).
  *
  * With no server list (the fetch failed) nothing can say the user's server
  * is gone, so it is dialled as recorded and Rust's connect answers for it,

@@ -475,14 +475,55 @@ async fn dial<S: DialSteps>(
 ///   * the log gives the origin, the counts and how far the retry went,
 ///     never a server.
 async fn retry_on_another_server<S: DialSteps>(
-    _steps: &mut S,
-    _target: &ConnectTarget,
+    steps: &mut S,
+    target: &ConnectTarget,
     error: IpcError,
 ) -> Result<(), IpcError> {
-    // SPEC-FIRST (MR-2514): main's behaviour, no retry on another server.
-    // The tests in `dial_tests` and `relay_retry::tests` fail on this; the
-    // next commit implements the rule.
-    Err(error)
+    let ConnectTarget::SingleHop { server_id, origin } = target else {
+        return Err(error);
+    };
+    if error.code == IpcErrorCode::Cancelled
+        || error.code.is_hard_refusal()
+        || !steps.still_current()
+    {
+        return Err(error);
+    }
+    if *origin != SelectionOrigin::Automatic {
+        steps.log(&relay_retry::no_handshake_line(None, *origin));
+        return Err(error);
+    }
+    let listed = steps.fresh_servers().await;
+    if !steps.still_current() {
+        return Err(error);
+    }
+    let Some(servers) = listed else {
+        steps.log(
+            "No handshake from the server: no server list in time, so no automatic retry \
+             (retry 0 of 1)",
+        );
+        return Err(error);
+    };
+    // Where the failed server was, should the fresh list no longer have it.
+    let last_known = relay_retry::known_location(server_id);
+    relay_retry::remember(&servers);
+    let choice = relay_retry::after_no_handshake(server_id, &servers, *origin, last_known.as_ref());
+    steps.log(&relay_retry::no_handshake_line(choice.as_ref(), *origin));
+    let Some(choice) = choice else {
+        return Err(error);
+    };
+    let moved = ConnectTarget::SingleHop {
+        server_id: choice.server.id,
+        origin: *origin,
+    };
+    steps.cover_the_gap().await;
+    steps.announce_relay_retry();
+    let result = steps.attempt_once(&moved, None).await;
+    let connected = result.is_ok();
+    steps.log(&relay_retry::retry_outcome_line(
+        connected,
+        relay_retry::count_retry(connected),
+    ));
+    result
 }
 
 /// Engage the block-all for a rebuild of a live session (no-op when the kill
