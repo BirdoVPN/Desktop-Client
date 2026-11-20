@@ -3063,12 +3063,13 @@ mod dial_tests {
         crate::vpn::relay_retry::remember(&[server(
             "srv-gone-known",
             "DE",
-            "Frankfurt",
+            "Munich",
             5,
             true,
             true,
         )]);
-        let mut list = fleet();
+        // The only other German server is Berlin; abroad is emptier.
+        let mut list: Vec<_> = fleet().into_iter().filter(|s| s.id != "srv-fra").collect();
         list.push(server("srv-ber", "DE", "Berlin", 40, true, true));
         let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
         world.servers = Some(list.clone());
@@ -3080,6 +3081,10 @@ mod dial_tests {
         .await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(world.dialled().last(), Some(&("srv-ber", None)));
+        assert_eq!(
+            *world.retry_reaches.borrow(),
+            vec![(SelectionOrigin::User, Reach::SameCountry)]
+        );
 
         let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
         world.servers = Some(list);
