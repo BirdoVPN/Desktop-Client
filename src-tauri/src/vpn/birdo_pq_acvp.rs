@@ -24,10 +24,10 @@
 //! than passing vacuously.
 
 use super::*;
-use ml_kem::array::sizes::{U3168, U32};
+use ml_kem::array::sizes::U3168;
 #[allow(deprecated)]
 use ml_kem::ExpandedKeyEncoding;
-use ml_kem::{EncapsulationKey, Key, TryKeyInit, B32};
+use ml_kem::{EncapsulationKey, Key, TryKeyInit};
 use sha2::Digest;
 
 const ACVP_JSON: &str = include_str!("fixtures/acvp-ml-kem-1024.json");
@@ -137,25 +137,20 @@ fn acvp_keygen() {
 }
 
 /// ML-KEM.Encaps_internal(ek, m): what the server does with the client's key.
+/// Through the KAT's own helper in `birdo_pq.rs`: scripts/ci/check-pq-features.sh
+/// keeps every reference to the deterministic encapsulation in that file.
 #[test]
 fn acvp_encapsulation() {
     for t in tests_of("encapsulation") {
-        let ek = encapsulation_key(&bytes(&t, "ek"))
-            .unwrap_or_else(|| panic!("encapsulation tcId {}: ek refused", tc(&t)));
-        let m: B32 = Array::<u8, U32>::try_from(bytes(&t, "m").as_slice()).expect("32-byte m");
-        let (c, k) = ek.encapsulate_deterministic(&m);
-        assert_eq!(
-            c.as_slice(),
-            bytes(&t, "c").as_slice(),
-            "encapsulation tcId {}: c",
+        let ek = bytes(&t, "ek");
+        assert!(
+            encapsulation_key(&ek).is_some(),
+            "encapsulation tcId {}: ek refused",
             tc(&t)
         );
-        assert_eq!(
-            k.as_slice(),
-            bytes(&t, "k").as_slice(),
-            "encapsulation tcId {}: k",
-            tc(&t)
-        );
+        let (c, k) = super::tests::encapsulate_with(&ek, &bytes(&t, "m"));
+        assert_eq!(c, bytes(&t, "c"), "encapsulation tcId {}: c", tc(&t));
+        assert_eq!(k, bytes(&t, "k"), "encapsulation tcId {}: k", tc(&t));
     }
 }
 
