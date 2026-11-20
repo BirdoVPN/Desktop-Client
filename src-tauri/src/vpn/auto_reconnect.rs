@@ -260,8 +260,10 @@ const REDIAL_API_TIMEOUT: Duration = Duration::from_secs(45);
 /// MR-2390: the cap on the server list a re-dial fetches to move off a
 /// server that left the pool. When it runs out, that attempt fails like a
 /// refused one and the next asks again; the server that left is never
-/// re-dialled meanwhile.
-const SERVER_LIST_TIMEOUT: Duration = Duration::from_secs(15);
+/// re-dialled meanwhile. MR-2514: also the cap on the list a user connect
+/// fetches for its one retry on another server (`commands::session`); when
+/// it runs out, there is no retry.
+pub(crate) const SERVER_LIST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How many health-check intervals the loop may go without checking in, when
 /// it has not announced a longer step, before the watchdog restarts it.

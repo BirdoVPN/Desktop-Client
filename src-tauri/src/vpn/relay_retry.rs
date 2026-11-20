@@ -39,6 +39,14 @@
 //!
 //! The choice is pure, so the tests below pin it. `auto_reconnect` fetches
 //! the list and applies the choice.
+//!
+//! A connect whose server never answered its FIRST handshake (MR-2514, iOS
+//! `retryOnAnotherRelay` from Mobile #645) is retried ONCE on another server
+//! by the same rule, for a server the client chose only
+//! ([`after_no_handshake`]). A location the user picked is never moved
+//! silently: that connect shows its error. `commands::session` fetches the
+//! list, dials the choice and logs counts only ([`no_handshake_line`],
+//! [`retry_outcome_line`]).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -220,6 +228,51 @@ pub fn log_line(choice: Option<&Choice>, origin: SelectionOrigin) -> String {
             origin.as_str()
         ),
     }
+}
+
+/// MR-2514: the server for the ONE automatic retry of a connect whose server
+/// never answered its first handshake, or `None`.
+///
+/// Only a server the client chose moves: [`next`]'s automatic rule, so the
+/// same city first, then the best server in any country (online, open to this
+/// plan, never `failed`). A location the user picked is never moved without
+/// a click (the owner's rule, 2026-11-19): `None`, and the connect shows its
+/// error.
+pub fn after_no_handshake(
+    _failed: &str,
+    _list: &[VpnServer],
+    _origin: SelectionOrigin,
+    _last_known: Option<&Location>,
+) -> Option<Choice> {
+    // SPEC-FIRST (MR-2514): main has no retry after an unanswered handshake.
+    None
+}
+
+/// The log line for the retry decision after an unanswered first handshake:
+/// the origin, the count and how far the retry goes. Like [`log_line`], it
+/// takes the whole choice and never names a server.
+pub fn no_handshake_line(_choice: Option<&Choice>, _origin: SelectionOrigin) -> String {
+    // SPEC-FIRST (MR-2514): main logs nothing.
+    String::new()
+}
+
+/// This run's automatic retries after an unanswered first handshake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetryCounts {
+    pub attempted: u64,
+    pub connected: u64,
+}
+
+/// Count one retry that ran, and whether it connected. This run's totals.
+pub fn count_retry(_connected: bool) -> RetryCounts {
+    // SPEC-FIRST (MR-2514): main counts nothing.
+    RetryCounts::default()
+}
+
+/// The log line for how the one retry ended, with this run's counts.
+pub fn retry_outcome_line(_connected: bool, _counts: RetryCounts) -> String {
+    // SPEC-FIRST (MR-2514): main logs nothing.
+    String::new()
 }
 
 fn best<'a>(candidates: impl Iterator<Item = &'a VpnServer>) -> Option<VpnServer> {
@@ -519,5 +572,120 @@ mod tests {
             none.contains("move 0 of 1") && none.contains("user pick"),
             "{none}"
         );
+    }
+
+    /// MR-2514: after an unanswered first handshake, a server the client
+    /// chose is retried on the best other server, in any country: not the
+    /// emptier Stockholm (outside the plan), not New York (offline, as a node
+    /// held for its jurisdiction is), never the server that failed.
+    #[test]
+    fn an_unanswered_automatic_pick_is_retried_on_the_best_server_anywhere() {
+        let mut list = fleet();
+        // The server that failed is still listed online: it never answered.
+        list[0].is_online = true;
+        assert_eq!(
+            picked(after_no_handshake(
+                "drained",
+                &list,
+                SelectionOrigin::Automatic,
+                None
+            )),
+            Some(("nl-ams".into(), Reach::OtherCountry))
+        );
+        // Only held, plan-excluded or offline servers left: no retry.
+        let ineligible: Vec<_> = list
+            .into_iter()
+            .filter(|s| s.id != "nl-ams" && s.id != "de-ber")
+            .collect();
+        assert!(
+            after_no_handshake("drained", &ineligible, SelectionOrigin::Automatic, None).is_none()
+        );
+    }
+
+    /// A location the user picked is never moved by this retry, not even
+    /// within its own country or city: the connect shows its error.
+    #[test]
+    fn an_unanswered_users_pick_is_never_moved() {
+        let mut list = fleet();
+        list.push(server("de-fra-2", "DE", "Frankfurt", 0, true, true));
+        let frankfurt = Location {
+            country_code: "DE".into(),
+            city: "Frankfurt".into(),
+        };
+        for last_known in [None, Some(&frankfurt)] {
+            assert!(
+                after_no_handshake("drained", &list, SelectionOrigin::User, last_known).is_none(),
+                "{last_known:?}"
+            );
+        }
+        // The same list does have a server for an automatic pick.
+        assert_eq!(
+            picked(after_no_handshake(
+                "drained",
+                &list,
+                SelectionOrigin::Automatic,
+                None
+            )),
+            Some(("de-fra-2".into(), Reach::SameCity))
+        );
+    }
+
+    /// The retry's log lines carry the origin, counts and a reach class only.
+    #[test]
+    fn the_retry_lines_name_no_server() {
+        let list = fleet();
+        let choice = after_no_handshake("drained", &list, SelectionOrigin::Automatic, None);
+        let lines = [
+            no_handshake_line(choice.as_ref(), SelectionOrigin::Automatic),
+            no_handshake_line(None, SelectionOrigin::User),
+            no_handshake_line(None, SelectionOrigin::Automatic),
+            retry_outcome_line(
+                true,
+                RetryCounts {
+                    attempted: 3,
+                    connected: 2,
+                },
+            ),
+            retry_outcome_line(
+                false,
+                RetryCounts {
+                    attempted: 3,
+                    connected: 2,
+                },
+            ),
+        ];
+        assert!(
+            lines[0].contains("retry 1 of 1") && lines[0].contains("other-country"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("retry 0 of 1") && lines[1].contains("user pick"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[3].contains("3 attempted, 2 connected"),
+            "{}",
+            lines[3]
+        );
+        assert!(lines[4].contains("not retried again"), "{}", lines[4]);
+        for line in &lines {
+            for s in &list {
+                for field in [&s.id, &s.name, &s.country, &s.country_code, &s.city] {
+                    assert!(!line.contains(field.as_str()), "{line} names `{field}`");
+                }
+            }
+        }
+    }
+
+    /// Every retry that ran is counted, and only the ones that connected as
+    /// connected. Other tests count too, so this reads a difference.
+    #[test]
+    fn every_retry_is_counted() {
+        let before = count_retry(false);
+        let after = count_retry(true);
+        assert!(after.attempted > before.attempted, "{before:?} {after:?}");
+        assert!(after.connected > before.connected, "{before:?} {after:?}");
     }
 }

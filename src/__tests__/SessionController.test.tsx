@@ -34,6 +34,7 @@ import {
 } from '@/session/settings-persist';
 import { CONSENT_VERSION } from '@/lib/consent';
 import {
+  connectToServer,
   RESUME_AFTER_UPDATE_COPY,
   RESUME_ROUTE_GONE_COPY,
   RESUME_SERVER_GONE_COPY,
@@ -594,6 +595,70 @@ describe("Auto-Connect keeps the user's server in its country (MR-2492)", () => 
     useAppStore.setState({ lastServerId: 'sto', lastServerOrigin: 'user' });
     render(<VpnSessionController />);
     await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'sto', origin: 'user' }]]));
+  });
+});
+
+/**
+ * MR-2514: a server the client chose that never answers its first handshake
+ * is retried ONCE by Rust on the best other server, maybe abroad
+ * (`commands::session::retry_on_another_server`). The UI says so, and the card
+ * and the record follow where the tunnel really is. A user's pick never moves.
+ */
+describe("the one retry of the client's pick on another server (MR-2514)", () => {
+  const RELAY_RETRY_COPY =
+    "That server didn't answer, so BirdoVPN is trying the best other server, which may be in another country.";
+  const stored = (id: string, countryCode: string, city: string, load: number): Server => ({
+    id,
+    name: `Node ${id}`,
+    country: countryCode,
+    countryCode,
+    city,
+    load,
+    isPremium: false,
+    isHighSpeed: false,
+    isPortForwarding: false,
+    isOnline: true,
+    isAccessible: true,
+  });
+  const fra = stored('fra', 'DE', 'Frankfurt', 10);
+  const ams = stored('ams', 'NL', 'Amsterdam', 30);
+
+  /** `connect_vpn` resolves with the tunnel up on `landedOn`. */
+  function connectLandsOn(landedOn: string) {
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) => {
+      if (cmd !== 'connect_vpn') return scripted?.(cmd, args, options);
+      status = { state: 'connected', seq: 7, server_id: landedOn, kill_switch_blocking: false, error: null };
+      return true;
+    });
+  }
+
+  it("Rust's retry is said once, as information", async () => {
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().statusSeq).toBe(1));
+    emit('relay-retry');
+    expect(useAppStore.getState().notice).toMatchObject({ text: RELAY_RETRY_COPY, tone: 'info' });
+  });
+
+  it('the card and the record follow the server the retry connected to, still the client\'s pick', async () => {
+    useAppStore.setState({ servers: [fra, ams] });
+    // Frankfurt never answered; Rust's one retry connected Amsterdam.
+    connectLandsOn('ams');
+    await expect(connectToServer(fra, 'automatic')).resolves.toBe(true);
+    const s = useAppStore.getState();
+    expect(s.currentServer?.id).toBe('ams');
+    expect(s.lastServerId).toBe('ams');
+    expect(s.lastServerOrigin).toBe('automatic');
+  });
+
+  it("a user's pick keeps its card and its record", async () => {
+    useAppStore.setState({ servers: [fra, ams] });
+    connectLandsOn('fra');
+    await expect(connectToServer(fra, 'user')).resolves.toBe(true);
+    const s = useAppStore.getState();
+    expect(s.currentServer?.id).toBe('fra');
+    expect(s.lastServerId).toBe('fra');
+    expect(s.lastServerOrigin).toBe('user');
   });
 });
 
