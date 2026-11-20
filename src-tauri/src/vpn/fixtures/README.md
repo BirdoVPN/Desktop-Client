@@ -1,8 +1,8 @@
 # BirdoPQ test fixtures
 
-Two committed vectors guard the ML-KEM-1024 (FIPS 203) path in
-`src-tauri/src/vpn/birdo_pq.rs`. Both are consumed by `#[cfg(test)]` tests in
-that file, which CI runs (`.github/workflows/tests.yml` -> `cargo test --lib`).
+Three committed vector sets guard the ML-KEM-1024 (FIPS 203) path in
+`src-tauri/src/vpn/birdo_pq.rs`. All are consumed by `#[cfg(test)]` tests in
+that file or its test-only child module `birdo_pq_acvp.rs`, which CI runs (`.github/workflows/tests.yml` -> `cargo test --lib`).
 The crate and feature set those tests run against are themselves gated by
 `scripts/ci/check-pq-features.sh` in the same workflow, which also checks the
 KAT fixture against its pin (below). The gate has its own self-test,
@@ -38,6 +38,38 @@ trip, and a KEM that is internally correct but byte-incompatible with the
 server passes all of them. FIPS 203 implicit rejection then makes the failure
 **silent** — a wrong key yields a plausible shared secret and the WireGuard
 handshake simply never completes. This is the only test that can catch that.
+
+## `acvp-ml-kem-1024.json` — NIST's own vectors (MR-1432)
+
+These are the ML-KEM-1024 test groups of NIST's ACVP-Server vector sets, the
+vectors a FIPS 140-3 module is validated with. `birdo_pq_acvp.rs` runs them
+against the linked RustCrypto `ml-kem`:
+
+| group | count |
+|---|---|
+| keyGen, from `d || z` (the seed this client keeps) | 25 |
+| encapsulation | 25 |
+| decapsulation, valid and modified ciphertexts (implicit rejection) | 10 |
+| FIPS 203 §7.2 key check | 10 (5 valid, 5 invalid) |
+| FIPS 203 §7.3 key check | 10 (5 valid, 5 invalid) |
+
+The KAT above shows that this client and the server agree. This set shows that
+the KEM itself matches the standard. Without it, two libraries that share one
+mistake would still agree.
+
+**It is a cut of NIST's files, not a copy.**
+- `scripts/extract-acvp-ml-kem-1024.py` keeps the ML-KEM-1024 groups' inputs
+  and expected results from
+  `gen-val/json-files/ML-KEM-{keyGen,encapDecap}-FIPS203/internalProjection.json`
+  at usnistgov/ACVP-Server `ad33b3d9504491767f1aa76382464f3b3fa2359e`.
+- The script refuses upstream files whose sha256 is not the one it pins.
+- The test pins the fixture's own sha256 (of its LF bytes), every group's
+  size, and each key check's valid/invalid split. An edited or emptied fixture
+  fails.
+- Regenerate it; never hand-edit it. The commands are in the script's
+  docstring.
+
+The keys in it are NIST's published test keys, not anyone's.
 
 ## `birdo-pq-pqclean-stored-key.json` — the linked-KEM guard
 
