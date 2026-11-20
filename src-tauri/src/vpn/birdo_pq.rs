@@ -1225,3 +1225,9 @@ mod tests {
         assert_eq!(current_mode(), PqMode::ServerProvided);
     }
 }
+
+// NIST ACVP ML-KEM-1024 vectors (MR-1432): a child module, so it reaches
+// `decapsulation_key` and the sizes without widening their visibility.
+#[cfg(test)]
+#[path = "birdo_pq_acvp.rs"]
+mod acvp;
