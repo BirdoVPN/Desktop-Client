@@ -101,6 +101,9 @@ impl ReconnectInfo {
                 .as_ref()
                 .map_or_else(|| self.server_id.clone(), |m| m.exit_id.clone()),
             multi_hop: self.multi_hop.clone(),
+            // MR-2569: a re-dial, or a move off a server that left, keeps
+            // who chose; the status says so.
+            origin: self.origin,
         }
     }
 }

@@ -17,9 +17,10 @@
  * than the server on record is Auto-Connect at launch, when that server is
  * offline, out of the plan or gone (`planUnattendedConnect` in
  * `session/vpn-actions.ts`). A dial that fails shows its error and waits for
- * the user, except a server the client chose whose first handshake never
- * comes: Rust retries that one ONCE on another server by the same rule
- * (MR-2514, `relay_retry::after_no_handshake`, `commands::session`).
+ * the user, except a server whose first handshake never comes: Rust retries
+ * that one ONCE on another server by the same rule, so a user's pick only
+ * within its country (MR-2514, `relay_retry::after_no_handshake`,
+ * `commands::session`).
  */
 import type { Server } from '@/store/app-store';
 import { pickBestServer } from '@/lib/ipc';

@@ -456,6 +456,7 @@ describe("Auto-Connect keeps the user's server in its country (MR-2492)", () => 
     useAppStore.setState({
       connectionState: 'disconnected',
       liveServerId: null,
+      liveServerOrigin: null,
       liveServerName: null,
       statusSeq: -1,
       pendingAction: null,
@@ -650,8 +651,8 @@ describe('the one retry on another server (MR-2514)', () => {
   it('a retry within the country says so, never "another country"', async () => {
     render(<VpnSessionController />);
     await waitFor(() => expect(useAppStore.getState().statusSeq).toBe(1));
-    for (const reach of ['same-country', 'same-city']) {
-      emit('relay-retry', { reach });
+    for (const payload of [{ reach: 'same-country' }, { reach: 'same-city' }, { origin: 'user', reach: 'same-country' }]) {
+      emit('relay-retry', payload);
       expect(useAppStore.getState().notice).toMatchObject({ text: RELAY_RETRY_SAME_COUNTRY_COPY, tone: 'info' });
     }
   });

@@ -22,7 +22,7 @@ use zeroize::Zeroize;
 use crate::api::session_gate::StoredSession;
 use crate::api::types::{ConnectResponse, MultiHopConnectResponse, VpnConfig, VpnServer};
 use crate::api::BirdoApi;
-use crate::commands::ipc_error::{IpcError, IpcErrorCode};
+use crate::commands::ipc_error::{IpcError, IpcErrorCode, TransportFailure};
 use crate::commands::killswitch;
 use crate::commands::vpn::{
     apply_vpn_settings, build_vpn_config, derive_quantum_psk, enforce_requested_protection,
@@ -338,8 +338,9 @@ trait DialSteps {
     /// `/vpn/servers`, fetched now, or `None` when it does not arrive in
     /// time (or the connect is superseded meanwhile).
     async fn fresh_servers(&mut self) -> Option<Vec<VpnServer>>;
-    /// Tell the UI the connect is going to another server.
-    fn announce_relay_retry(&self);
+    /// Tell the UI the connect is going to another server: who chose the
+    /// first one and how far the retry goes (classes, never the server).
+    fn announce_relay_retry(&self, origin: SelectionOrigin, reach: relay_retry::Reach);
     /// One counts-only line for the log.
     fn log(&self, line: &str);
 }
@@ -398,8 +399,11 @@ impl DialSteps for AppDial<'_> {
         }
     }
 
-    fn announce_relay_retry(&self) {
-        let _ = self.app.emit("relay-retry", ());
+    fn announce_relay_retry(&self, origin: SelectionOrigin, reach: relay_retry::Reach) {
+        let _ = self.app.emit(
+            "relay-retry",
+            serde_json::json!({ "origin": origin.as_str(), "reach": reach.as_str() }),
+        );
     }
 
     fn log(&self, line: &str) {
@@ -420,7 +424,9 @@ async fn dial<S: DialSteps>(
         ConnectPurpose::SettingsReapply { fallback_reason } => (fallback_reason, false),
     };
     let mut result = steps.attempt_once(target, first_transport).await;
-    // MR-2514: the server never answered the first handshake.
+    // MR-2514: the server never answered the first handshake. Silence only:
+    // an actively refused handshake is not a server that did not answer
+    // (review L2).
     let mut unanswered = false;
 
     // ADAPTIVE TRANSPORT: when the direct attempt failed in the
@@ -430,7 +436,7 @@ async fn dial<S: DialSteps>(
     // local Xray proxy, whose failures do not classify as transport-shaped.
     // Not for a settings reapply (see `ConnectPurpose`).
     if let Some(direct) = result.as_ref().err().filter(|_| adaptive) {
-        unanswered = transport_fallback_reason(direct).is_some();
+        unanswered = direct.transport == Some(TransportFailure::NoResponse);
         if let Some(reason) = fallback_reason_for(target, direct, steps.attempted_stealth()) {
             tracing::warn!(
                 "Adaptive Transport: direct WireGuard failed ({reason}) — rebuilding over the \
@@ -456,16 +462,19 @@ async fn dial<S: DialSteps>(
 /// handshake: direct, then over the stealth transport where the Adaptive
 /// Transport tried it. `error` is how that server failed.
 ///
-/// The owner's rule (2026-11-19, MR-2212 Q2), the same on every client (iOS
-/// `retryOnAnotherRelay`, Mobile #645):
-///   * only a server the CLIENT chose (`SelectionOrigin::Automatic`) moves,
-///     and it may go to another country. A location the USER picked, a
-///     Multi-Hop route included, is never moved silently: its error stands;
-///   * the server is `relay_retry::after_no_handshake`'s choice (#466's rule:
-///     online and open to this plan, as `/vpn/servers` lists them for this
-///     account, fetched now; never the server that failed). A node held for
-///     its jurisdiction is never listed online, and `/vpn/connect` checks
-///     the plan and the ONLINE status again;
+/// The owner's rule (2026-11-19, MR-2212 Q2; 2026-11-20 for a user's pick),
+/// the same on every client (iOS `retryOnAnotherRelay`, Mobile #645):
+///   * a server the CLIENT chose (`SelectionOrigin::Automatic`) may move to
+///     another country;
+///   * a location the USER picked moves only within its own country, the
+///     same city first ("Same country, like iPhone"); with nothing eligible
+///     there, its error stands. A Multi-Hop route, the user's own pair,
+///     never moves;
+///   * the server is `relay_retry::after_no_handshake`'s choice (#466's
+///     `next`: online and open to this plan, as `/vpn/servers` lists them
+///     for this account, fetched now; never the server that failed). A node
+///     held for its jurisdiction is never listed online, and `/vpn/connect`
+///     checks the plan and the ONLINE status again;
 ///   * ONE retry: its failure is the connect's, and is never retried again.
 ///     A Disconnect, a newer connect or a refusal no retry can overcome ends
 ///     the connect without one;
@@ -482,14 +491,9 @@ async fn retry_on_another_server<S: DialSteps>(
     let ConnectTarget::SingleHop { server_id, origin } = target else {
         return Err(error);
     };
-    if error.code == IpcErrorCode::Cancelled
-        || error.code.is_hard_refusal()
-        || !steps.still_current()
-    {
-        return Err(error);
-    }
-    if *origin != SelectionOrigin::Automatic {
-        steps.log(&relay_retry::no_handshake_line(None, *origin));
+    // A Disconnect, a newer connect, a refusal no retry can overcome, or a
+    // failure of this machine's own (review L2) ends it without a retry.
+    if !server_did_not_serve(&error) || !steps.still_current() {
         return Err(error);
     }
     let listed = steps.fresh_servers().await;
@@ -511,19 +515,41 @@ async fn retry_on_another_server<S: DialSteps>(
     let Some(choice) = choice else {
         return Err(error);
     };
+    // The move keeps who chose: a user's pick stays the user's.
     let moved = ConnectTarget::SingleHop {
         server_id: choice.server.id,
         origin: *origin,
     };
     steps.cover_the_gap().await;
-    steps.announce_relay_retry();
+    steps.announce_relay_retry(*origin, choice.reach);
     let result = steps.attempt_once(&moved, None).await;
+    // A Disconnect or a newer connect during the retry's dial: the connect is
+    // theirs, not a retry that failed (review L4).
+    if result
+        .as_ref()
+        .is_err_and(|e| e.code == IpcErrorCode::Cancelled)
+        || !steps.still_current()
+    {
+        return result;
+    }
     let connected = result.is_ok();
     steps.log(&relay_retry::retry_outcome_line(
         connected,
         relay_retry::count_retry(connected),
     ));
     result
+}
+
+/// Whether `error`, how the server's own attempts last failed, says the
+/// SERVER did not serve (MR-2514, review L2): its handshake got no answer
+/// (direct, or through the stealth transport), or the backend refused it as
+/// unavailable. Anything else (a Disconnect, a hard refusal, the adapter, the
+/// kill switch, a rate limit, the Stealth helper, an actively refused
+/// handshake) would fail the same way on another server, so it spends no
+/// retry.
+fn server_did_not_serve(error: &IpcError) -> bool {
+    error.transport == Some(TransportFailure::NoResponse)
+        || error.code == IpcErrorCode::ServerUnavailable
 }
 
 /// Engage the block-all for a rebuild of a live session (no-op when the kill
@@ -785,6 +811,9 @@ async fn attempt(
             .as_ref()
             .map_or_else(|| dialled_id.to_string(), |route| route.exit_id.clone()),
         multi_hop: multi_hop.clone(),
+        // MR-2569: published with the server, so the UI records who chose it
+        // (the relay retry keeps the connect's origin on the server it moves to).
+        origin: target.origin(),
     };
     vm.set_phase(ConnectPhase::Handshaking);
     vm.connect(
@@ -1786,6 +1815,44 @@ mod lifecycle_tests {
         assert!(restart.contains("EXIT_RESTARTING.store(true"));
     }
 
+    /// MR-2569 (review M1 of #470): the status names who chose the server it
+    /// names. A connect publishes its target's origin with the server
+    /// (`SessionLabel::origin`, which the relay retry's move keeps); a
+    /// re-dial or a move off a server that left publishes the record's; the
+    /// manager sets it with the server and clears it with it; the status
+    /// carries it as `serverOrigin`. The UI records a server Rust moved the
+    /// session to under that origin, never as the client's pick by guess.
+    #[test]
+    fn the_status_says_who_chose_the_server_it_names() {
+        let label = body("async fn attempt(");
+        let built = &label[label.find("let label = SessionLabel {").expect("the label")..];
+        assert!(
+            built[..built.find("};").unwrap()].contains("origin: target.origin(),"),
+            "{built}"
+        );
+        let manager = include_str!("../vpn/manager.rs").replace('\r', "");
+        order(
+            &manager,
+            &[
+                ".write_state_with(ConnectionState::Connected, |p| {",
+                "p.server_id = Some(label.server_id);",
+                "p.server_origin = Some(label.origin);",
+            ],
+        );
+        order(
+            &manager,
+            &["p.server_id = None;", "p.server_origin = None;"],
+        );
+        let redial = include_str!("../vpn/auto_reconnect.rs").replace('\r', "");
+        let redial = &redial[redial
+            .find("pub fn label(&self) -> SessionLabel {")
+            .unwrap()..];
+        let redial = &redial[..redial.find("\n    }").unwrap()];
+        assert!(redial.contains("origin: self.origin,"), "{redial}");
+        assert!(include_str!("vpn.rs")
+            .contains("server_origin: published.server_origin.map(SelectionOrigin::as_str),"));
+    }
+
     /// WIN-FIX-3: a settings reapply is rebuilt on the session's own
     /// transport and never runs the Adaptive Transport retry; a user connect
     /// starts direct and does. The session's settings are recorded at the
@@ -2433,6 +2500,7 @@ mod dial_tests {
     use crate::api::types::VpnServer;
     use crate::commands::ipc_error::{IpcError, IpcErrorCode};
     use crate::commands::vpn::FALLBACK_HANDSHAKE_TIMEOUT;
+    use crate::vpn::relay_retry::Reach;
 
     const STEALTH: Option<&str> = Some(FALLBACK_HANDSHAKE_TIMEOUT);
 
@@ -2504,6 +2572,8 @@ mod dial_tests {
         list_fetches: u32,
         stealth_notices: Cell<u32>,
         retry_notices: Cell<u32>,
+        /// Who chose, and how far each announced retry went.
+        retry_reaches: RefCell<Vec<(SelectionOrigin, Reach)>>,
         log: RefCell<Vec<String>>,
     }
 
@@ -2521,6 +2591,7 @@ mod dial_tests {
                 list_fetches: 0,
                 stealth_notices: Cell::new(0),
                 retry_notices: Cell::new(0),
+                retry_reaches: RefCell::new(Vec::new()),
                 log: RefCell::new(Vec::new()),
             }
         }
@@ -2583,8 +2654,9 @@ mod dial_tests {
             self.servers.clone()
         }
 
-        fn announce_relay_retry(&self) {
+        fn announce_relay_retry(&self, origin: SelectionOrigin, reach: Reach) {
             self.retry_notices.set(self.retry_notices.get() + 1);
+            self.retry_reaches.borrow_mut().push((origin, reach));
         }
 
         fn log(&self, line: &str) {
@@ -2615,6 +2687,10 @@ mod dial_tests {
         assert_eq!(world.gaps, 2, "the stealth retry and the relay retry");
         assert_eq!(world.stealth_notices.get(), 1);
         assert_eq!(world.retry_notices.get(), 1);
+        assert_eq!(
+            *world.retry_reaches.borrow(),
+            vec![(SelectionOrigin::Automatic, Reach::OtherCountry)]
+        );
         assert!(world.logged("automatic retry 1 of 1"), "{:?}", world.log);
         assert!(world.logged("other-country"), "{:?}", world.log);
         assert!(world.logged("connected (this run: "), "{:?}", world.log);
@@ -2681,6 +2757,11 @@ mod dial_tests {
         );
         assert_eq!(world.list_fetches, 1);
         assert_eq!(world.retry_notices.get(), 1);
+        // The UI is told it stays in the country.
+        assert_eq!(
+            *world.retry_reaches.borrow(),
+            vec![(SelectionOrigin::User, Reach::SameCountry)]
+        );
         assert!(
             world.logged("retry 1 of 1 on another server (user pick, same-country)"),
             "{:?}",

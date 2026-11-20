@@ -370,9 +370,15 @@ function useSelectionFollowsTunnel(): void {
     const live = findLiveServer(servers, liveServerId, liveServerName);
     if (live && s.currentServer?.id !== live.id) {
       s.setCurrentServer(live);
-      // MR-2492: a server this store never recorded was Rust's own pick (the
-      // tray's Quick Connect, with the server on record unusable or unknown).
-      s.setLastServerId(live.id, live.id === s.lastServerId ? s.lastServerOrigin : 'automatic');
+      // MR-2569: who chose it is Rust's word for this session
+      // (`serverOrigin`): the tray's Quick Connect taking a server of its own
+      // says "automatic"; a drain, a deletion or the retry after no handshake
+      // keeps the origin of the server it moved off, so a location the user
+      // picked and Rust moved within its country stays the user's. It used to
+      // be recorded as the client's pick, which the next connect could take
+      // abroad. A status that does not say never makes a server the client's.
+      const origin = s.liveServerOrigin ?? (live.id === s.lastServerId ? s.lastServerOrigin : 'user');
+      s.setLastServerId(live.id, origin);
     }
   }, [liveServerId, liveServerName, servers, connected]);
 }
@@ -472,23 +478,41 @@ function useStealthFallbackNotice(): void {
   );
 }
 
-/** MR-2514: what the user is told while Rust retries the client's pick elsewhere. */
+/** MR-2514: what the user is told while Rust retries elsewhere, maybe abroad. */
 const RELAY_RETRY_COPY =
   "That server didn't answer, so BirdoVPN is trying the best other server, " +
   'which may be in another country.';
 
+/** MR-2514: the same, when the retry stays in the country (always so for a user's pick). */
+const RELAY_RETRY_SAME_COUNTRY_COPY =
+  "That server didn't answer, so BirdoVPN is trying another server in the same country.";
+
 /**
- * MR-2514: a server the client chose never answered its first handshake, so
- * Rust is retrying the connect ONCE on the best other server (the owner's
- * rule: an automatic pick may move country once; a user's pick never moves).
- * Said once, as information: the card follows the tunnel. Never red.
+ * The notice for a `relay-retry` payload, `{ origin, reach }`: who chose the
+ * server that did not answer and how far the retry goes (classes, never a
+ * server). A user's pick only ever moves within its country, and so does a
+ * same-city or same-country retry; anything else, or no payload, gets the
+ * wider sentence, which says only that it MAY be another country.
+ */
+function relayRetryCopy(payload: unknown): string {
+  const p = (typeof payload === 'object' && payload !== null ? payload : {}) as { origin?: unknown; reach?: unknown };
+  const inCountry = p.origin === 'user' || p.reach === 'same-city' || p.reach === 'same-country';
+  return inCountry ? RELAY_RETRY_SAME_COUNTRY_COPY : RELAY_RETRY_COPY;
+}
+
+/**
+ * MR-2514: the server never answered its first handshake, so Rust is
+ * retrying the connect ONCE on another server: the client's pick on the best
+ * one anywhere, a user's pick only within its own country (the owner's rule,
+ * as on iOS). Said once, as information: the card follows the tunnel. Never
+ * red.
  */
 function useRelayRetryNotice(): void {
   useEffect(
     () =>
       unlistenLater(
-        listen('relay-retry', () => {
-          useAppStore.getState().showNotice({ text: RELAY_RETRY_COPY, tone: 'info' });
+        listen('relay-retry', (e) => {
+          useAppStore.getState().showNotice({ text: relayRetryCopy(e.payload), tone: 'info' });
         }),
       ),
     [],

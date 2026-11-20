@@ -248,6 +248,8 @@ export interface AppState {
   commandError: IpcError | null;
   giveUp: GiveUp | null;
   liveServerId: string | null;
+  /** MR-2569: who chose the live server, as Rust says (`VpnStatus.serverOrigin`). */
+  liveServerOrigin: 'user' | 'automatic' | null;
   /** Fallback for resolving the live server on a backend without `server_id`. */
   liveServerName: string | null;
   liveMultiHop: LiveMultiHop | null;
@@ -544,6 +546,7 @@ const idleConnection = {
   commandError: null,
   giveUp: null,
   liveServerId: null,
+  liveServerOrigin: null,
   liveServerName: null,
   liveMultiHop: null,
   stealthActive: false,
@@ -640,6 +643,7 @@ export const useAppStore = create<AppState>()(
         if (st.reconnectMax !== s.reconnectMax) patch.reconnectMax = st.reconnectMax;
         if (st.killSwitchBlocking !== s.killSwitchBlocking) patch.killSwitchBlocking = st.killSwitchBlocking;
         if (st.serverId !== s.liveServerId) patch.liveServerId = st.serverId;
+        if (st.serverOrigin !== s.liveServerOrigin) patch.liveServerOrigin = st.serverOrigin;
         if (st.serverName !== s.liveServerName) patch.liveServerName = st.serverName;
         if (!sameRoute(st.multiHop, s.liveMultiHop)) patch.liveMultiHop = st.multiHop;
         if (st.stealthActive !== s.stealthActive) patch.stealthActive = st.stealthActive;

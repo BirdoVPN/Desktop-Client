@@ -42,11 +42,11 @@
 //!
 //! A connect whose server never answered its FIRST handshake (MR-2514, iOS
 //! `retryOnAnotherRelay` from Mobile #645) is retried ONCE on another server
-//! by the same rule, for a server the client chose only
-//! ([`after_no_handshake`]). A location the user picked is never moved
-//! silently: that connect shows its error. `commands::session` fetches the
-//! list, dials the choice and logs counts only ([`no_handshake_line`],
-//! [`retry_outcome_line`]).
+//! by the same rule ([`after_no_handshake`]): the client's pick anywhere, a
+//! location the user picked only within its own country (owner, 2026-11-20:
+//! "Same country, like iPhone"), else that connect shows its error.
+//! `commands::session` fetches the list, dials the choice and logs counts
+//! only ([`no_handshake_line`], [`retry_outcome_line`]).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -80,7 +80,9 @@ impl SelectionOrigin {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    /// The wire word, the one `from_ipc` reads: the log, the `relay-retry`
+    /// event and the VPN status's `serverOrigin` (MR-2569) use it.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Automatic => "automatic",
             Self::User => "user",
@@ -98,7 +100,8 @@ pub enum Reach {
 }
 
 impl Reach {
-    fn as_str(self) -> &'static str {
+    /// The class's name, as the log and the UI's `relay-retry` notice get it.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::SameCity => "same-city",
             Self::SameCountry => "same-country",
@@ -231,23 +234,22 @@ pub fn log_line(choice: Option<&Choice>, origin: SelectionOrigin) -> String {
 }
 
 /// MR-2514: the server for the ONE automatic retry of a connect whose server
-/// never answered its first handshake, or `None`.
+/// never answered its first handshake, or `None`: [`next`], the rule a
+/// server that left the pool moves by, as iOS's `RelayRetry.next` is for both:
+///   * a server the client chose: the same city first, then the best server
+///     in any country;
+///   * a location the user picked: the same city first, then the best server
+///     in the SAME country, never abroad (owner, 2026-11-20: "Same country,
+///     like iPhone"); with none, `None` and the connect shows its error.
 ///
-/// Only a server the client chose moves: [`next`]'s automatic rule, so the
-/// same city first, then the best server in any country (online, open to this
-/// plan, never `failed`). A location the user picked is never moved without
-/// a click (the owner's rule, 2026-11-19): `None`, and the connect shows its
-/// error.
+/// Either way only servers online and open to this plan, never `failed`.
 pub fn after_no_handshake(
     failed: &str,
     list: &[VpnServer],
     origin: SelectionOrigin,
     last_known: Option<&Location>,
 ) -> Option<Choice> {
-    match origin {
-        SelectionOrigin::Automatic => next(failed, list, origin, last_known),
-        SelectionOrigin::User => None,
-    }
+    next(failed, list, origin, last_known)
 }
 
 /// The log line for the retry decision after an unanswered first handshake:
