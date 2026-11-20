@@ -922,7 +922,7 @@ mod gdpr_request_tests {
         assert!(squashed.contains(
             "letclassify:Classify=ifpath==endpoints::auth::REFRESH{Self::classify_refresh_error_after}else{Self::classify_error_response_after};"
         ));
-        assert!(squashed.contains("Origin::ControlPlane,classify)"));
+        assert!(squashed.contains("Origin::ControlPlane,classify,)"));
         let code = &SOURCE[..SOURCE.find("mod control_plane_hosts_tests").unwrap()];
         let uses = code
             .lines()
