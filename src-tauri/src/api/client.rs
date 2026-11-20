@@ -23,18 +23,42 @@ use erased_serde;
 /// reported it: on only for `dnsFilteringAvailable == Some(true)` (owner
 /// 2026-11-13: the row is hidden, and the connect flag is not sent, while the
 /// gate is off or not known). A success that says `false`, or omits the field,
-/// turns it off; a failed fetch leaves the last answer. Starts off; in memory
-/// only, like the UI's copy.
+/// turns it off; a failed fetch leaves the last answer.
+///
+/// MR-2373: and it starts at the last answer an earlier run's fetch gave
+/// (`commands::shield_gate`, restored in `setup` before the window can dial),
+/// off only when there is none. It used to start off at every launch, in
+/// memory only: a cold-start Auto-Connect dialled before the first fetch had
+/// answered, without the flag, while the row read ON a moment later.
 static DNS_FILTERING_GATE_ON: AtomicBool = AtomicBool::new(false);
+
+/// MR-2373: what keeps a changed gate for the next launch
+/// (`commands::shield_gate::load`). Unset in tests.
+static DNS_FILTERING_GATE_KEEPER: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> =
+    std::sync::OnceLock::new();
 
 /// Whether the last successful config fetch reported the fleet gate on.
 pub(crate) fn dns_filtering_gate_on() -> bool {
     DNS_FILTERING_GATE_ON.load(Ordering::Relaxed)
 }
 
-/// Record a successful fetch's gate: on only for an explicit `true`.
+/// Record a successful fetch's gate: on only for an explicit `true`. A
+/// change is kept for the next launch (MR-2373).
 pub(crate) fn note_dns_filtering_gate(available: Option<bool>) {
-    DNS_FILTERING_GATE_ON.store(available == Some(true), Ordering::Relaxed);
+    let on = available == Some(true);
+    if DNS_FILTERING_GATE_ON.swap(on, Ordering::Relaxed) != on {
+        if let Some(keep) = DNS_FILTERING_GATE_KEEPER.get() {
+            keep();
+        }
+    }
+}
+
+/// MR-2373: at start-up, the gate an earlier run's fetch left on record
+/// (`commands::shield_gate::load`), and what keeps the next change. The
+/// first registration wins.
+pub(crate) fn restore_dns_filtering_gate(on: bool, keep: impl Fn() + Send + Sync + 'static) {
+    DNS_FILTERING_GATE_ON.store(on, Ordering::Relaxed);
+    let _ = DNS_FILTERING_GATE_KEEPER.set(Box::new(keep));
 }
 
 /// The wire rule for `dnsFiltering`: the preference (after the Custom DNS
@@ -411,6 +435,9 @@ pub(crate) fn send_failed(error: reqwest::Error) -> ApiError {
 fn failure_without_answer(error: &(dyn std::error::Error + 'static)) -> ApiError {
     match super::cert_pin::PinRejection::in_chain(error) {
         Some(rejection) => ApiError::CertificatePinningFailed(rejection.label().to_owned()),
+        // MR-2548: an issuer WebPKI does not trust (an antivirus's or an
+        // office proxy's own root) is told apart too, by its type.
+        None if super::cert_pin::untrusted_issuer_in_chain(error) => ApiError::TlsIntercepted,
         None => ApiError::Network(error.to_string()),
     }
 }
@@ -2876,37 +2903,49 @@ mod send_failed_tests {
         assert_eq!(IpcError::from_api(&error).code, IpcErrorCode::CertPinFailed);
     }
 
-    /// The same server with its CA not trusted (the one root is ISRG Root
-    /// X1): WebPKI refuses the leaf (`UnknownIssuer`) before the pin is
-    /// asked, so it stays the network failure.
+    /// MR-2548 (D468-I3 of the #468 review): the same server with its CA not
+    /// trusted (the one root is ISRG Root X1), which is what an antivirus's
+    /// or an office proxy's own root looks like to this app: WebPKI refuses
+    /// the leaf (`UnknownIssuer`) before the pin is asked. Over the real
+    /// reqwest stack it is told as an interception (`tls_intercepted`), not
+    /// as "No internet connection". At 6ddfdc8 it was `network_offline`.
     #[tokio::test]
-    async fn a_real_untrusted_issuer_through_reqwest_stays_the_network() {
+    async fn a_real_untrusted_issuer_through_reqwest_is_told_as_an_interception() {
         let failed = dial_the_test_leaf(include_bytes!("isrg_root_x1.der")).await;
         assert!(super::never_left(&failed), "untrusted: the request left");
         let error = send_failed(failed);
         assert!(
-            matches!(error, ApiError::Network(_)),
-            "untrusted issuer: not the network"
+            matches!(error, ApiError::TlsIntercepted),
+            "untrusted issuer: not told as an interception"
         );
         assert_eq!(
             IpcError::from_api(&error).code,
-            IpcErrorCode::NetworkOffline
+            IpcErrorCode::TlsIntercepted
         );
     }
 
-    /// Only the pin's own refusal is told apart. A handshake that failed on
-    /// anything else (an issuer WebPKI does not trust; a rustls error that
-    /// merely has the pin's words) is the network failure, as before.
+    /// Only the pin's own refusal and (MR-2548) an issuer WebPKI does not
+    /// trust are told apart. A handshake that failed on anything else
+    /// (another WebPKI refusal; a rustls error that merely has the pin's or
+    /// the issuer's words) is the network failure, as before.
     #[test]
     fn only_the_pins_own_refusal_is_told_apart() {
+        let untrusted = failure_without_answer(&*failed_handshake(TlsError::InvalidCertificate(
+            CertificateError::UnknownIssuer,
+        )));
+        assert!(matches!(untrusted, ApiError::TlsIntercepted));
         for (case, tls) in [
-            (
-                "untrusted issuer",
-                TlsError::InvalidCertificate(CertificateError::UnknownIssuer),
-            ),
             (
                 "the pin's words",
                 TlsError::General(PinRejection::Mismatch.label().to_string()),
+            ),
+            (
+                "the issuer's words",
+                TlsError::General("invalid peer certificate: UnknownIssuer".into()),
+            ),
+            (
+                "an expired certificate",
+                TlsError::InvalidCertificate(CertificateError::Expired),
             ),
         ] {
             let error = failure_without_answer(&*failed_handshake(tls));
@@ -2925,6 +2964,7 @@ mod send_failed_tests {
         let fallback = &code[code.find("fn failure_without_answer(").unwrap()..];
         let fallback = &fallback[..fallback.find("\n}").unwrap()];
         assert!(fallback.contains("PinRejection::in_chain(error)"));
+        assert!(fallback.contains("untrusted_issuer_in_chain(error) => ApiError::TlsIntercepted"));
         assert!(fallback.contains("ApiError::Network(error.to_string())"));
         assert!(code.matches(".map_err(send_failed)").count() >= 4);
         assert!(!code.contains("Network(e.to_string())"));

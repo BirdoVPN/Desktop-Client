@@ -189,6 +189,7 @@ const DELETION_CODES: ReadonlySet<string> = new Set([
   'network_offline',
   'server_error',
   'cert_pin_failed',
+  'tls_intercepted',
   'upgrade_required',
 ]);
 
