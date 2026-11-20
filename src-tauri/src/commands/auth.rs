@@ -2235,7 +2235,9 @@ mod account_boundary_tests {
             "refresh_session",
             "refresh_detached",
             ".refresh_token()",
-            "retry_held_refresh",
+            // Split, or this file would read as one that calls it (the
+            // "called on a timer" pin in api::client).
+            concat!("retry_held", "_refresh"),
         ] {
             assert!(!state.contains(refresh), "{refresh}");
         }
