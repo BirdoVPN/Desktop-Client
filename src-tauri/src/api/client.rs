@@ -581,14 +581,17 @@ impl BirdoApi {
     /// Return a clone of the hardened reqwest Client for reuse by other commands.
     /// This avoids creating secondary un-hardened clients that bypass TLS pinning.
     ///
-    /// KNOWN EXCEPTION (P1-dk-updater-unpinned): the tauri-plugin-updater check
-    /// against `https://api.birdo.app/updates/...` (tauri.conf.json `updater`)
-    /// uses the plugin's OWN reqwest client, which is NOT pinned. Installed
-    /// code is still protected by the minisign signature check; the residual
-    /// risk is that a mis-issued certificate holder can suppress "update
-    /// available" (version-pinning) and fingerprint version/target/arch.
-    /// Fixing it means either the plugin's custom-client builder hook or a
-    /// pre-fetched manifest via BirdoApi.
+    /// The auto-updater does not use this client, and is pinned all the same
+    /// (P1-dk-updater-unpinned, fixed): tauri-plugin-updater builds its own
+    /// reqwest client, and `commands::updater::pinned_updater` configures it
+    /// with `configure_client` (HTTPS only, and the TLS config of
+    /// `cert_pin::rustls_config_pinning_birdo_hosts_only`). The check against
+    /// `https://api.birdo.app/updates/...` (tauri.conf.json `updater`) is
+    /// pinned with the same pin set as this client; the installer download,
+    /// a GitHub release asset, gets full WebPKI validation without the pin,
+    /// and the minisign signature decides whether it may run. The plugin's
+    /// own unpinned IPC commands are not granted to the webview
+    /// (`capabilities/default.json`).
     pub fn http_client(&self) -> Client {
         self.client.clone()
     }
