@@ -195,6 +195,11 @@ pub struct SessionLabel {
     /// The server the tunnel is on — for Multi-Hop, the EXIT.
     pub server_id: String,
     pub multi_hop: Option<MultiHopStatus>,
+    /// Who chose that server (MR-2569). Published with it, so the UI records
+    /// a server Rust moved the session to (a drain, a deletion, the retry
+    /// after no handshake) under the session's own origin, never as the
+    /// client's pick when the user chose the location.
+    pub origin: crate::vpn::relay_retry::SelectionOrigin,
 }
 
 /// The state part of `VpnStatus`, as last published. Read as ONE snapshot so
@@ -214,6 +219,8 @@ pub struct PublishedStatus {
     /// Dropped with the `Error` state or the tunnel, whichever goes first.
     pub tunnel_kept: bool,
     pub server_id: Option<String>,
+    /// Who chose `server_id` (MR-2569, [`SessionLabel::origin`]).
+    pub server_origin: Option<crate::vpn::relay_retry::SelectionOrigin>,
     pub multi_hop: Option<MultiHopStatus>,
     pub gave_up: Option<GaveUp>,
 }
@@ -282,6 +289,7 @@ impl StatusBus {
                 kill_switch_blocking: false,
                 tunnel_kept: false,
                 server_id: None,
+                server_origin: None,
                 multi_hop: None,
                 gave_up: None,
             }),
@@ -1159,6 +1167,7 @@ impl VpnManager {
                 let _ = self
                     .write_state_with(ConnectionState::Connected, |p| {
                         p.server_id = Some(label.server_id);
+                        p.server_origin = Some(label.origin);
                         p.multi_hop = label.multi_hop;
                     })
                     .await;
@@ -1403,6 +1412,7 @@ impl VpnManager {
         let _ = self
             .write_state_with(final_state, |p| {
                 p.server_id = None;
+                p.server_origin = None;
                 p.multi_hop = None;
                 extra(p);
             })
@@ -1653,6 +1663,7 @@ mod tests {
             server_name: "Amsterdam".into(),
             server_id: "ams-1".into(),
             multi_hop: None,
+            origin: crate::vpn::relay_retry::SelectionOrigin::User,
         }
     }
 
@@ -2286,6 +2297,7 @@ mod tests {
         let _ = mgr
             .write_state_with(ConnectionState::Connected, |p| {
                 p.server_id = Some("exit-1".into());
+                p.server_origin = Some(crate::vpn::relay_retry::SelectionOrigin::User);
                 p.multi_hop = Some(MultiHopStatus {
                     entry_id: "entry-1".into(),
                     entry_name: "Frankfurt".into(),
@@ -2299,6 +2311,10 @@ mod tests {
         let p = mgr.published();
         assert_eq!(p.state, ConnectionState::Disconnected);
         assert_eq!(p.server_id, None);
+        assert_eq!(
+            p.server_origin, None,
+            "MR-2569: who chose goes with the server"
+        );
         assert_eq!(p.multi_hop, None);
     }
 

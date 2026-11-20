@@ -20,9 +20,9 @@ use tokio::time::timeout;
 use zeroize::Zeroize;
 
 use crate::api::session_gate::StoredSession;
-use crate::api::types::{ConnectResponse, MultiHopConnectResponse, VpnConfig};
+use crate::api::types::{ConnectResponse, MultiHopConnectResponse, VpnConfig, VpnServer};
 use crate::api::BirdoApi;
-use crate::commands::ipc_error::{IpcError, IpcErrorCode};
+use crate::commands::ipc_error::{IpcError, IpcErrorCode, TransportFailure};
 use crate::commands::killswitch;
 use crate::commands::vpn::{
     apply_vpn_settings, build_vpn_config, derive_quantum_psk, enforce_requested_protection,
@@ -30,12 +30,12 @@ use crate::commands::vpn::{
     transport_fallback_reason,
 };
 use crate::storage::CredentialStore;
-use crate::vpn::auto_reconnect::ReconnectInfo;
+use crate::vpn::auto_reconnect::{ReconnectInfo, SERVER_LIST_TIMEOUT};
 use crate::vpn::birdo_pq::PqSession;
 use crate::vpn::manager::{
     ConnectPhase, ConnectionState, MultiHopStatus, SessionLabel, VpnManager,
 };
-use crate::vpn::relay_retry::SelectionOrigin;
+use crate::vpn::relay_retry::{self, SelectionOrigin};
 use crate::vpn::xray::XrayManager;
 use crate::vpn::AutoReconnectService;
 
@@ -303,40 +303,7 @@ pub(crate) async fn connect_session_for(
         // `attempt` records what it asks for before anything can fail.
         stealth_mode: false,
     };
-    let (first_transport, adaptive) = match purpose {
-        ConnectPurpose::User => (None, true),
-        ConnectPurpose::SettingsReapply { fallback_reason } => (fallback_reason, false),
-    };
-    let mut result = attempt(app, &target, first_transport, &mut ctx).await;
-
-    // ADAPTIVE TRANSPORT: when the direct attempt failed in the
-    // transport-shaped way (the establish-time handshake was unanswered or
-    // refused), retry ONCE with the backend's any-plan stealth grant. A single
-    // retry cannot loop: the stealth attempt's handshake runs against the
-    // local Xray proxy, whose failures do not classify as transport-shaped.
-    // Not for a settings reapply (see `ConnectPurpose`).
-    if let Some(direct) = result.as_ref().err().filter(|_| adaptive) {
-        if let Some(reason) = fallback_reason_for(&target, direct, ctx.stealth_mode) {
-            tracing::warn!(
-                "Adaptive Transport: direct WireGuard failed ({reason}) — rebuilding over the \
-                 stealth transport"
-            );
-            // Cover the transport switch with the same block that covers a
-            // reconnect gap, so the backlog of a user who believed they were
-            // protected cannot burst out in the clear on exactly the network
-            // that is interfering with us. No-op on a fresh first connect.
-            if ctx.was_live {
-                engage_rebuild_block(&mut ctx).await;
-            }
-            // Surface the switch — the user must never silently land on a
-            // different transport.
-            let _ = app.emit(
-                "adaptive-transport-fallback",
-                serde_json::json!({ "reason": reason }),
-            );
-            result = attempt(app, &target, Some(reason), &mut ctx).await;
-        }
-    }
+    let result = dial(&mut AppDial { app, ctx: &mut ctx }, &target, purpose).await;
 
     let result = match result {
         Ok(()) => Ok(()),
@@ -346,6 +313,250 @@ pub(crate) async fn connect_session_for(
         epoch: Some(epoch),
         result,
     }
+}
+
+/// What a user connect's attempts do to the world, apart from the
+/// `AppHandle`, so a test can drive [`dial`] and count them (MR-2514; the
+/// pattern of `vpn::RevertSteps`).
+trait DialSteps {
+    /// One full attempt at `target` over `transport` ([`attempt`]).
+    async fn attempt_once(
+        &mut self,
+        target: &ConnectTarget,
+        transport: Option<&'static str>,
+    ) -> Result<(), IpcError>;
+    /// The Stealth Mode the latest attempt asked for
+    /// ([`AttemptContext::stealth_mode`]).
+    fn attempted_stealth(&self) -> bool;
+    /// Before another attempt: a session that was live stays behind the
+    /// block across the gap. No-op on a fresh first connect.
+    async fn cover_the_gap(&mut self);
+    /// Tell the UI the session is going over the stealth transport.
+    fn announce_stealth(&self, reason: &'static str);
+    /// No Disconnect or newer connect has superseded this connect.
+    fn still_current(&self) -> bool;
+    /// `/vpn/servers`, fetched now, or `None` when it does not arrive in
+    /// time (or the connect is superseded meanwhile).
+    async fn fresh_servers(&mut self) -> Option<Vec<VpnServer>>;
+    /// Tell the UI the connect is going to another server: who chose the
+    /// first one and how far the retry goes (classes, never the server).
+    fn announce_relay_retry(&self, origin: SelectionOrigin, reach: relay_retry::Reach);
+    /// One counts-only line for the log.
+    fn log(&self, line: &str);
+}
+
+/// The app's [`DialSteps`].
+struct AppDial<'a> {
+    app: &'a AppHandle,
+    ctx: &'a mut AttemptContext,
+}
+
+impl DialSteps for AppDial<'_> {
+    async fn attempt_once(
+        &mut self,
+        target: &ConnectTarget,
+        transport: Option<&'static str>,
+    ) -> Result<(), IpcError> {
+        attempt(self.app, target, transport, self.ctx).await
+    }
+
+    fn attempted_stealth(&self) -> bool {
+        self.ctx.stealth_mode
+    }
+
+    async fn cover_the_gap(&mut self) {
+        // The same block that covers a reconnect gap, so the backlog of a
+        // user who believed they were protected cannot burst out in the
+        // clear on exactly the network that is interfering with us.
+        if self.ctx.was_live {
+            engage_rebuild_block(self.ctx).await;
+        }
+    }
+
+    fn announce_stealth(&self, reason: &'static str) {
+        let _ = self.app.emit(
+            "adaptive-transport-fallback",
+            serde_json::json!({ "reason": reason }),
+        );
+    }
+
+    fn still_current(&self) -> bool {
+        self.app.state::<VpnManager>().is_current(self.ctx.epoch)
+    }
+
+    async fn fresh_servers(&mut self) -> Option<Vec<VpnServer>> {
+        let vm = self.app.state::<VpnManager>();
+        let api = self.app.state::<BirdoApi>();
+        match vm
+            .run_cancellable(
+                self.ctx.epoch,
+                timeout(SERVER_LIST_TIMEOUT, api.get_servers()),
+            )
+            .await
+        {
+            Ok(Ok(Ok(servers))) => Some(servers),
+            _ => None,
+        }
+    }
+
+    fn announce_relay_retry(&self, origin: SelectionOrigin, reach: relay_retry::Reach) {
+        let _ = self.app.emit(
+            "relay-retry",
+            serde_json::json!({ "origin": origin.as_str(), "reach": reach.as_str() }),
+        );
+    }
+
+    fn log(&self, line: &str) {
+        tracing::warn!("{}", line);
+    }
+}
+
+/// A user connect's attempts, in order. A first attempt that fails can be
+/// followed by at most two more, each ONCE: the Adaptive Transport's on the
+/// same server, then the relay retry's on another (MR-2514). Never a loop.
+async fn dial<S: DialSteps>(
+    steps: &mut S,
+    target: &ConnectTarget,
+    purpose: ConnectPurpose,
+) -> Result<(), IpcError> {
+    let (first_transport, adaptive) = match purpose {
+        ConnectPurpose::User => (None, true),
+        ConnectPurpose::SettingsReapply { fallback_reason } => (fallback_reason, false),
+    };
+    let mut result = steps.attempt_once(target, first_transport).await;
+    // MR-2514: the server's first handshake never completed: no answer, or
+    // (review I3, as iOS, whose window counts any handshake that does not
+    // complete) a DIRECT handshake the relay actively refused. Refused
+    // through the local Stealth helper is this machine's (review L2).
+    let mut unanswered = false;
+
+    // ADAPTIVE TRANSPORT: when the direct attempt failed in the
+    // transport-shaped way (the establish-time handshake was unanswered or
+    // refused), retry ONCE with the backend's any-plan stealth grant. A single
+    // retry cannot loop: the stealth attempt's handshake runs against the
+    // local Xray proxy, whose failures do not classify as transport-shaped.
+    // Not for a settings reapply (see `ConnectPurpose`).
+    if let Some(direct) = result.as_ref().err().filter(|_| adaptive) {
+        unanswered = match direct.transport {
+            Some(TransportFailure::NoResponse) => true,
+            Some(TransportFailure::Refused) => !steps.attempted_stealth(),
+            None => false,
+        };
+        if let Some(reason) = fallback_reason_for(target, direct, steps.attempted_stealth()) {
+            tracing::warn!(
+                "Adaptive Transport: direct WireGuard failed ({reason}) — rebuilding over the \
+                 stealth transport"
+            );
+            // Cover the transport switch. No-op on a fresh first connect.
+            steps.cover_the_gap().await;
+            // Surface the switch — the user must never silently land on a
+            // different transport.
+            steps.announce_stealth(reason);
+            result = steps.attempt_once(target, Some(reason)).await;
+        }
+    }
+
+    match result {
+        Err(error) if unanswered => retry_on_another_server(steps, target, error).await,
+        result => result,
+    }
+}
+
+/// MR-2514 [DESK-AUTO-RETRY-PARITY]: the ONE automatic retry, on another
+/// server, of a user connect whose server never answered its first
+/// handshake: direct, then over the stealth transport where the Adaptive
+/// Transport tried it. `error` is how that server failed.
+///
+/// The owner's rule (2026-11-19, MR-2212 Q2; 2026-11-20 for a user's pick),
+/// the same on every client (iOS `retryOnAnotherRelay`, Mobile #645):
+///   * a server the CLIENT chose (`SelectionOrigin::Automatic`) may move to
+///     another country;
+///   * a location the USER picked moves only within its own country, the
+///     same city first ("Same country, like iPhone"); with nothing eligible
+///     there, its error stands. A Multi-Hop route, the user's own pair,
+///     never moves;
+///   * the server is `relay_retry::after_no_handshake`'s choice (#466's
+///     `next`: online and open to this plan, as `/vpn/servers` lists them
+///     for this account, fetched now; never the server that failed). A node
+///     held for its jurisdiction is never listed online, and `/vpn/connect`
+///     checks the plan and the ONLINE status again;
+///   * ONE retry: its failure is the connect's, and is never retried again.
+///     A Disconnect, a newer connect or a refusal no retry can overcome ends
+///     the connect without one;
+///   * the retry is a fresh connect to that server, direct (or over Stealth
+///     Mode when the user turned it on), under the same kill switch as the
+///     first attempt (`cover_the_gap`, and `attempt`'s relay permit);
+///   * the log gives the origin, the counts and how far the retry went,
+///     never a server.
+async fn retry_on_another_server<S: DialSteps>(
+    steps: &mut S,
+    target: &ConnectTarget,
+    error: IpcError,
+) -> Result<(), IpcError> {
+    let ConnectTarget::SingleHop { server_id, origin } = target else {
+        return Err(error);
+    };
+    // A Disconnect, a newer connect, a refusal no retry can overcome, or a
+    // failure of this machine's own (review L2) ends it without a retry.
+    if !server_did_not_serve(&error) || !steps.still_current() {
+        return Err(error);
+    }
+    let listed = steps.fresh_servers().await;
+    if !steps.still_current() {
+        return Err(error);
+    }
+    let Some(servers) = listed else {
+        steps.log(
+            "No handshake from the server: no server list in time, so no automatic retry \
+             (retry 0 of 1)",
+        );
+        return Err(error);
+    };
+    // Where the failed server was, should the fresh list no longer have it.
+    let last_known = relay_retry::known_location(server_id);
+    relay_retry::remember(&servers);
+    let choice = relay_retry::after_no_handshake(server_id, &servers, *origin, last_known.as_ref());
+    steps.log(&relay_retry::no_handshake_line(choice.as_ref(), *origin));
+    let Some(choice) = choice else {
+        return Err(error);
+    };
+    // The move keeps who chose: a user's pick stays the user's.
+    let moved = ConnectTarget::SingleHop {
+        server_id: choice.server.id,
+        origin: *origin,
+    };
+    steps.cover_the_gap().await;
+    steps.announce_relay_retry(*origin, choice.reach);
+    let result = steps.attempt_once(&moved, None).await;
+    // A Disconnect or a newer connect during the retry's dial: the connect is
+    // theirs, not a retry that failed (review L4).
+    if result
+        .as_ref()
+        .is_err_and(|e| e.code == IpcErrorCode::Cancelled)
+        || !steps.still_current()
+    {
+        return result;
+    }
+    let connected = result.is_ok();
+    steps.log(&relay_retry::retry_outcome_line(
+        connected,
+        relay_retry::count_retry(connected),
+    ));
+    result
+}
+
+/// Whether `error`, how the server's own attempts last failed, says the
+/// SERVER did not serve (MR-2514, review L2): its handshake got no answer
+/// (direct, or through the stealth transport), the backend refused it as
+/// unavailable, or the backend did not grant it the stealth transport (review
+/// L5, `IpcError::stealth_not_granted`). Anything else (a Disconnect, a hard
+/// refusal, the adapter, the kill switch, a rate limit, the local Stealth
+/// helper, a handshake refused through it) would fail the same way on
+/// another server, so it spends no retry.
+fn server_did_not_serve(error: &IpcError) -> bool {
+    error.transport == Some(TransportFailure::NoResponse)
+        || error.code == IpcErrorCode::ServerUnavailable
+        || error.stealth_not_granted
 }
 
 /// Engage the block-all for a rebuild of a live session (no-op when the kill
@@ -607,6 +818,9 @@ async fn attempt(
             .as_ref()
             .map_or_else(|| dialled_id.to_string(), |route| route.exit_id.clone()),
         multi_hop: multi_hop.clone(),
+        // MR-2569: published with the server, so the UI records who chose it
+        // (the relay retry keeps the connect's origin on the server it moves to).
+        origin: target.origin(),
     };
     vm.set_phase(ConnectPhase::Handshaking);
     vm.connect(
@@ -961,11 +1175,7 @@ pub(crate) async fn prepare_tunnel(
     // silently rebuilding it would just burn another multi-second handshake
     // failure and report a misleading error.
     if request.fallback_reason.is_some() && !response.stealth_enabled.unwrap_or(false) {
-        return Err(IpcError::new(
-            IpcErrorCode::StealthFailed,
-            "This network blocks standard VPN traffic, and the server could not provide \
-             Stealth Mode. Please try a different server.",
-        ));
+        return Err(IpcError::stealth_not_granted());
     }
 
     // AUD-DESK-08 (review of #446): a relay the kill switch could not permit
@@ -1608,23 +1818,83 @@ mod lifecycle_tests {
         assert!(restart.contains("EXIT_RESTARTING.store(true"));
     }
 
+    /// MR-2569 (review M1 of #470): the status names who chose the server it
+    /// names. A connect publishes its target's origin with the server
+    /// (`SessionLabel::origin`, which the relay retry's move keeps); a
+    /// re-dial or a move off a server that left publishes the record's; the
+    /// manager sets it with the server and clears it with it; the status
+    /// carries it as `serverOrigin`. The UI records a server Rust moved the
+    /// session to under that origin, never as the client's pick by guess.
+    #[test]
+    fn the_status_says_who_chose_the_server_it_names() {
+        let label = body("async fn attempt(");
+        let built = &label[label.find("let label = SessionLabel {").expect("the label")..];
+        assert!(
+            built[..built.find("};").unwrap()].contains("origin: target.origin(),"),
+            "{built}"
+        );
+        let manager = include_str!("../vpn/manager.rs").replace('\r', "");
+        order(
+            &manager,
+            &[
+                ".write_state_with(ConnectionState::Connected, |p| {",
+                "p.server_id = Some(label.server_id);",
+                "p.server_origin = Some(label.origin);",
+            ],
+        );
+        order(
+            &manager,
+            &["p.server_id = None;", "p.server_origin = None;"],
+        );
+        let redial = include_str!("../vpn/auto_reconnect.rs").replace('\r', "");
+        let redial = &redial[redial
+            .find("pub fn label(&self) -> SessionLabel {")
+            .unwrap()..];
+        let redial = &redial[..redial.find("\n    }").unwrap()];
+        assert!(redial.contains("origin: self.origin,"), "{redial}");
+        assert!(include_str!("vpn.rs")
+            .contains("server_origin: published.server_origin.map(SelectionOrigin::as_str),"));
+    }
+
+    /// Review L5 of #470: the backend not granting the stealth transport is
+    /// built by its own constructor at the one place it is decided, so the
+    /// relay retry can tell it from the local Stealth helper's failures,
+    /// which never use it.
+    #[test]
+    fn the_backends_stealth_refusal_has_its_own_constructor() {
+        let prepare = body("pub(crate) async fn prepare_tunnel(");
+        order(
+            prepare,
+            &[
+                "if request.fallback_reason.is_some() && !response.stealth_enabled.unwrap_or(false) {",
+                "return Err(IpcError::stealth_not_granted());",
+            ],
+        );
+        assert!(!include_str!("vpn.rs").contains("stealth_not_granted"));
+    }
+
     /// WIN-FIX-3: a settings reapply is rebuilt on the session's own
     /// transport and never runs the Adaptive Transport retry; a user connect
     /// starts direct and does. The session's settings are recorded at the
     /// commit, beside its reconnect record, for the reapply's revert.
     #[test]
     fn a_settings_reapply_keeps_its_transport_and_gets_no_stealth_retry() {
-        let connect = body("pub(crate) async fn connect_session_for(");
         order(
-            connect,
+            body("pub(crate) async fn connect_session_for("),
+            &["let result = dial(&mut AppDial { app, ctx: &mut ctx }, &target, purpose)"],
+        );
+        // MR-2514: the attempts moved into `dial` (driven in `dial_tests`).
+        order(
+            body("async fn dial<S: DialSteps>("),
             &[
                 "ConnectPurpose::User => (None, true)",
                 "ConnectPurpose::SettingsReapply { fallback_reason } => (fallback_reason, false)",
-                "attempt(app, &target, first_transport, &mut ctx)",
+                "steps.attempt_once(target, first_transport)",
                 ".filter(|_| adaptive)",
-                "fallback_reason_for(&target, direct, ctx.stealth_mode)",
+                "fallback_reason_for(target, direct, steps.attempted_stealth())",
             ],
         );
+        assert!(body("fn attempted_stealth(&self) -> bool {").contains("self.ctx.stealth_mode"));
         order(
             body("async fn attempt("),
             &[
@@ -1736,7 +2006,7 @@ mod lifecycle_tests {
                 "let intent_seen = killswitch::intent_seq();",
                 ".set_state(if was_live {",
                 "intent_seen,",
-                "attempt(app, &target, first_transport",
+                "let result = dial(",
             ],
         );
         let attempt = body("async fn attempt(");
@@ -1762,7 +2032,7 @@ mod lifecycle_tests {
                 "ar.stop()",
                 "let Some(epoch) = began else {",
                 "ConnectOutcome::never_began(IpcError::cancelled())",
-                "attempt(app, &target, first_transport",
+                "let result = dial(",
             ],
         );
         order(
@@ -2234,6 +2504,883 @@ mod lifecycle_tests {
             failure_outcome(false, ctx.was_live, ctx.old_transport_touched(&xray), true),
             FailureOutcome::Error { hold_block: true }
         );
+    }
+}
+
+/// MR-2514 [DESK-AUTO-RETRY-PARITY]: a user connect's attempts, driven
+/// through `dial` in a scripted world, so the owner's retry rule (2026-11-19,
+/// MR-2212 Q2) is tested as it runs: which servers are dialled, over which
+/// transport, how many times, and what the log says.
+#[cfg(test)]
+mod dial_tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+
+    use super::{dial, ConnectPurpose, ConnectTarget, DialSteps, SelectionOrigin};
+    use crate::api::types::VpnServer;
+    use crate::commands::ipc_error::{IpcError, IpcErrorCode};
+    use crate::commands::vpn::{FALLBACK_HANDSHAKE_TIMEOUT, FALLBACK_TRANSPORT_BLOCKED};
+    use crate::vpn::relay_retry::Reach;
+
+    const STEALTH: Option<&str> = Some(FALLBACK_HANDSHAKE_TIMEOUT);
+
+    /// A server in the `/vpn/servers` wire shape.
+    fn server(
+        id: &str,
+        cc: &str,
+        city: &str,
+        load: u8,
+        online: bool,
+        accessible: bool,
+    ) -> VpnServer {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": format!("name-{id}"),
+            "country": format!("country-{cc}"),
+            "countryCode": cc,
+            "city": city,
+            "load": load,
+            "isOnline": online,
+            "accessible": accessible,
+        }))
+        .unwrap()
+    }
+
+    /// One server per city, as the fleet is. `srv-fra` is the one that never
+    /// answers; `srv-held` is depooled for its jurisdiction (never listed
+    /// online); `srv-locked` is outside this plan.
+    fn fleet() -> Vec<VpnServer> {
+        vec![
+            server("srv-fra", "DE", "Frankfurt", 5, true, true),
+            server("srv-ams", "NL", "Amsterdam", 30, true, true),
+            server("srv-held", "SE", "Stockholm", 0, false, true),
+            server("srv-locked", "CH", "Zurich", 1, true, false),
+            server("srv-nyc", "US", "New York", 20, true, true),
+        ]
+    }
+
+    /// The establish-time handshake got no answer.
+    fn unanswered() -> IpcError {
+        IpcError::from_tunnel_failure(&format!(
+            "Failed to start tunnel: Handshake failed after 3 attempts: {}",
+            crate::vpn::ERR_HANDSHAKE_NO_RESPONSE
+        ))
+    }
+
+    fn picked_by(origin: SelectionOrigin, server_id: &str) -> ConnectTarget {
+        ConnectTarget::SingleHop {
+            server_id: server_id.into(),
+            origin,
+        }
+    }
+
+    /// A scripted world: each attempt takes the next answer (none left: no
+    /// handshake), and everything the connect does is written down.
+    struct World {
+        answers: VecDeque<Result<(), IpcError>>,
+        servers: Option<Vec<VpnServer>>,
+        stealth_setting: bool,
+        current: Cell<bool>,
+        /// A Disconnect lands while the list is fetched.
+        superseded_by_the_fetch: bool,
+        /// A Disconnect lands during this attempt (1-based): it answers
+        /// `cancelled`, as `attempt` does when its epoch moves.
+        superseded_on_dial: Option<usize>,
+        /// (server, transport) per attempt, in order.
+        dialled: Vec<(String, Option<&'static str>)>,
+        gaps: u32,
+        list_fetches: u32,
+        stealth_notices: Cell<u32>,
+        retry_notices: Cell<u32>,
+        /// Who chose, and how far each announced retry went.
+        retry_reaches: RefCell<Vec<(SelectionOrigin, Reach)>>,
+        log: RefCell<Vec<String>>,
+    }
+
+    impl World {
+        fn answering(answers: impl IntoIterator<Item = Result<(), IpcError>>) -> Self {
+            Self {
+                answers: answers.into_iter().collect(),
+                servers: Some(fleet()),
+                stealth_setting: false,
+                current: Cell::new(true),
+                superseded_by_the_fetch: false,
+                superseded_on_dial: None,
+                dialled: Vec::new(),
+                gaps: 0,
+                list_fetches: 0,
+                stealth_notices: Cell::new(0),
+                retry_notices: Cell::new(0),
+                retry_reaches: RefCell::new(Vec::new()),
+                log: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn dialled(&self) -> Vec<(&str, Option<&str>)> {
+            self.dialled
+                .iter()
+                .map(|(server, transport)| (server.as_str(), *transport))
+                .collect()
+        }
+
+        fn logged(&self, words: &str) -> bool {
+            self.log.borrow().iter().any(|line| line.contains(words))
+        }
+    }
+
+    impl DialSteps for World {
+        async fn attempt_once(
+            &mut self,
+            target: &ConnectTarget,
+            transport: Option<&'static str>,
+        ) -> Result<(), IpcError> {
+            let server = match target {
+                ConnectTarget::SingleHop { server_id, .. } => server_id.clone(),
+                ConnectTarget::MultiHop { entry_id, exit_id } => format!("{entry_id}>{exit_id}"),
+            };
+            self.dialled.push((server, transport));
+            let answer = self
+                .answers
+                .pop_front()
+                .unwrap_or_else(|| Err(unanswered()));
+            if self.superseded_on_dial == Some(self.dialled.len()) {
+                self.current.set(false);
+                return Err(IpcError::cancelled());
+            }
+            answer
+        }
+
+        fn attempted_stealth(&self) -> bool {
+            self.stealth_setting
+        }
+
+        async fn cover_the_gap(&mut self) {
+            self.gaps += 1;
+        }
+
+        fn announce_stealth(&self, _reason: &'static str) {
+            self.stealth_notices.set(self.stealth_notices.get() + 1);
+        }
+
+        fn still_current(&self) -> bool {
+            self.current.get()
+        }
+
+        async fn fresh_servers(&mut self) -> Option<Vec<VpnServer>> {
+            self.list_fetches += 1;
+            if self.superseded_by_the_fetch {
+                self.current.set(false);
+            }
+            self.servers.clone()
+        }
+
+        fn announce_relay_retry(&self, origin: SelectionOrigin, reach: Reach) {
+            self.retry_notices.set(self.retry_notices.get() + 1);
+            self.retry_reaches.borrow_mut().push((origin, reach));
+        }
+
+        fn log(&self, line: &str) {
+            self.log.borrow_mut().push(line.to_string());
+        }
+    }
+
+    /// A server the client chose that never answers, direct or over the
+    /// stealth transport, is retried ONCE on the best other server: here in
+    /// another country, past the emptier held and plan-locked nodes. The
+    /// retry runs under the same gap cover as the stealth retry, and the UI
+    /// is told.
+    #[tokio::test]
+    async fn an_automatic_pick_that_never_answers_is_retried_once_on_another_server() {
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            world.dialled(),
+            vec![("srv-fra", None), ("srv-fra", STEALTH), ("srv-nyc", None)]
+        );
+        assert_eq!(world.list_fetches, 1);
+        assert_eq!(world.gaps, 2, "the stealth retry and the relay retry");
+        assert_eq!(world.stealth_notices.get(), 1);
+        assert_eq!(world.retry_notices.get(), 1);
+        assert_eq!(
+            *world.retry_reaches.borrow(),
+            vec![(SelectionOrigin::Automatic, Reach::OtherCountry)]
+        );
+        assert!(world.logged("automatic retry 1 of 1"), "{:?}", world.log);
+        assert!(world.logged("other-country"), "{:?}", world.log);
+        assert!(world.logged("connected (this run: "), "{:?}", world.log);
+    }
+
+    /// One retry, whatever it meets: a retry that fails too ends the
+    /// connect with its error, and nothing is dialled after it.
+    #[tokio::test]
+    async fn a_retry_that_fails_too_is_never_retried_again() {
+        for retry_failure in [
+            unanswered(),
+            IpcError::connect_refused_with(
+                "Server unavailable",
+                false,
+                Some("server_unavailable"),
+                None,
+            ),
+        ] {
+            let code = retry_failure.code;
+            let mut world = World::answering([
+                Err(unanswered()),
+                Err(unanswered()),
+                Err(retry_failure),
+                Ok(()),
+                Ok(()),
+            ]);
+            let result = dial(
+                &mut world,
+                &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+                ConnectPurpose::User,
+            )
+            .await;
+            assert_eq!(result.unwrap_err().code, code);
+            assert_eq!(
+                world.dialled(),
+                vec![("srv-fra", None), ("srv-fra", STEALTH), ("srv-nyc", None)]
+            );
+            assert_eq!(world.list_fetches, 1);
+            assert_eq!(world.retry_notices.get(), 1);
+            assert!(world.logged("not retried again"), "{:?}", world.log);
+        }
+    }
+
+    /// Owner, 2026-11-20 ("Same country, like iPhone"): a location the user
+    /// picked that never answers is retried ONCE on the best other server in
+    /// its own country (the same city first), as on iOS. Here Berlin, not the
+    /// emptier servers abroad. A retry that fails too is not retried again.
+    #[tokio::test]
+    async fn a_users_pick_is_retried_once_in_its_own_country() {
+        let mut list = fleet();
+        list.push(server("srv-ber", "DE", "Berlin", 40, true, true));
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(()), Ok(())]);
+        world.servers = Some(list.clone());
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            world.dialled(),
+            vec![("srv-fra", None), ("srv-fra", STEALTH), ("srv-ber", None)]
+        );
+        assert_eq!(world.list_fetches, 1);
+        assert_eq!(world.retry_notices.get(), 1);
+        // The UI is told it stays in the country.
+        assert_eq!(
+            *world.retry_reaches.borrow(),
+            vec![(SelectionOrigin::User, Reach::SameCountry)]
+        );
+        assert!(
+            world.logged("retry 1 of 1 on another server (user pick, same-country)"),
+            "{:?}",
+            world.log
+        );
+
+        let mut world = World::answering([
+            Err(unanswered()),
+            Err(unanswered()),
+            Err(unanswered()),
+            Ok(()),
+        ]);
+        world.servers = Some(list);
+        assert!(dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await
+        .is_err());
+        assert_eq!(world.dialled().len(), 3, "{:?}", world.dialled());
+        assert!(world.logged("not retried again"), "{:?}", world.log);
+    }
+
+    /// A location the user picked never leaves its country: with no other
+    /// eligible server at home (here the only German one is held, and the
+    /// eligible ones are abroad) there is no retry, and the connect ends
+    /// with the server's own error. Nor does a Multi-Hop route move, the
+    /// user's own pair.
+    #[tokio::test]
+    async fn a_users_pick_never_goes_abroad() {
+        let mut list = fleet();
+        list.push(server("srv-ber-held", "DE", "Berlin", 0, false, true));
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(()), Ok(())]);
+        world.servers = Some(list);
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, IpcErrorCode::ServerUnreachable);
+        assert_eq!(
+            world.dialled(),
+            vec![("srv-fra", None), ("srv-fra", STEALTH)]
+        );
+        assert_eq!(world.retry_notices.get(), 0);
+        assert!(
+            world.logged("no automatic retry (user pick, retry 0 of 1)"),
+            "{:?}",
+            world.log
+        );
+
+        let mut world = World::answering([Err(unanswered()), Ok(()), Ok(())]);
+        let route = ConnectTarget::MultiHop {
+            entry_id: "srv-fra".into(),
+            exit_id: "srv-nyc".into(),
+        };
+        assert!(dial(&mut world, &route, ConnectPurpose::User)
+            .await
+            .is_err());
+        assert_eq!(world.dialled(), vec![("srv-fra>srv-nyc", None)]);
+        assert_eq!(world.list_fetches, 0);
+    }
+
+    /// Only servers the fresh list names online and open to this plan
+    /// qualify: never a node held for its jurisdiction (depooled, so not
+    /// online), never one outside the plan, never one only an earlier list
+    /// named (the account's allow-list is the list itself), never the server
+    /// that failed, even as the least loaded. With none left, no retry.
+    #[tokio::test]
+    async fn held_plan_excluded_and_unlisted_servers_are_never_chosen() {
+        crate::vpn::relay_retry::remember(&[server(
+            "srv-cached-only",
+            "FR",
+            "Paris",
+            0,
+            true,
+            true,
+        )]);
+        let mut fresh: Vec<_> = fleet().into_iter().filter(|s| s.id != "srv-nyc").collect();
+        fresh[0].load = 0;
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = Some(fresh.clone());
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(world.dialled().last(), Some(&("srv-ams", None)));
+
+        // Only the held and the plan-locked nodes are left: no retry.
+        let ineligible: Vec<_> = fresh.into_iter().filter(|s| s.id != "srv-ams").collect();
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = Some(ineligible);
+        assert!(dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            world.dialled(),
+            vec![("srv-fra", None), ("srv-fra", STEALTH)]
+        );
+        assert_eq!(world.retry_notices.get(), 0);
+        assert!(
+            world.logged("no automatic retry (automatic pick, retry 0 of 1)"),
+            "{:?}",
+            world.log
+        );
+
+        // A user's pick: the only other German servers are held or outside
+        // the plan, and the German one an earlier list named is not on the
+        // fresh list. No retry.
+        crate::vpn::relay_retry::remember(&[server(
+            "srv-ber-cached-only",
+            "DE",
+            "Berlin",
+            0,
+            true,
+            true,
+        )]);
+        let mut list = fleet();
+        list.push(server("srv-ham-held", "DE", "Hamburg", 0, false, true));
+        list.push(server("srv-muc-locked", "DE", "Munich", 0, true, false));
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = Some(list);
+        assert!(dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await
+        .is_err());
+        assert_eq!(world.dialled().len(), 2, "{:?}", world.dialled());
+        assert_eq!(world.retry_notices.get(), 0);
+    }
+
+    /// Without a fresh list in time there is no retry: a cached list could
+    /// name a server depooled since. The server's own error stands.
+    #[tokio::test]
+    async fn no_fresh_list_means_no_retry() {
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = None;
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, IpcErrorCode::ServerUnreachable);
+        assert_eq!(world.dialled().len(), 2);
+        assert_eq!(world.retry_notices.get(), 0);
+        assert!(world.logged("no server list in time"), "{:?}", world.log);
+    }
+
+    /// A Disconnect or a newer connect (before or during the list fetch),
+    /// or a refusal no retry can overcome, ends the connect without a retry.
+    #[tokio::test]
+    async fn a_disconnect_or_a_hard_refusal_ends_it_without_a_retry() {
+        for (second, current, superseded_by_the_fetch, fetches) in [
+            (IpcError::cancelled(), true, false, 0),
+            (
+                IpcError::connect_refused_with("Device limit", false, Some("device_limit"), None),
+                true,
+                false,
+                0,
+            ),
+            (unanswered(), false, false, 0),
+            (unanswered(), true, true, 1),
+        ] {
+            let mut world = World::answering([Err(unanswered()), Err(second), Ok(())]);
+            world.current.set(current);
+            world.superseded_by_the_fetch = superseded_by_the_fetch;
+            assert!(dial(
+                &mut world,
+                &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+                ConnectPurpose::User,
+            )
+            .await
+            .is_err());
+            assert_eq!(world.dialled().len(), 2, "{:?}", world.dialled());
+            assert_eq!(world.list_fetches, fetches);
+            assert_eq!(world.retry_notices.get(), 0);
+        }
+    }
+
+    /// Only a server that never answered the first handshake is retried
+    /// elsewhere: a refusal or a local failure is not, and neither is a
+    /// server the stealth transport reached.
+    #[tokio::test]
+    async fn only_a_server_that_never_answered_is_retried_elsewhere() {
+        for first in [
+            IpcError::connect_refused_with(
+                "Server unavailable",
+                false,
+                Some("server_unavailable"),
+                None,
+            ),
+            IpcError::from_tunnel_failure("Failed to create the adapter"),
+        ] {
+            let mut world = World::answering([Err(first), Ok(()), Ok(())]);
+            assert!(dial(
+                &mut world,
+                &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+                ConnectPurpose::User,
+            )
+            .await
+            .is_err());
+            assert_eq!(world.dialled(), vec![("srv-fra", None)]);
+            assert_eq!(world.list_fetches, 0);
+        }
+        let mut world = World::answering([Err(unanswered()), Ok(()), Ok(())]);
+        assert!(dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await
+        .is_ok());
+        assert_eq!(
+            world.dialled(),
+            vec![("srv-fra", None), ("srv-fra", STEALTH)]
+        );
+        assert_eq!(world.list_fetches, 0);
+    }
+
+    /// A settings reapply rebuilds the live session on its own server and
+    /// transport, and is reverted when that fails (WIN-FIX-3): it never
+    /// moves.
+    #[tokio::test]
+    async fn a_settings_reapply_is_never_moved() {
+        let mut world = World::answering([Err(unanswered()), Ok(()), Ok(())]);
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::SettingsReapply {
+                fallback_reason: STEALTH,
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(world.dialled(), vec![("srv-fra", STEALTH)]);
+        assert_eq!(world.list_fetches, 0);
+    }
+
+    /// With Stealth Mode turned on, the first attempt WAS the stealth
+    /// transport, so there is no Adaptive Transport retry; the relay retry
+    /// still runs, and asks for what the user's settings ask for.
+    #[tokio::test]
+    async fn with_stealth_mode_on_the_relay_retry_still_runs() {
+        let mut world = World::answering([Err(unanswered()), Ok(())]);
+        world.stealth_setting = true;
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(world.dialled(), vec![("srv-fra", None), ("srv-nyc", None)]);
+        assert_eq!(world.stealth_notices.get(), 0);
+        assert_eq!(world.retry_notices.get(), 1);
+    }
+
+    /// A user's pick goes to another server in the same CITY first, even a
+    /// fuller one, before the rest of its country; the log never says
+    /// other-country for it (review of #470, delta item 3).
+    #[tokio::test]
+    async fn a_users_pick_is_retried_in_its_own_city_first() {
+        let mut list = fleet();
+        list.push(server("srv-fra-2", "DE", "Frankfurt", 90, true, true));
+        list.push(server("srv-ber", "DE", "Berlin", 0, true, true));
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = Some(list);
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(world.dialled().last(), Some(&("srv-fra-2", None)));
+        assert!(world.logged("(user pick, same-city)"), "{:?}", world.log);
+        assert!(!world.logged("other-country"), "{:?}", world.log);
+    }
+
+    /// Where the failed server was: its entry in the fresh list, else where
+    /// an earlier list put it (read before this list is remembered). A
+    /// user's pick gone from the fresh list still moves within that
+    /// country. With neither, its country is unknown: a user's pick does
+    /// not move, and the server's own error stands.
+    #[tokio::test]
+    async fn a_users_pick_gone_from_the_fresh_list_keeps_its_country_from_an_earlier_list() {
+        crate::vpn::relay_retry::remember(&[server(
+            "srv-gone-known",
+            "DE",
+            "Munich",
+            5,
+            true,
+            true,
+        )]);
+        // The only other German server is Berlin; abroad is emptier.
+        let mut list: Vec<_> = fleet().into_iter().filter(|s| s.id != "srv-fra").collect();
+        list.push(server("srv-ber", "DE", "Berlin", 40, true, true));
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = Some(list.clone());
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-gone-known"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(world.dialled().last(), Some(&("srv-ber", None)));
+        assert_eq!(
+            *world.retry_reaches.borrow(),
+            vec![(SelectionOrigin::User, Reach::SameCountry)]
+        );
+
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = Some(list);
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-gone-unknown"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, IpcErrorCode::ServerUnreachable);
+        assert_eq!(world.dialled().len(), 2, "{:?}", world.dialled());
+        assert_eq!(world.retry_notices.get(), 0);
+    }
+
+    /// Review L2: only a server that truly did not answer spends the retry.
+    /// A local failure of the Stealth attempt (the adapter, the kill switch,
+    /// a rate limit) would fail the same way on any server, and an actively
+    /// refused handshake is not a silent one: neither moves the connect. A
+    /// backend that calls the server unavailable does.
+    #[tokio::test]
+    async fn only_a_true_no_answer_spends_the_retry() {
+        let refused = IpcError::from_tunnel_failure(&format!(
+            "Failed to start tunnel: Handshake failed: {}",
+            crate::vpn::ERR_HANDSHAKE_RECV
+        ));
+        for (first, second) in [
+            (
+                unanswered(),
+                IpcError::from_tunnel_failure("Failed to create the adapter"),
+            ),
+            (
+                unanswered(),
+                IpcError::new(IpcErrorCode::KillswitchFailed, "kill switch"),
+            ),
+            (
+                unanswered(),
+                IpcError::new(IpcErrorCode::RateLimited, "slow down"),
+            ),
+            // A local failure of the Stealth helper (`vpn::stealth_failed`).
+            (
+                unanswered(),
+                IpcError::new(IpcErrorCode::StealthFailed, "Stealth Mode couldn't start"),
+            ),
+            // Refused through the local Stealth helper: not the server's.
+            (refused.clone(), refused),
+        ] {
+            let last_code = second.code;
+            let mut world = World::answering([Err(first), Err(second), Ok(()), Ok(())]);
+            let result = dial(
+                &mut world,
+                &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+                ConnectPurpose::User,
+            )
+            .await;
+            assert_eq!(result.unwrap_err().code, last_code);
+            assert_eq!(world.dialled().len(), 2, "{:?}", world.dialled());
+            assert_eq!(world.list_fetches, 0);
+            assert_eq!(world.retry_notices.get(), 0);
+        }
+        let mut world = World::answering([
+            Err(unanswered()),
+            Err(IpcError::connect_refused_with(
+                "Server unavailable",
+                false,
+                Some("server_unavailable"),
+                None,
+            )),
+            Ok(()),
+        ]);
+        assert!(dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await
+        .is_ok());
+        assert_eq!(world.dialled().last(), Some(&("srv-nyc", None)));
+    }
+
+    /// Review L5 of #470: a server that cannot provide Stealth Mode is the
+    /// server not serving. Its direct handshake got no answer, and the
+    /// backend then did not grant the stealth transport for it (a node with
+    /// no Xray, or a refused grant): the connect moves to another server, as
+    /// iOS does for any no-answer. A failure of the LOCAL Stealth helper does
+    /// not (`only_a_true_no_answer_spends_the_retry`).
+    #[tokio::test]
+    async fn a_server_that_cannot_provide_stealth_is_retried_elsewhere() {
+        for origin in [SelectionOrigin::Automatic, SelectionOrigin::User] {
+            let mut list = fleet();
+            list.push(server("srv-ber", "DE", "Berlin", 40, true, true));
+            let mut world = World::answering([
+                Err(unanswered()),
+                Err(IpcError::stealth_not_granted()),
+                Ok(()),
+            ]);
+            world.servers = Some(list);
+            let result = dial(
+                &mut world,
+                &picked_by(origin, "srv-fra"),
+                ConnectPurpose::User,
+            )
+            .await;
+            assert!(result.is_ok(), "{origin:?}: {result:?}");
+            assert_eq!(
+                world.dialled().len(),
+                3,
+                "{origin:?}: {:?}",
+                world.dialled()
+            );
+            assert_eq!(world.retry_notices.get(), 1, "{origin:?}");
+        }
+    }
+
+    /// Review I3 of #470, iOS parity: iOS retries a dial whose first
+    /// handshake never completes within its window, whatever the cause, so a
+    /// DIRECT handshake the relay actively refused (its WireGuard port
+    /// unreachable) is retried elsewhere too. Refused through the local
+    /// Stealth helper (Stealth Mode on) is this machine's, and is not.
+    #[tokio::test]
+    async fn a_refused_direct_handshake_is_retried_like_one_that_never_came() {
+        let refused = || {
+            IpcError::from_tunnel_failure(&format!(
+                "Failed to start tunnel: Handshake failed: {}",
+                crate::vpn::ERR_HANDSHAKE_RECV
+            ))
+        };
+        let mut world = World::answering([Err(refused()), Err(unanswered()), Ok(())]);
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            world.dialled(),
+            vec![
+                ("srv-fra", None),
+                ("srv-fra", Some(FALLBACK_TRANSPORT_BLOCKED)),
+                ("srv-nyc", None)
+            ]
+        );
+
+        let mut world = World::answering([Err(refused()), Ok(()), Ok(())]);
+        world.stealth_setting = true;
+        assert!(dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await
+        .is_err());
+        assert_eq!(world.dialled(), vec![("srv-fra", None)]);
+        assert_eq!(world.list_fetches, 0);
+    }
+
+    /// Review L4 and its test gap: a Disconnect during the retry's own dial
+    /// ends the connect as cancelled, nothing is dialled after it, and it is
+    /// neither counted nor logged as a retry that failed.
+    #[tokio::test]
+    async fn a_retry_cancelled_during_its_dial_is_not_counted_as_failed() {
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(()), Ok(())]);
+        world.superseded_on_dial = Some(3);
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, IpcErrorCode::Cancelled);
+        assert_eq!(world.dialled().len(), 3, "{:?}", world.dialled());
+        assert!(!world.logged("failed too"), "{:?}", world.log);
+        assert!(!world.logged("this run: "), "{:?}", world.log);
+    }
+
+    /// Review test gap: without a retry there is no extra gap cover; the
+    /// Stealth retry's is the only one, and none without it.
+    #[tokio::test]
+    async fn no_gap_is_covered_for_a_retry_that_does_not_run() {
+        let mut world = World::answering([Err(unanswered()), Err(unanswered())]);
+        world.servers = None;
+        let _ = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert_eq!(world.gaps, 1, "the Stealth retry's only");
+
+        let mut world = World::answering([Err(unanswered()), Err(unanswered())]);
+        let _ = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert_eq!(world.gaps, 1, "the Stealth retry's only");
+
+        let mut world = World::answering([Err(IpcError::from_tunnel_failure(
+            "Failed to create the adapter",
+        ))]);
+        let _ = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert_eq!(world.gaps, 0);
+    }
+
+    /// Everything the retry path logs is counts: the origin, the retry's
+    /// number, a reach class and this run's totals. No server's id, name,
+    /// city or country, the failed one's or the target's.
+    #[tokio::test]
+    async fn the_retry_logs_counts_only() {
+        let mut lines = Vec::new();
+        for (origin, answers) in [
+            (
+                SelectionOrigin::Automatic,
+                vec![Err(unanswered()), Err(unanswered()), Ok(())],
+            ),
+            (
+                SelectionOrigin::Automatic,
+                vec![Err(unanswered()), Err(unanswered()), Err(unanswered())],
+            ),
+            (
+                SelectionOrigin::User,
+                vec![Err(unanswered()), Err(unanswered())],
+            ),
+        ] {
+            let mut world = World::answering(answers);
+            let _ = dial(
+                &mut world,
+                &picked_by(origin, "srv-fra"),
+                ConnectPurpose::User,
+            )
+            .await;
+            lines.extend(world.log.take());
+        }
+        let mut world = World::answering([Err(unanswered()), Err(unanswered())]);
+        world.servers = None;
+        let _ = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        lines.extend(world.log.take());
+        // A user's pick retried in its own country (owner, 2026-11-20).
+        let berlin = server("srv-ber", "DE", "Berlin", 40, true, true);
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = Some(fleet().into_iter().chain([berlin.clone()]).collect());
+        let _ = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        lines.extend(world.log.take());
+
+        assert!(lines.len() >= 8, "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("this run: ")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("retry 1 of 1 on another server (user pick, same-country)")),
+            "{lines:?}"
+        );
+        for line in &lines {
+            for s in fleet().into_iter().chain([berlin.clone()]) {
+                for field in [&s.id, &s.name, &s.country, &s.country_code, &s.city] {
+                    assert!(!line.contains(field.as_str()), "{line} names `{field}`");
+                }
+            }
+            assert!(!line.contains("srv-"), "{line}");
+        }
     }
 }
 
