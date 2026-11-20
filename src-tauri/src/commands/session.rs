@@ -2648,14 +2648,62 @@ mod dial_tests {
         }
     }
 
-    /// A location the user picked never moves without a click, not even
-    /// within its country: the connect shows its error. Nor does a
-    /// Multi-Hop route, the user's own pair.
+    /// Owner, 2026-11-20 ("Same country, like iPhone"): a location the user
+    /// picked that never answers is retried ONCE on the best other server in
+    /// its own country (the same city first), as on iOS. Here Berlin, not the
+    /// emptier servers abroad. A retry that fails too is not retried again.
     #[tokio::test]
-    async fn a_users_pick_is_never_retried_elsewhere() {
+    async fn a_users_pick_is_retried_once_in_its_own_country() {
         let mut list = fleet();
-        // Even with another server in the same city.
-        list.push(server("srv-fra-2", "DE", "Frankfurt", 0, true, true));
+        list.push(server("srv-ber", "DE", "Berlin", 40, true, true));
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(()), Ok(())]);
+        world.servers = Some(list.clone());
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            world.dialled(),
+            vec![("srv-fra", None), ("srv-fra", STEALTH), ("srv-ber", None)]
+        );
+        assert_eq!(world.list_fetches, 1);
+        assert_eq!(world.retry_notices.get(), 1);
+        assert!(
+            world.logged("retry 1 of 1 on another server (user pick, same-country)"),
+            "{:?}",
+            world.log
+        );
+
+        let mut world = World::answering([
+            Err(unanswered()),
+            Err(unanswered()),
+            Err(unanswered()),
+            Ok(()),
+        ]);
+        world.servers = Some(list);
+        assert!(dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await
+        .is_err());
+        assert_eq!(world.dialled().len(), 3, "{:?}", world.dialled());
+        assert!(world.logged("not retried again"), "{:?}", world.log);
+    }
+
+    /// A location the user picked never leaves its country: with no other
+    /// eligible server at home (here the only German one is held, and the
+    /// eligible ones are abroad) there is no retry, and the connect ends
+    /// with the server's own error. Nor does a Multi-Hop route move, the
+    /// user's own pair.
+    #[tokio::test]
+    async fn a_users_pick_never_goes_abroad() {
+        let mut list = fleet();
+        list.push(server("srv-ber-held", "DE", "Berlin", 0, false, true));
         let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(()), Ok(())]);
         world.servers = Some(list);
         let result = dial(
@@ -2669,7 +2717,6 @@ mod dial_tests {
             world.dialled(),
             vec![("srv-fra", None), ("srv-fra", STEALTH)]
         );
-        assert_eq!(world.list_fetches, 0);
         assert_eq!(world.retry_notices.get(), 0);
         assert!(
             world.logged("no automatic retry (user pick, retry 0 of 1)"),
@@ -2738,6 +2785,32 @@ mod dial_tests {
             "{:?}",
             world.log
         );
+
+        // A user's pick: the only other German servers are held or outside
+        // the plan, and the German one an earlier list named is not on the
+        // fresh list. No retry.
+        crate::vpn::relay_retry::remember(&[server(
+            "srv-ber-cached-only",
+            "DE",
+            "Berlin",
+            0,
+            true,
+            true,
+        )]);
+        let mut list = fleet();
+        list.push(server("srv-ham-held", "DE", "Hamburg", 0, false, true));
+        list.push(server("srv-muc-locked", "DE", "Munich", 0, true, false));
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = Some(list);
+        assert!(dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await
+        .is_err());
+        assert_eq!(world.dialled().len(), 2, "{:?}", world.dialled());
+        assert_eq!(world.retry_notices.get(), 0);
     }
 
     /// Without a fresh list in time there is no retry: a cached list could
@@ -2905,11 +2978,28 @@ mod dial_tests {
         )
         .await;
         lines.extend(world.log.take());
+        // A user's pick retried in its own country (owner, 2026-11-20).
+        let berlin = server("srv-ber", "DE", "Berlin", 40, true, true);
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = Some(fleet().into_iter().chain([berlin.clone()]).collect());
+        let _ = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        lines.extend(world.log.take());
 
-        assert!(lines.len() >= 6, "{lines:?}");
+        assert!(lines.len() >= 8, "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("this run: ")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("retry 1 of 1 on another server (user pick, same-country)")),
+            "{lines:?}"
+        );
         for line in &lines {
-            for s in fleet() {
+            for s in fleet().into_iter().chain([berlin.clone()]) {
                 for field in [&s.id, &s.name, &s.country, &s.country_code, &s.city] {
                     assert!(!line.contains(field.as_str()), "{line} names `{field}`");
                 }

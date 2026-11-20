@@ -599,14 +599,17 @@ describe("Auto-Connect keeps the user's server in its country (MR-2492)", () => 
 });
 
 /**
- * MR-2514: a server the client chose that never answers its first handshake
- * is retried ONCE by Rust on the best other server, maybe abroad
- * (`commands::session::retry_on_another_server`). The UI says so, and the card
- * and the record follow where the tunnel really is. A user's pick never moves.
+ * MR-2514: a server that never answers its first handshake is retried ONCE by
+ * Rust on another server (`commands::session::retry_on_another_server`): the
+ * client's pick on the best one anywhere, a user's pick only within its own
+ * country (owner, 2026-11-20, "Same country, like iPhone"). The UI says which,
+ * and the card and the record follow where the tunnel really is.
  */
-describe("the one retry of the client's pick on another server (MR-2514)", () => {
+describe('the one retry on another server (MR-2514)', () => {
   const RELAY_RETRY_COPY =
     "That server didn't answer, so BirdoVPN is trying the best other server, which may be in another country.";
+  const RELAY_RETRY_SAME_COUNTRY_COPY =
+    "That server didn't answer, so BirdoVPN is trying another server in the same country.";
   const stored = (id: string, countryCode: string, city: string, load: number): Server => ({
     id,
     name: `Node ${id}`,
@@ -638,6 +641,17 @@ describe("the one retry of the client's pick on another server (MR-2514)", () =>
     await waitFor(() => expect(useAppStore.getState().statusSeq).toBe(1));
     emit('relay-retry');
     expect(useAppStore.getState().notice).toMatchObject({ text: RELAY_RETRY_COPY, tone: 'info' });
+    emit('relay-retry', { reach: 'other-country' });
+    expect(useAppStore.getState().notice).toMatchObject({ text: RELAY_RETRY_COPY, tone: 'info' });
+  });
+
+  it('a retry within the country says so, never "another country"', async () => {
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().statusSeq).toBe(1));
+    for (const reach of ['same-country', 'same-city']) {
+      emit('relay-retry', { reach });
+      expect(useAppStore.getState().notice).toMatchObject({ text: RELAY_RETRY_SAME_COUNTRY_COPY, tone: 'info' });
+    }
   });
 
   it('the card and the record follow the server the retry connected to, still the client\'s pick', async () => {
@@ -658,6 +672,19 @@ describe("the one retry of the client's pick on another server (MR-2514)", () =>
     const s = useAppStore.getState();
     expect(s.currentServer?.id).toBe('fra');
     expect(s.lastServerId).toBe('fra');
+    expect(s.lastServerOrigin).toBe('user');
+  });
+
+  it("a user's pick that Rust retried in its own country: the card follows, and it stays the user's", async () => {
+    const ber = stored('ber', 'DE', 'Berlin', 40);
+    useAppStore.setState({ servers: [fra, ams, ber] });
+    // Frankfurt never answered; Rust's one retry connected Berlin.
+    connectLandsOn('ber');
+    await expect(connectToServer(fra, 'user')).resolves.toBe(true);
+    const s = useAppStore.getState();
+    expect(s.currentServer?.id).toBe('ber');
+    expect(s.lastServerId).toBe('ber');
+    // Still the user's: a later move never takes it out of Germany.
     expect(s.lastServerOrigin).toBe('user');
   });
 });

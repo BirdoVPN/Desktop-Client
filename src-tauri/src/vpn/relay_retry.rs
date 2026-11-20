@@ -632,32 +632,67 @@ mod tests {
         );
     }
 
-    /// A location the user picked is never moved by this retry, not even
-    /// within its own country or city: the connect shows its error.
+    /// Owner, 2026-11-20 ("Same country, like iPhone"): a location the user
+    /// picked is retried within its own country, the same city first, as on
+    /// iOS (`RelayRetry.next`, `.user`). It never leaves the country, even
+    /// when the only eligible server is abroad; with nothing eligible at home
+    /// there is no retry and the connect shows its error.
     #[test]
-    fn an_unanswered_users_pick_is_never_moved() {
+    fn an_unanswered_users_pick_stays_in_its_country() {
         let mut list = fleet();
-        list.push(server("de-fra-2", "DE", "Frankfurt", 0, true, true));
-        let frankfurt = Location {
-            country_code: "DE".into(),
-            city: "Frankfurt".into(),
-        };
-        for last_known in [None, Some(&frankfurt)] {
-            assert!(
-                after_no_handshake("drained", &list, SelectionOrigin::User, last_known).is_none(),
-                "{last_known:?}"
-            );
-        }
-        // The same list does have a server for an automatic pick.
+        // The server that failed is still listed online: it never answered.
+        list[0].is_online = true;
         assert_eq!(
             picked(after_no_handshake(
                 "drained",
                 &list,
+                SelectionOrigin::User,
+                None
+            )),
+            Some(("de-ber".into(), Reach::SameCountry)),
+            "the best other server in its country, not the emptier Amsterdam"
+        );
+        let mut with_sibling = list.clone();
+        with_sibling.push(server("de-fra-2", "DE", "Frankfurt", 90, true, true));
+        assert_eq!(
+            picked(after_no_handshake(
+                "drained",
+                &with_sibling,
+                SelectionOrigin::User,
+                None
+            )),
+            Some(("de-fra-2".into(), Reach::SameCity)),
+            "the same city first"
+        );
+        // Only abroad is eligible: a user's pick does not move; an automatic
+        // one does.
+        let abroad_only: Vec<_> = list.into_iter().filter(|s| s.id != "de-ber").collect();
+        assert!(after_no_handshake("drained", &abroad_only, SelectionOrigin::User, None).is_none());
+        assert_eq!(
+            picked(after_no_handshake(
+                "drained",
+                &abroad_only,
                 SelectionOrigin::Automatic,
                 None
             )),
-            Some(("de-fra-2".into(), Reach::SameCity))
+            Some(("nl-ams".into(), Reach::OtherCountry))
         );
+        // Gone from the list: its country from an earlier list, else nowhere.
+        let frankfurt = Location {
+            country_code: "DE".into(),
+            city: "Frankfurt".into(),
+        };
+        let without: Vec<_> = fleet().into_iter().filter(|s| s.id != "drained").collect();
+        assert_eq!(
+            picked(after_no_handshake(
+                "drained",
+                &without,
+                SelectionOrigin::User,
+                Some(&frankfurt)
+            )),
+            Some(("de-ber".into(), Reach::SameCountry))
+        );
+        assert!(after_no_handshake("drained", &without, SelectionOrigin::User, None).is_none());
     }
 
     /// The retry's log lines carry the origin, counts and a reach class only.
