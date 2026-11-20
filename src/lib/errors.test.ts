@@ -208,6 +208,12 @@ describe('errorCopy', () => {
   it('words an intercepted connection as an interception, not as no internet (MR-2548)', () => {
     const copy = errorCopy(err('tls_intercepted'));
     expect(copy).toEqual({ message: TLS_INTERCEPTED_COPY, action: 'retry' });
+    // The owner's wording (2026-11-20), word for word.
+    expect(copy.message).toBe(
+      'Something on this network or computer is intercepting secure connections (often antivirus ' +
+        'HTTPS scanning or a work network), so BirdoVPN sent nothing. Turn off HTTPS scanning or try ' +
+        'a different network.',
+    );
     expect(copy.message).toMatch(/intercepting secure connections/);
     expect(copy.message).toMatch(/sent nothing/);
     expect(copy.message).not.toMatch(/internet|latest version/i);
