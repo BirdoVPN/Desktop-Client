@@ -2013,9 +2013,12 @@ impl BirdoApi {
             move |presented| async move { self.refresh_flight(presented.as_str()).await },
             |access, rotated| {
                 use crate::storage::credentials::{CredentialKey, CredentialStore};
-                if let Err(e) = CredentialStore::store(CredentialKey::AccessToken, access) {
-                    tracing::error!("Could not persist refreshed access token ({e})");
-                }
+                // The ROTATED refresh token is written FIRST (review P469-L2): a kill
+                // between the two writes must never leave a fresh access token beside
+                // the CONSUMED refresh token, which the next refresh would replay and
+                // the server would treat as theft (every session revoked). Written in
+                // this order, a kill leaves the new refresh token with an older access
+                // token, which simply fails with 401 and refreshes.
                 // `None` means the server did not rotate, so the stored
                 // refresh token is still current and must be left alone.
                 if let Some(rotated) = rotated {
@@ -2025,6 +2028,9 @@ impl BirdoApi {
                              will replay a consumed token and the session will be revoked"
                         );
                     }
+                }
+                if let Err(e) = CredentialStore::store(CredentialKey::AccessToken, access) {
+                    tracing::error!("Could not persist refreshed access token ({e})");
                 }
             },
         )
@@ -2837,6 +2843,29 @@ mod token_restore_tests {
         assert!(internal.contains("self.refresh_and_adopt("));
         assert!(internal.contains("self.refresh_flight(presented.as_str())"));
         assert!(internal.contains("CredentialStore::store(CredentialKey::RefreshToken, rotated)"));
+        // Review P469-L2: the rotated refresh token is persisted BEFORE the access
+        // token, here and in CredentialStore::store_tokens, so a kill between the
+        // two writes never leaves a new access token beside a consumed refresh token.
+        let refresh_at = internal
+            .find("CredentialStore::store(CredentialKey::RefreshToken, rotated)")
+            .expect("the rotated refresh token is persisted");
+        let access_at = internal
+            .find("CredentialStore::store(CredentialKey::AccessToken, access)")
+            .expect("the access token is persisted");
+        assert!(refresh_at < access_at, "P469-L2: refresh token first");
+        const CREDS: &str = include_str!("../storage/credentials.rs");
+        let store_tokens = &CREDS[CREDS.find("pub fn store_tokens(").expect("store_tokens")..];
+        let store_tokens =
+            &store_tokens[..store_tokens.find("\n    }").expect("end of store_tokens")];
+        assert!(
+            store_tokens
+                .find("CredentialKey::RefreshToken")
+                .expect("refresh stored")
+                < store_tokens
+                    .find("CredentialKey::AccessToken")
+                    .expect("access stored"),
+            "P469-L2: store_tokens writes the refresh token first"
+        );
         let adopt = fn_body("async fn refresh_and_adopt<");
         assert!(adopt.contains(".inspect_err(super::session_gate::report_refresh_failure)?"));
         assert!(adopt.contains(".adopt_refreshed("));
