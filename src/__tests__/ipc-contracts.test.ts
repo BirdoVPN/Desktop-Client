@@ -204,6 +204,10 @@ describe('session-expired (contract §3.3)', () => {
     expect(parseSessionExpired({ reason: 'revoked' })).toBe('revoked');
     expect(parseSessionExpired({ reason: 'expired' })).toBe('expired');
     expect(parseSessionExpired(null)).toBe('expired');
+    // MR-2517: a refresh refused after a deletion whose answer was lost.
+    expect(parseSessionExpired({ reason: 'deleted' })).toBe('deleted');
+    expect(parseSessionExpired({ reason: 'Deleted' })).toBe('expired');
+    expect(parseSessionExpired({ reason: 42 })).toBe('expired');
   });
 });
 
