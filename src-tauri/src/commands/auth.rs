@@ -4,7 +4,6 @@
 
 use crate::api::client::AccountDeletion;
 use crate::api::error::ApiError;
-use crate::api::session_gate::{self, RefreshOutcome, StoredSession};
 use crate::api::types::{
     AccountNumber, LoginResult, RotateConfirmBody, RotatePrepareBody, UserProfile,
 };
@@ -839,6 +838,51 @@ pub async fn export_user_data(api: State<'_, BirdoApi>) -> Result<serde_json::Va
     api.export_user_data().await.map_err(IpcError::from)
 }
 
+/// What `get_auth_state` answers when the stored session's profile could not
+/// be fetched (MR-2550, review P469-L1). Decided from `get_profile`'s answer
+/// alone: its 401 has already run the refresh, so there is nothing left to
+/// try, and a second flight here would only present the same token again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileFailure {
+    /// Signed in, the identity unknown this cycle: the token is not the
+    /// problem, or may work next time.
+    KeepSession,
+    /// The server refused the session's refresh. The session gate has ended
+    /// it (`commands::session::handle_session_expired`, which also discards
+    /// the stored session when the refresh token itself was rejected).
+    SignedOut,
+    /// There was no session to ask with any more (a Sign Out, an expiry): the
+    /// answer is what memory holds now.
+    AsMemoryHolds,
+}
+
+/// `renewed`: the profile's 401 came back although the session was renewed
+/// during the call (its refresh worked, or a sign-in landed), so the 401 is
+/// no verdict on the session in memory now.
+///
+/// Only a DEFINITIVE rejection may end the stored session. Clearing it on
+/// any error used to throw away a valid 30-day refresh token at a launch
+/// with no connectivity (on a plane, behind a captive portal, mid-deploy),
+/// and an anonymous account whose number was never written down with it.
+/// The cost is asymmetric: keeping a dead token costs one failed request
+/// next launch, discarding a live one costs the account.
+///
+/// - 429, a 5xx that named its wait, a held request (MR-1808): "come back
+///   later", nothing about the token.
+/// - 401 (`Unauthorized`) and not renewed: `request_with_retry` refreshed,
+///   and the server refused it (MR-2500 / MR-1771: only a 401 ends a
+///   session; `error_after_failed_refresh`): signed out.
+/// - `NotAuthenticated`: as memory holds it.
+/// - anything else (no answer, a 5xx, a refresh that failed transiently and
+///   is held, a pin failure, an unreadable body): kept.
+fn after_profile_failure(error: &ApiError, renewed: bool) -> ProfileFailure {
+    match error {
+        ApiError::Unauthorized if !renewed => ProfileFailure::SignedOut,
+        ApiError::NotAuthenticated => ProfileFailure::AsMemoryHolds,
+        _ => ProfileFailure::KeepSession,
+    }
+}
+
 /// Get current authentication state
 #[tauri::command]
 pub async fn get_auth_state(
@@ -854,139 +898,43 @@ pub async fn get_auth_state(
             api.restore_tokens_if_absent(tokens.access_token.clone(), tokens.refresh_token.clone())
                 .await;
 
-            // Try to get user profile to validate token
+            // MR-2550 (review P469-L1): the session `get_profile` starts
+            // with, to tell a renewal during it from a refusal.
+            let before = api.access_token_value().await;
+            // Try to get user profile to validate token. Its 401 runs THE
+            // refresh (`request_with_retry`: detached, adopt-checked, after
+            // the "token changed while waiting" check), and the session gate
+            // ends the session when the server rejects it. No second flight
+            // here: one used to follow every failure but a 429/503, so a
+            // launch could present a dead token twice, or rotate a renewed
+            // pair again for nothing (each rotation one more lost-answer
+            // window), and an offline launch spent a refresh on every
+            // identity retry.
             match api.get_profile().await {
                 Ok(profile) => Ok(AuthState::of(profile)),
-                // Rate limited — the token is FINE, the server is just asking us
-                // to slow down. Refreshing here would spend another request on
-                // the same exhausted budget (and `/auth/refresh` is itself in the
-                // strict bucket), so a 429 would amplify into two. Keep the
-                // session and report the identity as unknown for this cycle; the
-                // next poll succeeds once the window rolls over.
-                //
-                // MR-1808: this arm matched only a 429 WITHOUT a message, and
-                // the backend puts one on every error, so a real 429 went on
-                // to the refresh anyway. Every 429 is `RateLimited` now; a 5xx
-                // that named its wait (`ServerBusy`) is the same "come back
-                // later", and says nothing about the token either.
-                Err(
-                    e @ (crate::api::error::ApiError::RateLimited { .. }
-                    | crate::api::error::ApiError::ServerBusy { .. }
-                    | crate::api::error::ApiError::Held { .. }),
-                ) => {
-                    tracing::warn!(
-                        "Profile fetch refused for now ({e}) — NOT refreshing; session kept, \
-                         identity unknown this cycle"
-                    );
-                    Ok(AuthState::unknown_identity(true))
-                }
                 Err(e) => {
-                    tracing::info!("Profile fetch failed ({e}) — attempting token refresh");
-                    // Token might be expired, try refresh.
-                    //
-                    // MR-2538 (D-L3 of the #467 review): the refresh a 401 runs
-                    // (`BirdoApi::refresh_session`), not a refresh of its own. It
-                    // runs detached to its end, so dropping this call loses
-                    // neither the lock nor the rotated pair; it adopts the pair
-                    // only if the session that asked is still there; and it
-                    // stores the pair, in memory and in the OS keystore, before
-                    // it releases the refresh lock.
-                    let refreshed = api.refresh_session().await;
-                    match (session_gate::refresh_outcome(&refreshed), refreshed) {
-                        (_, Ok(())) => {
-                            // MR-2538: the rotated pair is in the keystore already,
-                            // written under the refresh lock (`adopt_refreshed`),
-                            // which also logs a keystore that refused it. This arm
-                            // used to write it here, after the lock was released: a
-                            // kill in between left the consumed token stored for the
-                            // next launch to replay, and a Sign Out in between had
-                            // its cleared keystore written back.
-                            //
-                            // Re-fetch the profile with the refreshed access token so the
-                            // identity is populated. Previously this returned email:None,
-                            // so any auth check that hit the refresh path (e.g. app restart
-                            // once the access token had expired) made the app show
-                            // "Anonymous" for a real signed-in account.
-                            match api.get_profile().await {
-                                Ok(profile) => Ok(AuthState::of(profile)),
-                                // The refresh succeeded, so the session IS valid — do
-                                // not sign the user out over what is almost always a
-                                // transient network error. The identity is reported as
-                                // unknown (not as "no account"); the UI must render
-                                // that as a pending state rather than inventing one.
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Profile fetch failed after a successful token refresh \
-                                         ({e}) — session kept, identity unknown this cycle"
-                                    );
-                                    Ok(AuthState::unknown_identity(true))
-                                }
-                            }
-                        }
-                        // Only a DEFINITIVE rejection may destroy the stored session.
-                        //
-                        // This arm used to clear the keystore on ANY refresh error, so
-                        // launching with no connectivity — on a plane, behind a captive
-                        // portal, or simply while the backend was mid-deploy — threw
-                        // away a valid 30-day refresh token and signed the user out for
-                        // good. They had to type their password again, and an anonymous
-                        // account whose 24-digit ID they had not written down was gone
-                        // permanently. The cost is asymmetric: keeping a dead token
-                        // costs one failed request next launch, discarding a live one
-                        // costs the account.
-                        //
-                        // The session gate decides (REVIEW-WIN2-003, Android/iOS
-                        // `RefreshOutcome` parity): a 401 means the server rejected
-                        // the refresh token — it will never work again, so clearing
-                        // is right, and it is the only answer that does (MR-2500 /
-                        // MR-1771). Everything else (Network, ServerError, a 503
-                        // that put back a token whose rotation failed, RateLimited,
-                        // a 403 from in front of the backend,
-                        // CertificatePinningFailed, Parse) may well succeed on the
-                        // next attempt, so the session is kept and reported as
-                        // signed-in-with-unknown-identity, exactly as the
-                        // profile-fetch failure above already does.
-                        //
-                        // NOTE: this distinction only became reliable once
-                        // classify_error_response stopped collapsing every backend 401
-                        // into ApiError::Unknown. Before that, Unauthorized was
-                        // unreachable and this arm could not have told the cases apart.
-                        (RefreshOutcome::Unauthorized, Err(e)) => {
-                            if session_gate::stored_session_after(&e) == StoredSession::Discard {
-                                tracing::info!(
-                                    "Refresh token rejected by the server — clearing stored session"
-                                );
-                                let _ = credentials.clear_tokens();
-                            } else {
-                                tracing::info!(
-                                    "Refresh refused by the server — signed out, stored session kept"
-                                );
-                            }
-                            Ok(AuthState::unknown_identity(false))
-                        }
-                        // MR-2538: no session to refresh any more. It ended (a Sign
-                        // Out, an expiry) or was replaced while the refresh ran, or
-                        // just before it: the renewal, if one came, was dropped,
-                        // from memory and the keystore alike, and clearing is the
-                        // Sign Out's or the expiry's business. The answer is what
-                        // memory holds now. On main this put the pair back over a
-                        // Sign Out (signed in again), and a session already gone
-                        // read as signed in with an unknown identity.
-                        (_, Err(ApiError::NotAuthenticated)) => {
-                            tracing::info!(
-                                "The session ended while the start-up check refreshed it — \
-                                 nothing restored"
-                            );
-                            Ok(AuthState::unknown_identity(api.is_authenticated().await))
-                        }
-                        (_, Err(e)) => {
+                    let renewed = matches!(e, ApiError::Unauthorized) && {
+                        let now = api.access_token_value().await;
+                        now.is_some() && now != before
+                    };
+                    Ok(match after_profile_failure(&e, renewed) {
+                        ProfileFailure::KeepSession => {
                             tracing::warn!(
-                                "Token refresh failed transiently ({e}) — KEEPING the stored \
-                                 session; identity unknown this cycle"
+                                "Profile fetch failed ({e}) — session kept, identity unknown                                  this cycle"
                             );
-                            Ok(AuthState::unknown_identity(true))
+                            AuthState::unknown_identity(true)
                         }
-                    }
+                        ProfileFailure::SignedOut => {
+                            tracing::info!("The server refused the session's refresh — signed out");
+                            AuthState::unknown_identity(false)
+                        }
+                        ProfileFailure::AsMemoryHolds => {
+                            tracing::info!(
+                                "The session ended while the start-up check ran — nothing                                  restored"
+                            );
+                            AuthState::unknown_identity(api.is_authenticated().await)
+                        }
+                    })
                 }
             }
         }
@@ -2273,39 +2221,89 @@ mod account_boundary_tests {
         }
     }
 
-    /// MR-2538 (D-L3 of the #467 review): the start-up refresh is the one a
-    /// 401 runs (`BirdoApi::refresh_session`: detached, adopted only by the
-    /// session that asked, stored under the refresh lock; driven in
-    /// `api::client`). So `get_auth_state` writes none of it to the keystore
-    /// itself, after the lock is gone. Its answers stay as they were: a 401
-    /// signs out (discarding the stored session as the gate says), anything
-    /// else keeps the session, and a session that ended while it ran is
-    /// reported as memory holds it, never put back.
+    /// MR-2550 (review P469-L1): `get_auth_state` runs no refresh of its own.
+    /// `get_profile`'s 401 already ran THE refresh (`request_with_retry`:
+    /// detached, adopt-checked, after the "token changed while waiting"
+    /// check), so a second flight could only present a dead token again or
+    /// rotate a renewed pair for nothing. MR-2538's rule stands: nothing here
+    /// writes the keystore. On main it ran `api.refresh_session()` after
+    /// every failure but a 429/503.
     #[test]
-    fn the_startup_refresh_is_the_one_a_401_runs() {
+    fn the_startup_check_runs_no_refresh_of_its_own() {
         let state = body("get_auth_state");
-        assert!(state.contains("api.refresh_session().await"));
-        assert!(!state.contains(".refresh_token()"), "the old refresh");
+        for refresh in [
+            "refresh_session",
+            "refresh_detached",
+            ".refresh_token()",
+            "retry_held_refresh",
+        ] {
+            assert!(!state.contains(refresh), "{refresh}");
+        }
         assert!(!state.contains("store_tokens("), "stored outside the lock");
-        let renewed = state.find("(_, Ok(())) =>").expect("the renewal");
-        let rejected = state
-            .find("(RefreshOutcome::Unauthorized, Err(e)) =>")
-            .expect("the 401");
-        let gone = state
-            .find("(_, Err(ApiError::NotAuthenticated)) =>")
-            .expect("the session gone");
-        let kept = state.find("(_, Err(e)) =>").expect("the transient failure");
-        assert!(renewed < rejected && rejected < gone && gone < kept);
-        let rejected = &state[rejected..gone];
         assert!(
-            rejected.contains("session_gate::stored_session_after(&e) == StoredSession::Discard")
+            !state.contains("credentials.clear_tokens()"),
+            "the gate's to clear, for the session it ended"
         );
-        assert!(rejected.contains("credentials.clear_tokens()"));
-        assert!(rejected.contains("Ok(AuthState::unknown_identity(false))"));
-        let gone = &state[gone..kept];
-        assert!(gone.contains("Ok(AuthState::unknown_identity(api.is_authenticated().await))"));
-        assert!(!gone.contains("credentials."), "the keystore touched");
-        assert!(state[kept..].contains("Ok(AuthState::unknown_identity(true))"));
+        let before = state
+            .find("let before = api.access_token_value().await;")
+            .expect("the session it starts with");
+        let fetched = state.find("api.get_profile().await").expect("the fetch");
+        assert!(before < fetched);
+        assert!(state.contains("after_profile_failure(&e, renewed)"));
+        assert_eq!(
+            state.matches("api.get_profile()").count(),
+            1,
+            "a second fetch"
+        );
+    }
+
+    /// MR-2550: what the start-up check answers, from `get_profile`'s error
+    /// alone. Only a 401 the refresh could not answer signs out; a 401 after
+    /// a renewal, no answer, a 5xx, a held or rate-limited request, a pin
+    /// failure or an unreadable body keeps the session; a session already
+    /// gone is answered as memory holds it.
+    #[test]
+    fn the_startup_check_decides_from_the_profile_answer() {
+        use super::{after_profile_failure, ProfileFailure};
+        use crate::api::error::ApiError;
+        assert_eq!(
+            after_profile_failure(&ApiError::Unauthorized, false),
+            ProfileFailure::SignedOut
+        );
+        assert_eq!(
+            after_profile_failure(&ApiError::Unauthorized, true),
+            ProfileFailure::KeepSession,
+            "renewed during the call"
+        );
+        for renewed in [false, true] {
+            assert_eq!(
+                after_profile_failure(&ApiError::NotAuthenticated, renewed),
+                ProfileFailure::AsMemoryHolds
+            );
+        }
+        for kept in [
+            ApiError::Network("offline".into()),
+            ApiError::RateLimited {
+                retry_after_secs: Some(30),
+            },
+            ApiError::ServerBusy {
+                status: 503,
+                retry_after_secs: 1,
+            },
+            ApiError::Held {
+                status: 503,
+                retry_after_secs: 1,
+            },
+            ApiError::ServerError(502),
+            ApiError::Forbidden,
+            ApiError::CertificatePinningFailed("x".into()),
+            ApiError::Parse("eof".into()),
+        ] {
+            assert_eq!(
+                after_profile_failure(&kept, false),
+                ProfileFailure::KeepSession
+            );
+        }
     }
 
     /// MR-179: the proof rides the deletion call (number as digits, code
