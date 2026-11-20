@@ -2495,6 +2495,9 @@ mod dial_tests {
         current: Cell<bool>,
         /// A Disconnect lands while the list is fetched.
         superseded_by_the_fetch: bool,
+        /// A Disconnect lands during this attempt (1-based): it answers
+        /// `cancelled`, as `attempt` does when its epoch moves.
+        superseded_on_dial: Option<usize>,
         /// (server, transport) per attempt, in order.
         dialled: Vec<(String, Option<&'static str>)>,
         gaps: u32,
@@ -2512,6 +2515,7 @@ mod dial_tests {
                 stealth_setting: false,
                 current: Cell::new(true),
                 superseded_by_the_fetch: false,
+                superseded_on_dial: None,
                 dialled: Vec::new(),
                 gaps: 0,
                 list_fetches: 0,
@@ -2544,9 +2548,15 @@ mod dial_tests {
                 ConnectTarget::MultiHop { entry_id, exit_id } => format!("{entry_id}>{exit_id}"),
             };
             self.dialled.push((server, transport));
-            self.answers
+            let answer = self
+                .answers
                 .pop_front()
-                .unwrap_or_else(|| Err(unanswered()))
+                .unwrap_or_else(|| Err(unanswered()));
+            if self.superseded_on_dial == Some(self.dialled.len()) {
+                self.current.set(false);
+                return Err(IpcError::cancelled());
+            }
+            answer
         }
 
         fn attempted_stealth(&self) -> bool {
@@ -2938,6 +2948,182 @@ mod dial_tests {
         assert_eq!(world.dialled(), vec![("srv-fra", None), ("srv-nyc", None)]);
         assert_eq!(world.stealth_notices.get(), 0);
         assert_eq!(world.retry_notices.get(), 1);
+    }
+
+    /// A user's pick goes to another server in the same CITY first, even a
+    /// fuller one, before the rest of its country; the log never says
+    /// other-country for it (review of #470, delta item 3).
+    #[tokio::test]
+    async fn a_users_pick_is_retried_in_its_own_city_first() {
+        let mut list = fleet();
+        list.push(server("srv-fra-2", "DE", "Frankfurt", 90, true, true));
+        list.push(server("srv-ber", "DE", "Berlin", 0, true, true));
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = Some(list);
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(world.dialled().last(), Some(&("srv-fra-2", None)));
+        assert!(world.logged("(user pick, same-city)"), "{:?}", world.log);
+        assert!(!world.logged("other-country"), "{:?}", world.log);
+    }
+
+    /// Where the failed server was: its entry in the fresh list, else where
+    /// an earlier list put it (read before this list is remembered). A
+    /// user's pick gone from the fresh list still moves within that
+    /// country. With neither, its country is unknown: a user's pick does
+    /// not move, and the server's own error stands.
+    #[tokio::test]
+    async fn a_users_pick_gone_from_the_fresh_list_keeps_its_country_from_an_earlier_list() {
+        crate::vpn::relay_retry::remember(&[server(
+            "srv-gone-known",
+            "DE",
+            "Frankfurt",
+            5,
+            true,
+            true,
+        )]);
+        let mut list = fleet();
+        list.push(server("srv-ber", "DE", "Berlin", 40, true, true));
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = Some(list.clone());
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-gone-known"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(world.dialled().last(), Some(&("srv-ber", None)));
+
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(())]);
+        world.servers = Some(list);
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-gone-unknown"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, IpcErrorCode::ServerUnreachable);
+        assert_eq!(world.dialled().len(), 2, "{:?}", world.dialled());
+        assert_eq!(world.retry_notices.get(), 0);
+    }
+
+    /// Review L2: only a server that truly did not answer spends the retry.
+    /// A local failure of the Stealth attempt (the adapter, the kill switch,
+    /// a rate limit) would fail the same way on any server, and an actively
+    /// refused handshake is not a silent one: neither moves the connect. A
+    /// backend that calls the server unavailable does.
+    #[tokio::test]
+    async fn only_a_true_no_answer_spends_the_retry() {
+        let refused = IpcError::from_tunnel_failure(&format!(
+            "Failed to start tunnel: Handshake failed: {}",
+            crate::vpn::ERR_HANDSHAKE_RECV
+        ));
+        for (first, second) in [
+            (
+                unanswered(),
+                IpcError::from_tunnel_failure("Failed to create the adapter"),
+            ),
+            (
+                unanswered(),
+                IpcError::new(IpcErrorCode::KillswitchFailed, "kill switch"),
+            ),
+            (
+                unanswered(),
+                IpcError::new(IpcErrorCode::RateLimited, "slow down"),
+            ),
+            (refused, unanswered()),
+        ] {
+            let last_code = second.code;
+            let mut world = World::answering([Err(first), Err(second), Ok(()), Ok(())]);
+            let result = dial(
+                &mut world,
+                &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+                ConnectPurpose::User,
+            )
+            .await;
+            assert_eq!(result.unwrap_err().code, last_code);
+            assert_eq!(world.dialled().len(), 2, "{:?}", world.dialled());
+            assert_eq!(world.list_fetches, 0);
+            assert_eq!(world.retry_notices.get(), 0);
+        }
+        let mut world = World::answering([
+            Err(unanswered()),
+            Err(IpcError::connect_refused_with(
+                "Server unavailable",
+                false,
+                Some("server_unavailable"),
+                None,
+            )),
+            Ok(()),
+        ]);
+        assert!(dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await
+        .is_ok());
+        assert_eq!(world.dialled().last(), Some(&("srv-nyc", None)));
+    }
+
+    /// Review L4 and its test gap: a Disconnect during the retry's own dial
+    /// ends the connect as cancelled, nothing is dialled after it, and it is
+    /// neither counted nor logged as a retry that failed.
+    #[tokio::test]
+    async fn a_retry_cancelled_during_its_dial_is_not_counted_as_failed() {
+        let mut world = World::answering([Err(unanswered()), Err(unanswered()), Ok(()), Ok(())]);
+        world.superseded_on_dial = Some(3);
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, IpcErrorCode::Cancelled);
+        assert_eq!(world.dialled().len(), 3, "{:?}", world.dialled());
+        assert!(!world.logged("failed too"), "{:?}", world.log);
+        assert!(!world.logged("this run: "), "{:?}", world.log);
+    }
+
+    /// Review test gap: without a retry there is no extra gap cover; the
+    /// Stealth retry's is the only one, and none without it.
+    #[tokio::test]
+    async fn no_gap_is_covered_for_a_retry_that_does_not_run() {
+        let mut world = World::answering([Err(unanswered()), Err(unanswered())]);
+        world.servers = None;
+        let _ = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert_eq!(world.gaps, 1, "the Stealth retry's only");
+
+        let mut world = World::answering([Err(unanswered()), Err(unanswered())]);
+        let _ = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::User, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert_eq!(world.gaps, 1, "the Stealth retry's only");
+
+        let mut world = World::answering([Err(IpcError::from_tunnel_failure(
+            "Failed to create the adapter",
+        ))]);
+        let _ = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert_eq!(world.gaps, 0);
     }
 
     /// Everything the retry path logs is counts: the origin, the retry's

@@ -561,7 +561,8 @@ describe("Auto-Connect keeps the user's server in its country (MR-2492)", () => 
     const first = render(<VpnSessionController />);
     await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));
     // Rust's Quick Connect found Frankfurt unusable and took Stockholm.
-    emit('vpn-status-changed', { state: 'connected', seq: 5, server_id: 'sto', error: null });
+    // MR-2569: Rust says who chose the server its tray Quick Connect took.
+    emit('vpn-status-changed', { state: 'connected', seq: 5, server_id: 'sto', server_origin: 'automatic', error: null });
     await waitFor(() => expect(useAppStore.getState().lastServerId).toBe('sto'));
     first.unmount();
 
@@ -580,7 +581,8 @@ describe("Auto-Connect keeps the user's server in its country (MR-2492)", () => 
     useAppStore.setState({ lastServerId: 'fra' });
     const first = render(<VpnSessionController />);
     await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));
-    emit('vpn-status-changed', { state: 'connected', seq: 5, server_id: 'sto', error: null });
+    // MR-2569: Rust says who chose the server its tray Quick Connect took.
+    emit('vpn-status-changed', { state: 'connected', seq: 5, server_id: 'sto', server_origin: 'automatic', error: null });
     await waitFor(() => expect(useAppStore.getState().lastServerOrigin).toBe('automatic'));
     first.unmount();
 
@@ -675,6 +677,17 @@ describe('the one retry on another server (MR-2514)', () => {
     expect(s.lastServerOrigin).toBe('user');
   });
 
+  // Review L1: the record names where the tunnel really is, even before the
+  // UI's list has that server; the card follows once the list does.
+  it("the record names the server Rust's retry landed on even when the UI's list lacks it", async () => {
+    useAppStore.setState({ servers: [fra, ams] });
+    connectLandsOn('zrh');
+    await expect(connectToServer(fra, 'automatic')).resolves.toBe(true);
+    const s = useAppStore.getState();
+    expect(s.lastServerId).toBe('zrh');
+    expect(s.lastServerOrigin).toBe('automatic');
+  });
+
   it("a user's pick that Rust retried in its own country: the card follows, and it stays the user's", async () => {
     const ber = stored('ber', 'DE', 'Berlin', 40);
     useAppStore.setState({ servers: [fra, ams, ber] });
@@ -686,6 +699,50 @@ describe('the one retry on another server (MR-2514)', () => {
     expect(s.lastServerId).toBe('ber');
     // Still the user's: a later move never takes it out of Germany.
     expect(s.lastServerOrigin).toBe('user');
+  });
+});
+
+/**
+ * MR-2569 (review M1 of #470): when Rust moves a session to another server
+ * (a drain or a deletion, MR-2390; the retry after no handshake, MR-2514),
+ * the card follows the tunnel and the record takes WHO CHOSE from Rust's
+ * status. It used to record any server it had not recorded itself as the
+ * client's pick, so a user's location moved within its country became
+ * "automatic", and the next connect could take it abroad without a click.
+ */
+describe("a server Rust moved to keeps who chose it (MR-2569)", () => {
+  beforeEach(() => {
+    servers = [
+      server('fra', 10, { countryCode: 'DE', city: 'Frankfurt' }),
+      server('ber', 40, { countryCode: 'DE', city: 'Berlin' }),
+      server('ams', 30, { country: 'Netherlands', countryCode: 'NL', city: 'Amsterdam' }),
+    ];
+    useAppStore.setState({ lastServerId: 'fra', lastServerOrigin: 'user' });
+  });
+
+  it("a user's pick Rust moved within its country stays the user's", async () => {
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));
+    emit('vpn-status-changed', { state: 'connected', seq: 5, server_id: 'ber', server_origin: 'user', error: null });
+    await waitFor(() => expect(useAppStore.getState().lastServerId).toBe('ber'));
+    expect(useAppStore.getState().currentServer?.id).toBe('ber');
+    expect(useAppStore.getState().lastServerOrigin).toBe('user');
+  });
+
+  it("a status that does not say who chose never turns the user's record into the client's", async () => {
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));
+    emit('vpn-status-changed', { state: 'connected', seq: 5, server_id: 'ber', error: null });
+    await waitFor(() => expect(useAppStore.getState().lastServerId).toBe('ber'));
+    expect(useAppStore.getState().lastServerOrigin).toBe('user');
+  });
+
+  it("the client's own pick, as Rust says, is recorded as the client's", async () => {
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));
+    emit('vpn-status-changed', { state: 'connected', seq: 5, server_id: 'ams', server_origin: 'automatic', error: null });
+    await waitFor(() => expect(useAppStore.getState().lastServerId).toBe('ams'));
+    expect(useAppStore.getState().lastServerOrigin).toBe('automatic');
   });
 });
 
