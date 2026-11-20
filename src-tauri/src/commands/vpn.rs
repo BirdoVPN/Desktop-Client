@@ -1366,9 +1366,13 @@ pub async fn get_subscription_status(
 /// refuse when signed out.
 ///
 /// Errors are returned as `Err` rather than swallowed into a default here: the
-/// CALLER owns the fallback, and the frontend's fallback is "available". If
-/// this returned a synthesized `dnsFilteringAvailable: false` on a network
-/// blip, every offline client would hide a feature that works.
+/// CALLER owns the fallback. The frontend keeps the answer it had (unknown,
+/// which hides the BirdoShield row, until a fetch first answers; owner
+/// 2026-11-13), and Rust's gate keeps its own last answer too
+/// (`api::client::note_dns_filtering_gate` runs on a success only; MR-2373:
+/// restored at start-up from the last run's, `commands::shield_gate`). A
+/// synthesized `dnsFilteringAvailable: false` on a network blip would turn
+/// both off over a fetch that said nothing.
 #[tauri::command]
 pub async fn get_client_config(
     api: State<'_, BirdoApi>,
@@ -1902,18 +1906,82 @@ mod tests {
     /// `dnsFilteringAvailable == Some(true)`: an explicit `false` and an absent
     /// field both turn it off. The ONLY test that writes the process-wide gate
     /// (nothing else in the suite reads it), so it cannot race another test.
+    ///
+    /// MR-2373: the gate starts at what the last run left on record (here ON,
+    /// as `commands::shield_gate::load` restores it before the window can
+    /// dial), so a cold-start dial sends the flag before the first fetch; and
+    /// every CHANGE a fetch makes, and only a change, is kept for the next
+    /// launch. At 6ddfdc8 it started off, in memory only.
     #[test]
     fn the_fleet_gate_is_on_only_for_an_explicit_true() {
-        use crate::api::client::{dns_filtering_gate_on, note_dns_filtering_gate};
+        use crate::api::client::{
+            dns_filtering_gate_on, dns_filtering_with_gate, note_dns_filtering_gate,
+            restore_dns_filtering_gate,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static KEPT: AtomicUsize = AtomicUsize::new(0);
+        restore_dns_filtering_gate(true, || {
+            KEPT.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(dns_filtering_gate_on(), "the last run's ON");
+        assert!(
+            dns_filtering_with_gate(true, dns_filtering_gate_on()),
+            "a cold-start dial sends the flag"
+        );
+        assert_eq!(KEPT.load(Ordering::SeqCst), 0, "restoring is no change");
         note_dns_filtering_gate(Some(true));
         assert!(dns_filtering_gate_on());
+        assert_eq!(
+            KEPT.load(Ordering::SeqCst),
+            0,
+            "an unchanged answer is not rewritten"
+        );
         note_dns_filtering_gate(None);
         assert!(!dns_filtering_gate_on(), "absent is not on");
+        assert_eq!(KEPT.load(Ordering::SeqCst), 1, "the change is kept");
         note_dns_filtering_gate(Some(true));
         note_dns_filtering_gate(Some(false));
         assert!(!dns_filtering_gate_on());
+        assert_eq!(KEPT.load(Ordering::SeqCst), 3);
         note_dns_filtering_gate(None);
         assert!(!dns_filtering_gate_on());
+        assert_eq!(KEPT.load(Ordering::SeqCst), 3);
+    }
+
+    /// MR-2373 (the reviewer's "no test pins the wiring"): the gate is moved
+    /// by a SUCCESSFUL config fetch and by nothing else: `get_client_config`
+    /// notes the answer only after the response was read as the config (a
+    /// failed fetch returns before it), and nothing else in the client
+    /// writes the gate but `note_dns_filtering_gate` and the start-up
+    /// restore.
+    #[test]
+    fn only_a_successful_config_fetch_moves_the_fleet_gate() {
+        let client = include_str!("../api/client.rs").replace('\r', "");
+        let code = &client[..client
+            .find("mod control_plane_hosts_tests")
+            .expect("the tests")];
+        let fetch = &code[code
+            .find("pub async fn get_client_config(&self)")
+            .expect("get_client_config")..];
+        let fetch = &fetch[..fetch.find("\n    }").expect("end of fn")];
+        let read = fetch
+            .find(".await?;")
+            .expect("the config read, failing first");
+        let noted = fetch
+            .find("note_dns_filtering_gate(config.dns_filtering_available);")
+            .expect("the gate noted");
+        assert!(read < noted, "noted before the fetch succeeded");
+        assert_eq!(
+            code.matches("DNS_FILTERING_GATE_ON.store(").count()
+                + code.matches("DNS_FILTERING_GATE_ON.swap(").count(),
+            2,
+            "another writer of the gate"
+        );
+        assert_eq!(
+            code.matches("note_dns_filtering_gate(").count(),
+            2,
+            "its definition and the one call"
+        );
     }
 
     /// The gate is applied at the wire, not folded into the settings the

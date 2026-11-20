@@ -573,6 +573,12 @@ fn main() {
                     .unwrap_or(false),
             );
 
+            // MR-2373: the BirdoShield fleet gate the last run's config fetch
+            // left on record, before the window exists: a cold-start
+            // Auto-Connect (the window starts it) then dials with the
+            // last-known gate, not with an in-memory "off".
+            commands::shield_gate::load(app.handle());
+
             // MR-1946: the main window is built here, not by Tauri from
             // tauri.conf.json ("create": false), so that on Windows it runs on
             // a WebView2 environment that keeps WebView2's crash reports on

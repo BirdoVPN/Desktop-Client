@@ -204,8 +204,31 @@ impl PinRejection {
     /// InvalidData) → `rustls::Error`; through a proxy, with one `io::Error`
     /// fewer.
     pub(crate) fn in_chain(error: &(dyn StdError + 'static)) -> Option<Self> {
-        find_rejection(error, CHAIN_DEPTH)
+        find_tls(error, CHAIN_DEPTH, &Self::of)
     }
+}
+
+/// MR-2548 (D468-I3 of the #468 review): whether a failed request's handshake
+/// was refused by step 1 of the verifier, WebPKI, because the chain does not
+/// end at a root it trusts (`CertificateError::UnknownIssuer`), anywhere in
+/// `error` and the errors under it ([`PinRejection::in_chain`]'s walk).
+///
+/// The roots are the compiled-in webpki-roots, not the OS store, so a root
+/// an antivirus's HTTPS scanning or an office proxy installed on the machine
+/// is not one of them: that interception, probably the most common one on
+/// Windows, fails HERE, before the pin is asked, and used to reach the user
+/// as `network_offline` ("No internet connection"). Matched on the type
+/// rustls puts in the chain, never on any text. Any other WebPKI refusal (an
+/// expired certificate, a name mismatch) is not this.
+pub(crate) fn untrusted_issuer_in_chain(error: &(dyn StdError + 'static)) -> bool {
+    find_tls(error, CHAIN_DEPTH, &|tls| {
+        matches!(
+            tls,
+            TlsError::InvalidCertificate(CertificateError::UnknownIssuer)
+        )
+        .then_some(())
+    })
+    .is_some()
 }
 
 impl fmt::Display for PinRejection {
@@ -221,22 +244,28 @@ impl StdError for PinRejection {}
 /// else's bug) from looping here.
 const CHAIN_DEPTH: u8 = 16;
 
-fn find_rejection(error: &(dyn StdError + 'static), depth: u8) -> Option<PinRejection> {
+/// The first rustls error in `error` and the errors under it that `found`
+/// recognises.
+fn find_tls<T>(
+    error: &(dyn StdError + 'static),
+    depth: u8,
+    found: &dyn Fn(&TlsError) -> Option<T>,
+) -> Option<T> {
     let depth = depth.checked_sub(1)?;
-    if let Some(found) = error.downcast_ref::<TlsError>().and_then(PinRejection::of) {
-        return Some(found);
+    if let Some(hit) = error.downcast_ref::<TlsError>().and_then(found) {
+        return Some(hit);
     }
     // `io::Error::source()` skips the error an `io::Error` wraps (it answers
     // that error's own source), and the rustls error comes up inside two of
     // them. So each `io::Error` is looked into as well as past.
-    if let Some(found) = error
+    if let Some(hit) = error
         .downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::get_ref)
-        .and_then(|wrapped| find_rejection(wrapped, depth))
+        .and_then(|wrapped| find_tls(wrapped, depth, found))
     {
-        return Some(found);
+        return Some(hit);
     }
-    find_rejection(error.source()?, depth)
+    find_tls(error.source()?, depth, found)
 }
 
 /// Step 3 of the verifier, on the chain's SPKI pins in order (`None` for a
@@ -735,6 +764,50 @@ mod tests {
         ];
         for (case, other) in others {
             assert_eq!(PinRejection::in_chain(&*other), None, "{case}");
+        }
+    }
+
+    /// MR-2548: an issuer WebPKI does not trust (an antivirus's or an office
+    /// proxy's own root) is found in a failed request's chain by its type, at
+    /// the depth reqwest hands it up and through a proxy; the pin's own
+    /// refusal, another WebPKI refusal, the same words untyped and a refused
+    /// connection are not it.
+    #[test]
+    fn an_untrusted_issuer_is_found_in_a_failed_requests_chain() {
+        let unknown = || TlsError::InvalidCertificate(CertificateError::UnknownIssuer);
+        assert!(untrusted_issuer_in_chain(&*failed_handshake(unknown())));
+        assert!(untrusted_issuer_in_chain(&std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            unknown()
+        )));
+        let others: [(&str, Box<dyn StdError + Send + Sync>); 5] = [
+            (
+                "the pin's refusal",
+                failed_handshake(PinRejection::Mismatch.into_tls_error()),
+            ),
+            (
+                "an expired certificate",
+                failed_handshake(TlsError::InvalidCertificate(CertificateError::Expired)),
+            ),
+            (
+                "a name mismatch",
+                failed_handshake(TlsError::InvalidCertificate(
+                    CertificateError::NotValidForName,
+                )),
+            ),
+            (
+                "the same words, untyped",
+                failed_handshake(TlsError::General(
+                    "invalid peer certificate: UnknownIssuer".into(),
+                )),
+            ),
+            (
+                "connection refused",
+                Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+            ),
+        ];
+        for (case, other) in others {
+            assert!(!untrusted_issuer_in_chain(&*other), "{case}");
         }
     }
 

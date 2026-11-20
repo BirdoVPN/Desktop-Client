@@ -81,6 +81,13 @@ pub enum ApiError {
     Parse(String),
     /// SEC-C1: TLS certificate pinning verification failed (possible MITM)
     CertificatePinningFailed(String),
+    /// MR-2548: the server's certificate chain does not end at a root this
+    /// app trusts (WebPKI's `UnknownIssuer`, before the pin is asked): most
+    /// often an antivirus's HTTPS scanning or an office proxy with its own
+    /// root, intercepting secure connections. Like a pin failure, the
+    /// handshake failed before any byte of the request was written. Not the
+    /// network, which is how it used to read.
+    TlsIntercepted,
     /// Any other non-2xx answer that carried the backend's own sentence. The
     /// status travels with it so `commands::ipc_error` can pick an error code
     /// by status instead of by wording, and the sentence stays the specific,
@@ -302,6 +309,10 @@ impl fmt::Display for ApiError {
             ),
             ApiError::Parse(msg) => write!(f, "Failed to parse response: {}", msg),
             ApiError::CertificatePinningFailed(msg) => write!(f, "Security verification failed. This may mean the app needs updating or your connection is being intercepted. Please update BirdoVPN to the latest version. ({})", msg),
+            ApiError::TlsIntercepted => write!(
+                f,
+                "Secure connection refused: the server's certificate is not from an authority this app trusts (intercepted)"
+            ),
             ApiError::Rejected { message, .. }
             | ApiError::TwoFactorRequired(message)
             | ApiError::TwoFactorInvalid(message)

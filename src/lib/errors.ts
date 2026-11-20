@@ -35,6 +35,11 @@ export type ErrorContext = 'vpn' | 'sign_in' | 'anonymous_sign_in' | 'password_c
 export const PQ_FAILED_COPY =
   'Quantum-protected handshake failed. Not connecting, because continuing would fall back to ' +
   'weaker encryption. Try again, or turn off Quantum Protection in Settings to connect without it.';
+/** MR-2548: an interception of secure connections. Owner-approved wording, 2026-11-20. */
+export const TLS_INTERCEPTED_COPY =
+  'Something on this network or computer is intercepting secure connections (often antivirus ' +
+  'HTTPS scanning or a work network), so BirdoVPN sent nothing. Turn off HTTPS scanning or try a ' +
+  'different network.';
 export const STEALTH_FAILED_COPY =
   "Stealth Mode couldn't start. Not connecting, so your traffic isn't sent unprotected. " +
   'Try again, or choose another location.';
@@ -194,6 +199,15 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
       'network may be intercepting secure connections: try a different network.',
     action: null,
   },
+  // MR-2548 (wording owner-approved 2026-11-20): the server's certificate is not
+  // from an authority the app trusts, refused before the pin is asked. The
+  // app trusts its own compiled-in roots, not the computer's, so this is
+  // what an antivirus's HTTPS scanning or an office proxy with its own root
+  // looks like; it used to read "No internet connection", which sent the
+  // user to check a network that works. Nothing was sent. Its own words, kept
+  // apart from cert_pin_failed (whose first advice is the update) and from
+  // every connectivity message.
+  tls_intercepted: { message: TLS_INTERCEPTED_COPY, action: 'retry' },
   stealth_failed: { message: STEALTH_FAILED_COPY, action: 'retry' },
   pq_failed: { message: PQ_FAILED_COPY, action: 'open_settings' },
   killswitch_failed: {
