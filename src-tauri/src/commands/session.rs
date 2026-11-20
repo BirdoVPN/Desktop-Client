@@ -1168,11 +1168,7 @@ pub(crate) async fn prepare_tunnel(
     // silently rebuilding it would just burn another multi-second handshake
     // failure and report a misleading error.
     if request.fallback_reason.is_some() && !response.stealth_enabled.unwrap_or(false) {
-        return Err(IpcError::new(
-            IpcErrorCode::StealthFailed,
-            "This network blocks standard VPN traffic, and the server could not provide \
-             Stealth Mode. Please try a different server.",
-        ));
+        return Err(IpcError::stealth_not_granted());
     }
 
     // AUD-DESK-08 (review of #446): a relay the kill switch could not permit
@@ -1853,6 +1849,23 @@ mod lifecycle_tests {
             .contains("server_origin: published.server_origin.map(SelectionOrigin::as_str),"));
     }
 
+    /// Review L5 of #470: the backend not granting the stealth transport is
+    /// built by its own constructor at the one place it is decided, so the
+    /// relay retry can tell it from the local Stealth helper's failures,
+    /// which never use it.
+    #[test]
+    fn the_backends_stealth_refusal_has_its_own_constructor() {
+        let prepare = body("pub(crate) async fn prepare_tunnel(");
+        order(
+            prepare,
+            &[
+                "if request.fallback_reason.is_some() && !response.stealth_enabled.unwrap_or(false) {",
+                "return Err(IpcError::stealth_not_granted());",
+            ],
+        );
+        assert!(!include_str!("vpn.rs").contains("stealth_not_granted"));
+    }
+
     /// WIN-FIX-3: a settings reapply is rebuilt on the session's own
     /// transport and never runs the Adaptive Transport retry; a user connect
     /// starts direct and does. The session's settings are recorded at the
@@ -2499,7 +2512,7 @@ mod dial_tests {
     use super::{dial, ConnectPurpose, ConnectTarget, DialSteps, SelectionOrigin};
     use crate::api::types::VpnServer;
     use crate::commands::ipc_error::{IpcError, IpcErrorCode};
-    use crate::commands::vpn::FALLBACK_HANDSHAKE_TIMEOUT;
+    use crate::commands::vpn::{FALLBACK_HANDSHAKE_TIMEOUT, FALLBACK_TRANSPORT_BLOCKED};
     use crate::vpn::relay_retry::Reach;
 
     const STEALTH: Option<&str> = Some(FALLBACK_HANDSHAKE_TIMEOUT);
@@ -3123,7 +3136,13 @@ mod dial_tests {
                 unanswered(),
                 IpcError::new(IpcErrorCode::RateLimited, "slow down"),
             ),
-            (refused, unanswered()),
+            // A local failure of the Stealth helper (`vpn::stealth_failed`).
+            (
+                unanswered(),
+                IpcError::new(IpcErrorCode::StealthFailed, "Stealth Mode couldn't start"),
+            ),
+            // Refused through the local Stealth helper: not the server's.
+            (refused.clone(), refused),
         ] {
             let last_code = second.code;
             let mut world = World::answering([Err(first), Err(second), Ok(()), Ok(())]);
@@ -3156,6 +3175,83 @@ mod dial_tests {
         .await
         .is_ok());
         assert_eq!(world.dialled().last(), Some(&("srv-nyc", None)));
+    }
+
+    /// Review L5 of #470: a server that cannot provide Stealth Mode is the
+    /// server not serving. Its direct handshake got no answer, and the
+    /// backend then did not grant the stealth transport for it (a node with
+    /// no Xray, or a refused grant): the connect moves to another server, as
+    /// iOS does for any no-answer. A failure of the LOCAL Stealth helper does
+    /// not (`only_a_true_no_answer_spends_the_retry`).
+    #[tokio::test]
+    async fn a_server_that_cannot_provide_stealth_is_retried_elsewhere() {
+        for origin in [SelectionOrigin::Automatic, SelectionOrigin::User] {
+            let mut list = fleet();
+            list.push(server("srv-ber", "DE", "Berlin", 40, true, true));
+            let mut world = World::answering([
+                Err(unanswered()),
+                Err(IpcError::stealth_not_granted()),
+                Ok(()),
+            ]);
+            world.servers = Some(list);
+            let result = dial(
+                &mut world,
+                &picked_by(origin, "srv-fra"),
+                ConnectPurpose::User,
+            )
+            .await;
+            assert!(result.is_ok(), "{origin:?}: {result:?}");
+            assert_eq!(
+                world.dialled().len(),
+                3,
+                "{origin:?}: {:?}",
+                world.dialled()
+            );
+            assert_eq!(world.retry_notices.get(), 1, "{origin:?}");
+        }
+    }
+
+    /// Review I3 of #470, iOS parity: iOS retries a dial whose first
+    /// handshake never completes within its window, whatever the cause, so a
+    /// DIRECT handshake the relay actively refused (its WireGuard port
+    /// unreachable) is retried elsewhere too. Refused through the local
+    /// Stealth helper (Stealth Mode on) is this machine's, and is not.
+    #[tokio::test]
+    async fn a_refused_direct_handshake_is_retried_like_one_that_never_came() {
+        let refused = || {
+            IpcError::from_tunnel_failure(&format!(
+                "Failed to start tunnel: Handshake failed: {}",
+                crate::vpn::ERR_HANDSHAKE_RECV
+            ))
+        };
+        let mut world = World::answering([Err(refused()), Err(unanswered()), Ok(())]);
+        let result = dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            world.dialled(),
+            vec![
+                ("srv-fra", None),
+                ("srv-fra", Some(FALLBACK_TRANSPORT_BLOCKED)),
+                ("srv-nyc", None)
+            ]
+        );
+
+        let mut world = World::answering([Err(refused()), Ok(()), Ok(())]);
+        world.stealth_setting = true;
+        assert!(dial(
+            &mut world,
+            &picked_by(SelectionOrigin::Automatic, "srv-fra"),
+            ConnectPurpose::User,
+        )
+        .await
+        .is_err());
+        assert_eq!(world.dialled(), vec![("srv-fra", None)]);
+        assert_eq!(world.list_fetches, 0);
     }
 
     /// Review L4 and its test gap: a Disconnect during the retry's own dial

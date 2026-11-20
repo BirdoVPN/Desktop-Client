@@ -35,6 +35,7 @@ import {
 import { CONSENT_VERSION } from '@/lib/consent';
 import {
   connectToServer,
+  switchToServer,
   RESUME_AFTER_UPDATE_COPY,
   RESUME_ROUTE_GONE_COPY,
   RESUME_SERVER_GONE_COPY,
@@ -687,6 +688,20 @@ describe('the one retry on another server (MR-2514)', () => {
     const s = useAppStore.getState();
     expect(s.lastServerId).toBe('zrh');
     expect(s.lastServerOrigin).toBe('automatic');
+  });
+
+  // Review L1b of #470: a live switch is a user connect, so Rust may retry it
+  // within its country; the record names where the tunnel landed, as on
+  // every other connect path.
+  it("a switch Rust retried in the user's country records where it landed, still the user's", async () => {
+    const ber = stored('ber', 'DE', 'Berlin', 40);
+    useAppStore.setState({ servers: [fra, ams, ber] });
+    connectLandsOn('ber');
+    await expect(switchToServer(fra)).resolves.toBe(true);
+    const s = useAppStore.getState();
+    expect(s.currentServer?.id).toBe('ber');
+    expect(s.lastServerId).toBe('ber');
+    expect(s.lastServerOrigin).toBe('user');
   });
 
   it("a user's pick that Rust retried in its own country: the card follows, and it stays the user's", async () => {

@@ -259,6 +259,19 @@ impl IpcError {
         )
     }
 
+    /// The Adaptive Transport's stealth retry came back without the stealth
+    /// transport: the BACKEND did not grant it for this server (a node with no
+    /// Xray, or a grant it refused). Its own constructor, so the relay retry
+    /// can tell it from a failure of the local Stealth helper (MR-2514,
+    /// review L5 of #470).
+    pub fn stealth_not_granted() -> Self {
+        Self::new(
+            IpcErrorCode::StealthFailed,
+            "This network blocks standard VPN traffic, and the server could not provide \
+             Stealth Mode. Please try a different server.",
+        )
+    }
+
     pub fn not_elevated() -> Self {
         Self::new(
             IpcErrorCode::NotElevated,
