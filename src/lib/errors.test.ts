@@ -190,6 +190,16 @@ describe('errorCopy', () => {
     expect(message).not.toMatch(/reach|check your (internet|connection)/i);
   });
 
+  it('puts the update before the network for a pin failure, and says nothing was sent (MR-2537)', () => {
+    const { message, action } = errorCopy(err('cert_pin_failed'));
+    expect(message).toMatch(/sent nothing/);
+    const update = message.indexOf('latest version from birdo.app');
+    expect(update).toBeGreaterThan(-1);
+    expect(update).toBeLessThan(message.indexOf('try a different network'));
+    // The in-app update check is pinned as well, so no Update button.
+    expect(action).toBeNull();
+  });
+
   it('words invalid credentials for the place they happened', () => {
     expect(errorCopy(err('invalid_credentials'), 'sign_in').message).toMatch(/email or password/);
     expect(errorCopy(err('invalid_credentials'), 'anonymous_sign_in').message).toMatch(/account number/);

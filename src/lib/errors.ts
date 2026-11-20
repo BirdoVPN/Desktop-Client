@@ -180,10 +180,18 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   // Kept apart from every connectivity message on purpose: a pin failure can
   // mean the connection is being intercepted, and "check your internet" would
   // tell the user to keep trying on exactly that network.
+  // MR-2537: the update comes first. The pin is checked only after the chain
+  // has passed ordinary validation against public roots, so the usual
+  // interception (an antivirus or office proxy with its own root) never gets
+  // this far; what does is mostly the service's certificate moving to a CA
+  // this version does not pin, which a newer version fixes. In-app update
+  // checks are pinned too, hence the website. The handshake failed before
+  // the request went out, so nothing of the user's was sent.
   cert_pin_failed: {
     message:
-      "BirdoVPN couldn't verify it is talking to its own servers. Something on this network " +
-      'may be intercepting secure connections. Try a different network.',
+      "BirdoVPN couldn't verify it is talking to its own servers, so it sent nothing. " +
+      "Get the latest version from birdo.app. If that doesn't help, something on this " +
+      'network may be intercepting secure connections: try a different network.',
     action: null,
   },
   stealth_failed: { message: STEALTH_FAILED_COPY, action: 'retry' },

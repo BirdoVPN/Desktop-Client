@@ -387,6 +387,34 @@ pub(crate) fn never_left(error: &reqwest::Error) -> bool {
     error.is_connect()
 }
 
+/// What a request that got no answer met (MR-2537): the certificate pin
+/// refusing the server's chain, or else the network.
+///
+/// A pin refusal fails the TLS handshake, before any byte of the request
+/// (its token, its body) is written, and it used to be told exactly like a
+/// network failure: `network_offline`, "Couldn't reach BirdoVPN. Check your
+/// internet connection." It is now `CertificatePinningFailed`
+/// (`cert_pin_failed`), recognised by the type the verifier puts in the
+/// chain (`cert_pin::PinRejection::in_chain`), never by the error's text.
+/// Everything after this treats the two alike: the refresh is held for the
+/// same backoff (`refresh_policy`), the session is kept (`session_gate`),
+/// neither is a hard refusal, and neither names another server.
+///
+/// The pin failure carries a fixed label, never the transport error's text:
+/// that names the URL, and a heartbeat's URL carries the session's key id.
+pub(crate) fn send_failed(error: reqwest::Error) -> ApiError {
+    failure_without_answer(&error)
+}
+
+/// [`send_failed`] on any error, so a test can hand it the chain a failed
+/// handshake comes up with (a `reqwest::Error` cannot be built by hand).
+fn failure_without_answer(error: &(dyn std::error::Error + 'static)) -> ApiError {
+    match super::cert_pin::PinRejection::in_chain(error) {
+        Some(rejection) => ApiError::CertificatePinningFailed(rejection.label().to_owned()),
+        None => ApiError::Network(error.to_string()),
+    }
+}
+
 /// The response's `Retry-After`, parsed and clamped
 /// (`error::retry_after_header`, MR-1808). Read before the body consumes the
 /// response. MR-2500 / MR-1771 (the one timing table, lead 2026-11-19
@@ -1102,7 +1130,7 @@ impl BirdoApi {
             }
             None => self.gdpr_delete_request(token.as_str(), body).send().await,
         };
-        let response = sent.map_err(|e| ApiError::Network(e.to_string()))?;
+        let response = sent.map_err(send_failed)?;
         let status = response.status();
         // MR-1808: a refused deletion reports the server's wait. Not through
         // the retry gate: the deletion is the user's own deliberate action, so
@@ -1358,7 +1386,7 @@ impl BirdoApi {
             .json(body)
             .send()
             .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .map_err(send_failed)?;
         let status = response.status();
         let retry_after = retry_after_of(&response);
         let text = response.text().await.unwrap_or_default();
@@ -1611,12 +1639,7 @@ impl BirdoApi {
     /// version-floor block. See `upgrade_gate::Origin`.
     pub async fn get_client_config(&self) -> Result<ClientConfigResponse, ApiError> {
         let url = format!("{}{}", WEB_BASE_URL, endpoints::config::CLIENT_CONFIG);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+        let response = self.client.get(&url).send().await.map_err(send_failed)?;
         let config: ClientConfigResponse = self
             .handle_response_from(response, super::upgrade_gate::Origin::Web)
             .await?;
@@ -1981,10 +2004,7 @@ impl BirdoApi {
             request = request.bearer_auth(token.as_str());
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+        let response = request.send().await.map_err(send_failed)?;
         let result = self.handle_response(response).await;
         if let Err(error) = &result {
             self.retry_gate
@@ -2669,6 +2689,222 @@ mod around_the_tunnel_tests {
     }
 }
 
+/// MR-2537: a request that got no answer is told as what it met.
+#[cfg(test)]
+mod send_failed_tests {
+    use super::{failure_without_answer, hardened_client_builder, send_failed, ApiError};
+    use crate::api::cert_pin::{failed_handshake, PinRejection};
+    use crate::commands::ipc_error::{IpcError, IpcErrorCode};
+    use rustls::{CertificateError, Error as TlsError};
+
+    /// A handshake the pin refused, in the chain reqwest hands it up in, is
+    /// a pin failure, `cert_pin_failed`, never `network_offline`. Like the
+    /// network failure it is retryable, no hard refusal and no ending the
+    /// server decided (auto-reconnect keeps re-dialling the same server),
+    /// and it carries nothing of the URL (a heartbeat's names its key id).
+    #[test]
+    fn a_pin_refusal_is_told_as_a_pin_failure_not_as_no_network() {
+        for (case, rejection) in [
+            ("mismatch", PinRejection::Mismatch),
+            ("unparseable", PinRejection::Unparseable),
+        ] {
+            let error = failure_without_answer(&*failed_handshake(rejection.into_tls_error()));
+            let ApiError::CertificatePinningFailed(reason) = &error else {
+                panic!("{case}: not told as a pin failure");
+            };
+            assert_eq!(reason.as_str(), rejection.label(), "{case}");
+            let told = IpcError::from_api(&error);
+            assert_eq!(told.code, IpcErrorCode::CertPinFailed, "{case}");
+            assert!(told.retryable, "{case}");
+            assert!(!told.code.is_hard_refusal(), "{case}");
+            assert!(
+                !crate::vpn::reconnect_policy::server_ended(told.code),
+                "{case}"
+            );
+            assert!(
+                !told.message.contains("key-123") && !told.message.contains("http"),
+                "{case}: the URL is in it"
+            );
+        }
+    }
+
+    /// A connection that failed with no pin refusal in it is the network
+    /// failure, as before. A real one, from the hardened (pinned) client:
+    /// nothing listens on the port, so the connection is refused.
+    #[tokio::test]
+    async fn a_refused_connection_is_still_the_network() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let Ok(client) = hardened_client_builder().build() else {
+            panic!("the hardened client");
+        };
+        let Err(refused) = client.get(format!("https://{addr}/")).send().await else {
+            panic!("nothing listens there");
+        };
+        let error = send_failed(refused);
+        assert!(
+            matches!(error, ApiError::Network(_)),
+            "refused: not the network"
+        );
+        assert_eq!(
+            IpcError::from_api(&error).code,
+            IpcErrorCode::NetworkOffline
+        );
+    }
+
+    /// TEST-ONLY fixtures for the real handshakes below (review D468-L1),
+    /// made once with OpenSSL 3.5, valid 2026-01-01 to 2126-01-01:
+    /// - a P-256 CA, "BirdoVPN TEST-ONLY pin-refusal CA" (its key was
+    ///   discarded);
+    /// - a leaf it signed for IP 127.0.0.1 (serverAuth);
+    /// - that leaf's PKCS#8 key, which serves only the loopback handshake in
+    ///   these tests.
+    ///
+    /// Nothing in the app trusts or pins any of them.
+    const TEST_CA: &[u8] = include_bytes!("testdata/TEST-ONLY-pin-ca.der");
+    const TEST_LEAF: &[u8] = include_bytes!("testdata/TEST-ONLY-pin-leaf.der");
+    const TEST_LEAF_KEY: &[u8] = include_bytes!("testdata/TEST-ONLY-pin-leaf-key.pkcs8.der");
+
+    /// A TLS server on 127.0.0.1 that presents the test leaf for one
+    /// handshake, run to its end (the client refuses the leaf and hangs up).
+    fn serve_the_test_leaf_once() -> std::net::SocketAddr {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let Ok(versions) = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+        else {
+            panic!("the server's TLS versions");
+        };
+        let Ok(config) = versions.with_no_client_auth().with_single_cert(
+            vec![CertificateDer::from(TEST_LEAF)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(TEST_LEAF_KEY)),
+        ) else {
+            panic!("the server's certificate");
+        };
+        let config = std::sync::Arc::new(config);
+        std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            let bound = Some(std::time::Duration::from_secs(10));
+            let _ = socket.set_read_timeout(bound);
+            let _ = socket.set_write_timeout(bound);
+            let Ok(mut tls) = rustls::ServerConnection::new(config) else {
+                return;
+            };
+            while tls.is_handshaking() {
+                if tls.complete_io(&mut socket).is_err() {
+                    break;
+                }
+            }
+        });
+        addr
+    }
+
+    /// A request to the test server from the API client's own builder
+    /// (`hardened_client_builder`: its timeouts, HTTPS only, the DoH
+    /// resolver), with the API client's TLS config, the real pinning
+    /// verifier over every host, trusting `root` alone
+    /// (`cert_pin::rustls_config_trusting`, the one test-only seam).
+    async fn dial_the_test_leaf(root: &[u8]) -> reqwest::Error {
+        let mut roots = rustls::RootCertStore::empty();
+        assert!(
+            roots
+                .add(rustls::pki_types::CertificateDer::from(root))
+                .is_ok(),
+            "the test root"
+        );
+        let Ok(client) = hardened_client_builder()
+            .use_preconfigured_tls(crate::api::cert_pin::rustls_config_trusting(roots))
+            .build()
+        else {
+            panic!("the client");
+        };
+        let addr = serve_the_test_leaf_once();
+        let Err(failed) = client.get(format!("https://{addr}/")).send().await else {
+            panic!("the handshake went through");
+        };
+        failed
+    }
+
+    /// Review D468-L1: a REAL pin refusal, end to end, over loopback. WebPKI
+    /// accepts the test leaf (its CA is the one root), the pin does not
+    /// (nothing in the chain is pinned), rustls aborts the handshake, and the
+    /// error comes up through the real tokio-rustls, hyper-rustls,
+    /// hyper-util and reqwest layers. It must be told as a pin failure. A
+    /// bump that rewraps any of those layers so the refusal can no longer be
+    /// found turns this red, instead of quietly bringing back
+    /// `network_offline`.
+    #[tokio::test]
+    async fn a_real_pin_refusal_through_reqwest_is_told_as_a_pin_failure() {
+        let failed = dial_the_test_leaf(TEST_CA).await;
+        assert!(super::never_left(&failed), "pin: the request left");
+        let error = send_failed(failed);
+        let ApiError::CertificatePinningFailed(reason) = &error else {
+            panic!("a real pin refusal was not told as a pin failure");
+        };
+        assert_eq!(reason.as_str(), PinRejection::Mismatch.label());
+        assert_eq!(IpcError::from_api(&error).code, IpcErrorCode::CertPinFailed);
+    }
+
+    /// The same server with its CA not trusted (the one root is ISRG Root
+    /// X1): WebPKI refuses the leaf (`UnknownIssuer`) before the pin is
+    /// asked, so it stays the network failure.
+    #[tokio::test]
+    async fn a_real_untrusted_issuer_through_reqwest_stays_the_network() {
+        let failed = dial_the_test_leaf(include_bytes!("isrg_root_x1.der")).await;
+        assert!(super::never_left(&failed), "untrusted: the request left");
+        let error = send_failed(failed);
+        assert!(
+            matches!(error, ApiError::Network(_)),
+            "untrusted issuer: not the network"
+        );
+        assert_eq!(
+            IpcError::from_api(&error).code,
+            IpcErrorCode::NetworkOffline
+        );
+    }
+
+    /// Only the pin's own refusal is told apart. A handshake that failed on
+    /// anything else (an issuer WebPKI does not trust; a rustls error that
+    /// merely has the pin's words) is the network failure, as before.
+    #[test]
+    fn only_the_pins_own_refusal_is_told_apart() {
+        for (case, tls) in [
+            (
+                "untrusted issuer",
+                TlsError::InvalidCertificate(CertificateError::UnknownIssuer),
+            ),
+            (
+                "the pin's words",
+                TlsError::General(PinRejection::Mismatch.label().to_string()),
+            ),
+        ] {
+            let error = failure_without_answer(&*failed_handshake(tls));
+            assert!(matches!(error, ApiError::Network(_)), "{case}");
+        }
+    }
+
+    /// The wiring: the one `Network` error this file builds outside its tests
+    /// is the one `failure_without_answer` falls back to, after it looked
+    /// for the pin; every send goes through it (`send_failed`).
+    #[test]
+    fn every_send_looks_for_the_pin_first() {
+        const SOURCE: &str = include_str!("client.rs");
+        let code = &SOURCE[..SOURCE.find("mod control_plane_hosts_tests").unwrap()];
+        assert_eq!(code.matches("ApiError::Network(").count(), 1);
+        let fallback = &code[code.find("fn failure_without_answer(").unwrap()..];
+        let fallback = &fallback[..fallback.find("\n}").unwrap()];
+        assert!(fallback.contains("PinRejection::in_chain(error)"));
+        assert!(fallback.contains("ApiError::Network(error.to_string())"));
+        assert!(code.matches(".map_err(send_failed)").count() >= 4);
+        assert!(!code.contains("Network(e.to_string())"));
+    }
+}
+
 #[cfg(test)]
 mod token_restore_tests {
     use super::BirdoApi;
@@ -3257,9 +3493,14 @@ mod retry_after_tests {
         Err(ApiError::Network("operation timed out".into()))
     }
 
-    /// A TLS pin failure, as the client reports one.
+    /// A TLS pin failure, through the client's real mapping (MR-2537): the
+    /// pin's refusal, in the error a request whose handshake it failed
+    /// comes back with.
     fn pin_failed() -> Result<RefreshResponse, ApiError> {
-        Err(ApiError::CertificatePinningFailed("pin".into()))
+        use crate::api::cert_pin::{failed_handshake, PinRejection};
+        Err(failure_without_answer(&*failed_handshake(
+            PinRejection::Mismatch.into_tls_error(),
+        )))
     }
 
     /// An unreadable 2xx, through the client's real mapping: a 200 whose

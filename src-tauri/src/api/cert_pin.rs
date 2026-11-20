@@ -23,6 +23,8 @@
 //! reqwest only exposes the leaf via `TlsInfo`, so chain pinning must happen
 //! here, inside the TLS handshake.
 
+use std::error::Error as StdError;
+use std::fmt;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -30,7 +32,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
-    ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, OtherError,
+    RootCertStore, SignatureScheme,
 };
 use sha2::{Digest, Sha256};
 
@@ -146,6 +149,117 @@ fn is_birdo_host(server_name: &ServerName<'_>) -> bool {
     }
 }
 
+/// Why the pin refused a chain that WebPKI had just accepted (MR-2537).
+///
+/// The verifier hands it to rustls as
+/// `Error::InvalidCertificate(CertificateError::Other(..))`, the variant
+/// rustls keeps for a custom verifier's own reason, and rustls aborts the
+/// handshake with it, before any HTTP byte is written. The API client then
+/// finds it again BY TYPE in the failed request's error chain
+/// ([`PinRejection::in_chain`]) and tells the user a pin failure
+/// (`ApiError::CertificatePinningFailed`, `cert_pin_failed`).
+///
+/// It used to be a `TlsError::General(String)`, which nothing told apart
+/// from any other failed connection: a real pin failure reached the user as
+/// `network_offline`, "Couldn't reach BirdoVPN. Check your internet
+/// connection." `CertificatePinningFailed` was built only in tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinRejection {
+    /// Not one certificate in the chain could be parsed, so the pin could not
+    /// be checked: refused (fail closed).
+    Unparseable,
+    /// The chain parsed, and no certificate in it carries a pinned SPKI.
+    Mismatch,
+}
+
+impl PinRejection {
+    /// A fixed description: no host, no URL, nothing taken from the chain.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Unparseable => "certificate chain SPKI unparseable — pin check impossible",
+            Self::Mismatch => "certificate SPKI pin mismatch",
+        }
+    }
+
+    /// The error the verifier fails the handshake with.
+    pub(crate) fn into_tls_error(self) -> TlsError {
+        TlsError::InvalidCertificate(CertificateError::Other(OtherError(Arc::new(self))))
+    }
+
+    /// The pin's refusal `error` is, if it is one: matched on the type the
+    /// verifier put in it, never on any text.
+    pub(crate) fn of(error: &TlsError) -> Option<Self> {
+        match error {
+            TlsError::InvalidCertificate(CertificateError::Other(OtherError(reason))) => {
+                (**reason).downcast_ref::<Self>().copied()
+            }
+            _ => None,
+        }
+    }
+
+    /// The pin's refusal anywhere in `error` and the errors under it: what a
+    /// request whose handshake the pin refused fails with. reqwest 0.12
+    /// hands it up as `reqwest::Error` → `hyper_util` `Error` (Connect) →
+    /// `io::Error` (hyper-rustls, kind Other) → `io::Error` (tokio-rustls,
+    /// InvalidData) → `rustls::Error`; through a proxy, with one `io::Error`
+    /// fewer.
+    pub(crate) fn in_chain(error: &(dyn StdError + 'static)) -> Option<Self> {
+        find_rejection(error, CHAIN_DEPTH)
+    }
+}
+
+impl fmt::Display for PinRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl StdError for PinRejection {}
+
+/// How many errors deep [`PinRejection::in_chain`] looks. The chain of a
+/// failed request is five; the bound only keeps a chain that loops (someone
+/// else's bug) from looping here.
+const CHAIN_DEPTH: u8 = 16;
+
+fn find_rejection(error: &(dyn StdError + 'static), depth: u8) -> Option<PinRejection> {
+    let depth = depth.checked_sub(1)?;
+    if let Some(found) = error.downcast_ref::<TlsError>().and_then(PinRejection::of) {
+        return Some(found);
+    }
+    // `io::Error::source()` skips the error an `io::Error` wraps (it answers
+    // that error's own source), and the rustls error comes up inside two of
+    // them. So each `io::Error` is looked into as well as past.
+    if let Some(found) = error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::get_ref)
+        .and_then(|wrapped| find_rejection(wrapped, depth))
+    {
+        return Some(found);
+    }
+    find_rejection(error.source()?, depth)
+}
+
+/// Step 3 of the verifier, on the chain's SPKI pins in order (`None` for a
+/// certificate x509-parser cannot read): accepted when any one is pinned.
+/// Otherwise refused: [`PinRejection::Mismatch`] when the chain could be
+/// read, and [`PinRejection::Unparseable`] when not one certificate could
+/// (FAIL CLOSED, see the verifier). Lazy: nothing after the first pinned
+/// certificate is parsed.
+fn pin_verdict(chain: impl IntoIterator<Item = Option<String>>) -> Result<(), PinRejection> {
+    let mut parsed_any = false;
+    for spki in chain.into_iter().flatten() {
+        parsed_any = true;
+        if PINNED_SPKI_SHA256.contains(&spki.as_str()) {
+            return Ok(());
+        }
+    }
+    Err(if parsed_any {
+        PinRejection::Mismatch
+    } else {
+        PinRejection::Unparseable
+    })
+}
+
 #[derive(Debug)]
 struct SpkiPinningVerifier {
     inner: Arc<WebPkiServerVerifier>,
@@ -179,36 +293,26 @@ impl ServerCertVerifier for SpkiPinningVerifier {
         }
 
         // 3) SPKI pin check across the presented chain (leaf + intermediates).
-        let mut parsed_any = false;
-        for cert in std::iter::once(end_entity).chain(intermediates.iter()) {
-            if let Some(spki) = spki_sha256_b64(cert) {
-                parsed_any = true;
-                if PINNED_SPKI_SHA256.contains(&spki.as_str()) {
-                    return Ok(ServerCertVerified::assertion());
-                }
-            }
-        }
-
-        if !parsed_any {
+        let chain = std::iter::once(end_entity).chain(intermediates.iter());
+        let Err(rejection) = pin_verdict(chain.map(spki_sha256_b64)) else {
+            return Ok(ServerCertVerified::assertion());
+        };
+        match rejection {
             // No certificate in the chain could be parsed by x509-parser. FAIL
             // CLOSED: WebPKI just parsed and validated this same chain, so a
             // chain our SPKI extractor cannot read at all is either a crafted
             // chain or a parser bug — and treating it as "pinned OK" would turn
             // the pin from a hard gate into advisory exactly when it matters.
-            tracing::error!(
+            PinRejection::Unparseable => tracing::error!(
                 "cert-pin: could not parse any certificate SPKI in the chain — refusing connection (fail closed)"
-            );
-            return Err(TlsError::General(
-                "certificate chain SPKI unparseable — pin check impossible".to_string(),
-            ));
+            ),
+            PinRejection::Mismatch => tracing::error!(
+                "cert-pin: no pinned SPKI matched the presented chain — refusing connection (possible MITM or un-pinned CA change)"
+            ),
         }
-
-        tracing::error!(
-            "cert-pin: no pinned SPKI matched the presented chain — refusing connection (possible MITM or un-pinned CA change)"
-        );
-        Err(TlsError::General(
-            "certificate SPKI pin mismatch".to_string(),
-        ))
+        // Refused either way. The API client tells it from a network failure
+        // by this error's type (`PinRejection::in_chain`, MR-2537).
+        Err(rejection.into_tls_error())
     }
 
     fn verify_tls12_signature(
@@ -292,7 +396,20 @@ pub fn rustls_config_pinning_birdo_hosts_only() -> ClientConfig {
 fn build_config(scope: PinScope) -> ClientConfig {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    config_trusting(roots, scope)
+}
 
+/// Tests (MR-2537, review D468-L1): the API client's config, the real
+/// `SpkiPinningVerifier` pinning every host, over `roots` in place of the
+/// Mozilla store. A hermetic test can then pass WebPKI with its own CA and
+/// meet the pin in a real handshake.
+#[cfg(test)]
+pub(crate) fn rustls_config_trusting(roots: RootCertStore) -> ClientConfig {
+    config_trusting(roots, PinScope::AllHosts)
+}
+
+/// [`build_config`] over a given root store.
+fn config_trusting(roots: RootCertStore, scope: PinScope) -> ClientConfig {
     // Select the ring CryptoProvider EXPLICITLY (for both the verifier and the
     // client config) instead of relying on rustls' process-level default.
     // Other dependencies (e.g. sentry's transport) may enable the aws-lc-rs
@@ -336,6 +453,47 @@ pub(crate) fn webpki_root_spki_pins() -> Vec<String> {
             base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&der))
         })
         .collect()
+}
+
+/// Tests: a request's error when its TLS handshake failed with `tls`, built
+/// the way reqwest 0.12 hands one up. Read from the sources this lockfile
+/// builds (reqwest 0.12.28, hyper-util 0.1.19, hyper-rustls 0.27.7,
+/// tokio-rustls 0.26.4), outermost first:
+/// - `reqwest::Error`, "error sending request for url (…)", whose `source()`
+///   is
+/// - `hyper_util::client::legacy::Error` (kind Connect), whose `source()` is
+/// - `io::Error::new(Other, e)` (hyper-rustls `HttpsConnector`), wrapping
+/// - `io::Error::new(InvalidData, e)` (tokio-rustls, the handshake), wrapping
+/// - the `rustls::Error` the verifier returned.
+///
+/// The two outer layers cannot be built by hand, so they are stand-ins with
+/// the same `source()`. The URL is a heartbeat's: its path carries the
+/// session's key id, which nothing told to the user may repeat.
+#[cfg(test)]
+pub(crate) fn failed_handshake(tls: TlsError) -> Box<dyn StdError + Send + Sync> {
+    #[derive(Debug)]
+    struct Layer {
+        text: &'static str,
+        source: Box<dyn StdError + Send + Sync>,
+    }
+    impl fmt::Display for Layer {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.text)
+        }
+    }
+    impl StdError for Layer {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            Some(&*self.source)
+        }
+    }
+    let handshake = std::io::Error::new(std::io::ErrorKind::InvalidData, tls);
+    Box::new(Layer {
+        text: "error sending request for url (https://api.birdo.app/vpn/heartbeat/key-123)",
+        source: Box::new(Layer {
+            text: "client error (Connect)",
+            source: Box::new(std::io::Error::other(handshake)),
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -463,6 +621,134 @@ mod tests {
     fn malformed_der_returns_none_and_does_not_panic() {
         let cert = CertificateDer::from(vec![0u8, 1, 2, 3, 4]);
         assert!(spki_sha256_b64(&cert).is_none());
+    }
+
+    /// Sectigo Public Server Authentication Root E46, which github.com
+    /// chains to: a real SPKI pin, and not one of ours.
+    const UNPINNED_SPKI: &str = "sLVjNUaFYfW7n6EtgBeEpjOlcnBdNPMrZDRF36iwBdE=";
+
+    /// MR-2537, step 3 of the verifier, unchanged by the refusal getting a
+    /// type: accepted when any certificate in the chain is pinned; refused
+    /// when none is; refused (fail closed) when not one could be read.
+    #[test]
+    fn the_pin_accepts_a_pinned_chain_and_refuses_every_other() {
+        assert!(!PINNED_SPKI_SHA256.contains(&UNPINNED_SPKI));
+        let pinned = || Some(ISRG_X1_SPKI.to_string());
+        let unpinned = || Some(UNPINNED_SPKI.to_string());
+        let cases = [
+            ("pinned", vec![pinned()], Ok(())),
+            ("pinned further up", vec![unpinned(), pinned()], Ok(())),
+            (
+                "pinned past an unreadable one",
+                vec![None, pinned()],
+                Ok(()),
+            ),
+            ("unpinned", vec![unpinned()], Err(PinRejection::Mismatch)),
+            (
+                "unpinned and unreadable",
+                vec![None, unpinned()],
+                Err(PinRejection::Mismatch),
+            ),
+            (
+                "unreadable",
+                vec![None, None],
+                Err(PinRejection::Unparseable),
+            ),
+            ("empty", vec![], Err(PinRejection::Unparseable)),
+        ];
+        for (case, chain, verdict) in cases {
+            assert_eq!(pin_verdict(chain), verdict, "{case}");
+        }
+        // Through the real extraction.
+        let isrg = CertificateDer::from(ISRG_X1_DER.to_vec());
+        let junk = CertificateDer::from(vec![0u8, 1, 2, 3, 4]);
+        assert_eq!(pin_verdict([&junk, &isrg].map(spki_sha256_b64)), Ok(()));
+        assert_eq!(
+            pin_verdict([&junk].map(spki_sha256_b64)),
+            Err(PinRejection::Unparseable)
+        );
+    }
+
+    /// MR-2537: the verifier's refusal is an `InvalidCertificate` carrying
+    /// its own type, and is recognised by that type, never by its words.
+    #[test]
+    fn the_pin_refusal_is_recognised_by_its_type() {
+        for rejection in [PinRejection::Mismatch, PinRejection::Unparseable] {
+            let tls = rejection.into_tls_error();
+            assert!(matches!(
+                tls,
+                TlsError::InvalidCertificate(CertificateError::Other(_))
+            ));
+            assert_eq!(PinRejection::of(&tls), Some(rejection));
+        }
+        let others = [
+            (
+                "the same words, untyped",
+                TlsError::General(PinRejection::Mismatch.label().to_string()),
+            ),
+            (
+                "an issuer WebPKI does not trust",
+                TlsError::InvalidCertificate(CertificateError::UnknownIssuer),
+            ),
+            (
+                "another verifier's own reason",
+                TlsError::InvalidCertificate(CertificateError::Other(OtherError(Arc::new(
+                    std::io::Error::other("x"),
+                )))),
+            ),
+        ];
+        for (case, other) in others {
+            assert_eq!(PinRejection::of(&other), None, "{case}");
+        }
+    }
+
+    /// MR-2537: the refusal is found where a failed request carries it: two
+    /// `io::Error`s down (whose `source()` skips what they wrap) under
+    /// reqwest's and hyper-util's layers, or, through a proxy, one down. A
+    /// handshake that failed for any other reason is not a pin refusal.
+    #[test]
+    fn the_pin_refusal_is_found_in_a_failed_requests_chain() {
+        for rejection in [PinRejection::Mismatch, PinRejection::Unparseable] {
+            let failed = failed_handshake(rejection.into_tls_error());
+            assert_eq!(PinRejection::in_chain(&*failed), Some(rejection));
+            let proxied =
+                std::io::Error::new(std::io::ErrorKind::InvalidData, rejection.into_tls_error());
+            assert_eq!(PinRejection::in_chain(&proxied), Some(rejection));
+        }
+        let others: [(&str, Box<dyn StdError + Send + Sync>); 3] = [
+            (
+                "the same words, untyped",
+                failed_handshake(TlsError::General(
+                    PinRejection::Mismatch.label().to_string(),
+                )),
+            ),
+            (
+                "an issuer WebPKI does not trust",
+                failed_handshake(TlsError::InvalidCertificate(
+                    CertificateError::UnknownIssuer,
+                )),
+            ),
+            (
+                "connection refused",
+                Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+            ),
+        ];
+        for (case, other) in others {
+            assert_eq!(PinRejection::in_chain(&*other), None, "{case}");
+        }
+    }
+
+    /// MR-2537, the wiring: the verifier refuses with the typed refusal and
+    /// nothing else, so no refusal of the pin's can reach the client as an
+    /// error it cannot tell from the network's.
+    #[test]
+    fn the_verifier_refuses_with_the_typed_refusal() {
+        const SOURCE: &str = include_str!("cert_pin.rs");
+        let verifier = &SOURCE[SOURCE.find("fn verify_server_cert(").unwrap()..];
+        let verifier = &verifier[..verifier.find("\n    }").unwrap()];
+        assert!(verifier.contains("pin_verdict(chain.map(spki_sha256_b64))"));
+        assert!(verifier.contains("Err(rejection.into_tls_error())"));
+        assert!(!verifier.contains("General"));
     }
 
     #[test]
