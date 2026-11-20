@@ -424,9 +424,10 @@ async fn dial<S: DialSteps>(
         ConnectPurpose::SettingsReapply { fallback_reason } => (fallback_reason, false),
     };
     let mut result = steps.attempt_once(target, first_transport).await;
-    // MR-2514: the server never answered the first handshake. Silence only:
-    // an actively refused handshake is not a server that did not answer
-    // (review L2).
+    // MR-2514: the server's first handshake never completed: no answer, or
+    // (review I3, as iOS, whose window counts any handshake that does not
+    // complete) a DIRECT handshake the relay actively refused. Refused
+    // through the local Stealth helper is this machine's (review L2).
     let mut unanswered = false;
 
     // ADAPTIVE TRANSPORT: when the direct attempt failed in the
@@ -436,7 +437,11 @@ async fn dial<S: DialSteps>(
     // local Xray proxy, whose failures do not classify as transport-shaped.
     // Not for a settings reapply (see `ConnectPurpose`).
     if let Some(direct) = result.as_ref().err().filter(|_| adaptive) {
-        unanswered = direct.transport == Some(TransportFailure::NoResponse);
+        unanswered = match direct.transport {
+            Some(TransportFailure::NoResponse) => true,
+            Some(TransportFailure::Refused) => !steps.attempted_stealth(),
+            None => false,
+        };
         if let Some(reason) = fallback_reason_for(target, direct, steps.attempted_stealth()) {
             tracing::warn!(
                 "Adaptive Transport: direct WireGuard failed ({reason}) — rebuilding over the \
@@ -542,14 +547,16 @@ async fn retry_on_another_server<S: DialSteps>(
 
 /// Whether `error`, how the server's own attempts last failed, says the
 /// SERVER did not serve (MR-2514, review L2): its handshake got no answer
-/// (direct, or through the stealth transport), or the backend refused it as
-/// unavailable. Anything else (a Disconnect, a hard refusal, the adapter, the
-/// kill switch, a rate limit, the Stealth helper, an actively refused
-/// handshake) would fail the same way on another server, so it spends no
-/// retry.
+/// (direct, or through the stealth transport), the backend refused it as
+/// unavailable, or the backend did not grant it the stealth transport (review
+/// L5, `IpcError::stealth_not_granted`). Anything else (a Disconnect, a hard
+/// refusal, the adapter, the kill switch, a rate limit, the local Stealth
+/// helper, a handshake refused through it) would fail the same way on
+/// another server, so it spends no retry.
 fn server_did_not_serve(error: &IpcError) -> bool {
     error.transport == Some(TransportFailure::NoResponse)
         || error.code == IpcErrorCode::ServerUnavailable
+        || error.stealth_not_granted
 }
 
 /// Engage the block-all for a rebuild of a live session (no-op when the kill

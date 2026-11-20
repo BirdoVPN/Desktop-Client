@@ -137,7 +137,9 @@ export async function switchToServer(server: Server): Promise<boolean> {
   const ok = await run('switching', 'connect_vpn', connectArgs(server.id, 'user'));
   const s = useAppStore.getState();
   if (ok) {
-    s.setLastServerId(server.id, 'user');
+    // Rust may retry a switch within the user's country (MR-2514): record
+    // where it landed, as every connect path does (review L1b of #470).
+    recordConnected(server.id, 'user');
   } else {
     s.setCurrentServer(findLiveServer(s.servers, s.liveServerId, s.liveServerName) ?? before);
   }
