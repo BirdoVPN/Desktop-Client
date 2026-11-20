@@ -609,14 +609,17 @@ impl BirdoApi {
     /// Return a clone of the hardened reqwest Client for reuse by other commands.
     /// This avoids creating secondary un-hardened clients that bypass TLS pinning.
     ///
-    /// KNOWN EXCEPTION (P1-dk-updater-unpinned): the tauri-plugin-updater check
-    /// against `https://api.birdo.app/updates/...` (tauri.conf.json `updater`)
-    /// uses the plugin's OWN reqwest client, which is NOT pinned. Installed
-    /// code is still protected by the minisign signature check; the residual
-    /// risk is that a mis-issued certificate holder can suppress "update
-    /// available" (version-pinning) and fingerprint version/target/arch.
-    /// Fixing it means either the plugin's custom-client builder hook or a
-    /// pre-fetched manifest via BirdoApi.
+    /// The auto-updater does not use this client, and is pinned all the same
+    /// (P1-dk-updater-unpinned, fixed): tauri-plugin-updater builds its own
+    /// reqwest client, and `commands::updater::pinned_updater` configures it
+    /// with `configure_client` (HTTPS only, and the TLS config of
+    /// `cert_pin::rustls_config_pinning_birdo_hosts_only`). The check against
+    /// `https://api.birdo.app/updates/...` (tauri.conf.json `updater`) is
+    /// pinned with the same pin set as this client; the installer download,
+    /// a GitHub release asset, gets full WebPKI validation without the pin,
+    /// and the minisign signature decides whether it may run. The plugin's
+    /// own unpinned IPC commands are not granted to the webview
+    /// (`capabilities/default.json`).
     pub fn http_client(&self) -> Client {
         self.client.clone()
     }
@@ -721,38 +724,28 @@ impl BirdoApi {
         Ok(response)
     }
 
-    /// Refresh access token
-    /// FIX C-1: Updated to persist the new refresh token when server returns one
-    /// (server now returns tokens in JSON body for desktop clients).
-    pub async fn refresh_token(&self) -> Result<RefreshResponse, ApiError> {
-        // H-1 FIX: Serialize all token refresh operations (including this public
-        // entry point) so concurrent callers cannot race and overwrite each
-        // other's tokens with stale values.
-        let _guard = self.refresh_lock.lock().await;
-
-        let refresh = self
-            .refresh_token
-            .read()
-            .await
-            .clone()
-            .ok_or(ApiError::NotAuthenticated)?;
-
-        // MR-2500 / MR-1771: one flight under the policy (a 429 or a 5xx keeps
-        // the token and sends it again), and only a 401 ends the session.
-        let response: RefreshResponse = self
-            .refresh_flight(refresh.as_str())
-            .await
-            .inspect_err(super::session_gate::report_refresh_failure)?;
-
-        // Update access token
-        *self.access_token.write().await = Some(Zeroizing::new(response.access_token.clone()));
-
-        // FIX C-1: Also update refresh token if server rotated it
-        if let Some(ref new_refresh) = response.refresh_token {
-            *self.refresh_token.write().await = Some(Zeroizing::new(new_refresh.clone()));
-        }
-
-        Ok(response)
+    /// The start-up refresh (`commands::auth::get_auth_state`, when the stored
+    /// session's profile could not be fetched): the refresh a 401 runs, and
+    /// no other (MR-2538, D-L3 of the #467 review). Under the refresh lock,
+    /// so one flight presents a token at a time; run detached to its end
+    /// (WIN3-004), so a caller dropped mid-flight loses neither the lock nor
+    /// the rotated pair; and the pair is adopted only by the session that
+    /// asked, and persisted to the OS keystore before the lock is released
+    /// (REVIEW-WIN4-002, `adopt_refreshed`). The policy is the one every
+    /// refresh flies under (MR-2500 / MR-1771): only a 401 ends the session,
+    /// and a held or failed flight is answered at once with its hold.
+    ///
+    /// `NotAuthenticated` when there is no session to refresh, or it ended (a
+    /// Sign Out, an expiry) or was replaced while the refresh ran: the pair
+    /// is then dropped, from memory and the keystore alike.
+    ///
+    /// It replaces the public `refresh_token()`, the one refresh that was
+    /// none of this: it ran inside its caller, wrote the rotated pair to
+    /// memory over whatever a Sign Out had left there, and left
+    /// `get_auth_state` to write it to the keystore after the lock was gone.
+    pub async fn refresh_session(&self) -> Result<(), ApiError> {
+        let lock = Arc::clone(&self.refresh_lock).lock_owned().await;
+        self.refresh_detached(lock).await
     }
 
     /// Logout (invalidate tokens on server)
@@ -2036,6 +2029,46 @@ impl BirdoApi {
     /// Internal: refresh the access token. Only ever run through
     /// [`refresh_detached`](Self::refresh_detached).
     async fn refresh_token_internal(&self) -> Result<(), ApiError> {
+        self.refresh_and_adopt(
+            move |presented| async move { self.refresh_flight(presented.as_str()).await },
+            |access, rotated| {
+                use crate::storage::credentials::{CredentialKey, CredentialStore};
+                // The ROTATED refresh token is written FIRST (review P469-L2): a kill
+                // between the two writes must never leave a fresh access token beside
+                // the CONSUMED refresh token, which the next refresh would replay and
+                // the server would treat as theft (every session revoked). Written in
+                // this order, a kill leaves the new refresh token with an older access
+                // token, which simply fails with 401 and refreshes.
+                // `None` means the server did not rotate, so the stored
+                // refresh token is still current and must be left alone.
+                if let Some(rotated) = rotated {
+                    if let Err(e) = CredentialStore::store(CredentialKey::RefreshToken, rotated) {
+                        tracing::error!(
+                            "Could not persist ROTATED refresh token ({e}) — the next launch \
+                             will replay a consumed token and the session will be revoked"
+                        );
+                    }
+                }
+                if let Err(e) = CredentialStore::store(CredentialKey::AccessToken, access) {
+                    tracing::error!("Could not persist refreshed access token ({e})");
+                }
+            },
+        )
+        .await
+    }
+
+    /// [`Self::refresh_token_internal`] with its flight and its keystore write
+    /// given, so a test can script the server's answer and watch what reaches
+    /// the keystore, and when (MR-2538).
+    async fn refresh_and_adopt<F, Fut>(
+        &self,
+        fly: F,
+        persist: impl FnOnce(&str, Option<&str>),
+    ) -> Result<(), ApiError>
+    where
+        F: FnOnce(Zeroizing<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<RefreshResponse, ApiError>>,
+    {
         let refresh = self
             .refresh_token
             .read()
@@ -2047,8 +2080,7 @@ impl BirdoApi {
         // the token and sends the same one again; `refresh_policy`). Only a
         // 401 is the server rejecting the refresh token: contract §3.3 ends
         // the session everywhere (see `session_gate`).
-        let response: RefreshResponse = self
-            .refresh_flight(refresh.as_str())
+        let response: RefreshResponse = fly(refresh.clone())
             .await
             .inspect_err(super::session_gate::report_refresh_failure)?;
 
@@ -2070,29 +2102,14 @@ impl BirdoApi {
         //
         // Best-effort: a keystore failure must not fail the request that
         // triggered the refresh — the in-memory tokens are still valid for this
-        // session — but it is logged loudly because it costs the next one.
+        // session — but it is logged loudly because it costs the next one
+        // (`refresh_token_internal`'s `persist`).
         let adopted = self
             .adopt_refreshed(
                 refresh.as_str(),
                 response.access_token,
                 response.refresh_token,
-                |access, rotated| {
-                    use crate::storage::credentials::{CredentialKey, CredentialStore};
-                    if let Err(e) = CredentialStore::store(CredentialKey::AccessToken, access) {
-                        tracing::error!("Could not persist refreshed access token ({e})");
-                    }
-                    // `None` means the server did not rotate, so the stored
-                    // refresh token is still current and must be left alone.
-                    if let Some(rotated) = rotated {
-                        if let Err(e) = CredentialStore::store(CredentialKey::RefreshToken, rotated)
-                        {
-                            tracing::error!(
-                                "Could not persist ROTATED refresh token ({e}) — the next launch \
-                                 will replay a consumed token and the session will be revoked"
-                            );
-                        }
-                    }
-                },
+                persist,
             )
             .await;
         if !adopted {
@@ -2161,9 +2178,18 @@ impl BirdoApi {
     /// flight failed and held the refresh, nothing has renewed or ended the
     /// session since, and the hold is over (`RetryGate::refresh_retry_due`).
     /// Cheap: the window's focus asks it every time (`main.rs`).
+    ///
+    /// MR-2538 (D-I2 of the #467 review): and only while there is a session
+    /// to refresh. A flight that outlives a Sign Out (it runs detached) and
+    /// then fails records a retry owed for a session that is gone; focus
+    /// would log a retry and find nothing to send. A token slot being
+    /// written this instant is not read as signed out: the gate decides.
     pub fn refresh_retry_due(&self) -> bool {
-        self.retry_gate
-            .refresh_retry_due(&refresh_hold_key(), std::time::Instant::now())
+        let signed_out = matches!(self.refresh_token.try_read().as_deref(), Ok(None));
+        !signed_out
+            && self
+                .retry_gate
+                .refresh_retry_due(&refresh_hold_key(), std::time::Instant::now())
     }
 
     /// MR-2500 / MR-1771 (lead decision 2026-11-19; Mobile #653's foreground
@@ -3001,7 +3027,11 @@ mod token_restore_tests {
     }
 
     /// WIN3-004, the wiring: every refresh after a 401 goes through the
-    /// detached runner, with the lock handed to it.
+    /// detached runner, with the lock handed to it. MR-2538: so does the
+    /// start-up refresh (`refresh_session`, `get_auth_state`'s), and there is
+    /// no other way to run one: the public `refresh_token()`, which ran
+    /// inline and wrote memory without the adopt check, is gone, and the one
+    /// flight and the one adopt are `refresh_token_internal`'s.
     #[test]
     fn every_refresh_after_a_401_is_detached() {
         const SOURCE: &str = include_str!("client.rs");
@@ -3014,6 +3044,7 @@ mod token_restore_tests {
             "async fn request_with_retry<",
             "pub async fn delete_account(",
             "pub async fn request_deletion_hold(",
+            "pub async fn refresh_session(",
         ] {
             let body = fn_body(signature);
             assert!(
@@ -3030,6 +3061,50 @@ mod token_restore_tests {
             1,
             "a refresh run inline"
         );
+        assert!(
+            !code.contains("pub async fn refresh_token("),
+            "the old refresh"
+        );
+        assert_eq!(
+            code.matches(".refresh_and_adopt(").count(),
+            1,
+            "a second adopt"
+        );
+        assert_eq!(
+            code.matches(".refresh_flight(").count(),
+            1,
+            "a flight outside it"
+        );
+        let internal = fn_body("async fn refresh_token_internal(");
+        assert!(internal.contains("self.refresh_and_adopt("));
+        assert!(internal.contains("self.refresh_flight(presented.as_str())"));
+        assert!(internal.contains("CredentialStore::store(CredentialKey::RefreshToken, rotated)"));
+        // Review P469-L2: the rotated refresh token is persisted BEFORE the access
+        // token, here and in CredentialStore::store_tokens, so a kill between the
+        // two writes never leaves a new access token beside a consumed refresh token.
+        let refresh_at = internal
+            .find("CredentialStore::store(CredentialKey::RefreshToken, rotated)")
+            .expect("the rotated refresh token is persisted");
+        let access_at = internal
+            .find("CredentialStore::store(CredentialKey::AccessToken, access)")
+            .expect("the access token is persisted");
+        assert!(refresh_at < access_at, "P469-L2: refresh token first");
+        const CREDS: &str = include_str!("../storage/credentials.rs");
+        let store_tokens = &CREDS[CREDS.find("pub fn store_tokens(").expect("store_tokens")..];
+        let store_tokens =
+            &store_tokens[..store_tokens.find("\n    }").expect("end of store_tokens")];
+        assert!(
+            store_tokens
+                .find("CredentialKey::RefreshToken")
+                .expect("refresh stored")
+                < store_tokens
+                    .find("CredentialKey::AccessToken")
+                    .expect("access stored"),
+            "P469-L2: store_tokens writes the refresh token first"
+        );
+        let adopt = fn_body("async fn refresh_and_adopt<");
+        assert!(adopt.contains(".inspect_err(super::session_gate::report_refresh_failure)?"));
+        assert!(adopt.contains(".adopt_refreshed("));
     }
 
     /// REVIEW-WIN4-002: a refresh that outlived its session never puts the
@@ -4196,22 +4271,16 @@ mod retry_after_tests {
             .find(".note(&held, error, std::time::Instant::now())")
             .expect("the note");
         assert!(check < send && send < note);
-        // MR-2500 / MR-1771: both refreshes fly under the policy, and the
-        // one send of a flight is a `do_request`.
+        // MR-2500 / MR-1771: every refresh flies under the policy, and the
+        // one send of a flight is a `do_request`. MR-2538: the start-up
+        // refresh included; it is the one `refresh_token_internal` runs.
         let fn_body = |signature: &str| {
             let start = SOURCE.find(signature).expect(signature);
             let rest = &SOURCE[start..];
             &rest[..rest.find("\n    }").expect("end of fn")]
         };
-        for signature in [
-            "async fn refresh_token_internal(",
-            "pub async fn refresh_token(",
-        ] {
-            assert!(
-                fn_body(signature).contains(".refresh_flight(refresh.as_str())"),
-                "{signature}"
-            );
-        }
+        assert!(fn_body("async fn refresh_token_internal(")
+            .contains("self.refresh_flight(presented.as_str())"));
         assert!(fn_body("async fn refresh_flight(").contains(".do_request::<RefreshResponse>("));
         // One send, and no wait in the call (lead decision 2026-11-19).
         let fly = fn_body("async fn fly_refresh<");
@@ -4221,10 +4290,354 @@ mod retry_after_tests {
             "async fn fly_refresh<",
             "async fn refresh_flight(",
             "async fn refresh_token_internal(",
-            "pub async fn refresh_token(",
+            "async fn refresh_and_adopt<",
+            "pub async fn refresh_session(",
         ] {
             assert!(!fn_body(signature).contains("sleep"), "{signature}");
         }
         assert!(!include_str!("refresh_policy.rs").contains("sleep("));
+    }
+
+    /// What a refresh handed the OS keystore (`adopt_refreshed`'s
+    /// `persist`), and whether the refresh lock was held when it did. Fixture
+    /// pairs only, compared and never formatted (CodeQL reads an assert's
+    /// message as a log).
+    #[derive(Default)]
+    struct Keystore {
+        writes: std::sync::Mutex<Vec<(String, Option<String>, bool)>>,
+    }
+
+    impl Keystore {
+        /// Written exactly once, with this pair, while the lock was held.
+        fn holds(&self, access: &str, rotated: Option<&str>) -> bool {
+            let writes = self.writes.lock().unwrap();
+            matches!(
+                writes.as_slice(),
+                [(a, r, true)] if a == access && r.as_deref() == rotated
+            )
+        }
+
+        fn untouched(&self) -> bool {
+            self.writes.lock().unwrap().is_empty()
+        }
+    }
+
+    /// The `persist` a refresh run under `lock` is given, recording into
+    /// `keystore`.
+    fn keystore_writer(
+        keystore: &Arc<Keystore>,
+        lock: &Arc<tokio::sync::Mutex<()>>,
+    ) -> impl FnOnce(&str, Option<&str>) + Send + 'static {
+        let (keystore, lock) = (Arc::clone(keystore), Arc::clone(lock));
+        move |access: &str, rotated: Option<&str>| {
+            let under_the_lock = lock.try_lock().is_err();
+            keystore.writes.lock().unwrap().push((
+                access.to_owned(),
+                rotated.map(str::to_owned),
+                under_the_lock,
+            ));
+        }
+    }
+
+    /// `refresh_session` as it runs (`refresh_detached`, then
+    /// `refresh_token_internal`): the refresh lock taken, then the refresh
+    /// run to its end on a task of its own that holds it. Only the wire and
+    /// the keystore are scripted: the token goes out at once (recorded by
+    /// `server`), its answer comes back when `answered` fires, and the
+    /// keystore write is recorded in `keystore`.
+    fn startup_refresh(
+        api: &BirdoApi,
+        server: &Arc<ScriptedRefresh>,
+        keystore: &Arc<Keystore>,
+        answer: Result<RefreshResponse, ApiError>,
+        answered: tokio::sync::oneshot::Receiver<()>,
+    ) -> impl std::future::Future<Output = Result<(), ApiError>> + Send + 'static {
+        let (api, server) = (api.clone(), Arc::clone(server));
+        let persist = keystore_writer(keystore, &api.refresh_lock);
+        async move {
+            let lock = Arc::clone(&api.refresh_lock).lock_owned().await;
+            let refreshing = api.clone();
+            super::run_holding(lock, async move {
+                let (api, scripted) = (&refreshing, &server);
+                api.refresh_and_adopt(
+                    move |_presented| async move {
+                        api.fly_refresh(async move {
+                            let sent = scripted.send(api, answer).await;
+                            let _ = answered.await;
+                            sent
+                        })
+                        .await
+                    },
+                    persist,
+                )
+                .await
+            })
+            .await
+        }
+    }
+
+    /// An answer that is already back.
+    fn answered_now() -> tokio::sync::oneshot::Receiver<()> {
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let _ = answer.send(());
+        answered
+    }
+
+    /// The pair the session holds in memory is exactly this one.
+    async fn holds_in_memory(api: &BirdoApi, access: &str, refresh: &str) -> bool {
+        api.access_token_value().await.as_deref() == Some(access)
+            && api
+                .refresh_token
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|t| t.as_str() == refresh)
+    }
+
+    /// MR-2538 (D-L3 of the #467 review): a Sign Out that lands while the
+    /// start-up refresh is out (`logout` clears the tokens without the
+    /// refresh lock) is final. The renewal that comes back after it is
+    /// dropped: not written to memory, not to the keystore, and the call is
+    /// told the session is gone (`NotAuthenticated`), which `get_auth_state`
+    /// reports as memory holds it: signed out. On main the public
+    /// `refresh_token()` wrote the pair back into memory over the Sign Out,
+    /// and `get_auth_state` then wrote it to the keystore: signed in again at
+    /// the next launch.
+    #[tokio::test]
+    async fn a_sign_out_during_the_startup_refresh_never_brings_the_pair_back() {
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let server = Arc::new(ScriptedRefresh::default());
+        let keystore = Arc::new(Keystore::default());
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let refresh = tokio::spawn(startup_refresh(
+            &api,
+            &server,
+            &keystore,
+            renewed(),
+            answered,
+        ));
+        for _ in 0..1000 {
+            if server.sent() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(server.sent(), 1, "the token never went");
+        assert!(server.all_the_same_token(), "another token went");
+
+        // The Sign Out, while the token is on the wire.
+        api.clear_tokens().await;
+        let _ = answer.send(());
+        let Ok(result) = refresh.await else {
+            panic!("the refresh task failed");
+        };
+        let Err(gone) = result else {
+            panic!("the renewal was adopted after a Sign Out");
+        };
+        assert!(
+            matches!(gone, ApiError::NotAuthenticated),
+            "not told the session is gone"
+        );
+        assert_eq!(server.sent(), 1);
+        assert!(
+            !api.is_authenticated().await,
+            "the pair came back in memory"
+        );
+        assert!(
+            api.refresh_token.read().await.is_none(),
+            "the refresh token came back in memory"
+        );
+        assert!(keystore.untouched(), "the pair reached the keystore");
+        assert!(api.refresh_lock.try_lock().is_ok(), "the lock was kept");
+    }
+
+    /// MR-2538: the start-up refresh stores the rotated pair, in memory and
+    /// in the OS keystore, while it still holds the refresh lock, so nothing
+    /// that waits for the lock (a sign-in, a restore, the next refresh, a
+    /// Sign Out's teardown) can come between the two, and a kill after the
+    /// memory write finds the keystore written already. A pair the server did
+    /// not rotate leaves the stored refresh token alone. On main
+    /// `get_auth_state` wrote the keystore itself, after `refresh_token()`
+    /// had released the lock.
+    #[tokio::test]
+    async fn the_startup_refresh_stores_the_pair_before_it_lets_go_of_the_lock() {
+        for (case, body, rotated) in [
+            (
+                "rotated",
+                r#"{"access_token":"a2","refresh_token":"r2"}"#,
+                Some("r2"),
+            ),
+            ("not rotated", r#"{"access_token":"a2"}"#, None),
+        ] {
+            let api = BirdoApi::new();
+            api.set_tokens("a1".into(), "r1".into()).await;
+            let server = Arc::new(ScriptedRefresh::default());
+            let keystore = Arc::new(Keystore::default());
+            let renewal = Ok(serde_json::from_str::<RefreshResponse>(body).unwrap());
+
+            let result = startup_refresh(&api, &server, &keystore, renewal, answered_now()).await;
+            assert!(result.is_ok(), "{case}: not renewed");
+            assert!(
+                keystore.holds("a2", rotated),
+                "{case}: not stored under the refresh lock"
+            );
+            assert!(
+                holds_in_memory(&api, "a2", rotated.unwrap_or("r1")).await,
+                "{case}: not adopted"
+            );
+            assert!(api.refresh_lock.try_lock().is_ok(), "{case}: lock kept");
+        }
+    }
+
+    /// MR-2538: the start-up refresh outlives a caller dropped while the
+    /// token is on the wire (WIN3-004, as every refresh a 401 runs): the lock
+    /// stays held until the answer is in, and the rotated pair it carries is
+    /// still adopted and persisted. On main the refresh ran inside
+    /// `get_auth_state`: dropping it dropped the lock and the pair, and the
+    /// client kept the token the server had just consumed.
+    #[tokio::test]
+    async fn a_dropped_startup_refresh_still_stores_the_rotated_pair() {
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let server = Arc::new(ScriptedRefresh::default());
+        let keystore = Arc::new(Keystore::default());
+        let (answer, answered) = tokio::sync::oneshot::channel();
+
+        let caller = startup_refresh(&api, &server, &keystore, renewed(), answered);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), caller)
+                .await
+                .is_err(),
+            "the caller was not dropped first"
+        );
+        assert_eq!(server.sent(), 1, "the token never went");
+        assert!(
+            api.refresh_lock.try_lock().is_err(),
+            "the lock went with the caller"
+        );
+
+        let _ = answer.send(());
+        let _next = tokio::time::timeout(Duration::from_secs(5), api.refresh_lock.lock())
+            .await
+            .expect("the refresh never finished");
+        assert!(
+            holds_in_memory(&api, "a2", "r2").await,
+            "the rotated pair was dropped"
+        );
+        assert!(
+            keystore.holds("a2", Some("r2")),
+            "the rotated pair never reached the keystore"
+        );
+    }
+
+    /// MR-2538: the start-up refresh keeps the one refresh policy (MR-2500 /
+    /// MR-1771), as every other refresh does. A 401 is the server rejecting
+    /// the token: the session's end (`session_gate`), the stored session
+    /// discarded, and `get_auth_state` reports signed out. A 429 or a 5xx
+    /// keeps the session and holds the refresh, told at once (the clock is
+    /// paused: nothing waits in the call); inside the hold the next one sends
+    /// nothing, and once it is over the SAME token goes and renews. Nothing
+    /// reaches the keystore before that renewal.
+    #[tokio::test(start_paused = true)]
+    async fn the_startup_refresh_keeps_the_one_refresh_policy() {
+        use crate::api::session_gate::{self, StoredSession};
+        // The answer, and the hold the call is told (status, wait); none for
+        // the 401.
+        let cases = vec![
+            ("401", refused(401, "", None), None),
+            (
+                "401, sentence",
+                refused(401, r#"{"message":"No"}"#, None),
+                None,
+            ),
+            ("429, header", refused(429, "", Some(42)), Some((429, 42))),
+            ("429, body", refused(429, LIMITED_17, None), Some((429, 17))),
+            ("429, no wait", refused(429, "", None), Some((429, 60))),
+            ("500", refused(500, "", None), Some((503, 1))),
+            ("503", refused(503, "", None), Some((503, 1))),
+            ("503, busy", refused(503, "", Some(10)), Some((503, 10))),
+        ];
+        for (case, answer, held) in cases {
+            let api = BirdoApi::new();
+            api.set_tokens("a1".into(), "r1".into()).await;
+            let server = Arc::new(ScriptedRefresh::default());
+            let keystore = Arc::new(Keystore::default());
+            let started = tokio::time::Instant::now();
+
+            let Err(failed) =
+                startup_refresh(&api, &server, &keystore, answer, answered_now()).await
+            else {
+                panic!("{case}: renewed");
+            };
+            assert_eq!(tokio::time::Instant::now(), started, "{case}: it waited");
+            assert_eq!(server.sent(), 1, "{case}");
+            assert!(keystore.untouched(), "{case}: the keystore was written");
+            assert!(tokens_untouched(&api).await, "{case}: the session changed");
+
+            let Some((status, wait)) = held else {
+                assert!(session_gate::refresh_rejected(&failed), "{case}: kept");
+                assert!(
+                    session_gate::stored_session_after(&failed) == StoredSession::Discard,
+                    "{case}: the stored session kept"
+                );
+                assert!(!api.refresh_retry_due(), "{case}: a retry owed");
+                continue;
+            };
+            assert!(
+                !session_gate::refresh_rejected(&failed),
+                "{case}: signed out"
+            );
+            assert!(
+                matches!(
+                    failed,
+                    ApiError::Held { status: s, retry_after_secs: w } if s == status && w == wait
+                ),
+                "{case}: not told the hold"
+            );
+
+            // Inside the hold: nothing is sent.
+            let again = startup_refresh(&api, &server, &keystore, renewed(), answered_now()).await;
+            assert!(matches!(again, Err(ApiError::Held { .. })), "{case}");
+            assert_eq!(server.sent(), 1, "{case}: sent inside the hold");
+            assert!(keystore.untouched(), "{case}: the keystore was written");
+
+            // Once it is over, the SAME token goes, and renews.
+            api.retry_gate.elapse(Duration::from_secs(wait));
+            assert!(api.refresh_retry_due(), "{case}: not owed");
+            let renewal =
+                startup_refresh(&api, &server, &keystore, renewed(), answered_now()).await;
+            assert!(renewal.is_ok(), "{case}: not renewed after the hold");
+            assert_eq!(server.sent(), 2, "{case}");
+            assert!(server.all_the_same_token(), "{case}: another token went");
+            assert!(keystore.holds("a2", Some("r2")), "{case}: not stored");
+            assert!(!api.refresh_retry_due(), "{case}: owed after renewing");
+            assert_eq!(tokio::time::Instant::now(), started, "{case}: it waited");
+        }
+    }
+
+    /// MR-2538 (D-I2 of the #467 review): a flight that outlives a Sign Out
+    /// and then fails leaves nothing owed. Its failure is recorded after the
+    /// Sign Out forgot the session's holds, but with no session left to
+    /// refresh, focus sends nothing and logs nothing; the next sign-in starts
+    /// clean as before. At 5d91302f focus found the retry due once the hold
+    /// was over, and ran it for a session that was gone.
+    #[tokio::test]
+    async fn a_flight_that_fails_after_a_sign_out_leaves_nothing_owed() {
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let server = ScriptedRefresh::default();
+        let flight = Arc::clone(&api.refresh_lock).lock_owned().await;
+        api.clear_tokens().await;
+        let _ = api
+            .fly_refresh(server.send(&api, refused(503, "", None)))
+            .await;
+        drop(flight);
+        api.retry_gate.elapse(Duration::from_secs(1));
+        assert!(!api.refresh_retry_due(), "owed for a session that is gone");
+        assert!(api.lock_for_held_refresh().is_none(), "focus would retry");
+
+        api.begin_session("b1".into(), "s1".into()).await;
+        assert!(!api.refresh_retry_due(), "owed from the last session");
     }
 }

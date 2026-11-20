@@ -161,8 +161,10 @@ impl CredentialStore {
 
     /// Store access and refresh tokens (instance method for State<CredentialStore>)
     pub fn store_tokens(&self, access: &str, refresh: &str) -> Result<(), String> {
-        Self::store(CredentialKey::AccessToken, access)?;
+        // Refresh token FIRST (review P469-L2): a kill between the two writes must
+        // never pair a new access token with an old, possibly consumed, refresh token.
         Self::store(CredentialKey::RefreshToken, refresh)?;
+        Self::store(CredentialKey::AccessToken, access)?;
         Ok(())
     }
 

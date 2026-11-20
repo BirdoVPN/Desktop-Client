@@ -882,26 +882,26 @@ pub async fn get_auth_state(
                 }
                 Err(e) => {
                     tracing::info!("Profile fetch failed ({e}) — attempting token refresh");
-                    // Token might be expired, try refresh
-                    let refreshed = api.refresh_token().await;
+                    // Token might be expired, try refresh.
+                    //
+                    // MR-2538 (D-L3 of the #467 review): the refresh a 401 runs
+                    // (`BirdoApi::refresh_session`), not a refresh of its own. It
+                    // runs detached to its end, so dropping this call loses
+                    // neither the lock nor the rotated pair; it adopts the pair
+                    // only if the session that asked is still there; and it
+                    // stores the pair, in memory and in the OS keystore, before
+                    // it releases the refresh lock.
+                    let refreshed = api.refresh_session().await;
                     match (session_gate::refresh_outcome(&refreshed), refreshed) {
-                        (_, Ok(new_tokens)) => {
-                            // Use rotated refresh token if server returned one, else keep existing
-                            let refresh_to_store = new_tokens
-                                .refresh_token
-                                .as_deref()
-                                .unwrap_or(&tokens.refresh_token);
-                            if let Err(e) =
-                                credentials.store_tokens(&new_tokens.access_token, refresh_to_store)
-                            {
-                                // Not fatal for THIS call (the in-memory tokens still
-                                // work), but it means the session dies at the next
-                                // launch — so say so instead of discarding it.
-                                tracing::error!(
-                                    "Refreshed tokens could not be persisted to the OS keystore \
-                                     ({e}) — this session will not survive a restart"
-                                );
-                            }
+                        (_, Ok(())) => {
+                            // MR-2538: the rotated pair is in the keystore already,
+                            // written under the refresh lock (`adopt_refreshed`),
+                            // which also logs a keystore that refused it. This arm
+                            // used to write it here, after the lock was released: a
+                            // kill in between left the consumed token stored for the
+                            // next launch to replay, and a Sign Out in between had
+                            // its cleared keystore written back.
+                            //
                             // Re-fetch the profile with the refreshed access token so the
                             // identity is populated. Previously this returned email:None,
                             // so any auth check that hit the refresh path (e.g. app restart
@@ -963,6 +963,21 @@ pub async fn get_auth_state(
                                 );
                             }
                             Ok(AuthState::unknown_identity(false))
+                        }
+                        // MR-2538: no session to refresh any more. It ended (a Sign
+                        // Out, an expiry) or was replaced while the refresh ran, or
+                        // just before it: the renewal, if one came, was dropped,
+                        // from memory and the keystore alike, and clearing is the
+                        // Sign Out's or the expiry's business. The answer is what
+                        // memory holds now. On main this put the pair back over a
+                        // Sign Out (signed in again), and a session already gone
+                        // read as signed in with an unknown identity.
+                        (_, Err(ApiError::NotAuthenticated)) => {
+                            tracing::info!(
+                                "The session ended while the start-up check refreshed it — \
+                                 nothing restored"
+                            );
+                            Ok(AuthState::unknown_identity(api.is_authenticated().await))
                         }
                         (_, Err(e)) => {
                             tracing::warn!(
@@ -2256,6 +2271,41 @@ mod account_boundary_tests {
                 e.message
             );
         }
+    }
+
+    /// MR-2538 (D-L3 of the #467 review): the start-up refresh is the one a
+    /// 401 runs (`BirdoApi::refresh_session`: detached, adopted only by the
+    /// session that asked, stored under the refresh lock; driven in
+    /// `api::client`). So `get_auth_state` writes none of it to the keystore
+    /// itself, after the lock is gone. Its answers stay as they were: a 401
+    /// signs out (discarding the stored session as the gate says), anything
+    /// else keeps the session, and a session that ended while it ran is
+    /// reported as memory holds it, never put back.
+    #[test]
+    fn the_startup_refresh_is_the_one_a_401_runs() {
+        let state = body("get_auth_state");
+        assert!(state.contains("api.refresh_session().await"));
+        assert!(!state.contains(".refresh_token()"), "the old refresh");
+        assert!(!state.contains("store_tokens("), "stored outside the lock");
+        let renewed = state.find("(_, Ok(())) =>").expect("the renewal");
+        let rejected = state
+            .find("(RefreshOutcome::Unauthorized, Err(e)) =>")
+            .expect("the 401");
+        let gone = state
+            .find("(_, Err(ApiError::NotAuthenticated)) =>")
+            .expect("the session gone");
+        let kept = state.find("(_, Err(e)) =>").expect("the transient failure");
+        assert!(renewed < rejected && rejected < gone && gone < kept);
+        let rejected = &state[rejected..gone];
+        assert!(
+            rejected.contains("session_gate::stored_session_after(&e) == StoredSession::Discard")
+        );
+        assert!(rejected.contains("credentials.clear_tokens()"));
+        assert!(rejected.contains("Ok(AuthState::unknown_identity(false))"));
+        let gone = &state[gone..kept];
+        assert!(gone.contains("Ok(AuthState::unknown_identity(api.is_authenticated().await))"));
+        assert!(!gone.contains("credentials."), "the keystore touched");
+        assert!(state[kept..].contains("Ok(AuthState::unknown_identity(true))"));
     }
 
     /// MR-179: the proof rides the deletion call (number as digits, code
