@@ -228,6 +228,13 @@ impl RetryGate {
     /// session since, and the hold on the refresh `key` is over. The
     /// window's return to the foreground asks this
     /// (`BirdoApi::retry_held_refresh`); nothing asks it on a timer.
+    /// MR-2532: whether a refresh is held (its wait still runs) or owed (the
+    /// last flight got no verdict). A Sign Out then ends the session with the
+    /// refresh token instead of the bearer (`BirdoApi::end_server_session`).
+    pub(crate) fn refresh_held_or_owed(&self, key: &str, now: Instant) -> bool {
+        self.refresh_failures.load(Ordering::SeqCst) > 0 || self.check(key, now).is_err()
+    }
+
     pub(crate) fn refresh_retry_due(&self, key: &str, now: Instant) -> bool {
         self.refresh_failures.load(Ordering::SeqCst) > 0 && self.check(key, now).is_ok()
     }
