@@ -12,6 +12,7 @@ pub mod pow;
 mod refresh_policy;
 mod retry_gate;
 pub mod session_gate;
+mod sign_out;
 pub mod types;
 pub mod upgrade_gate;
 

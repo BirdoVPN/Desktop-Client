@@ -435,6 +435,10 @@ fn retry_after_of(response: &reqwest::Response) -> Option<u64> {
 
 /// What the token refresh is held under in the retry gate (MR-1808): its
 /// method and path, like every route outside the credential bucket.
+/// MR-2532: how long a Sign Out waits for a refresh already on the wire
+/// before it reads the tokens ([`BirdoApi::end_server_session`]).
+const LOGOUT_REFRESH_WAIT: Duration = Duration::from_secs(15);
+
 fn refresh_hold_key() -> String {
     super::retry_gate::hold_key(&reqwest::Method::POST, endpoints::auth::REFRESH)
 }
@@ -748,13 +752,90 @@ impl BirdoApi {
         self.refresh_detached(lock).await
     }
 
-    /// Logout (invalidate tokens on server)
+    /// Logout (invalidate tokens on server), then clear them here.
+    ///
+    /// MR-2532: the server half NEVER refreshes ([`Self::end_server_session`]).
+    /// It went through `request_with_retry`: an expired access token's 401
+    /// started a refresh, and while the refresh was held (a 429's wait, a
+    /// backoff) that refresh was answered at once with the hold, nothing
+    /// reached the server, and the session lived on there until it expired.
     pub async fn logout(&self) -> Result<(), ApiError> {
-        let _ = self
-            .post::<_, serde_json::Value>(endpoints::auth::LOGOUT, &EmptyBody {}, true)
-            .await;
+        self.end_server_session(|with| self.send_logout(with)).await;
         self.clear_tokens().await;
         Ok(())
+    }
+
+    /// MR-2532 (owner decision 2026-11-20, option a): end the session on the
+    /// server without a refresh, with `send` doing each `POST /auth/logout`
+    /// (given, so a test can script the server).
+    ///
+    /// 1. A refresh already on the wire holds the refresh lock to its end
+    ///    (WIN3-004); it is waited for, at most [`LOGOUT_REFRESH_WAIT`], so
+    ///    the pair read next is the one it lands, never the token it consumed.
+    /// 2. With a usable access token and no refresh held or owed: the bearer,
+    ///    and the refresh token only if the bearer is answered 401.
+    /// 3. Otherwise: the refresh token in the body, which the server revokes
+    ///    exactly that session for, issuing nothing (`sign_out::sign_out_plan`).
+    async fn end_server_session<F, Fut>(&self, send: F)
+    where
+        F: Fn(super::sign_out::LogoutWith) -> Fut,
+        Fut: std::future::Future<Output = Result<(), ApiError>>,
+    {
+        use super::sign_out::{sign_out_plan, unix_now, LogoutWith, SignOutPlan};
+        let _ = tokio::time::timeout(LOGOUT_REFRESH_WAIT, self.refresh_lock.lock()).await;
+        let access = self.access_token_value().await;
+        let refresh = self
+            .refresh_token
+            .read()
+            .await
+            .as_ref()
+            .map(|t| t.to_string());
+        let held = self
+            .retry_gate
+            .refresh_held_or_owed(&refresh_hold_key(), std::time::Instant::now());
+        match sign_out_plan(access.as_deref(), refresh.is_some(), held, unix_now()) {
+            SignOutPlan::Nothing => {}
+            SignOutPlan::RefreshToken => {
+                if let Some(refresh) = refresh {
+                    let _ = send(LogoutWith::RefreshToken(refresh)).await;
+                }
+            }
+            SignOutPlan::BearerThenRefreshTokenOn401 => {
+                let bearer = send(LogoutWith::Bearer).await;
+                if let (Err(ApiError::Unauthorized), Some(refresh)) = (bearer, refresh) {
+                    let _ = send(LogoutWith::RefreshToken(refresh)).await;
+                }
+            }
+        }
+    }
+
+    /// One `POST /auth/logout`, sent once through `do_request` (the retry gate
+    /// holds and learns as for any request; nothing refreshes).
+    async fn send_logout(&self, with: super::sign_out::LogoutWith) -> Result<(), ApiError> {
+        use super::sign_out::LogoutWith;
+        let post = reqwest::Method::POST;
+        match with {
+            LogoutWith::Bearer => self
+                .do_request::<serde_json::Value>(
+                    &post,
+                    endpoints::auth::LOGOUT,
+                    Some(&EmptyBody {}),
+                    true,
+                )
+                .await
+                .map(|_| ()),
+            LogoutWith::RefreshToken(refresh_token) => {
+                let payload = RefreshRequest { refresh_token };
+                self.do_request::<serde_json::Value>(
+                    &post,
+                    endpoints::auth::LOGOUT,
+                    Some(&payload),
+                    false,
+                )
+                .await
+                .map(|_| ())
+            }
+        }
     }
 
     /// GDPR Art. 17: permanently delete the account.
@@ -4639,5 +4720,197 @@ mod retry_after_tests {
 
         api.begin_session("b1".into(), "s1".into()).await;
         assert!(!api.refresh_retry_due(), "owed from the last session");
+    }
+}
+
+/// MR-2532 [SIGNOUT-DURING-REFRESH-HOLD]: a Sign Out ends its session on the
+/// server with the refresh token whenever the bearer cannot, and never
+/// refreshes. The server is scripted: `end_server_session` is handed the send.
+#[cfg(test)]
+mod sign_out_tests {
+    use super::super::sign_out::{test_jwt, unix_now, LogoutWith};
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// The sign-out's server half against a scripted server: what it sent, in
+    /// order. `answers` answer the sends in turn; past them, `Ok`.
+    async fn sent_by(api: &BirdoApi, answers: Vec<Result<(), ApiError>>) -> Vec<LogoutWith> {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let answers = Arc::new(StdMutex::new(answers.into_iter()));
+        api.end_server_session(|with| {
+            let (sent, answers) = (Arc::clone(&sent), Arc::clone(&answers));
+            async move {
+                sent.lock().unwrap().push(with);
+                answers.lock().unwrap().next().unwrap_or(Ok(()))
+            }
+        })
+        .await;
+        let sent = sent.lock().unwrap().clone();
+        sent
+    }
+
+    fn live() -> String {
+        test_jwt(Some(unix_now() + 600))
+    }
+
+    fn expired() -> String {
+        test_jwt(Some(unix_now() - 10))
+    }
+
+    #[tokio::test]
+    async fn a_usable_bearer_signs_out_alone() {
+        let api = BirdoApi::new();
+        api.set_tokens(live(), "r1".into()).await;
+        assert_eq!(sent_by(&api, vec![Ok(())]).await, vec![LogoutWith::Bearer]);
+    }
+
+    /// The bearer's 401 hands over to the refresh token; nothing refreshes.
+    #[tokio::test]
+    async fn a_bearer_answered_401_sends_the_refresh_token_once() {
+        let api = BirdoApi::new();
+        api.set_tokens(live(), "r1".into()).await;
+        assert_eq!(
+            sent_by(&api, vec![Err(ApiError::Unauthorized)]).await,
+            vec![LogoutWith::Bearer, LogoutWith::RefreshToken("r1".into())]
+        );
+    }
+
+    /// Any other answer to the bearer, or none, ends the server half.
+    #[tokio::test]
+    async fn only_a_401_hands_over_to_the_refresh_token() {
+        let api = BirdoApi::new();
+        api.set_tokens(live(), "r1".into()).await;
+        assert_eq!(
+            sent_by(
+                &api,
+                vec![Err(ApiError::RateLimited {
+                    retry_after_secs: Some(5)
+                })]
+            )
+            .await,
+            vec![LogoutWith::Bearer]
+        );
+    }
+
+    /// The case the row is about: the access token has expired. The refresh
+    /// token goes at once, with no refresh first.
+    #[tokio::test]
+    async fn an_expired_access_token_sends_the_refresh_token() {
+        let api = BirdoApi::new();
+        api.set_tokens(expired(), "r1".into()).await;
+        assert_eq!(
+            sent_by(&api, vec![]).await,
+            vec![LogoutWith::RefreshToken("r1".into())]
+        );
+    }
+
+    /// A refresh held by the server's 429 (or owed after a failure): the
+    /// refresh token goes at once, even beside an access token that still
+    /// reads as usable, and the hold is not waited out.
+    #[tokio::test]
+    async fn a_held_refresh_sends_the_refresh_token_without_waiting() {
+        let api = BirdoApi::new();
+        api.set_tokens(live(), "r1".into()).await;
+        assert!(api.retry_gate.refresh_failed(
+            &refresh_hold_key(),
+            &ApiError::RateLimited {
+                retry_after_secs: Some(60)
+            },
+            std::time::Instant::now(),
+            0.5,
+        ));
+        assert_eq!(
+            sent_by(&api, vec![]).await,
+            vec![LogoutWith::RefreshToken("r1".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_sent_with_no_session() {
+        let api = BirdoApi::new();
+        assert_eq!(sent_by(&api, vec![]).await, Vec::<LogoutWith>::new());
+    }
+
+    /// A refresh on the wire when the Sign Out comes has consumed the token
+    /// in memory. The Sign Out waits for it and signs out with what it lands.
+    #[tokio::test]
+    async fn a_refresh_on_the_wire_is_waited_for_and_its_pair_signs_out() {
+        let api = BirdoApi::new();
+        api.set_tokens(expired(), "r1".into()).await;
+        let lock = Arc::clone(&api.refresh_lock).lock_owned().await;
+        let refreshing = api.clone();
+        let landed = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            refreshing.set_tokens(expired(), "r2".into()).await;
+            drop(lock);
+        });
+        assert_eq!(
+            sent_by(&api, vec![]).await,
+            vec![LogoutWith::RefreshToken("r2".into())]
+        );
+        landed.await.unwrap();
+    }
+
+    /// ...but at most `LOGOUT_REFRESH_WAIT`: a refresh that never ends does not
+    /// hold the Sign Out (its local clear still follows).
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_for_a_refresh_is_bounded() {
+        let api = BirdoApi::new();
+        api.set_tokens(expired(), "r1".into()).await;
+        let lock = Arc::clone(&api.refresh_lock).lock_owned().await;
+        let stuck = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(lock);
+        });
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            sent_by(&api, vec![]).await,
+            vec![LogoutWith::RefreshToken("r1".into())]
+        );
+        assert_eq!(started.elapsed(), LOGOUT_REFRESH_WAIT);
+        stuck.abort();
+    }
+
+    /// The Sign Out never refreshes and never goes through the 401-refresh
+    /// path, and the tokens are cleared after the server half.
+    #[test]
+    fn the_sign_out_never_refreshes() {
+        const SOURCE: &str = include_str!("client.rs");
+        let fn_body = |signature: &str| {
+            let start = SOURCE.find(signature).expect(signature);
+            let rest = &SOURCE[start..];
+            &rest[..rest.find("\n    }").expect("end of fn")]
+        };
+        for signature in [
+            "pub async fn logout(&self)",
+            "async fn end_server_session<",
+            "async fn send_logout(",
+        ] {
+            let body = fn_body(signature);
+            for forbidden in [
+                "refresh_detached",
+                "request_with_retry",
+                "refresh_flight",
+                "self.post",
+                "self.get(",
+            ] {
+                assert!(!body.contains(forbidden), "{signature}: {forbidden}");
+            }
+        }
+        let logout = fn_body("pub async fn logout(&self)");
+        let server = logout
+            .find("self.end_server_session(")
+            .expect("the server half");
+        let clear = logout
+            .find("self.clear_tokens().await")
+            .expect("the local clear");
+        assert!(server < clear);
+        let send = fn_body("async fn send_logout(");
+        assert!(send.contains("RefreshRequest { refresh_token }"));
+        let flat = send.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("Some(&payload), false,"),
+            "the refresh token goes without a bearer"
+        );
     }
 }
