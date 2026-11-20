@@ -2753,6 +2753,121 @@ mod send_failed_tests {
         );
     }
 
+    /// TEST-ONLY fixtures for the real handshakes below (review D468-L1),
+    /// made once with OpenSSL 3.5, valid 2026-01-01 to 2126-01-01:
+    /// - a P-256 CA, "BirdoVPN TEST-ONLY pin-refusal CA" (its key was
+    ///   discarded);
+    /// - a leaf it signed for IP 127.0.0.1 (serverAuth);
+    /// - that leaf's PKCS#8 key, which serves only the loopback handshake in
+    ///   these tests.
+    ///
+    /// Nothing in the app trusts or pins any of them.
+    const TEST_CA: &[u8] = include_bytes!("testdata/TEST-ONLY-pin-ca.der");
+    const TEST_LEAF: &[u8] = include_bytes!("testdata/TEST-ONLY-pin-leaf.der");
+    const TEST_LEAF_KEY: &[u8] = include_bytes!("testdata/TEST-ONLY-pin-leaf-key.pkcs8.der");
+
+    /// A TLS server on 127.0.0.1 that presents the test leaf for one
+    /// handshake, run to its end (the client refuses the leaf and hangs up).
+    fn serve_the_test_leaf_once() -> std::net::SocketAddr {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let Ok(versions) = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+        else {
+            panic!("the server's TLS versions");
+        };
+        let Ok(config) = versions.with_no_client_auth().with_single_cert(
+            vec![CertificateDer::from(TEST_LEAF)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(TEST_LEAF_KEY)),
+        ) else {
+            panic!("the server's certificate");
+        };
+        let config = std::sync::Arc::new(config);
+        std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            let bound = Some(std::time::Duration::from_secs(10));
+            let _ = socket.set_read_timeout(bound);
+            let _ = socket.set_write_timeout(bound);
+            let Ok(mut tls) = rustls::ServerConnection::new(config) else {
+                return;
+            };
+            while tls.is_handshaking() {
+                if tls.complete_io(&mut socket).is_err() {
+                    break;
+                }
+            }
+        });
+        addr
+    }
+
+    /// A request to the test server from the API client's own builder
+    /// (`hardened_client_builder`: its timeouts, HTTPS only, the DoH
+    /// resolver), with the API client's TLS config, the real pinning
+    /// verifier over every host, trusting `root` alone
+    /// (`cert_pin::rustls_config_trusting`, the one test-only seam).
+    async fn dial_the_test_leaf(root: &[u8]) -> reqwest::Error {
+        let mut roots = rustls::RootCertStore::empty();
+        assert!(
+            roots
+                .add(rustls::pki_types::CertificateDer::from(root))
+                .is_ok(),
+            "the test root"
+        );
+        let Ok(client) = hardened_client_builder()
+            .use_preconfigured_tls(crate::api::cert_pin::rustls_config_trusting(roots))
+            .build()
+        else {
+            panic!("the client");
+        };
+        let addr = serve_the_test_leaf_once();
+        let Err(failed) = client.get(format!("https://{addr}/")).send().await else {
+            panic!("the handshake went through");
+        };
+        failed
+    }
+
+    /// Review D468-L1: a REAL pin refusal, end to end, over loopback. WebPKI
+    /// accepts the test leaf (its CA is the one root), the pin does not
+    /// (nothing in the chain is pinned), rustls aborts the handshake, and the
+    /// error comes up through the real tokio-rustls, hyper-rustls,
+    /// hyper-util and reqwest layers. It must be told as a pin failure. A
+    /// bump that rewraps any of those layers so the refusal can no longer be
+    /// found turns this red, instead of quietly bringing back
+    /// `network_offline`.
+    #[tokio::test]
+    async fn a_real_pin_refusal_through_reqwest_is_told_as_a_pin_failure() {
+        let failed = dial_the_test_leaf(TEST_CA).await;
+        assert!(super::never_left(&failed), "pin: the request left");
+        let error = send_failed(failed);
+        let ApiError::CertificatePinningFailed(reason) = &error else {
+            panic!("a real pin refusal was not told as a pin failure");
+        };
+        assert_eq!(reason.as_str(), PinRejection::Mismatch.label());
+        assert_eq!(IpcError::from_api(&error).code, IpcErrorCode::CertPinFailed);
+    }
+
+    /// The same server with its CA not trusted (the one root is ISRG Root
+    /// X1): WebPKI refuses the leaf (`UnknownIssuer`) before the pin is
+    /// asked, so it stays the network failure.
+    #[tokio::test]
+    async fn a_real_untrusted_issuer_through_reqwest_stays_the_network() {
+        let failed = dial_the_test_leaf(include_bytes!("isrg_root_x1.der")).await;
+        assert!(super::never_left(&failed), "untrusted: the request left");
+        let error = send_failed(failed);
+        assert!(
+            matches!(error, ApiError::Network(_)),
+            "untrusted issuer: not the network"
+        );
+        assert_eq!(
+            IpcError::from_api(&error).code,
+            IpcErrorCode::NetworkOffline
+        );
+    }
+
     /// Only the pin's own refusal is told apart. A handshake that failed on
     /// anything else (an issuer WebPKI does not trust; a rustls error that
     /// merely has the pin's words) is the network failure, as before.

@@ -396,7 +396,20 @@ pub fn rustls_config_pinning_birdo_hosts_only() -> ClientConfig {
 fn build_config(scope: PinScope) -> ClientConfig {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    config_trusting(roots, scope)
+}
 
+/// Tests (MR-2537, review D468-L1): the API client's config, the real
+/// `SpkiPinningVerifier` pinning every host, over `roots` in place of the
+/// Mozilla store. A hermetic test can then pass WebPKI with its own CA and
+/// meet the pin in a real handshake.
+#[cfg(test)]
+pub(crate) fn rustls_config_trusting(roots: RootCertStore) -> ClientConfig {
+    config_trusting(roots, PinScope::AllHosts)
+}
+
+/// [`build_config`] over a given root store.
+fn config_trusting(roots: RootCertStore, scope: PinScope) -> ClientConfig {
     // Select the ring CryptoProvider EXPLICITLY (for both the verifier and the
     // client config) instead of relying on rustls' process-level default.
     // Other dependencies (e.g. sentry's transport) may enable the aws-lc-rs
