@@ -626,13 +626,17 @@ mod gdpr_request_tests {
                 other => panic!("{body} was read as {other:?}"),
             }
         }
-        for bare in [
-            r#"{"statusCode":401,"message":"Unauthorized","error":"Unauthorized"}"#,
-            "",
+        // MR-2533: the API's own JSON 401 is told apart from any other.
+        for (bare, from_api) in [
+            (
+                r#"{"statusCode":401,"message":"Unauthorized","error":"Unauthorized"}"#,
+                true,
+            ),
+            ("", false),
         ] {
             assert!(matches!(
                 after(true, StatusCode::UNAUTHORIZED, bare),
-                GdprDeleteOutcome::SessionExpired
+                GdprDeleteOutcome::SessionExpired { from_api: f } if f == from_api
             ));
         }
         assert!(matches!(
@@ -654,13 +658,76 @@ mod gdpr_request_tests {
     /// refresh the server refused with 401 (the token itself is dead) says
     /// the session went with the account; nothing transient does, and a 403
     /// says nothing about the account either.
+    ///
+    /// MR-2533: and only the API's own JSON 401, which the refresh's
+    /// classifier makes `Rejected { status: 401 }`. Any other 401 (no body,
+    /// an HTML page, another responder's JSON) is the bare `Unauthorized`:
+    /// the session still ends, but nothing is said about the account. At
+    /// aa224c7 the bare `Unauthorized` said it too.
     #[test]
     fn only_a_401_from_the_refresh_says_the_session_went_with_the_account() {
-        assert!(BirdoApi::refresh_says_gone(&ApiError::Unauthorized));
         assert!(BirdoApi::refresh_says_gone(&ApiError::Rejected {
             status: 401,
             message: "Invalid refresh token".into(),
         }));
+        assert!(
+            !BirdoApi::refresh_says_gone(&ApiError::Unauthorized),
+            "a 401 that is not the API's"
+        );
+        for (body, from_api) in [
+            (
+                r#"{"statusCode":401,"message":"Invalid refresh token","error":"Unauthorized","timestamp":"2026-11-20T00:00:00.000Z","path":"/api/auth/refresh"}"#,
+                true,
+            ),
+            (r#"{"statusCode":401,"message":"Unauthorized"}"#, true),
+            ("", false),
+            (
+                "<html><body>401 Authorization Required</body></html>",
+                false,
+            ),
+            (r#"{"error":"unauthorized"}"#, false),
+            (r#"{"statusCode":"401","message":"Unauthorized"}"#, false),
+            (r#"{"statusCode":401,"message":"  "}"#, false),
+            (r#"{"statusCode":403,"message":"Forbidden"}"#, false),
+            ("[401]", false),
+        ] {
+            let refused =
+                BirdoApi::classify_refresh_error_after(StatusCode::UNAUTHORIZED, body, None);
+            assert_eq!(BirdoApi::refresh_says_gone(&refused), from_api, "{body}");
+            // Either way the server rejected the refresh token: the session
+            // ends, the stored one is discarded, and a caller is told
+            // `Unauthorized`, as before.
+            assert!(
+                super::super::session_gate::refresh_rejected(&refused),
+                "{body}"
+            );
+            assert_eq!(
+                super::super::session_gate::stored_session_after(&refused),
+                super::super::session_gate::StoredSession::Discard,
+                "{body}"
+            );
+            assert!(
+                matches!(
+                    super::super::session_gate::error_after_failed_refresh(refused),
+                    ApiError::Unauthorized
+                ),
+                "{body}"
+            );
+        }
+        // Anything but a 401 is no 401 to it.
+        for status in [403, 429, 500, 503] {
+            let body = r#"{"statusCode":401,"message":"x"}"#;
+            let refused = BirdoApi::classify_refresh_error_after(
+                StatusCode::from_u16(status).unwrap(),
+                body,
+                Some(5),
+            );
+            assert!(!BirdoApi::refresh_says_gone(&refused), "{status}");
+            assert!(
+                !super::super::session_gate::refresh_rejected(&refused),
+                "{status}"
+            );
+        }
         for kept in [
             ApiError::Forbidden,
             ApiError::Rejected {
@@ -829,10 +896,40 @@ mod gdpr_request_tests {
             .expect("the memory is read");
         let sent = body.find("self.send_gdpr_delete(").expect("the request");
         assert!(read < sent, "read after the attempt that may set it");
-        assert!(body.contains("if unconfirmed_before && Self::refresh_says_gone(&refused) =>"));
+        let squashed: String = body.split_whitespace().collect();
+        // MR-2533: both 401s the API's own.
+        assert!(squashed.contains("GdprDeleteOutcome::SessionExpired{from_api}=>"));
+        assert!(squashed
+            .contains("ifunconfirmed_before&&from_api&&Self::refresh_says_gone(&refused)=>"));
         assert!(body.contains(".finish_gdpr_delete(GdprDeleteOutcome::AlreadyDeleted)"));
         assert!(body.contains("session_gate::error_after_failed_refresh(e)"));
         assert!(body.contains("self.conclude_gdpr_delete(unconfirmed_before, outcome)"));
+    }
+
+    /// MR-2533, the wiring: the token refresh's answer, and only it, is read
+    /// by `classify_refresh_error_after` (which keeps whether its 401 is the
+    /// API's own); every other route, and the web origin's config, by the
+    /// classifier they always had.
+    #[test]
+    fn only_the_refresh_is_read_by_its_own_classifier() {
+        const SOURCE: &str = include_str!("client.rs");
+        let fn_body = |signature: &str| {
+            let start = SOURCE.find(signature).expect(signature);
+            let rest = &SOURCE[start..];
+            &rest[..rest.find("\n    }").expect("end of fn")]
+        };
+        let squashed: String = fn_body("async fn do_request<").split_whitespace().collect();
+        assert!(squashed.contains(
+            "letclassify:Classify=ifpath==endpoints::auth::REFRESH{Self::classify_refresh_error_after}else{Self::classify_error_response_after};"
+        ));
+        assert!(squashed.contains("Origin::ControlPlane,classify,)"));
+        let code = &SOURCE[..SOURCE.find("mod control_plane_hosts_tests").unwrap()];
+        let uses = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("Self::classify_refresh_error_after"))
+            .count();
+        assert_eq!(uses, 1, "another route read as the refresh");
     }
 
     /// The password check's 401 is the ANSWER and must reach the user
@@ -851,10 +948,10 @@ mod gdpr_request_tests {
         }
 
         let expired = r#"{"statusCode":401,"message":"Unauthorized","error":"Unauthorized"}"#;
-        for body in [expired, ""] {
+        for (body, from_api) in [(expired, true), ("", false)] {
             assert!(matches!(
                 BirdoApi::classify_gdpr_delete_response(StatusCode::UNAUTHORIZED, body),
-                GdprDeleteOutcome::SessionExpired
+                GdprDeleteOutcome::SessionExpired { from_api: f } if f == from_api
             ));
         }
     }
@@ -1226,7 +1323,7 @@ mod deletion_hold_tests {
             Err(ApiError::Parse(_))
         ));
         assert!(matches!(
-            BirdoApi::deletion_hold_from(GdprDeleteOutcome::SessionExpired),
+            BirdoApi::deletion_hold_from(GdprDeleteOutcome::SessionExpired { from_api: true }),
             Err(ApiError::Unauthorized)
         ));
     }
