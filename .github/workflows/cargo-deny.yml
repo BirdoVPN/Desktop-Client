@@ -63,7 +63,7 @@ jobs:
       # `cargo install --locked cargo-deny` compiling the latest release from
       # source on every run (most of the old 2.4-minute median).
       - name: Install cargo-deny
-        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-deny@0.20.2
 
