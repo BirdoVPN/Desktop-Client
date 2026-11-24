@@ -9,3 +9,5 @@
 # checkout would hash differently from the LF bytes git stores.
 src-tauri/src/vpn/fixtures/birdo-pq-ml-kem-1024.kat.json text eol=lf
 src-tauri/src/vpn/fixtures/birdo-pq-ml-kem-1024.kat.json.sha256 text eol=lf
+# MR-1432: the NIST ACVP ML-KEM-1024 cut; birdo_pq_acvp.rs pins the sha256 of its LF bytes.
+src-tauri/src/vpn/fixtures/acvp-ml-kem-1024.json text eol=lf

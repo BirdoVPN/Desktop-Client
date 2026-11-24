@@ -184,6 +184,7 @@ mod tests {
             kill_switch_blocking: false,
             error: None,
             server_id: None,
+            server_origin: None,
             multi_hop: None,
             gave_up: None,
             seq: 1,

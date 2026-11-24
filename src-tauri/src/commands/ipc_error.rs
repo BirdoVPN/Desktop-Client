@@ -187,6 +187,12 @@ pub struct IpcError {
     pub settings_restored: bool,
     #[serde(skip)]
     pub transport: Option<TransportFailure>,
+    /// Internal only: the backend did not grant the stealth transport the
+    /// Adaptive Transport asked for ([`IpcError::stealth_not_granted`]). The
+    /// SERVER did not serve, unlike a failure of the local Stealth helper,
+    /// so the relay retry may move the connect (MR-2514, review L5 of #470).
+    #[serde(skip)]
+    pub stealth_not_granted: bool,
     /// `account_restricted` only: when it ends and where to ask for a review,
     /// both already checked (`Restriction::from_wire`). Absent from the wire
     /// otherwise.
@@ -253,6 +259,7 @@ impl IpcError {
             retry_after_secs: None,
             settings_restored: false,
             transport: None,
+            stealth_not_granted: false,
             restriction: None,
         }
     }
@@ -262,6 +269,21 @@ impl IpcError {
             IpcErrorCode::Cancelled,
             "The connection attempt was cancelled.",
         )
+    }
+
+    /// The Adaptive Transport's stealth retry came back without the stealth
+    /// transport: the BACKEND did not grant it for this server (a node with no
+    /// Xray, or a grant it refused). Its own constructor, so the relay retry
+    /// can tell it from a failure of the local Stealth helper (MR-2514,
+    /// review L5 of #470).
+    pub fn stealth_not_granted() -> Self {
+        let mut error = Self::new(
+            IpcErrorCode::StealthFailed,
+            "This network blocks standard VPN traffic, and the server could not provide \
+             Stealth Mode. Please try a different server.",
+        );
+        error.stealth_not_granted = true;
+        error
     }
 
     pub fn not_elevated() -> Self {

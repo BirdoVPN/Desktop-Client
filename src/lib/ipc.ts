@@ -212,6 +212,12 @@ export interface VpnStatus {
    */
   error: IpcError | null | undefined;
   serverId: string | null;
+  /**
+   * MR-2569: who chose `serverId`, as Rust holds it for the session. A server
+   * Rust moved the session to is recorded under THIS origin, so a location the
+   * user picked stays the user's. `null`: no server, or not said.
+   */
+  serverOrigin: 'user' | 'automatic' | null;
   multiHop: LiveMultiHop | null;
   /**
    * Set only on the `error` status that ENDED an auto-reconnect recovery
@@ -263,6 +269,11 @@ function parseMultiHop(v: unknown): LiveMultiHop | null {
 }
 
 /** Returns null for anything that is not a recognisable status (never throws). */
+/** Exactly Rust's two words (`SelectionOrigin::as_str`); anything else is not said. */
+function parseOrigin(raw: unknown): 'user' | 'automatic' | null {
+  return raw === 'user' || raw === 'automatic' ? raw : null;
+}
+
 export function parseVpnStatus(raw: unknown): VpnStatus | null {
   if (!isObj(raw) || typeof raw.state !== 'string') return null;
   const legacy = LEGACY_STATES[raw.state];
@@ -286,6 +297,7 @@ export function parseVpnStatus(raw: unknown): VpnStatus | null {
     killSwitchBlocking: bool(blocking, legacy?.blocking ?? false),
     error,
     serverId: str(pick(raw, 'serverId', 'server_id')),
+    serverOrigin: parseOrigin(pick(raw, 'serverOrigin', 'server_origin')),
     multiHop: parseMultiHop(pick(raw, 'multiHop', 'multi_hop')),
     gaveUp: parseGaveUp(pick(raw, 'gaveUp', 'gave_up')),
     seq: num(raw.seq),
