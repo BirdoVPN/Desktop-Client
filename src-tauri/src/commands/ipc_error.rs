@@ -70,6 +70,11 @@ pub enum IpcErrorCode {
     /// nothing was deleted or put on hold. Retryable.
     StepUpUnavailable,
     CertPinFailed,
+    /// MR-2548: the server's certificate is not from an authority this app
+    /// trusts (WebPKI's `UnknownIssuer`): something on the network or the
+    /// computer (antivirus HTTPS scanning, an office proxy) is intercepting
+    /// secure connections. Retryable: it can pass on another network.
+    TlsIntercepted,
     StealthFailed,
     PqFailed,
     /// MR-2417: the server's BirdoPQ key-confirmation tag (`pqKeyConfirmTag`)
@@ -414,6 +419,7 @@ impl IpcError {
             ApiError::CertificatePinningFailed(_) => {
                 Self::new(IpcErrorCode::CertPinFailed, error.to_string())
             }
+            ApiError::TlsIntercepted => Self::new(IpcErrorCode::TlsIntercepted, error.to_string()),
             // A sign-up proof of work the server refused twice: its sentence
             // ("The security check expired. Please try again.") is the advice.
             ApiError::PowRefused { message, .. } => Self::new(IpcErrorCode::ServerError, message),
@@ -725,6 +731,7 @@ mod tests {
             (IpcErrorCode::StepUpNoFactor, "step_up_no_factor"),
             (IpcErrorCode::StepUpUnavailable, "step_up_unavailable"),
             (IpcErrorCode::CertPinFailed, "cert_pin_failed"),
+            (IpcErrorCode::TlsIntercepted, "tls_intercepted"),
             (IpcErrorCode::StealthFailed, "stealth_failed"),
             (IpcErrorCode::PqFailed, "pq_failed"),
             (IpcErrorCode::PqKeyMismatch, "pq_key_mismatch"),
@@ -804,6 +811,7 @@ mod tests {
                 ApiError::CertificatePinningFailed("x".into()),
                 IpcErrorCode::CertPinFailed,
             ),
+            (ApiError::TlsIntercepted, IpcErrorCode::TlsIntercepted),
             (
                 ApiError::UpgradeRequired(crate::api::upgrade_gate::RequiredUpdate {
                     required_version: None,

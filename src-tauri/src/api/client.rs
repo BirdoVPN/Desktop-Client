@@ -23,18 +23,42 @@ use erased_serde;
 /// reported it: on only for `dnsFilteringAvailable == Some(true)` (owner
 /// 2026-11-13: the row is hidden, and the connect flag is not sent, while the
 /// gate is off or not known). A success that says `false`, or omits the field,
-/// turns it off; a failed fetch leaves the last answer. Starts off; in memory
-/// only, like the UI's copy.
+/// turns it off; a failed fetch leaves the last answer.
+///
+/// MR-2373: and it starts at the last answer an earlier run's fetch gave
+/// (`commands::shield_gate`, restored in `setup` before the window can dial),
+/// off only when there is none. It used to start off at every launch, in
+/// memory only: a cold-start Auto-Connect dialled before the first fetch had
+/// answered, without the flag, while the row read ON a moment later.
 static DNS_FILTERING_GATE_ON: AtomicBool = AtomicBool::new(false);
+
+/// MR-2373: what keeps a changed gate for the next launch
+/// (`commands::shield_gate::load`). Unset in tests.
+static DNS_FILTERING_GATE_KEEPER: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> =
+    std::sync::OnceLock::new();
 
 /// Whether the last successful config fetch reported the fleet gate on.
 pub(crate) fn dns_filtering_gate_on() -> bool {
     DNS_FILTERING_GATE_ON.load(Ordering::Relaxed)
 }
 
-/// Record a successful fetch's gate: on only for an explicit `true`.
+/// Record a successful fetch's gate: on only for an explicit `true`. A
+/// change is kept for the next launch (MR-2373).
 pub(crate) fn note_dns_filtering_gate(available: Option<bool>) {
-    DNS_FILTERING_GATE_ON.store(available == Some(true), Ordering::Relaxed);
+    let on = available == Some(true);
+    if DNS_FILTERING_GATE_ON.swap(on, Ordering::Relaxed) != on {
+        if let Some(keep) = DNS_FILTERING_GATE_KEEPER.get() {
+            keep();
+        }
+    }
+}
+
+/// MR-2373: at start-up, the gate an earlier run's fetch left on record
+/// (`commands::shield_gate::load`), and what keeps the next change. The
+/// first registration wins.
+pub(crate) fn restore_dns_filtering_gate(on: bool, keep: impl Fn() + Send + Sync + 'static) {
+    DNS_FILTERING_GATE_ON.store(on, Ordering::Relaxed);
+    let _ = DNS_FILTERING_GATE_KEEPER.set(Box::new(keep));
 }
 
 /// The wire rule for `dnsFiltering`: the preference (after the Custom DNS
@@ -124,7 +148,10 @@ pub(crate) enum GdprDeleteOutcome {
     /// cancelled. Nothing local may be cleared for it.
     Held(DeletionHold),
     /// 401 from the JWT guard — refresh the access token and retry once.
-    SessionExpired,
+    /// MR-2533: `from_api` when its body is the API's own JSON 401
+    /// ([`api_error_message`]); only such a 401 can, after an unreadable 2xx,
+    /// say the account is gone ([`BirdoApi::refresh_says_gone`]).
+    SessionExpired { from_api: bool },
     /// Anything else, carrying the error to show (the password check's 401
     /// message included).
     Refused(ApiError),
@@ -172,15 +199,27 @@ const IDENTITY_UNVERIFIED: &str = "Unable to verify identity";
 /// API's own 404 says the account is gone; an HTML page, an empty body or
 /// another responder's JSON says nothing about it.
 pub(crate) fn is_api_not_found(body: &str) -> bool {
+    api_error_message(body, 404).is_some()
+}
+
+/// The sentence of the API's own JSON error for `status` (MR-2483 review L1,
+/// MR-2533): `Some` only when `body` is an object whose `statusCode` is the
+/// number `status` and whose `message` is a non-empty string, the shape
+/// birdo-web's `GlobalExceptionFilter` writes for every error. An HTML page,
+/// an empty body or another responder's JSON is `None`.
+pub(crate) fn api_error_message(body: &str, status: u16) -> Option<String> {
     let Ok(serde_json::Value::Object(body)) = serde_json::from_str::<serde_json::Value>(body)
     else {
-        return false;
+        return None;
     };
-    body.get("statusCode").and_then(serde_json::Value::as_u64) == Some(404)
-        && body
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|m| !m.trim().is_empty())
+    if body.get("statusCode").and_then(serde_json::Value::as_u64) != Some(u64::from(status)) {
+        return None;
+    }
+    body.get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned)
 }
 
 /// What a deletion that ended the account came to (`delete_account`).
@@ -314,6 +353,10 @@ pub(crate) fn build_multi_hop_request(
     }
 }
 
+/// How a refusal's status, body and `Retry-After` become an `ApiError`
+/// (`BirdoApi::handle_response_from`).
+type Classify = fn(StatusCode, &str, Option<u64>) -> ApiError;
+
 pub struct BirdoApi {
     client: Client,
     /// F-23 FIX: Tokens wrapped in Zeroizing<String> so old values are securely
@@ -411,6 +454,9 @@ pub(crate) fn send_failed(error: reqwest::Error) -> ApiError {
 fn failure_without_answer(error: &(dyn std::error::Error + 'static)) -> ApiError {
     match super::cert_pin::PinRejection::in_chain(error) {
         Some(rejection) => ApiError::CertificatePinningFailed(rejection.label().to_owned()),
+        // MR-2548: an issuer WebPKI does not trust (an antivirus's or an
+        // office proxy's own root) is told apart too, by its type.
+        None if super::cert_pin::untrusted_issuer_in_chain(error) => ApiError::TlsIntercepted,
         None => ApiError::Network(error.to_string()),
     }
 }
@@ -565,8 +611,18 @@ impl BirdoApi {
 
     /// Clear authentication tokens. MR-2012: the session's request holds go
     /// with them (`RetryGate::forget_session`).
+    ///
+    /// MR-2551 (review P469-I1): both slots are cleared under ONE held access
+    /// lock, in the lock order of `clear_tokens_if` and `adopt_refreshed`
+    /// (access, then refresh). They used to be cleared under separate locks,
+    /// so a refresh's adopt could land in between: it found the refresh
+    /// token still there, wrote its access token back over the cleared slot,
+    /// and a Sign Out left an access token in memory with no refresh token
+    /// (`is_authenticated()` true, and `restore_tokens_if_absent` refusing
+    /// the next restore).
     pub async fn clear_tokens(&self) {
-        *self.access_token.write().await = None;
+        let mut access = self.access_token.write().await;
+        *access = None;
         *self.refresh_token.write().await = None;
         self.retry_gate.forget_session();
         self.deletion_unconfirmed.store(false, Ordering::SeqCst);
@@ -724,29 +780,13 @@ impl BirdoApi {
         Ok(response)
     }
 
-    /// The start-up refresh (`commands::auth::get_auth_state`, when the stored
-    /// session's profile could not be fetched): the refresh a 401 runs, and
-    /// no other (MR-2538, D-L3 of the #467 review). Under the refresh lock,
-    /// so one flight presents a token at a time; run detached to its end
-    /// (WIN3-004), so a caller dropped mid-flight loses neither the lock nor
-    /// the rotated pair; and the pair is adopted only by the session that
-    /// asked, and persisted to the OS keystore before the lock is released
-    /// (REVIEW-WIN4-002, `adopt_refreshed`). The policy is the one every
-    /// refresh flies under (MR-2500 / MR-1771): only a 401 ends the session,
-    /// and a held or failed flight is answered at once with its hold.
-    ///
-    /// `NotAuthenticated` when there is no session to refresh, or it ended (a
-    /// Sign Out, an expiry) or was replaced while the refresh ran: the pair
-    /// is then dropped, from memory and the keystore alike.
-    ///
-    /// It replaces the public `refresh_token()`, the one refresh that was
-    /// none of this: it ran inside its caller, wrote the rotated pair to
-    /// memory over whatever a Sign Out had left there, and left
-    /// `get_auth_state` to write it to the keystore after the lock was gone.
-    pub async fn refresh_session(&self) -> Result<(), ApiError> {
-        let lock = Arc::clone(&self.refresh_lock).lock_owned().await;
-        self.refresh_detached(lock).await
-    }
+    // MR-2550 (review P469-L1): there is no start-up refresh of its own any
+    // more. `get_auth_state` used to run `refresh_session` after
+    // `get_profile`, whose own 401 had already run the refresh (the
+    // detached, adopt-checked one `request_with_retry` runs, with the
+    // "token changed while waiting" check), so a launch could send two
+    // flights, or a third rotation for no reason. It now decides from
+    // `get_profile`'s answer alone (`commands::auth::after_profile_failure`).
 
     /// Logout (invalidate tokens on server)
     pub async fn logout(&self) -> Result<(), ApiError> {
@@ -807,7 +847,7 @@ impl BirdoApi {
         let unconfirmed_before = self.deletion_unconfirmed();
         let token_before = self.access_token_value().await;
         let outcome = match self.send_gdpr_delete(&body, around_the_tunnel).await? {
-            GdprDeleteOutcome::SessionExpired => {
+            GdprDeleteOutcome::SessionExpired { from_api } => {
                 {
                     // Same serialisation as request_with_retry: only refresh if
                     // nobody else already did while we waited for the lock.
@@ -817,9 +857,16 @@ impl BirdoApi {
                             Ok(()) => {}
                             // MR-2483: the session went with the account. The
                             // session gate has ended it as well (the refresh
-                            // reports itself); this says why.
+                            // reports itself); this says why. MR-2533: only
+                            // when BOTH 401s are the API's own JSON: a
+                            // responder that is not the API (the one that may
+                            // have sent the unreadable 2xx) answering 401 to
+                            // both ends the session, and says nothing about
+                            // the account.
                             Err(refused)
-                                if unconfirmed_before && Self::refresh_says_gone(&refused) =>
+                                if unconfirmed_before
+                                    && from_api
+                                    && Self::refresh_says_gone(&refused) =>
                             {
                                 return self
                                     .finish_gdpr_delete(GdprDeleteOutcome::AlreadyDeleted)
@@ -907,11 +954,14 @@ impl BirdoApi {
     /// `session_gate::StoredSession::Discard`) mean the session went with the
     /// account: the erasure deletes every session. A 403, a 429, a 5xx or no
     /// answer say nothing about the account and keep their own meaning.
+    ///
+    /// MR-2533: and only the API's own JSON 401. A refresh's 401 in that
+    /// shape is `Rejected { status: 401 }` ([`Self::classify_refresh_error_after`]);
+    /// any other 401 (an empty body, an HTML page, another responder's JSON)
+    /// stays the bare `Unauthorized`: it still ends the session (the session
+    /// gate reads both alike), but it says nothing about the account.
     pub(crate) fn refresh_says_gone(refused: &ApiError) -> bool {
-        matches!(
-            refused,
-            ApiError::Unauthorized | ApiError::Rejected { status: 401, .. }
-        )
+        matches!(refused, ApiError::Rejected { status: 401, .. })
     }
 
     /// What `delete_account` does with its classified answer. The tokens are
@@ -939,7 +989,7 @@ impl BirdoApi {
             // `after_unconfirmed` has already made the API's 404 `Refused`
             // or `AlreadyDeleted`; were it to arrive here, it is its error.
             GdprDeleteOutcome::Refused(error) | GdprDeleteOutcome::ApiNotFound(error) => Err(error),
-            GdprDeleteOutcome::SessionExpired => Err(ApiError::Unauthorized),
+            GdprDeleteOutcome::SessionExpired { .. } => Err(ApiError::Unauthorized),
         }
     }
 
@@ -972,7 +1022,7 @@ impl BirdoApi {
         };
         let token_before = self.access_token_value().await;
         let outcome = match self.send_gdpr_delete(&body, None).await? {
-            GdprDeleteOutcome::SessionExpired => {
+            GdprDeleteOutcome::SessionExpired { .. } => {
                 {
                     let lock = Arc::clone(&self.refresh_lock).lock_owned().await;
                     if self.access_token_value().await == token_before {
@@ -1017,7 +1067,7 @@ impl BirdoApi {
             }
             // A hold request's 404 is the error it always was, whatever its shape.
             GdprDeleteOutcome::Refused(error) | GdprDeleteOutcome::ApiNotFound(error) => Err(error),
-            GdprDeleteOutcome::SessionExpired => Err(ApiError::Unauthorized),
+            GdprDeleteOutcome::SessionExpired { .. } => Err(ApiError::Unauthorized),
         }
     }
 
@@ -1151,7 +1201,8 @@ impl BirdoApi {
     ///   true`, MR-2370); an unreadable one is an error the user can retry,
     ///   and nothing is wiped (see [`DeleteAccountResponse`]).
     /// - 401 whose message is passport's bare "Unauthorized" (or no message):
-    ///   the access token expired — refresh and retry.
+    ///   the access token expired — refresh and retry (MR-2533: noting whether
+    ///   the body was the API's own JSON 401).
     /// - 401 with any other message: the password check refused; that message
     ///   is the answer.
     /// - anything else: the normal mapping, which keeps the backend's message.
@@ -1237,7 +1288,9 @@ impl BirdoApi {
                         message: m,
                     })
                 }
-                _ => GdprDeleteOutcome::SessionExpired,
+                _ => GdprDeleteOutcome::SessionExpired {
+                    from_api: api_error_message(body, 401).is_some(),
+                },
             };
         }
         let refused = Self::classify_error_response_after(status, body, retry_after);
@@ -1634,7 +1687,11 @@ impl BirdoApi {
         let url = format!("{}{}", WEB_BASE_URL, endpoints::config::CLIENT_CONFIG);
         let response = self.client.get(&url).send().await.map_err(send_failed)?;
         let config: ClientConfigResponse = self
-            .handle_response_from(response, super::upgrade_gate::Origin::Web)
+            .handle_response_from(
+                response,
+                super::upgrade_gate::Origin::Web,
+                Self::classify_error_response_after,
+            )
             .await?;
         note_dns_filtering_gate(config.dns_filtering_available);
         Ok(config)
@@ -1998,7 +2055,20 @@ impl BirdoApi {
         }
 
         let response = request.send().await.map_err(send_failed)?;
-        let result = self.handle_response(response).await;
+        // MR-2533: the refresh's refusals keep whether its 401 was the API's
+        // own (`classify_refresh_error_after`); every other route as before.
+        let classify: Classify = if path == endpoints::auth::REFRESH {
+            Self::classify_refresh_error_after
+        } else {
+            Self::classify_error_response_after
+        };
+        let result = self
+            .handle_response_from(
+                response,
+                super::upgrade_gate::Origin::ControlPlane,
+                classify,
+            )
+            .await;
         if let Err(error) = &result {
             self.retry_gate
                 .note(&held, error, std::time::Instant::now());
@@ -2080,9 +2150,22 @@ impl BirdoApi {
         // the token and sends the same one again; `refresh_policy`). Only a
         // 401 is the server rejecting the refresh token: contract §3.3 ends
         // the session everywhere (see `session_gate`).
-        let response: RefreshResponse = fly(refresh.clone())
-            .await
-            .inspect_err(super::session_gate::report_refresh_failure)?;
+        let response: RefreshResponse = match fly(refresh.clone()).await {
+            Ok(response) => response,
+            Err(error) => {
+                if super::session_gate::refresh_rejected(&error) {
+                    // MR-2552 (review P469-I2): the session the rejection
+                    // ends is read HERE, inside the flight and under the
+                    // refresh lock, which a sign-in waits for. The handler
+                    // used to read it when its task first ran, after the
+                    // lock was gone: a new sign-in could land first, and the
+                    // old session's late 401 signed THAT one out.
+                    let ended = self.ended_by(&error).await;
+                    super::session_gate::report_rejection(ended);
+                }
+                return Err(error);
+            }
+        };
 
         // REVIEW-WIN4-002: adopted only by the session that asked. A refresh
         // runs detached (WIN3-004), so it can outlive a Sign Out, or a sign-in
@@ -2217,6 +2300,24 @@ impl BirdoApi {
         self.refresh_retry_due().then_some(lock)
     }
 
+    /// What a refresh the server rejected with `error` ended, as it stands
+    /// at the rejection (MR-2552): the access token in memory now, which is
+    /// the only one the teardown may clear (`clear_tokens_if`); what becomes
+    /// of the keystore's copy; and (MR-2517) whether the ACCOUNT went, not
+    /// just the session: this session's last deletion attempt was answered
+    /// with a 2xx that did not confirm it (MR-2370), and the refresh's 401
+    /// is the API's own (MR-2533, [`Self::refresh_says_gone`]). That is the
+    /// heartbeat's (or any request's) twin of the deletion retry's
+    /// `AlreadyDeleted` (MR-2483): the erasure deletes every session, so the
+    /// first refresh after it is refused.
+    async fn ended_by(&self, error: &ApiError) -> super::session_gate::EndedSession {
+        super::session_gate::EndedSession {
+            expired: self.access_token.read().await.clone(),
+            stored: super::session_gate::stored_session_after(error),
+            account_deleted: self.deletion_unconfirmed() && Self::refresh_says_gone(error),
+        }
+    }
+
     /// Store a refresh's result only if the refresh token it presented is
     /// still this client's, in the lock order of `clear_tokens_if` (access,
     /// then refresh). `persist` runs under both locks.
@@ -2316,6 +2417,31 @@ impl BirdoApi {
     #[cfg(test)]
     pub(crate) fn classify_error_response(status: StatusCode, error_text: &str) -> ApiError {
         Self::classify_error_response_after(status, error_text, None)
+    }
+
+    /// The token refresh's refusals (`do_request` on `/auth/refresh`):
+    /// [`Self::classify_error_response_after`], except that a 401 in the API's
+    /// own JSON error shape ([`api_error_message`]) is `Rejected { status:
+    /// 401, message }` (MR-2533). Every other 401 stays the bare
+    /// `Unauthorized`. Both are the server rejecting the refresh token to the
+    /// session gate, the refresh policy and the retry gate
+    /// (`session_gate::refresh_rejected`), and both reach a caller as
+    /// `Unauthorized` (`session_gate::error_after_failed_refresh`). Only
+    /// [`Self::refresh_says_gone`] reads the difference.
+    pub(crate) fn classify_refresh_error_after(
+        status: StatusCode,
+        error_text: &str,
+        retry_after: Option<u64>,
+    ) -> ApiError {
+        if status == StatusCode::UNAUTHORIZED {
+            if let Some(message) = api_error_message(error_text, 401) {
+                return ApiError::Rejected {
+                    status: 401,
+                    message,
+                };
+            }
+        }
+        Self::classify_error_response_after(status, error_text, retry_after)
     }
 
     /// [`Self::classify_error_response`], told the response's `Retry-After`
@@ -2516,13 +2642,19 @@ impl BirdoApi {
         }
     }
 
-    /// Control-plane responses (everything through `do_request`).
+    /// Control-plane responses, read as `do_request` reads every route but
+    /// the token refresh. The tests' way in.
+    #[cfg(test)]
     async fn handle_response<T: DeserializeOwned>(
         &self,
         response: reqwest::Response,
     ) -> Result<T, ApiError> {
-        self.handle_response_from(response, super::upgrade_gate::Origin::ControlPlane)
-            .await
+        self.handle_response_from(
+            response,
+            super::upgrade_gate::Origin::ControlPlane,
+            Self::classify_error_response_after,
+        )
+        .await
     }
 
     /// `handle_response`, told which origin produced the response.
@@ -2532,10 +2664,15 @@ impl BirdoApi {
     /// control plane. `get_client_config` reuses this handler against the WEB
     /// origin, so the origin has to travel with the response -- see
     /// `upgrade_gate::Origin`.
+    ///
+    /// `classify` maps a refusal: [`Self::classify_error_response_after`],
+    /// or for the token refresh [`Self::classify_refresh_error_after`]
+    /// (MR-2533; chosen in `do_request`).
     async fn handle_response_from<T: DeserializeOwned>(
         &self,
         response: reqwest::Response,
         origin: super::upgrade_gate::Origin,
+        classify: Classify,
     ) -> Result<T, ApiError> {
         // SEC-C1: certificate pinning now happens during the TLS handshake
         // (see super::cert_pin) — no post-response check is required.
@@ -2569,7 +2706,7 @@ impl BirdoApi {
             );
             String::new()
         });
-        let error = Self::classify_error_response_after(status, &error_text, retry_after);
+        let error = classify(status, &error_text, retry_after);
         // Latch the forced-version floor process-wide the FIRST time any request
         // is refused. Done here rather than in `classify_error_response` so that
         // function stays pure and unit-testable; the latch is what stops
@@ -2876,37 +3013,49 @@ mod send_failed_tests {
         assert_eq!(IpcError::from_api(&error).code, IpcErrorCode::CertPinFailed);
     }
 
-    /// The same server with its CA not trusted (the one root is ISRG Root
-    /// X1): WebPKI refuses the leaf (`UnknownIssuer`) before the pin is
-    /// asked, so it stays the network failure.
+    /// MR-2548 (D468-I3 of the #468 review): the same server with its CA not
+    /// trusted (the one root is ISRG Root X1), which is what an antivirus's
+    /// or an office proxy's own root looks like to this app: WebPKI refuses
+    /// the leaf (`UnknownIssuer`) before the pin is asked. Over the real
+    /// reqwest stack it is told as an interception (`tls_intercepted`), not
+    /// as "No internet connection". At 6ddfdc8 it was `network_offline`.
     #[tokio::test]
-    async fn a_real_untrusted_issuer_through_reqwest_stays_the_network() {
+    async fn a_real_untrusted_issuer_through_reqwest_is_told_as_an_interception() {
         let failed = dial_the_test_leaf(include_bytes!("isrg_root_x1.der")).await;
         assert!(super::never_left(&failed), "untrusted: the request left");
         let error = send_failed(failed);
         assert!(
-            matches!(error, ApiError::Network(_)),
-            "untrusted issuer: not the network"
+            matches!(error, ApiError::TlsIntercepted),
+            "untrusted issuer: not told as an interception"
         );
         assert_eq!(
             IpcError::from_api(&error).code,
-            IpcErrorCode::NetworkOffline
+            IpcErrorCode::TlsIntercepted
         );
     }
 
-    /// Only the pin's own refusal is told apart. A handshake that failed on
-    /// anything else (an issuer WebPKI does not trust; a rustls error that
-    /// merely has the pin's words) is the network failure, as before.
+    /// Only the pin's own refusal and (MR-2548) an issuer WebPKI does not
+    /// trust are told apart. A handshake that failed on anything else
+    /// (another WebPKI refusal; a rustls error that merely has the pin's or
+    /// the issuer's words) is the network failure, as before.
     #[test]
     fn only_the_pins_own_refusal_is_told_apart() {
+        let untrusted = failure_without_answer(&*failed_handshake(TlsError::InvalidCertificate(
+            CertificateError::UnknownIssuer,
+        )));
+        assert!(matches!(untrusted, ApiError::TlsIntercepted));
         for (case, tls) in [
-            (
-                "untrusted issuer",
-                TlsError::InvalidCertificate(CertificateError::UnknownIssuer),
-            ),
             (
                 "the pin's words",
                 TlsError::General(PinRejection::Mismatch.label().to_string()),
+            ),
+            (
+                "the issuer's words",
+                TlsError::General("invalid peer certificate: UnknownIssuer".into()),
+            ),
+            (
+                "an expired certificate",
+                TlsError::InvalidCertificate(CertificateError::Expired),
             ),
         ] {
             let error = failure_without_answer(&*failed_handshake(tls));
@@ -2925,6 +3074,7 @@ mod send_failed_tests {
         let fallback = &code[code.find("fn failure_without_answer(").unwrap()..];
         let fallback = &fallback[..fallback.find("\n}").unwrap()];
         assert!(fallback.contains("PinRejection::in_chain(error)"));
+        assert!(fallback.contains("untrusted_issuer_in_chain(error) => ApiError::TlsIntercepted"));
         assert!(fallback.contains("ApiError::Network(error.to_string())"));
         assert!(code.matches(".map_err(send_failed)").count() >= 4);
         assert!(!code.contains("Network(e.to_string())"));
@@ -3027,11 +3177,12 @@ mod token_restore_tests {
     }
 
     /// WIN3-004, the wiring: every refresh after a 401 goes through the
-    /// detached runner, with the lock handed to it. MR-2538: so does the
-    /// start-up refresh (`refresh_session`, `get_auth_state`'s), and there is
-    /// no other way to run one: the public `refresh_token()`, which ran
-    /// inline and wrote memory without the adopt check, is gone, and the one
-    /// flight and the one adopt are `refresh_token_internal`'s.
+    /// detached runner, with the lock handed to it, and there is no other way
+    /// to run one: the public `refresh_token()`, which ran inline and wrote
+    /// memory without the adopt check, is gone (MR-2538), and so is the
+    /// start-up refresh (`refresh_session`, MR-2550: `get_auth_state` runs
+    /// none of its own); the one flight and the one adopt are
+    /// `refresh_token_internal`'s.
     #[test]
     fn every_refresh_after_a_401_is_detached() {
         const SOURCE: &str = include_str!("client.rs");
@@ -3044,7 +3195,6 @@ mod token_restore_tests {
             "async fn request_with_retry<",
             "pub async fn delete_account(",
             "pub async fn request_deletion_hold(",
-            "pub async fn refresh_session(",
         ] {
             let body = fn_body(signature);
             assert!(
@@ -3064,6 +3214,10 @@ mod token_restore_tests {
         assert!(
             !code.contains("pub async fn refresh_token("),
             "the old refresh"
+        );
+        assert!(
+            !code.contains("pub async fn refresh_session("),
+            "a start-up refresh of its own"
         );
         assert_eq!(
             code.matches(".refresh_and_adopt(").count(),
@@ -3103,7 +3257,18 @@ mod token_restore_tests {
             "P469-L2: store_tokens writes the refresh token first"
         );
         let adopt = fn_body("async fn refresh_and_adopt<");
-        assert!(adopt.contains(".inspect_err(super::session_gate::report_refresh_failure)?"));
+        // MR-2552: a rejection is reported with the session it ended, read
+        // inside the flight (under the refresh lock), before it returns.
+        let rejected = adopt
+            .find("if super::session_gate::refresh_rejected(&error) {")
+            .expect("the rejection");
+        let named = adopt
+            .find("let ended = self.ended_by(&error).await;")
+            .expect("named at the rejection");
+        let reported = adopt
+            .find("super::session_gate::report_rejection(ended);")
+            .expect("reported");
+        assert!(rejected < named && named < reported);
         assert!(adopt.contains(".adopt_refreshed("));
     }
 
@@ -3217,6 +3382,40 @@ mod token_restore_tests {
                 "{signature}"
             );
         }
+    }
+
+    /// MR-2551 (review P469-I1): a Sign Out clears both token slots under ONE
+    /// held access lock, as `clear_tokens_if` does. Here the refresh slot is
+    /// busy (a reader holds it), so `clear_tokens` parks on it with the
+    /// access slot already cleared: the access lock must still be held then,
+    /// or a refresh's adopt (access, then refresh) could take both locks in
+    /// between, find the refresh token still there and write its access token
+    /// back. On main the access lock was let go after the first slot.
+    #[tokio::test]
+    async fn a_sign_out_holds_the_access_lock_until_both_slots_are_clear() {
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let reading = api.refresh_token.read().await;
+        let clearing = tokio::spawn({
+            let api = api.clone();
+            async move { api.clear_tokens().await }
+        });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !clearing.is_finished(),
+            "the refresh slot was not waited for"
+        );
+        assert!(
+            api.access_token.try_read().is_err(),
+            "the access lock was let go before the refresh slot was clear"
+        );
+        drop(reading);
+        clearing.await.expect("the clear");
+        assert!(!api.is_authenticated().await);
+        assert_eq!(refresh_in_memory(&api).await, None);
+        assert!(api.access_token.try_read().is_ok());
     }
 
     /// REVIEW-WIN2-021: the expired session's teardown clears ITS tokens, and
@@ -3416,7 +3615,7 @@ mod retry_after_tests {
     /// MR-1771: a 429 from `/auth/refresh` keeps the session, through what
     /// the refresh runs on its answer: `handle_response`, the hold
     /// `do_request` notes under the refresh's key, and the session gate's
-    /// verdict (`report_refresh_failure` ends a session only on what
+    /// verdict (`report_rejection` ends a session only on what
     /// `refresh_rejected` accepts, and the rotated pair is adopted only on
     /// `Ok`). It is never `session_expired`, the caller is told
     /// `rate_limited`, and the next refresh is not sent until the wait is
@@ -4272,8 +4471,8 @@ mod retry_after_tests {
             .expect("the note");
         assert!(check < send && send < note);
         // MR-2500 / MR-1771: every refresh flies under the policy, and the
-        // one send of a flight is a `do_request`. MR-2538: the start-up
-        // refresh included; it is the one `refresh_token_internal` runs.
+        // one send of a flight is a `do_request`; it is the one
+        // `refresh_token_internal` runs.
         let fn_body = |signature: &str| {
             let start = SOURCE.find(signature).expect(signature);
             let rest = &SOURCE[start..];
@@ -4291,7 +4490,6 @@ mod retry_after_tests {
             "async fn refresh_flight(",
             "async fn refresh_token_internal(",
             "async fn refresh_and_adopt<",
-            "pub async fn refresh_session(",
         ] {
             assert!(!fn_body(signature).contains("sleep"), "{signature}");
         }
@@ -4339,7 +4537,7 @@ mod retry_after_tests {
         }
     }
 
-    /// `refresh_session` as it runs (`refresh_detached`, then
+    /// A refresh as a 401 runs it (`refresh_detached`, then
     /// `refresh_token_internal`): the refresh lock taken, then the refresh
     /// run to its end on a task of its own that holds it. Only the wire and
     /// the keystore are scripted: the token goes out at once (recorded by
@@ -4639,5 +4837,147 @@ mod retry_after_tests {
 
         api.begin_session("b1".into(), "s1".into()).await;
         assert!(!api.refresh_retry_due(), "owed from the last session");
+    }
+
+    /// A refresh refused as the real flight reads it (`do_request` on
+    /// `/auth/refresh`, `classify_refresh_error_after`, MR-2533).
+    fn refresh_refused(status: u16, body: &str) -> Result<RefreshResponse, ApiError> {
+        Err(BirdoApi::classify_refresh_error_after(
+            StatusCode::from_u16(status).unwrap(),
+            body,
+            None,
+        ))
+    }
+
+    const API_401: &str =
+        r#"{"statusCode":401,"message":"Invalid refresh token","error":"Unauthorized"}"#;
+
+    /// MR-2552 (review P469-I2): a late 401 names the session it ended, read
+    /// at the rejection, inside the flight, under the refresh lock. A sign-in
+    /// queued on that lock lands only after it, so the expiry's teardown
+    /// (`clear_tokens_if` with what was named) leaves the new session alone.
+    /// On main the handler read the access token when its task first ran,
+    /// after the lock was gone: here that is `b1`, and the new session was
+    /// the one signed out and cleared.
+    #[tokio::test]
+    async fn a_late_401_names_the_session_it_ended_not_the_next_one() {
+        use crate::api::session_gate::{reported, StoredSession};
+        let _ = reported::take();
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let server = Arc::new(ScriptedRefresh::default());
+        let keystore = Arc::new(Keystore::default());
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let refresh = tokio::spawn(startup_refresh(
+            &api,
+            &server,
+            &keystore,
+            refresh_refused(401, API_401),
+            answered,
+        ));
+        for _ in 0..1000 {
+            if server.sent() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(server.sent(), 1, "the token never went");
+
+        // A new sign-in while the old token is out: it waits for the flight.
+        let signing_in = tokio::spawn({
+            let api = api.clone();
+            async move { api.begin_session("b1".into(), "s1".into()).await }
+        });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !signing_in.is_finished(),
+            "the sign-in did not wait for the flight"
+        );
+
+        let _ = answer.send(());
+        let Ok(Err(refused)) = refresh.await else {
+            panic!("the refresh was not refused");
+        };
+        assert!(crate::api::session_gate::refresh_rejected(&refused));
+        signing_in.await.expect("the sign-in");
+        assert!(holds_in_memory(&api, "b1", "s1").await, "the new session");
+
+        let reports = reported::take();
+        assert_eq!(reports.len(), 1, "one rejection, one report");
+        let ended = &reports[0];
+        assert!(
+            ended.expired.as_deref() == Some("a1"),
+            "named the wrong session"
+        );
+        assert!(ended.stored == StoredSession::Discard);
+        assert!(!ended.account_deleted);
+        // What the handler then does with it.
+        assert!(!api.clear_tokens_if(ended.expired.as_deref()).await);
+        assert!(
+            holds_in_memory(&api, "b1", "s1").await,
+            "the new session was cleared"
+        );
+    }
+
+    /// MR-2517: a refresh refused after a deletion whose 2xx could not be read
+    /// (MR-2370; the heartbeat's refresh, or any request's) reports that the
+    /// ACCOUNT went, so the teardown clears what a deletion clears and the UI
+    /// says "deleted", not "session expired". MR-2533: only when the refresh's
+    /// 401 is the API's own JSON; a bare or foreign 401 still ends the
+    /// session, as expired. Without the unreadable 2xx, a 401 is an expiry.
+    /// On main nothing carried the deletion to that path.
+    #[tokio::test]
+    async fn a_refusal_after_a_lost_deletion_says_the_account_went() {
+        use crate::api::session_gate::{reported, StoredSession};
+        for (case, unconfirmed, body, deleted) in [
+            ("API 401 after the lost 2xx", true, API_401, true),
+            ("bare 401 after the lost 2xx", true, "", false),
+            (
+                "HTML 401 after the lost 2xx",
+                true,
+                "<html><body>401</body></html>",
+                false,
+            ),
+            ("API 401, no deletion", false, API_401, false),
+        ] {
+            let _ = reported::take();
+            let api = BirdoApi::new();
+            api.set_tokens("a1".into(), "r1".into()).await;
+            if unconfirmed {
+                let lost = BirdoApi::classify_gdpr_delete_response(StatusCode::OK, "");
+                assert!(
+                    api.conclude_gdpr_delete(false, lost).await.is_err(),
+                    "{case}"
+                );
+                assert!(api.deletion_unconfirmed(), "{case}");
+            }
+            let server = Arc::new(ScriptedRefresh::default());
+            let keystore = Arc::new(Keystore::default());
+            let result = startup_refresh(
+                &api,
+                &server,
+                &keystore,
+                refresh_refused(401, body),
+                answered_now(),
+            )
+            .await;
+            assert!(result.is_err(), "{case}");
+            let reports = reported::take();
+            assert_eq!(reports.len(), 1, "{case}");
+            assert_eq!(reports[0].account_deleted, deleted, "{case}");
+            assert!(reports[0].expired.as_deref() == Some("a1"), "{case}");
+            assert!(reports[0].stored == StoredSession::Discard, "{case}");
+            assert!(keystore.untouched(), "{case}");
+        }
+        // Nothing but a 401 is reported at all.
+        let _ = reported::take();
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let server = Arc::new(ScriptedRefresh::default());
+        let keystore = Arc::new(Keystore::default());
+        let _ = startup_refresh(&api, &server, &keystore, timed_out(), answered_now()).await;
+        assert!(reported::take().is_empty(), "a timeout ended the session");
     }
 }

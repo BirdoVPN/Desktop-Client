@@ -1078,8 +1078,8 @@ where
 ///
 /// Every field is `Option` and defaulted: a payload from an OLDER web deploy —
 /// one that predates the field — must deserialize, not error. `None` means
-/// "the server did not say", which the UI treats as AVAILABLE. See
-/// `dns_filtering_available`.
+/// "the server did not say". For `dns_filtering_available` that is NOT "on"
+/// (owner 2026-11-13; see the field).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientConfigResponse {
@@ -1087,12 +1087,17 @@ pub struct ClientConfigResponse {
     /// fleet this account dials? The per-device opt-in is the `dnsFiltering`
     /// connect flag; this says whether that flag can do anything at all.
     ///
-    /// `None` (field absent, older web deploy) is NOT `false`. The UI's default
-    /// is AVAILABLE, so a client that cannot learn the answer keeps offering a
-    /// feature that works, instead of hiding a working one behind a fetch
-    /// failure. The dishonest state this whole field exists to prevent — a
-    /// toggle that reads ON while the server hands out Cloudflare — only
-    /// happens on an explicit `false`.
+    /// Owner 2026-11-13: only an explicit `true` is ON. Rust's gate
+    /// (`api::client::note_dns_filtering_gate`) reads `false` and `None` alike
+    /// as off, and sends no `dnsFiltering` flag then; the UI leaves the answer
+    /// it had for a `None` (an older web deploy) or a failed fetch, and starts
+    /// unknown, which HIDES the BirdoShield row (`useClientConfig.ts`). So a
+    /// client that never learns the answer offers nothing, and the dishonest
+    /// state this field exists to prevent (a toggle that reads ON while the
+    /// server hands out its unfiltered resolver) cannot be shown. This used to
+    /// say the UI's default was AVAILABLE; it has not been since #433.
+    /// MR-2373: Rust's gate starts at the last answer an earlier run's fetch
+    /// gave (`commands::shield_gate`).
     #[serde(default)]
     pub dns_filtering_available: Option<bool>,
     /// The per-plan `features` map, reduced to the flags this client acts

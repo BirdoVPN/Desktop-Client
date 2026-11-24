@@ -573,6 +573,12 @@ fn main() {
                     .unwrap_or(false),
             );
 
+            // MR-2373: the BirdoShield fleet gate the last run's config fetch
+            // left on record, before the window exists: a cold-start
+            // Auto-Connect (the window starts it) then dials with the
+            // last-known gate, not with an in-memory "off".
+            commands::shield_gate::load(app.handle());
+
             // MR-1946: the main window is built here, not by Tauri from
             // tauri.conf.json ("create": false), so that on Windows it runs on
             // a WebView2 environment that keeps WebView2's crash reports on
@@ -712,10 +718,12 @@ fn main() {
             // session everywhere — tunnel, tokens — and the UI is told.
             {
                 let handle = app.handle().clone();
-                crate::api::session_gate::set_handler(move |stored| {
+                // MR-2552: `ended` names the session the rejection ended, read
+                // when it was reported, not when this task first runs.
+                crate::api::session_gate::set_handler(move |ended| {
                     let app = handle.clone();
                     tauri::async_runtime::spawn(async move {
-                        commands::session::handle_session_expired(&app, stored).await;
+                        commands::session::handle_session_expired(&app, ended).await;
                     });
                 });
             }

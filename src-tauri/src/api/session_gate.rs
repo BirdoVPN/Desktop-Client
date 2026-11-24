@@ -32,7 +32,10 @@ use std::sync::OnceLock;
 use super::error::ApiError;
 
 /// What one refresh attempt says about the sign-in session (Android/iOS
-/// `RefreshOutcome {SUCCESS, UNAUTHORIZED, TRANSIENT}` parity).
+/// `RefreshOutcome {SUCCESS, UNAUTHORIZED, TRANSIENT}` parity). The tests'
+/// vocabulary since MR-2550: its last production caller, `get_auth_state`'s
+/// own refresh, is gone, and every flight decides with [`refresh_rejected`].
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefreshOutcome {
     Success,
@@ -55,16 +58,40 @@ pub enum StoredSession {
     Keep,
 }
 
-type Handler = Box<dyn Fn(StoredSession) + Send + Sync>;
+/// What a refresh the server rejected ended, as it stood AT the rejection
+/// (`BirdoApi::ended_by`, read inside the flight, under the refresh lock).
+///
+/// MR-2552 (review P469-I2): the handler used to read the expired session
+/// itself, when its task first ran. By then the refresh lock was gone, and a
+/// sign-in queued on it could have landed: the old session's late 401 then
+/// named the NEW session's token, and signed it out and cleared its
+/// keystore. The token is never formatted: no `Debug`.
+pub struct EndedSession {
+    /// The access token in memory at the rejection (`None`: signed out
+    /// already). The teardown ends a session only while it is still this one
+    /// (`commands::session::handle_session_expired`, `clear_tokens_if`).
+    pub expired: Option<zeroize::Zeroizing<String>>,
+    /// What becomes of the OS keystore's copy.
+    pub stored: StoredSession,
+    /// MR-2517: the ACCOUNT went, not just the session. This session's last
+    /// deletion attempt was answered with a 2xx that did not confirm it
+    /// (MR-2370), and the refresh's 401 is the API's own (MR-2533). The
+    /// teardown then clears what a confirmed deletion clears, and the UI says
+    /// the account is deleted, not that the session expired.
+    pub account_deleted: bool,
+}
+
+type Handler = Box<dyn Fn(EndedSession) + Send + Sync>;
 
 static HANDLER: OnceLock<Handler> = OnceLock::new();
 
 /// Register the session-expiry handler. The first registration wins.
-pub fn set_handler(handler: impl Fn(StoredSession) + Send + Sync + 'static) {
+pub fn set_handler(handler: impl Fn(EndedSession) + Send + Sync + 'static) {
     let _ = HANDLER.set(Box::new(handler));
 }
 
 /// Classify a refresh attempt.
+#[cfg(test)]
 pub(crate) fn refresh_outcome<T>(result: &Result<T, ApiError>) -> RefreshOutcome {
     match result {
         Ok(_) => RefreshOutcome::Success,
@@ -131,6 +158,7 @@ pub(crate) fn error_after_failed_refresh(refresh_error: ApiError) -> ApiError {
         | ApiError::NotAuthenticated
         | ApiError::Parse(_)
         | ApiError::CertificatePinningFailed(_)
+        | ApiError::TlsIntercepted
         | ApiError::UpgradeRequired(_) => refresh_error,
         _ => ApiError::ServerBusy {
             status: 503,
@@ -139,12 +167,50 @@ pub(crate) fn error_after_failed_refresh(refresh_error: ApiError) -> ApiError {
     }
 }
 
-/// Report a failed refresh. Does nothing unless the server refused it.
-pub(crate) fn report_refresh_failure(error: &ApiError) {
-    if refresh_rejected(error) {
-        if let Some(handler) = HANDLER.get() {
-            handler(stored_session_after(error));
-        }
+/// Report a refresh the server refused ([`refresh_rejected`]): the handler
+/// ends `ended`.
+pub(crate) fn report_rejection(ended: EndedSession) {
+    #[cfg(test)]
+    let ended = {
+        reported::note(&ended);
+        ended
+    };
+    if let Some(handler) = HANDLER.get() {
+        handler(ended);
+    }
+}
+
+/// What this test thread's flights reported, so a test can see what a
+/// rejection named. The token is kept only as "this one" comparisons.
+#[cfg(test)]
+pub(crate) mod reported {
+    use super::{EndedSession, StoredSession};
+    use std::cell::RefCell;
+
+    /// One report, without its token: whether it named `expected`.
+    pub(crate) struct Report {
+        pub(crate) expired: Option<String>,
+        pub(crate) stored: StoredSession,
+        pub(crate) account_deleted: bool,
+    }
+
+    thread_local! {
+        static REPORTS: RefCell<Vec<Report>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn note(ended: &EndedSession) {
+        REPORTS.with(|r| {
+            r.borrow_mut().push(Report {
+                expired: ended.expired.as_ref().map(|t| t.as_str().to_owned()),
+                stored: ended.stored,
+                account_deleted: ended.account_deleted,
+            })
+        });
+    }
+
+    /// The reports since the last call, oldest first.
+    pub(crate) fn take() -> Vec<Report> {
+        REPORTS.with(|r| std::mem::take(&mut *r.borrow_mut()))
     }
 }
 
@@ -286,6 +352,11 @@ mod tests {
                 Err(ApiError::CertificatePinningFailed("x".into())),
                 IpcErrorCode::CertPinFailed,
             ),
+            (
+                "intercepted",
+                Err(ApiError::TlsIntercepted),
+                IpcErrorCode::TlsIntercepted,
+            ),
         ];
         for (case, result, code) in cases {
             assert_eq!(
@@ -380,6 +451,7 @@ mod tests {
                 ),
             ),
             ("pin", ApiError::CertificatePinningFailed("x".into())),
+            ("intercepted", ApiError::TlsIntercepted),
             ("unreadable 2xx", ApiError::Parse("eof".into())),
         ];
         for (case, error) in cases {

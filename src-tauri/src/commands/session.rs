@@ -19,7 +19,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::time::timeout;
 use zeroize::Zeroize;
 
-use crate::api::session_gate::StoredSession;
+use crate::api::session_gate::{EndedSession, StoredSession};
 use crate::api::types::{ConnectResponse, MultiHopConnectResponse, VpnConfig, VpnServer};
 use crate::api::BirdoApi;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode, TransportFailure};
@@ -1572,42 +1572,86 @@ static EXPIRY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Contract §3.3: the sign-in session is over. Tear the VPN down, clear the
 /// tokens and tell the UI, which routes to sign-in with a banner.
-/// `stored`: whether the keystore's copy goes too — only when the server
-/// rejected the refresh token itself (`session_gate::StoredSession`).
+/// `ended.stored`: whether the keystore's copy goes too — only when the
+/// server rejected the refresh token itself (`session_gate::StoredSession`).
 /// Idempotent: every request in flight can report the same rejection.
-pub async fn handle_session_expired(app: &AppHandle, stored: StoredSession) {
+pub async fn handle_session_expired(app: &AppHandle, ended: EndedSession) {
     if EXPIRY_IN_FLIGHT.swap(true, Ordering::SeqCst) {
         return;
     }
-    tracing::warn!("The sign-in session ended — signing out");
+    end_expired(app, ended).await;
+    EXPIRY_IN_FLIGHT.store(false, Ordering::SeqCst);
+}
+
+/// [`handle_session_expired`] once it is the only one running.
+async fn end_expired(app: &AppHandle, ended: EndedSession) {
     let api = app.state::<BirdoApi>();
-    // REVIEW-WIN2-021: the tokens to clear are the ones that expired. The UI
-    // is on Login at once, and the teardown below takes seconds: a user who
-    // signs straight back in has new tokens by the time it is over.
-    let expired = api.access_token_value().await;
-    end_session(app, EndReason::SessionExpired).await;
-    if api.clear_tokens_if(expired.as_deref()).await {
-        if stored == StoredSession::Discard {
-            if let Err(e) = app.state::<CredentialStore>().clear_tokens() {
-                tracing::warn!(
-                    "Could not clear the stored session: {}",
-                    crate::utils::redact::sanitize_error(&e.to_string())
-                );
-            }
-        }
-        // REVIEW-WIN-007 / REVIEW-WIN2-023: the next account to sign in on
-        // this machine must not inherit this one's server or route.
-        crate::commands::settings::clear_account_choices(app).await;
-    } else {
-        tracing::info!("A new sign-in arrived while the expired session ended — keeping it");
+    // MR-2552 (review P469-I2): the tokens to clear are the ones that
+    // expired, named when the rejection was reported (`ended.expired`), never
+    // read here: this task can first run after a new sign-in has landed. A
+    // session that is no longer the current one ends nothing: no teardown of
+    // the new session's tunnel, no clear, no event that would drop the UI to
+    // Login over it.
+    let expired = ended.expired.as_ref().map(|t| t.as_str());
+    if api.access_token_value().await.as_deref() != expired {
+        tracing::info!("A refusal for a session already replaced — the current one is kept");
+        return;
     }
-    // Only "expired" is emitted: the backend's refresh 401 carries nothing
-    // that tells a revoked session apart from an expired one.
+    let deleted = ended.account_deleted;
+    if deleted {
+        // MR-2517: an earlier deletion's answer was lost (MR-2370), and the
+        // session went with the account.
+        tracing::warn!(
+            "The account was deleted (an earlier deletion's answer was lost) — signing out"
+        );
+    } else {
+        tracing::warn!("The sign-in session ended — signing out");
+    }
+    // REVIEW-WIN2-021: the UI may already be on Login (`end_expired_session`),
+    // and the teardown below takes seconds: a user who signs straight back in
+    // has new tokens by the time it is over, and they are kept.
+    end_session(
+        app,
+        if deleted {
+            EndReason::AccountDeleted
+        } else {
+            EndReason::SessionExpired
+        },
+    )
+    .await;
+    if !api.clear_tokens_if(expired).await {
+        // MR-2552: nor is the UI told: `session-expired` would sign the new
+        // session out of the window.
+        tracing::info!("A new sign-in arrived while the expired session ended — keeping it");
+        return;
+    }
+    if ended.stored == StoredSession::Discard {
+        if let Err(e) = app.state::<CredentialStore>().clear_tokens() {
+            tracing::warn!(
+                "Could not clear the stored session: {}",
+                crate::utils::redact::sanitize_error(&e.to_string())
+            );
+        }
+    }
+    // REVIEW-WIN-007 / REVIEW-WIN2-023: the next account to sign in on
+    // this machine must not inherit this one's server or route.
+    crate::commands::settings::clear_account_choices(app).await;
+    if deleted {
+        // MR-2517: what a deletion the server confirmed clears
+        // (`commands::auth::delete_account`), the keystore above included:
+        // the PQ state and the device identifier (C-8).
+        crate::vpn::birdo_pq::purge_legacy_keypair_files();
+        crate::vpn::birdo_pq::record_disabled();
+        crate::utils::device_id::rotate();
+    }
+    // "expired" for every other end: the backend's refresh 401 carries
+    // nothing that tells a revoked session apart from an expired one.
+    // MR-2517: "deleted" puts Login's account-deleted notice up
+    // (`src/session/controller.tsx`).
     let _ = app.emit(
         "session-expired",
-        serde_json::json!({ "reason": "expired" }),
+        serde_json::json!({ "reason": if deleted { "deleted" } else { "expired" } }),
     );
-    EXPIRY_IN_FLIGHT.store(false, Ordering::SeqCst);
 }
 
 /// A command was refused with `session_expired` (REVIEW-WIN-012).
@@ -1629,7 +1673,21 @@ pub async fn handle_session_expired(app: &AppHandle, stored: StoredSession) {
 /// launch re-checks it. Idempotent, like `handle_session_expired`.
 #[tauri::command]
 pub async fn end_expired_session(app: AppHandle) {
-    handle_session_expired(&app, StoredSession::Keep).await;
+    // The session the UI saw end is the one in memory now.
+    let expired = app
+        .state::<BirdoApi>()
+        .access_token_value()
+        .await
+        .map(zeroize::Zeroizing::new);
+    handle_session_expired(
+        &app,
+        EndedSession {
+            expired,
+            stored: StoredSession::Keep,
+            account_deleted: false,
+        },
+    )
+    .await;
 }
 
 /// Source pins for the lifecycle ordering. The functions take an `AppHandle`,
@@ -2102,29 +2160,93 @@ mod lifecycle_tests {
     /// (REVIEW-WIN2-003). The tokens cleared are the ones that expired, read
     /// BEFORE the teardown (REVIEW-WIN2-021; `clear_tokens_if` is tested in
     /// `api::client`).
+    ///
+    /// MR-2552 (review P469-I2): for a rejected refresh, "the ones that
+    /// expired" are named when the rejection is reported (`ended.expired`,
+    /// read under the refresh lock, `BirdoApi::ended_by`); the handler reads
+    /// no token of its own. A session no longer current ends nothing (no
+    /// teardown, no clear, no event), and a sign-in during the teardown is
+    /// kept and not signed out of the window either. On main the handler read
+    /// `api.access_token_value()` when its task first ran: a sign-in that
+    /// landed first was the session it tore down and cleared.
     #[test]
     fn an_expired_session_reported_by_the_ui_takes_the_same_path() {
         order(
             body("pub async fn end_expired_session("),
-            &["handle_session_expired(&app, StoredSession::Keep)"],
+            &[
+                ".access_token_value()",
+                "stored: StoredSession::Keep",
+                "account_deleted: false",
+            ],
         );
-        let handled = body("pub async fn handle_session_expired(");
+        assert!(
+            body("pub async fn handle_session_expired(").contains("end_expired(app, ended).await")
+        );
+        let handled = body("async fn end_expired(");
         order(
             handled,
             &[
-                "api.access_token_value().await",
-                "end_session(app, EndReason::SessionExpired)",
-                "api.clear_tokens_if(expired.as_deref())",
-                "stored == StoredSession::Discard",
+                "let expired = ended.expired.as_ref().map(|t| t.as_str());",
+                "if api.access_token_value().await.as_deref() != expired {",
+                "return;",
+                "end_session(",
+                "EndReason::AccountDeleted",
+                "EndReason::SessionExpired",
+                "if !api.clear_tokens_if(expired).await {",
+                "return;",
+                "ended.stored == StoredSession::Discard",
                 "CredentialStore>().clear_tokens()",
                 "settings::clear_account_choices(app)",
                 "\"session-expired\"",
             ],
         );
+        assert_eq!(
+            handled.matches("access_token_value()").count(),
+            1,
+            "the handler names the expired token itself"
+        );
         assert!(
             !handled.contains("api.clear_tokens()") && !handled.contains(".clear_tokens().await"),
             "an unconditional clear wipes a session signed in during the teardown"
         );
+    }
+
+    /// MR-2517: a refresh rejected after a deletion whose answer was lost
+    /// (the heartbeat's, or any request's) ends the session as the deletion
+    /// does: the deletion's teardown, the keystore, the account's choices,
+    /// the PQ state and the device identifier, and the UI is told "deleted",
+    /// not "expired". Only for the session that ended (after the
+    /// `clear_tokens_if` check). On main this path said "session expired" and
+    /// kept the device id and the PQ state.
+    #[test]
+    fn a_refusal_after_a_lost_deletion_ends_it_as_deleted() {
+        let handled = body("async fn end_expired(");
+        let cleared = handled
+            .find("if !api.clear_tokens_if(expired).await {")
+            .expect("the check");
+        let after = &handled[cleared..];
+        order(
+            after,
+            &[
+                "if deleted {",
+                "crate::vpn::birdo_pq::purge_legacy_keypair_files();",
+                "crate::vpn::birdo_pq::record_disabled();",
+                "crate::utils::device_id::rotate();",
+                "\"reason\": if deleted { \"deleted\" } else { \"expired\" }",
+            ],
+        );
+        assert!(handled.contains("let deleted = ended.account_deleted;"));
+        // The same three a confirmed deletion clears.
+        const AUTH: &str = include_str!("auth.rs");
+        let delete = &AUTH[AUTH.find("pub async fn delete_account(").unwrap()..];
+        let delete = &delete[..delete.find("\n}").unwrap()];
+        for step in [
+            "crate::vpn::birdo_pq::purge_legacy_keypair_files();",
+            "crate::vpn::birdo_pq::record_disabled();",
+            "crate::utils::device_id::rotate();",
+        ] {
+            assert!(delete.contains(step), "{step}");
+        }
     }
 
     /// W1-010: every way a user connect can fail ends somewhere explainable.

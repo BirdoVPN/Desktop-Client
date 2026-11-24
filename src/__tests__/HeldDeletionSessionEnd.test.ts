@@ -14,6 +14,7 @@ import {
   heldDeletionGeneration,
   noteHeldDeletion,
 } from '@/lib/held-deletion';
+import { parseSessionExpired } from '@/lib/ipc';
 import { endDeletedSession, endSession, expireSession, signOut } from '@/session/session';
 import { useAppStore } from '@/store/app-store';
 
@@ -103,6 +104,40 @@ describe('an already-deleted account wins over session-expired, in either order'
     signedInWithAHold();
     endDeletedSession();
     endSession('expired');
+    expect(useAppStore.getState().isAuthenticated).toBe(false);
+    expect(useAppStore.getState().sessionEndedReason).toBe('deleted');
+  });
+});
+
+/**
+ * MR-2517: Rust's `session-expired` says `deleted` when a refresh (the
+ * heartbeat's, or any request's) was refused after a deletion whose answer was
+ * lost. Login says the account is deleted, never "your session expired", and
+ * whatever arrives first: the command that met the 401 (`expireSession`) may
+ * already have signed out as expired. On main the event could only say
+ * expired or revoked.
+ */
+describe("Rust's session-expired says the account was deleted (MR-2517)", () => {
+  it('deleted: signed out, the hold cleared, Login says deleted, no command', () => {
+    signedInWithAHold();
+    endSession(parseSessionExpired({ reason: 'deleted' }));
+    expect(useAppStore.getState().isAuthenticated).toBe(false);
+    expect(useAppStore.getState().sessionEndedReason).toBe('deleted');
+    expect(getHeldDeletion()).toBeNull();
+    expect(vi.mocked(invoke)).not.toHaveBeenCalled();
+  });
+
+  it('after the command that met the 401 signed out as expired', () => {
+    signedInWithAHold();
+    expireSession();
+    endSession(parseSessionExpired({ reason: 'deleted' }));
+    expect(useAppStore.getState().sessionEndedReason).toBe('deleted');
+  });
+
+  it('before it', () => {
+    signedInWithAHold();
+    endSession(parseSessionExpired({ reason: 'deleted' }));
+    expireSession();
     expect(useAppStore.getState().isAuthenticated).toBe(false);
     expect(useAppStore.getState().sessionEndedReason).toBe('deleted');
   });
