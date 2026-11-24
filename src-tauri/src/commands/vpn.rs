@@ -807,6 +807,11 @@ pub struct VpnStatus {
     pub kill_switch_blocking: bool,
     pub error: Option<IpcError>,
     pub server_id: Option<String>,
+    /// MR-2569: who chose `server_id`, `"user"` or `"automatic"` (the word
+    /// `connect_vpn`'s `origin` takes), null with no server. The UI records a
+    /// server Rust moved the session to under THIS origin, so a location the
+    /// user picked stays the user's and never leaves its country later.
+    pub server_origin: Option<&'static str>,
     pub multi_hop: Option<MultiHopStatus>,
     /// Non-null only on the `error` status that ended an auto-reconnect
     /// recovery (REVIEW-WIN-009); see `manager::GaveUp`.
@@ -880,6 +885,7 @@ pub(crate) async fn build_vpn_status(
         kill_switch_blocking: published.kill_switch_blocking,
         error,
         server_id: published.server_id,
+        server_origin: published.server_origin.map(SelectionOrigin::as_str),
         multi_hop: published.multi_hop,
         gave_up: published.gave_up,
         seq: published.seq,
@@ -2066,6 +2072,7 @@ mod tests {
             kill_switch_blocking: true,
             error: Some(IpcError::new(IpcErrorCode::ServerUnreachable, "x")),
             server_id: Some("exit-1".into()),
+            server_origin: Some(SelectionOrigin::User.as_str()),
             multi_hop: Some(MultiHopStatus {
                 entry_id: "entry-1".into(),
                 entry_name: "Frankfurt".into(),
@@ -2110,11 +2117,13 @@ mod tests {
                 "seq",
                 "serverId",
                 "serverName",
+                "serverOrigin",
                 "state",
                 "stealthActive"
             ]
         );
         assert_eq!(json["phase"], "handshaking");
+        assert_eq!(json["serverOrigin"], "user", "MR-2569");
         assert_eq!(json["gaveUp"], serde_json::json!({ "attempts": 10 }));
         assert_eq!(json["error"]["code"], "server_unreachable");
         assert!(json["error"].get("retry_after_secs").is_some());
