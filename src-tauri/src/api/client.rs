@@ -479,12 +479,21 @@ fn retry_after_of(response: &reqwest::Response) -> Option<u64> {
     super::error::retry_after_header(value, std::time::SystemTime::now())
 }
 
+/// MR-2532: how long a Sign Out waits for a refresh already on the wire
+/// before it reads the tokens ([`BirdoApi::end_server_session`]). Inside
+/// [`SIGN_OUT_SERVER_BOUND`], so a refresh that never ends still leaves the
+/// Sign Out time to send.
+const LOGOUT_REFRESH_WAIT: Duration = Duration::from_secs(10);
+
+/// MR-2532 (review of #475, M2): the whole server half of a Sign Out's
+/// `/auth/logout`, the wait for a refresh on the wire included, as Android
+/// caps its own (`LOGOUT_SERVER_CALL_TIMEOUT_MS`, 15 s). Past it, the local
+/// clear goes ahead. A send alone could otherwise take reqwest's 30 s, and a
+/// second one after a 401 as long again.
+const SIGN_OUT_SERVER_BOUND: Duration = Duration::from_secs(15);
+
 /// What the token refresh is held under in the retry gate (MR-1808): its
 /// method and path, like every route outside the credential bucket.
-/// MR-2532: how long a Sign Out waits for a refresh already on the wire
-/// before it reads the tokens ([`BirdoApi::end_server_session`]).
-const LOGOUT_REFRESH_WAIT: Duration = Duration::from_secs(15);
-
 fn refresh_hold_key() -> String {
     super::retry_gate::hold_key(&reqwest::Method::POST, endpoints::auth::REFRESH)
 }
@@ -800,36 +809,72 @@ impl BirdoApi {
     /// backoff) that refresh was answered at once with the hold, nothing
     /// reached the server, and the session lived on there until it expired.
     pub async fn logout(&self) -> Result<(), ApiError> {
-        self.end_server_session(|with| self.send_logout(with)).await;
-        self.clear_tokens().await;
+        self.logout_with(|with| self.send_logout(with)).await;
         Ok(())
     }
 
+    /// [`Self::logout`] with `send` doing each `POST /auth/logout` (given, so
+    /// a test can script the server).
+    ///
+    /// Review of #475, L1: the refresh lock the server half waited on stays
+    /// held until the tokens are cleared, as `begin_session` holds it. A
+    /// refresh that starts meanwhile (a UI request's 401, the focus retry)
+    /// waits, then finds no session; it can no longer consume the token the
+    /// Sign Out just read, or rotate a session the server then keeps.
+    async fn logout_with<F, Fut>(&self, send: F)
+    where
+        F: Fn(super::sign_out::LogoutWith) -> Fut,
+        Fut: std::future::Future<Output = Result<(), ApiError>>,
+    {
+        let refreshing = self.end_server_session(send).await;
+        self.clear_tokens().await;
+        drop(refreshing);
+    }
+
     /// MR-2532 (owner decision 2026-11-20, option a): end the session on the
-    /// server without a refresh, with `send` doing each `POST /auth/logout`
-    /// (given, so a test can script the server).
+    /// server without a refresh, with `send` doing each `POST /auth/logout`.
+    /// Returns the refresh lock's guard, when it was had, for the caller to
+    /// hold until the tokens are cleared (L1).
     ///
     /// 1. A refresh already on the wire holds the refresh lock to its end
     ///    (WIN3-004); it is waited for, at most [`LOGOUT_REFRESH_WAIT`], so
     ///    the pair read next is the one it lands, never the token it consumed.
     /// 2. With a usable access token and no refresh held or owed: the bearer,
     ///    and the refresh token only if the bearer is answered 401.
-    /// 3. Otherwise: the refresh token in the body, which the server revokes
-    ///    exactly that session for, issuing nothing (`sign_out::sign_out_plan`).
-    async fn end_server_session<F, Fut>(&self, send: F)
+    /// 3. Otherwise: the refresh token in the body. The server revokes that
+    ///    token's session and issues nothing (`sign_out::sign_out_plan`).
+    ///
+    /// All of it within [`SIGN_OUT_SERVER_BOUND`] (review of #475, M2).
+    async fn end_server_session<F, Fut>(&self, send: F) -> Option<tokio::sync::MutexGuard<'_, ()>>
+    where
+        F: Fn(super::sign_out::LogoutWith) -> Fut,
+        Fut: std::future::Future<Output = Result<(), ApiError>>,
+    {
+        let deadline = tokio::time::Instant::now() + SIGN_OUT_SERVER_BOUND;
+        let refreshing = tokio::time::timeout(LOGOUT_REFRESH_WAIT, self.refresh_lock.lock())
+            .await
+            .ok();
+        if tokio::time::timeout_at(deadline, self.send_sign_out(send))
+            .await
+            .is_err()
+        {
+            tracing::info!(
+                "The server's sign-out did not answer within {} s; signing out here",
+                SIGN_OUT_SERVER_BOUND.as_secs()
+            );
+        }
+        refreshing
+    }
+
+    /// The sends of [`Self::end_server_session`], by `sign_out::sign_out_plan`.
+    async fn send_sign_out<F, Fut>(&self, send: F)
     where
         F: Fn(super::sign_out::LogoutWith) -> Fut,
         Fut: std::future::Future<Output = Result<(), ApiError>>,
     {
         use super::sign_out::{sign_out_plan, unix_now, LogoutWith, SignOutPlan};
-        let _ = tokio::time::timeout(LOGOUT_REFRESH_WAIT, self.refresh_lock.lock()).await;
         let access = self.access_token_value().await;
-        let refresh = self
-            .refresh_token
-            .read()
-            .await
-            .as_ref()
-            .map(|t| t.to_string());
+        let refresh = self.refresh_token.read().await.clone();
         let held = self
             .retry_gate
             .refresh_held_or_owed(&refresh_hold_key(), std::time::Instant::now());
@@ -849,6 +894,47 @@ impl BirdoApi {
         }
     }
 
+    /// MR-2532, owner decision 2026-11-24 ("never refresh at sign-out"): one
+    /// request of the Sign Out flow, other than `/auth/logout` itself (the
+    /// peer release, the held-deletion read, the cancel-first). Sent ONCE
+    /// through `do_request` with the access token on file, and never
+    /// refreshed on its 401: a refresh there could replay a token a lost
+    /// refresh already consumed, which the server reads as theft and answers
+    /// by revoking every session and WireGuard peer of the account. Not sent
+    /// at all when that token is unusable (expired, within 30 s of it, or
+    /// none): `NotAuthenticated`, and nothing reaches the network.
+    async fn sign_out_request<T: DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&(dyn erased_serde::Serialize + Sync)>,
+    ) -> Result<T, ApiError> {
+        use super::sign_out::{access_token_usable, unix_now};
+        let usable = self
+            .access_token
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|token| access_token_usable(token.as_str(), unix_now()));
+        if !usable {
+            return Err(ApiError::NotAuthenticated);
+        }
+        self.do_request::<T>(&method, path, body, true).await
+    }
+
+    /// The Sign Out's release of the session's WireGuard peer
+    /// ([`Self::sign_out_request`]). `NotAuthenticated` when nothing was sent:
+    /// the server's stale-connection sweep frees the slot.
+    pub async fn release_peer_for_sign_out(&self, key_id: &str) -> Result<(), ApiError> {
+        self.sign_out_request::<serde_json::Value>(
+            reqwest::Method::DELETE,
+            &endpoints::vpn::connection(key_id),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// One `POST /auth/logout`, sent once through `do_request` (the retry gate
     /// holds and learns as for any request; nothing refreshes).
     async fn send_logout(&self, with: super::sign_out::LogoutWith) -> Result<(), ApiError> {
@@ -864,8 +950,11 @@ impl BirdoApi {
                 )
                 .await
                 .map(|_| ()),
-            LogoutWith::RefreshToken(refresh_token) => {
-                let payload = RefreshRequest { refresh_token };
+            LogoutWith::RefreshToken(mut refresh_token) => {
+                // Moved, not copied: RefreshRequest zeroizes it on drop.
+                let payload = RefreshRequest {
+                    refresh_token: std::mem::take(&mut *refresh_token),
+                };
                 self.do_request::<serde_json::Value>(
                     &post,
                     endpoints::auth::LOGOUT,
@@ -1162,6 +1251,18 @@ impl BirdoApi {
             .ok_or_else(|| ApiError::Parse("pendingChanges is not a list".into()))
     }
 
+    /// [`Self::list_pending_changes`] for the Sign Out flow (the dialog's
+    /// read, Profile's check before it): once, never refreshed, not sent
+    /// without a usable access token ([`Self::sign_out_request`]). A read
+    /// that did not answer leaves the dialog's "could not check" caution.
+    pub async fn list_pending_changes_for_sign_out(&self) -> Result<Vec<PendingChange>, ApiError> {
+        let value: serde_json::Value = self
+            .sign_out_request(reqwest::Method::GET, endpoints::auth::PENDING_CHANGES, None)
+            .await?;
+        pending_changes_from(&value)
+            .ok_or_else(|| ApiError::Parse("pendingChanges is not a list".into()))
+    }
+
     /// MR-2335: `POST /auth/pending-changes/:id/cancel`. `Ok(true)`: cancelled
     /// now; `Ok(false)`: 404 `pending_change_not_found`, it is gone already
     /// (applied, cancelled elsewhere, or dropped by the server on a sign-out or
@@ -1170,14 +1271,36 @@ impl BirdoApi {
         if !pending_change_id_ok(id) {
             return Err(ApiError::Unknown("not a pending change id".into()));
         }
-        match self
-            .post::<_, serde_json::Value>(
+        Self::cancelled_from(
+            self.post::<_, serde_json::Value>(
                 &endpoints::pending_change_cancel(id),
                 &EmptyBody {},
                 true,
             )
-            .await
-        {
+            .await,
+        )
+    }
+
+    /// [`Self::cancel_pending_change`] for the Sign Out's cancel-first: once,
+    /// never refreshed, not sent without a usable access token
+    /// ([`Self::sign_out_request`]). A cancel that did not go through blocks
+    /// the Sign Out in the dialog (Retry, or Sign out anyway).
+    pub async fn cancel_pending_change_for_sign_out(&self, id: &str) -> Result<bool, ApiError> {
+        if !pending_change_id_ok(id) {
+            return Err(ApiError::Unknown("not a pending change id".into()));
+        }
+        Self::cancelled_from(
+            self.sign_out_request::<serde_json::Value>(
+                reqwest::Method::POST,
+                &endpoints::pending_change_cancel(id),
+                Some(&EmptyBody {}),
+            )
+            .await,
+        )
+    }
+
+    fn cancelled_from(answer: Result<serde_json::Value, ApiError>) -> Result<bool, ApiError> {
+        match answer {
             Ok(_) => Ok(true),
             Err(ApiError::PendingChangeNotFound) => Ok(false),
             Err(e) => Err(e),
@@ -4888,19 +5011,26 @@ mod sign_out_tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
+    /// The refresh-token sign-out, as sent.
+    fn by_refresh(token: &str) -> LogoutWith {
+        LogoutWith::RefreshToken(Zeroizing::new(token.to_string()))
+    }
+
     /// The sign-out's server half against a scripted server: what it sent, in
     /// order. `answers` answer the sends in turn; past them, `Ok`.
     async fn sent_by(api: &BirdoApi, answers: Vec<Result<(), ApiError>>) -> Vec<LogoutWith> {
         let sent = Arc::new(StdMutex::new(Vec::new()));
         let answers = Arc::new(StdMutex::new(answers.into_iter()));
-        api.end_server_session(|with| {
-            let (sent, answers) = (Arc::clone(&sent), Arc::clone(&answers));
-            async move {
-                sent.lock().unwrap().push(with);
-                answers.lock().unwrap().next().unwrap_or(Ok(()))
-            }
-        })
-        .await;
+        let refreshing = api
+            .end_server_session(|with| {
+                let (sent, answers) = (Arc::clone(&sent), Arc::clone(&answers));
+                async move {
+                    sent.lock().unwrap().push(with);
+                    answers.lock().unwrap().next().unwrap_or(Ok(()))
+                }
+            })
+            .await;
+        drop(refreshing);
         let sent = sent.lock().unwrap().clone();
         sent
     }
@@ -4927,7 +5057,7 @@ mod sign_out_tests {
         api.set_tokens(live(), "r1".into()).await;
         assert_eq!(
             sent_by(&api, vec![Err(ApiError::Unauthorized)]).await,
-            vec![LogoutWith::Bearer, LogoutWith::RefreshToken("r1".into())]
+            vec![LogoutWith::Bearer, by_refresh("r1")]
         );
     }
 
@@ -4954,10 +5084,7 @@ mod sign_out_tests {
     async fn an_expired_access_token_sends_the_refresh_token() {
         let api = BirdoApi::new();
         api.set_tokens(expired(), "r1".into()).await;
-        assert_eq!(
-            sent_by(&api, vec![]).await,
-            vec![LogoutWith::RefreshToken("r1".into())]
-        );
+        assert_eq!(sent_by(&api, vec![]).await, vec![by_refresh("r1")]);
     }
 
     /// A refresh held by the server's 429 (or owed after a failure): the
@@ -4975,10 +5102,7 @@ mod sign_out_tests {
             std::time::Instant::now(),
             0.5,
         ));
-        assert_eq!(
-            sent_by(&api, vec![]).await,
-            vec![LogoutWith::RefreshToken("r1".into())]
-        );
+        assert_eq!(sent_by(&api, vec![]).await, vec![by_refresh("r1")]);
     }
 
     #[tokio::test]
@@ -5000,10 +5124,7 @@ mod sign_out_tests {
             refreshing.set_tokens(expired(), "r2".into()).await;
             drop(lock);
         });
-        assert_eq!(
-            sent_by(&api, vec![]).await,
-            vec![LogoutWith::RefreshToken("r2".into())]
-        );
+        assert_eq!(sent_by(&api, vec![]).await, vec![by_refresh("r2")]);
         landed.await.unwrap();
     }
 
@@ -5019,12 +5140,146 @@ mod sign_out_tests {
             drop(lock);
         });
         let started = tokio::time::Instant::now();
-        assert_eq!(
-            sent_by(&api, vec![]).await,
-            vec![LogoutWith::RefreshToken("r1".into())]
-        );
+        assert_eq!(sent_by(&api, vec![]).await, vec![by_refresh("r1")]);
         assert_eq!(started.elapsed(), LOGOUT_REFRESH_WAIT);
         stuck.abort();
+    }
+
+    /// Review of #475, M2: the whole server half is bounded. A server that
+    /// never answers (here, both the wait for a stuck refresh and the send)
+    /// holds the Sign Out for `SIGN_OUT_SERVER_BOUND`, then the local clear
+    /// runs. Before, the send alone had reqwest's 30 s, a second one after a
+    /// 401 as long again, after a 15 s wait.
+    #[tokio::test(start_paused = true)]
+    async fn the_server_half_is_bounded_overall() {
+        let api = BirdoApi::new();
+        api.set_tokens(expired(), "r1".into()).await;
+        let lock = Arc::clone(&api.refresh_lock).lock_owned().await;
+        let stuck = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(lock);
+        });
+        let started = tokio::time::Instant::now();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(120),
+            api.logout_with(|_| std::future::pending::<Result<(), ApiError>>()),
+        )
+        .await;
+        assert!(ended.is_ok(), "the Sign Out never ended");
+        assert_eq!(started.elapsed(), SIGN_OUT_SERVER_BOUND);
+        assert!(!api.is_authenticated().await, "cleared here all the same");
+        stuck.abort();
+    }
+
+    /// Review of #475, L1: a refresh that starts while the Sign Out is at the
+    /// server (a UI request's 401, the focus retry) waits for the refresh
+    /// lock until the tokens are cleared, and finds nothing to present.
+    /// Before, the lock was let go as soon as it was had, so that refresh ran
+    /// alongside and could consume the token the Sign Out had just read.
+    #[tokio::test]
+    async fn a_refresh_started_during_the_sign_out_finds_no_token() {
+        let api = BirdoApi::new();
+        api.set_tokens(live(), "r1".into()).await;
+        let seen = Arc::new(StdMutex::new(None));
+        api.logout_with(|_| {
+            let (api, seen) = (api.clone(), Arc::clone(&seen));
+            async move {
+                let refresh = tokio::spawn(async move {
+                    let _refreshing = api.refresh_lock.lock().await;
+                    let presented = api
+                        .refresh_token
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|t| t.to_string());
+                    presented
+                });
+                // Let it run as far as it can while the Sign Out is out.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                *seen.lock().unwrap() = Some(refresh);
+                Ok(())
+            }
+        })
+        .await;
+        let refresh = seen.lock().unwrap().take().expect("sent");
+        assert_eq!(refresh.await.unwrap(), None, "the refresh read the token");
+    }
+
+    /// MR-2532, owner decision 2026-11-24 ("never refresh at sign-out"), the
+    /// WHOLE client half of a Sign Out with the tunnel up and the access
+    /// token expired, in its order: the peer release, the held-deletion read
+    /// and the cancel-first send NOTHING (no usable access token, so no
+    /// 401 and no refresh; the sweep frees the slot), and `/auth/logout`
+    /// goes once with the refresh token. Nothing is refreshed: the refresh
+    /// token is the one on file throughout, no refresh is held or owed, and
+    /// the refresh lock is free. (The command wiring is pinned in
+    /// `commands::auth::sign_out_flow_tests`.)
+    #[tokio::test]
+    async fn the_whole_sign_out_with_an_expired_access_token_refreshes_nothing() {
+        let api = BirdoApi::new();
+        api.set_tokens(expired(), "r1".into()).await;
+        assert!(matches!(
+            api.release_peer_for_sign_out("key-1").await,
+            Err(ApiError::NotAuthenticated)
+        ));
+        assert!(matches!(
+            api.list_pending_changes_for_sign_out().await,
+            Err(ApiError::NotAuthenticated)
+        ));
+        assert!(matches!(
+            api.cancel_pending_change_for_sign_out("cm1234567890abcdefghijklm")
+                .await,
+            Err(ApiError::NotAuthenticated)
+        ));
+        assert_eq!(
+            api.refresh_token.read().await.as_ref().map(|t| t.as_str()),
+            Some("r1")
+        );
+        assert!(api.refresh_lock.try_lock().is_ok());
+        assert_eq!(sent_by(&api, vec![]).await, vec![by_refresh("r1")]);
+        assert!(!api
+            .retry_gate
+            .refresh_held_or_owed(&refresh_hold_key(), std::time::Instant::now()));
+    }
+
+    /// Every request of the Sign Out flow goes through `sign_out_request`:
+    /// `do_request` once, never `request_with_retry` or a refresh, and only
+    /// with a usable access token.
+    #[test]
+    fn the_sign_out_requests_go_once_without_a_refresh() {
+        const SOURCE: &str = include_str!("client.rs");
+        let fn_body = |signature: &str| {
+            let start = SOURCE.find(signature).expect(signature);
+            let rest = &SOURCE[start..];
+            &rest[..rest.find("\n    }").expect("end of fn")]
+        };
+        let once = fn_body("async fn sign_out_request<");
+        let flat: String = once.split_whitespace().collect();
+        assert!(flat.contains("access_token_usable(token.as_str(),unix_now())"));
+        assert!(flat.contains("if!usable{returnErr(ApiError::NotAuthenticated);}"));
+        assert!(flat.contains("self.do_request::<T>(&method,path,body,true).await"));
+        for signature in [
+            "async fn sign_out_request<",
+            "pub async fn release_peer_for_sign_out(",
+            "pub async fn list_pending_changes_for_sign_out(",
+            "pub async fn cancel_pending_change_for_sign_out(",
+        ] {
+            let body = fn_body(signature);
+            for forbidden in [
+                "refresh_detached",
+                "request_with_retry",
+                "refresh_flight",
+                "self.post",
+                "self.get(",
+                "self.delete(",
+            ] {
+                assert!(!body.contains(forbidden), "{signature}: {forbidden}");
+            }
+            if signature != "async fn sign_out_request<" {
+                let squashed: String = body.split_whitespace().collect();
+                assert!(squashed.contains("self.sign_out_request"), "{signature}");
+            }
+        }
     }
 
     /// The Sign Out never refreshes and never goes through the 401-refresh
@@ -5039,7 +5294,9 @@ mod sign_out_tests {
         };
         for signature in [
             "pub async fn logout(&self)",
+            "async fn logout_with<",
             "async fn end_server_session<",
+            "async fn send_sign_out<",
             "async fn send_logout(",
         ] {
             let body = fn_body(signature);
@@ -5053,17 +5310,19 @@ mod sign_out_tests {
                 assert!(!body.contains(forbidden), "{signature}: {forbidden}");
             }
         }
-        let logout = fn_body("pub async fn logout(&self)");
+        assert!(fn_body("pub async fn logout(&self)").contains("self.logout_with("));
+        let logout = fn_body("async fn logout_with<");
         let server = logout
-            .find("self.end_server_session(")
+            .find("let refreshing = self.end_server_session(")
             .expect("the server half");
         let clear = logout
             .find("self.clear_tokens().await")
             .expect("the local clear");
-        assert!(server < clear);
+        let unlocked = logout.find("drop(refreshing)").expect("the guard");
+        assert!(server < clear && clear < unlocked);
         let send = fn_body("async fn send_logout(");
-        assert!(send.contains("RefreshRequest { refresh_token }"));
         let flat = send.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("refresh_token: std::mem::take(&mut *refresh_token),"));
         assert!(
             flat.contains("Some(&payload), false,"),
             "the refresh token goes without a bearer"

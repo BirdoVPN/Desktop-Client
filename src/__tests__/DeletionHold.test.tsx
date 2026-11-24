@@ -636,7 +636,8 @@ describe('signing out with a hold filed here: the app cancels it first (M1)', ()
     await openWithHoldFiledHere();
     await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
     await waitFor(() => expect(signOut).toHaveBeenCalledTimes(1));
-    expect(calls('cancel_pending_change')).toEqual([['cancel_pending_change', { id: HOLD_ID }]]);
+    // MR-2532: in the Sign Out's mode (once, never refreshed).
+    expect(calls('cancel_pending_change')).toEqual([['cancel_pending_change', { id: HOLD_ID, signingOut: true }]]);
     const cancelAt = mockedInvoke.mock.invocationCallOrder[
       mockedInvoke.mock.calls.findIndex(([c]) => c === 'cancel_pending_change')
     ];
@@ -683,6 +684,62 @@ describe('signing out with a hold filed here: the app cancels it first (M1)', ()
     await userEvent.click(screen.getByRole('button', { name: 'Sign out anyway' }));
     await waitFor(() => expect(signOut).toHaveBeenCalledTimes(1));
     expect(calls('cancel_pending_change')).toHaveLength(1);
+  });
+});
+
+/**
+ * MR-2532, owner decision 2026-11-24 ("never refresh at sign-out"): the Sign
+ * Out flow's own requests (the dialog's read, Profile's check before it, the
+ * cancel-first) ask Rust for the Sign Out's mode: once with the access token
+ * on file, never refreshed on a 401, not sent when it is unusable
+ * (`BirdoApi::sign_out_request`). The page's own reads and the dialog's
+ * Cancel deletion (the user stays) are ordinary requests.
+ */
+describe('MR-2532: the Sign Out flow never refreshes', () => {
+  const listed = [{ id: HOLD_ID, action: 'account_delete', applyAfter: APPLY_AFTER }];
+  // What Rust answers for a Sign Out request it did not send, or that got a 401.
+  const notSent = () => Promise.reject(refusal('unknown', 'This could not be checked before signing out.'));
+
+  it("the dialog's read and its cancel-first go in the Sign Out's mode", async () => {
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true, generation: heldDeletionGeneration() });
+    listResult = () => Promise.resolve(listed);
+    render(<SignOutDialog open stillConnected onClose={() => {}} />);
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
+    expect(calls('list_pending_changes')[0]).toEqual(['list_pending_changes', { signingOut: true }]);
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await waitFor(() => expect(signOut).toHaveBeenCalledTimes(1));
+    expect(calls('cancel_pending_change')).toEqual([['cancel_pending_change', { id: HOLD_ID, signingOut: true }]]);
+  });
+
+  it("Profile's check before Sign out goes in that mode; the page's own read does not", async () => {
+    render(<Profile />);
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
+    expect(calls('list_pending_changes')[0]).toEqual(['list_pending_changes']);
+    await userEvent.click(screen.getByRole('button', { name: /^sign out/i }));
+    await waitFor(() => expect(signOut).toHaveBeenCalledTimes(1));
+    expect(calls('list_pending_changes')[1]).toEqual(['list_pending_changes', { signingOut: true }]);
+  });
+
+  it('a read Rust did not send (no usable access token) is "could not check", never an expired session', async () => {
+    listResult = notSent;
+    render(<SignOutDialog open stillConnected onClose={() => {}} />);
+    expect(await screen.findByText(HOLD_UNCHECKED_CAUTION)).toBeInTheDocument();
+    expect(expireSession).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await waitFor(() => expect(signOut).toHaveBeenCalledTimes(1));
+  });
+
+  it('a cancel-first Rust did not send blocks the Sign Out, never ends it as expired', async () => {
+    noteHeldDeletion({ id: HOLD_ID, applyAfter: APPLY_AFTER }, { filedHere: true, generation: heldDeletionGeneration() });
+    listResult = () => Promise.resolve(listed);
+    cancelResult = notSent;
+    render(<SignOutDialog open stillConnected onClose={() => {}} />);
+    await waitFor(() => expect(calls('list_pending_changes')).toHaveLength(1));
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    expect(await screen.findByText(/The deletion is still scheduled/)).toBeInTheDocument();
+    expect(signOut).not.toHaveBeenCalled();
+    expect(expireSession).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Sign out anyway' })).toBeEnabled();
   });
 });
 

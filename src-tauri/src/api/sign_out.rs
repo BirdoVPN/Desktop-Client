@@ -13,11 +13,19 @@
 //! answered at once with the hold, so nothing reached the server and the
 //! session lived on until it expired.
 //!
-//! Mobile twins: Android `BirdoRepository.endServerSession`, iOS
-//! `SignOutRevocation` (Mobile-Client).
+//! Owner decision 2026-11-24 ("never refresh at sign-out"): that holds for
+//! EVERY request of the Sign Out flow, not only `/auth/logout`. The peer
+//! release, the held-deletion read and the cancel-first each go ONCE with the
+//! access token on file, never refreshed on a 401, and are not sent at all
+//! when that token is unusable (`BirdoApi::sign_out_request`). The server's
+//! stale-connection sweep frees an unreleased peer in about 5-10 minutes.
+//!
+//! Mobile twins: Android `BirdoRepository.endServerSession` and
+//! `releasePeerForSignOut`, iOS `SignOutRevocation` (Mobile-Client).
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use zeroize::Zeroizing;
 
 /// An access token this close to its `exp` is not presented: it may expire on
 /// the way. The same 30 s as Android and iOS.
@@ -36,12 +44,24 @@ pub(crate) enum SignOutPlan {
 }
 
 /// One `POST /auth/logout`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum LogoutWith {
     /// The access token as the bearer, an empty body.
     Bearer,
-    /// No bearer; `{ "refresh_token": … }` in the body.
-    RefreshToken(String),
+    /// No bearer; `{ "refresh_token": … }` in the body. Zeroized on drop, as
+    /// the session's own slots are (F-23).
+    RefreshToken(Zeroizing<String>),
+}
+
+/// Never prints the refresh token (review of #475, N1), as iOS's
+/// `SignOutTokens` and Android's `RefreshRequest` do not.
+impl std::fmt::Debug for LogoutWith {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bearer => f.write_str("Bearer"),
+            Self::RefreshToken(_) => f.write_str("RefreshToken(<redacted>)"),
+        }
+    }
 }
 
 /// The plan for a session holding `access` (if any) and a refresh token (if
@@ -164,6 +184,15 @@ mod tests {
             sign_out_plan(Some(&jwt(Some(NOW + 600))), false, true, NOW),
             SignOutPlan::BearerThenRefreshTokenOn401
         );
+    }
+
+    #[test]
+    fn the_refresh_token_never_prints() {
+        let with = LogoutWith::RefreshToken(Zeroizing::new("r-secret-123".to_string()));
+        for printed in [format!("{with:?}"), format!("{with:#?}")] {
+            assert!(!printed.contains("r-secret-123"), "{printed}");
+            assert!(printed.contains("RefreshToken"), "{printed}");
+        }
     }
 
     #[test]

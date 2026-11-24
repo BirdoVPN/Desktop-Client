@@ -769,15 +769,40 @@ pub struct PendingChangeItem {
     pub detail: Option<String>,
 }
 
+/// MR-2532, owner decision 2026-11-24 ("never refresh at sign-out"): what a
+/// request of the Sign Out flow answers when it was not sent (no usable
+/// access token) or was answered 401. Never `session_expired`: that would end
+/// a deliberate Sign Out as an expired session (the UI's `command` does so on
+/// that code), and it is not one. The dialog reads it as "could not check" /
+/// "could not cancel".
+fn sign_out_request_failure(error: ApiError) -> IpcError {
+    match error {
+        ApiError::Unauthorized | ApiError::NotAuthenticated => {
+            IpcError::unknown("This could not be checked before signing out.")
+        }
+        other => IpcError::from(other),
+    }
+}
+
 /// MR-2335: `GET /auth/pending-changes`, read on opening Profile and on window
 /// focus. A hold can vanish between two reads (the server cancels it on a
 /// sign-out elsewhere, a number rotation, a password or 2FA change), so an
 /// empty list is an answer, not an error.
+///
+/// `signing_out`: the Sign Out flow's read (MR-2532): once, never refreshed,
+/// not sent without a usable access token (`BirdoApi::sign_out_request`).
 #[tauri::command]
 pub async fn list_pending_changes(
+    signing_out: Option<bool>,
     api: State<'_, BirdoApi>,
 ) -> Result<Vec<PendingChangeItem>, IpcError> {
-    let rows = api.list_pending_changes().await.map_err(IpcError::from)?;
+    let rows = if signing_out == Some(true) {
+        api.list_pending_changes_for_sign_out()
+            .await
+            .map_err(sign_out_request_failure)?
+    } else {
+        api.list_pending_changes().await.map_err(IpcError::from)?
+    };
     Ok(rows
         .into_iter()
         .map(|row| PendingChangeItem {
@@ -804,18 +829,27 @@ pub struct CancelPendingChangeResult {
 
 /// MR-2335: `POST /auth/pending-changes/:id/cancel`. Cancelling a held
 /// deletion keeps the account; nothing local changes either way.
+///
+/// `signing_out`: the Sign Out's cancel-first (MR-2532): once, never
+/// refreshed, not sent without a usable access token.
 #[tauri::command]
 pub async fn cancel_pending_change(
     id: String,
+    signing_out: Option<bool>,
     api: State<'_, BirdoApi>,
 ) -> Result<CancelPendingChangeResult, IpcError> {
     if !crate::api::types::pending_change_id_ok(&id) {
         return Err(IpcError::unknown("That change could not be found."));
     }
-    let cancelled = api
-        .cancel_pending_change(&id)
-        .await
-        .map_err(IpcError::from)?;
+    let cancelled = if signing_out == Some(true) {
+        api.cancel_pending_change_for_sign_out(&id)
+            .await
+            .map_err(sign_out_request_failure)?
+    } else {
+        api.cancel_pending_change(&id)
+            .await
+            .map_err(IpcError::from)?
+    };
     tracing::info!(
         "Pending change {}",
         if cancelled {
@@ -1585,6 +1619,157 @@ pub async fn login_anonymous(
                 code: Some(sign_in_failure_code(&e)),
             })
         }
+    }
+}
+
+/// MR-2532, owner decision 2026-11-24 ("never refresh at sign-out"): the
+/// WHOLE Sign Out, from the UI's click to the local clear, with the tunnel up
+/// and the access token expired. No step may reach `/auth/refresh`: every
+/// request goes once with the access token on file, or not at all. Source
+/// pins across the UI and Rust (a Tauri command takes `State`, which a unit
+/// test cannot build); the client half is driven in
+/// `api::client::sign_out_tests`.
+///
+/// Before the owner's decision: the UI disconnected first through
+/// `disconnect_vpn` (`UserDisconnect`), whose peer release went through
+/// `request_with_retry` and refreshed on a 401, `end_session(SignOut)` did the
+/// same, and the dialog's held-deletion read and cancel-first refreshed too.
+#[cfg(test)]
+mod sign_out_flow_tests {
+    const AUTH: &str = include_str!("auth.rs");
+    const SESSION: &str = include_str!("session.rs");
+    const CLIENT: &str = include_str!("../api/client.rs");
+    const UI_SIGN_OUT: &str = include_str!("../../../src/session/session.ts");
+    const UI_HOLD: &str = include_str!("../../../src/session/held-deletion.ts");
+    const UI_DIALOG: &str = include_str!("../../../src/components/home/SignOutDialog.tsx");
+    const UI_PROFILE: &str = include_str!("../../../src/screens/Profile.tsx");
+
+    /// `text` from `start` to the first `end` after it.
+    fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+        let from = text
+            .find(start)
+            .unwrap_or_else(|| panic!("not found: {start}"));
+        let rest = &text[from..];
+        let to = rest
+            .find(end)
+            .unwrap_or_else(|| panic!("no end after: {start}"));
+        &rest[..to]
+    }
+
+    /// Without any whitespace, so rustfmt and prettier cannot move a pin.
+    fn squash(text: &str) -> String {
+        text.split_whitespace().collect()
+    }
+
+    fn has(text: &str, needle: &str) -> bool {
+        squash(text).contains(&squash(needle))
+    }
+
+    fn in_order(text: &str, steps: &[&str]) {
+        let text = squash(text);
+        let mut at = 0;
+        for step in steps {
+            let step = squash(step);
+            let found = text[at..]
+                .find(&step)
+                .unwrap_or_else(|| panic!("missing, or out of order: {step}"));
+            at += found + step.len();
+        }
+    }
+
+    #[test]
+    fn the_whole_sign_out_never_refreshes() {
+        // 1. The UI's Sign Out goes straight to Rust's logout.
+        let ui = between(UI_SIGN_OUT, "export async function signOut()", "\n}");
+        assert!(
+            !ui.contains("disconnect_vpn"),
+            "the UI disconnects first, through the release that refreshes"
+        );
+        assert!(has(ui, "await invoke('logout');"));
+
+        // 2. logout: the session ends (the peer release), then the server's
+        //    sign-out, then the keystore.
+        let logout = between(AUTH, "pub async fn logout(", "\n}");
+        in_order(
+            logout,
+            &[
+                "end_session(&app, EndReason::SignOut).await;",
+                "api.logout().await;",
+                "credentials.clear_tokens()",
+            ],
+        );
+
+        // 3. A Sign Out's peer release is the one that never refreshes.
+        let tunnel = between(SESSION, "async fn end_the_tunnel(", "\n}");
+        assert!(
+            has(
+                tunnel,
+                "if reason == EndReason::SignOut { api.release_peer_for_sign_out(&key_id).await } \
+                 else { api.disconnect_vpn(&key_id).await }"
+            ),
+            "the Sign Out releases the peer through disconnect_vpn"
+        );
+
+        // 4. The client half: each step sends once, through do_request.
+        for signature in [
+            "pub async fn release_peer_for_sign_out(",
+            "pub async fn list_pending_changes_for_sign_out(",
+            "pub async fn cancel_pending_change_for_sign_out(",
+            "async fn sign_out_request<",
+            "pub async fn logout(&self)",
+            "async fn logout_with<",
+            "async fn end_server_session<",
+            "async fn send_sign_out<",
+            "async fn send_logout(",
+        ] {
+            let body = between(CLIENT, signature, "\n    }");
+            for refreshing in [
+                "request_with_retry",
+                "refresh_detached",
+                "refresh_flight",
+                "self.get(",
+                "self.post(",
+                "self.delete(",
+            ] {
+                assert!(
+                    !body.contains(refreshing),
+                    "{signature} reaches {refreshing}"
+                );
+            }
+        }
+
+        // 5. The Sign Out UI's own requests ask for that mode...
+        assert!(has(UI_DIALOG, "refreshHeldDeletion({ signingOut: true })"));
+        assert!(has(
+            UI_DIALOG,
+            "cancelHeldDeletion(hold.id, { reread: false, signingOut: true })"
+        ));
+        let profile = between(UI_PROFILE, "const handleSignOut = async () => {", "\n  };");
+        assert!(has(
+            profile,
+            "refreshHeldDeletionWithin(HOLD_READ_WAIT_MS, { signingOut: true })"
+        ));
+        assert!(has(
+            UI_HOLD,
+            "command<unknown>('list_pending_changes', { signingOut: true })"
+        ));
+        assert!(has(
+            UI_HOLD,
+            "signingOut ? { id, signingOut: true } : { id }"
+        ));
+        // ...and Rust honours it, never answering `session_expired` there.
+        let list = between(AUTH, "pub async fn list_pending_changes(", "\n}");
+        assert!(has(
+            list,
+            "api.list_pending_changes_for_sign_out().await.map_err(sign_out_request_failure)?"
+        ));
+        let cancel = between(AUTH, "pub async fn cancel_pending_change(", "\n}");
+        assert!(has(
+            cancel,
+            "api.cancel_pending_change_for_sign_out(&id).await.map_err(sign_out_request_failure)?"
+        ));
+        let failure = between(AUTH, "fn sign_out_request_failure(", "\n}");
+        assert!(!failure.contains("session_expired"), "{failure}");
     }
 }
 

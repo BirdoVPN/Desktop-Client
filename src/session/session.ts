@@ -4,7 +4,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { clearHeldDeletion } from '@/lib/held-deletion';
 import { useAppStore } from '@/store/app-store';
-import { selectTunnelActive } from '@/store/selectors';
 
 /**
  * Rust ended the session (contract §3.3: it has already torn the tunnel down
@@ -62,24 +61,24 @@ export function endDeletedSession(): void {
  * on Login with the machine firewalled and every control that could release
  * it behind the sign-in.
  *
- * Rust's `logout` performs the same teardown itself in v2 (contract §3.2);
- * disconnecting first anyway keeps this correct against a backend that does
- * not, and `disconnect_vpn` is valid in every state (§3.1).
+ * Rust's `logout` ends the VPN session itself, in every state, before the
+ * credentials go (contract §3.2: `end_session(SignOut)`), the held block
+ * included. MR-2532, owner decision 2026-11-24 ("never refresh at sign-out"):
+ * nothing here calls `disconnect_vpn` first any more. Its peer release
+ * refreshes on a 401, and the Sign Out's own release goes once, never
+ * refreshed, and only with a usable access token
+ * (`BirdoApi::release_peer_for_sign_out`).
  */
 export async function signOut(): Promise<void> {
-  if (selectTunnelActive(useAppStore.getState())) {
-    try {
-      await invoke('disconnect_vpn');
-    } catch {
-      /* best effort — Rust's logout tears down too */
-    }
-  }
   try {
     await invoke('logout');
   } catch {
     /* best effort — local state is cleared regardless */
   }
-  // MR-2335: signing out cancelled any held deletion on the server.
+  // MR-2335: the next account must not inherit this one's held deletion.
+  // Signing out voids on the server only a hold THIS session filed (when its
+  // session ends there); one filed on the website or another device stays
+  // (birdo-web #883), and the next sign-in reads it again.
   clearHeldDeletion();
   useAppStore.getState().logout();
 }

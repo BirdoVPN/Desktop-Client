@@ -222,12 +222,6 @@ impl RetryGate {
         self.refresh_failures.store(0, Ordering::SeqCst);
     }
 
-    /// MR-2500 / MR-1771 (lead decision 2026-11-19; Mobile #653's
-    /// `retryIsDue`): whether the last refresh flight failed in a way that
-    /// held it ([`Self::refresh_failed`]), nothing has renewed or ended the
-    /// session since, and the hold on the refresh `key` is over. The
-    /// window's return to the foreground asks this
-    /// (`BirdoApi::retry_held_refresh`); nothing asks it on a timer.
     /// MR-2532: whether a refresh is held (its wait still runs) or owed (the
     /// last flight got no verdict). A Sign Out then ends the session with the
     /// refresh token instead of the bearer (`BirdoApi::end_server_session`).
@@ -235,6 +229,12 @@ impl RetryGate {
         self.refresh_failures.load(Ordering::SeqCst) > 0 || self.check(key, now).is_err()
     }
 
+    /// MR-2500 / MR-1771 (lead decision 2026-11-19; Mobile #653's
+    /// `retryIsDue`): whether the last refresh flight failed in a way that
+    /// held it ([`Self::refresh_failed`]), nothing has renewed or ended the
+    /// session since, and the hold on the refresh `key` is over. The
+    /// window's return to the foreground asks this
+    /// (`BirdoApi::retry_held_refresh`); nothing asks it on a timer.
     pub(crate) fn refresh_retry_due(&self, key: &str, now: Instant) -> bool {
         self.refresh_failures.load(Ordering::SeqCst) > 0 && self.check(key, now).is_ok()
     }
