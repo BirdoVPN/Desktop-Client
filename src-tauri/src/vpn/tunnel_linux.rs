@@ -6116,6 +6116,7 @@ mod netns_teardown_tests {
             server_name: name.into(),
             server_id: name.into(),
             multi_hop: None,
+            origin: crate::vpn::relay_retry::SelectionOrigin::User,
         }
     }
 

@@ -32,7 +32,10 @@ use std::sync::OnceLock;
 use super::error::ApiError;
 
 /// What one refresh attempt says about the sign-in session (Android/iOS
-/// `RefreshOutcome {SUCCESS, UNAUTHORIZED, TRANSIENT}` parity).
+/// `RefreshOutcome {SUCCESS, UNAUTHORIZED, TRANSIENT}` parity). The tests'
+/// vocabulary since MR-2550: its last production caller, `get_auth_state`'s
+/// own refresh, is gone, and every flight decides with [`refresh_rejected`].
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefreshOutcome {
     Success,
@@ -65,6 +68,7 @@ pub fn set_handler(handler: impl Fn(StoredSession) + Send + Sync + 'static) {
 }
 
 /// Classify a refresh attempt.
+#[cfg(test)]
 pub(crate) fn refresh_outcome<T>(result: &Result<T, ApiError>) -> RefreshOutcome {
     match result {
         Ok(_) => RefreshOutcome::Success,
@@ -131,6 +135,7 @@ pub(crate) fn error_after_failed_refresh(refresh_error: ApiError) -> ApiError {
         | ApiError::NotAuthenticated
         | ApiError::Parse(_)
         | ApiError::CertificatePinningFailed(_)
+        | ApiError::TlsIntercepted
         | ApiError::UpgradeRequired(_) => refresh_error,
         _ => ApiError::ServerBusy {
             status: 503,
@@ -286,6 +291,11 @@ mod tests {
                 Err(ApiError::CertificatePinningFailed("x".into())),
                 IpcErrorCode::CertPinFailed,
             ),
+            (
+                "intercepted",
+                Err(ApiError::TlsIntercepted),
+                IpcErrorCode::TlsIntercepted,
+            ),
         ];
         for (case, result, code) in cases {
             assert_eq!(
@@ -380,6 +390,7 @@ mod tests {
                 ),
             ),
             ("pin", ApiError::CertificatePinningFailed("x".into())),
+            ("intercepted", ApiError::TlsIntercepted),
             ("unreadable 2xx", ApiError::Parse("eof".into())),
         ];
         for (case, error) in cases {

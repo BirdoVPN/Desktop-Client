@@ -700,8 +700,10 @@ mod tests {
 
     /// Server-side encapsulation, deterministic so the test vectors are fixed.
     /// This is the only place the client ever encapsulates; in production the
-    /// server does it with `@noble/post-quantum`.
-    fn encapsulate_with(pk: &[u8], m: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    /// server does it with `@noble/post-quantum`. `pub(super)` only so the
+    /// ACVP tests (`birdo_pq_acvp.rs`, MR-1432) use it too: the PQ gate keeps
+    /// every reference to the deterministic encapsulation in this file.
+    pub(super) fn encapsulate_with(pk: &[u8], m: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let k: Key<EncapsulationKey<MlKem1024>> =
             Array::<u8, U1568>::try_from(pk).expect("1568-byte encapsulation key");
         let ek = <EncapsulationKey<MlKem1024> as TryKeyInit>::new(&k)
@@ -1225,3 +1227,9 @@ mod tests {
         assert_eq!(current_mode(), PqMode::ServerProvided);
     }
 }
+
+// NIST ACVP ML-KEM-1024 vectors (MR-1432): a child module, so it reaches
+// `decapsulation_key` and the sizes without widening their visibility.
+#[cfg(test)]
+#[path = "birdo_pq_acvp.rs"]
+mod acvp;
