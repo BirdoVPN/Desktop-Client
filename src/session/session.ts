@@ -10,8 +10,17 @@ import { selectTunnelActive } from '@/store/selectors';
  * Rust ended the session (contract §3.3: it has already torn the tunnel down
  * and cleared the tokens) — drop to Login and say why. Idempotent: the
  * `session-expired` event and the command that tripped it usually both arrive.
+ *
+ * MR-2517: `deleted` is Rust's word for a refresh refused after a deletion
+ * whose answer was lost (the heartbeat's, or any request's): Rust has cleared
+ * what a deletion clears, and Login says the account is deleted, whatever
+ * arrived first (`endDeletedSession`).
  */
-export function endSession(reason: 'expired' | 'revoked'): void {
+export function endSession(reason: 'expired' | 'revoked' | 'deleted'): void {
+  if (reason === 'deleted') {
+    endDeletedSession();
+    return;
+  }
   const s = useAppStore.getState();
   if (!s.isAuthenticated) return;
   // MR-2335: the next account must not inherit this one's held deletion.

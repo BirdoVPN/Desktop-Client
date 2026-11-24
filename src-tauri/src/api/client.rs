@@ -2150,9 +2150,22 @@ impl BirdoApi {
         // the token and sends the same one again; `refresh_policy`). Only a
         // 401 is the server rejecting the refresh token: contract §3.3 ends
         // the session everywhere (see `session_gate`).
-        let response: RefreshResponse = fly(refresh.clone())
-            .await
-            .inspect_err(super::session_gate::report_refresh_failure)?;
+        let response: RefreshResponse = match fly(refresh.clone()).await {
+            Ok(response) => response,
+            Err(error) => {
+                if super::session_gate::refresh_rejected(&error) {
+                    // MR-2552 (review P469-I2): the session the rejection
+                    // ends is read HERE, inside the flight and under the
+                    // refresh lock, which a sign-in waits for. The handler
+                    // used to read it when its task first ran, after the
+                    // lock was gone: a new sign-in could land first, and the
+                    // old session's late 401 signed THAT one out.
+                    let ended = self.ended_by(&error).await;
+                    super::session_gate::report_rejection(ended);
+                }
+                return Err(error);
+            }
+        };
 
         // REVIEW-WIN4-002: adopted only by the session that asked. A refresh
         // runs detached (WIN3-004), so it can outlive a Sign Out, or a sign-in
@@ -2285,6 +2298,24 @@ impl BirdoApi {
         }
         let lock = Arc::clone(&self.refresh_lock).try_lock_owned().ok()?;
         self.refresh_retry_due().then_some(lock)
+    }
+
+    /// What a refresh the server rejected with `error` ended, as it stands
+    /// at the rejection (MR-2552): the access token in memory now, which is
+    /// the only one the teardown may clear (`clear_tokens_if`); what becomes
+    /// of the keystore's copy; and (MR-2517) whether the ACCOUNT went, not
+    /// just the session: this session's last deletion attempt was answered
+    /// with a 2xx that did not confirm it (MR-2370), and the refresh's 401
+    /// is the API's own (MR-2533, [`Self::refresh_says_gone`]). That is the
+    /// heartbeat's (or any request's) twin of the deletion retry's
+    /// `AlreadyDeleted` (MR-2483): the erasure deletes every session, so the
+    /// first refresh after it is refused.
+    async fn ended_by(&self, error: &ApiError) -> super::session_gate::EndedSession {
+        super::session_gate::EndedSession {
+            expired: self.access_token.read().await.clone(),
+            stored: super::session_gate::stored_session_after(error),
+            account_deleted: self.deletion_unconfirmed() && Self::refresh_says_gone(error),
+        }
     }
 
     /// Store a refresh's result only if the refresh token it presented is
@@ -3226,7 +3257,18 @@ mod token_restore_tests {
             "P469-L2: store_tokens writes the refresh token first"
         );
         let adopt = fn_body("async fn refresh_and_adopt<");
-        assert!(adopt.contains(".inspect_err(super::session_gate::report_refresh_failure)?"));
+        // MR-2552: a rejection is reported with the session it ended, read
+        // inside the flight (under the refresh lock), before it returns.
+        let rejected = adopt
+            .find("if super::session_gate::refresh_rejected(&error) {")
+            .expect("the rejection");
+        let named = adopt
+            .find("let ended = self.ended_by(&error).await;")
+            .expect("named at the rejection");
+        let reported = adopt
+            .find("super::session_gate::report_rejection(ended);")
+            .expect("reported");
+        assert!(rejected < named && named < reported);
         assert!(adopt.contains(".adopt_refreshed("));
     }
 
@@ -3573,7 +3615,7 @@ mod retry_after_tests {
     /// MR-1771: a 429 from `/auth/refresh` keeps the session, through what
     /// the refresh runs on its answer: `handle_response`, the hold
     /// `do_request` notes under the refresh's key, and the session gate's
-    /// verdict (`report_refresh_failure` ends a session only on what
+    /// verdict (`report_rejection` ends a session only on what
     /// `refresh_rejected` accepts, and the rotated pair is adopted only on
     /// `Ok`). It is never `session_expired`, the caller is told
     /// `rate_limited`, and the next refresh is not sent until the wait is
@@ -4795,5 +4837,147 @@ mod retry_after_tests {
 
         api.begin_session("b1".into(), "s1".into()).await;
         assert!(!api.refresh_retry_due(), "owed from the last session");
+    }
+
+    /// A refresh refused as the real flight reads it (`do_request` on
+    /// `/auth/refresh`, `classify_refresh_error_after`, MR-2533).
+    fn refresh_refused(status: u16, body: &str) -> Result<RefreshResponse, ApiError> {
+        Err(BirdoApi::classify_refresh_error_after(
+            StatusCode::from_u16(status).unwrap(),
+            body,
+            None,
+        ))
+    }
+
+    const API_401: &str =
+        r#"{"statusCode":401,"message":"Invalid refresh token","error":"Unauthorized"}"#;
+
+    /// MR-2552 (review P469-I2): a late 401 names the session it ended, read
+    /// at the rejection, inside the flight, under the refresh lock. A sign-in
+    /// queued on that lock lands only after it, so the expiry's teardown
+    /// (`clear_tokens_if` with what was named) leaves the new session alone.
+    /// On main the handler read the access token when its task first ran,
+    /// after the lock was gone: here that is `b1`, and the new session was
+    /// the one signed out and cleared.
+    #[tokio::test]
+    async fn a_late_401_names_the_session_it_ended_not_the_next_one() {
+        use crate::api::session_gate::{reported, StoredSession};
+        let _ = reported::take();
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let server = Arc::new(ScriptedRefresh::default());
+        let keystore = Arc::new(Keystore::default());
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let refresh = tokio::spawn(startup_refresh(
+            &api,
+            &server,
+            &keystore,
+            refresh_refused(401, API_401),
+            answered,
+        ));
+        for _ in 0..1000 {
+            if server.sent() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(server.sent(), 1, "the token never went");
+
+        // A new sign-in while the old token is out: it waits for the flight.
+        let signing_in = tokio::spawn({
+            let api = api.clone();
+            async move { api.begin_session("b1".into(), "s1".into()).await }
+        });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !signing_in.is_finished(),
+            "the sign-in did not wait for the flight"
+        );
+
+        let _ = answer.send(());
+        let Ok(Err(refused)) = refresh.await else {
+            panic!("the refresh was not refused");
+        };
+        assert!(crate::api::session_gate::refresh_rejected(&refused));
+        signing_in.await.expect("the sign-in");
+        assert!(holds_in_memory(&api, "b1", "s1").await, "the new session");
+
+        let reports = reported::take();
+        assert_eq!(reports.len(), 1, "one rejection, one report");
+        let ended = &reports[0];
+        assert!(
+            ended.expired.as_deref() == Some("a1"),
+            "named the wrong session"
+        );
+        assert!(ended.stored == StoredSession::Discard);
+        assert!(!ended.account_deleted);
+        // What the handler then does with it.
+        assert!(!api.clear_tokens_if(ended.expired.as_deref()).await);
+        assert!(
+            holds_in_memory(&api, "b1", "s1").await,
+            "the new session was cleared"
+        );
+    }
+
+    /// MR-2517: a refresh refused after a deletion whose 2xx could not be read
+    /// (MR-2370; the heartbeat's refresh, or any request's) reports that the
+    /// ACCOUNT went, so the teardown clears what a deletion clears and the UI
+    /// says "deleted", not "session expired". MR-2533: only when the refresh's
+    /// 401 is the API's own JSON; a bare or foreign 401 still ends the
+    /// session, as expired. Without the unreadable 2xx, a 401 is an expiry.
+    /// On main nothing carried the deletion to that path.
+    #[tokio::test]
+    async fn a_refusal_after_a_lost_deletion_says_the_account_went() {
+        use crate::api::session_gate::{reported, StoredSession};
+        for (case, unconfirmed, body, deleted) in [
+            ("API 401 after the lost 2xx", true, API_401, true),
+            ("bare 401 after the lost 2xx", true, "", false),
+            (
+                "HTML 401 after the lost 2xx",
+                true,
+                "<html><body>401</body></html>",
+                false,
+            ),
+            ("API 401, no deletion", false, API_401, false),
+        ] {
+            let _ = reported::take();
+            let api = BirdoApi::new();
+            api.set_tokens("a1".into(), "r1".into()).await;
+            if unconfirmed {
+                let lost = BirdoApi::classify_gdpr_delete_response(StatusCode::OK, "");
+                assert!(
+                    api.conclude_gdpr_delete(false, lost).await.is_err(),
+                    "{case}"
+                );
+                assert!(api.deletion_unconfirmed(), "{case}");
+            }
+            let server = Arc::new(ScriptedRefresh::default());
+            let keystore = Arc::new(Keystore::default());
+            let result = startup_refresh(
+                &api,
+                &server,
+                &keystore,
+                refresh_refused(401, body),
+                answered_now(),
+            )
+            .await;
+            assert!(result.is_err(), "{case}");
+            let reports = reported::take();
+            assert_eq!(reports.len(), 1, "{case}");
+            assert_eq!(reports[0].account_deleted, deleted, "{case}");
+            assert!(reports[0].expired.as_deref() == Some("a1"), "{case}");
+            assert!(reports[0].stored == StoredSession::Discard, "{case}");
+            assert!(keystore.untouched(), "{case}");
+        }
+        // Nothing but a 401 is reported at all.
+        let _ = reported::take();
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let server = Arc::new(ScriptedRefresh::default());
+        let keystore = Arc::new(Keystore::default());
+        let _ = startup_refresh(&api, &server, &keystore, timed_out(), answered_now()).await;
+        assert!(reported::take().is_empty(), "a timeout ended the session");
     }
 }

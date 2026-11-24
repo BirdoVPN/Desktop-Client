@@ -341,9 +341,16 @@ export function parseQuotaWarning(raw: unknown): { secondsRemaining: number | nu
   return { secondsRemaining: secs !== null && secs >= 0 ? secs : null };
 }
 
-/** `session-expired` (contract §3.3). An unrecognised reason is treated as expiry. */
-export function parseSessionExpired(raw: unknown): 'expired' | 'revoked' {
-  return isObj(raw) && raw.reason === 'revoked' ? 'revoked' : 'expired';
+/**
+ * `session-expired` (contract §3.3). An unrecognised reason is treated as expiry.
+ * MR-2517: `deleted` when a refresh was refused after a deletion whose answer
+ * was lost (MR-2370): the session went with the account.
+ */
+export function parseSessionExpired(raw: unknown): 'expired' | 'revoked' | 'deleted' {
+  if (!isObj(raw)) return 'expired';
+  if (raw.reason === 'revoked') return 'revoked';
+  if (raw.reason === 'deleted') return 'deleted';
+  return 'expired';
 }
 
 /**

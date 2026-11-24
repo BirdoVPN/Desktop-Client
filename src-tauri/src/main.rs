@@ -718,10 +718,12 @@ fn main() {
             // session everywhere — tunnel, tokens — and the UI is told.
             {
                 let handle = app.handle().clone();
-                crate::api::session_gate::set_handler(move |stored| {
+                // MR-2552: `ended` names the session the rejection ended, read
+                // when it was reported, not when this task first runs.
+                crate::api::session_gate::set_handler(move |ended| {
                     let app = handle.clone();
                     tauri::async_runtime::spawn(async move {
-                        commands::session::handle_session_expired(&app, stored).await;
+                        commands::session::handle_session_expired(&app, ended).await;
                     });
                 });
             }
