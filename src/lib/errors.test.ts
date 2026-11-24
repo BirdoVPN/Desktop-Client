@@ -327,3 +327,24 @@ describe('quotaGraceMessage', () => {
     expect(quotaGraceMessage(null)).toBe('Free data allowance used — your connection ends soon.');
   });
 });
+
+/**
+ * MR-2417: the server's BirdoPQ key-confirmation tag did not match the key this
+ * app derived. Before the tag this surfaced as a handshake that never completed
+ * ("try another location"), which is untrue: no other server helps.
+ */
+describe('pq_key_mismatch: the security handshake mismatch (MR-2417)', () => {
+  it('is a known code on the wire, not folded into unknown', () => {
+    expect(toIpcError({ code: 'pq_key_mismatch', message: 'x', retryable: false }).code).toBe('pq_key_mismatch');
+  });
+
+  it('says what happened and what helps (update, then support), and never another location', () => {
+    const copy = errorCopy(err('pq_key_mismatch' as IpcErrorCode, { retryable: false }), 'vpn');
+    expect(copy.action).toBe('update');
+    expect(copy.message).toMatch(/security handshake mismatch/i);
+    expect(copy.message).toMatch(/update/i);
+    expect(copy.message).toMatch(/contact support/i);
+    expect(copy.message).not.toMatch(/another (location|server)/i);
+    expect(copy.message).not.toBe(PQ_FAILED_COPY);
+  });
+});

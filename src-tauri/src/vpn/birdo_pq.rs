@@ -1027,6 +1027,95 @@ mod tests {
             .is_err());
     }
 
+    // ── Key confirmation (MR-2417) ────────────────────────────────────────
+
+    /// The key-confirmation tag as the SERVER computes it (birdo-web
+    /// `pqKeyConfirmTag`): HKDF-SHA-256(ss, salt "BirdoPQ-v1-PSK", info
+    /// "BirdoPQ-v1-KeyConfirm" || nonce, 32). Built from the hkdf crate here,
+    /// not from the production helper, so the production check is graded
+    /// against an independent derivation.
+    fn server_tag(ss: &[u8], nonce: &[u8]) -> String {
+        let mut tag = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(HKDF_SALT), ss)
+            .expand_multi_info(&[b"BirdoPQ-v1-KeyConfirm".as_slice(), nonce], &mut tag)
+            .expect("32 bytes is a valid HKDF-SHA-256 length");
+        base64::engine::general_purpose::STANDARD.encode(tag)
+    }
+
+    /// A post-quantum connect response as it arrives on the wire (through
+    /// serde, as the API client reads it), with or without the tag.
+    fn wire_response(ct: &[u8], nonce: &[u8], tag: Option<String>) -> ConnectResponse {
+        let std_b64 = base64::engine::general_purpose::STANDARD;
+        let mut body = serde_json::json!({
+            "success": true,
+            "quantumEnabled": true,
+            "rosenpassPublicKey": std_b64.encode(ct),
+            "rosenpassEndpoint": std_b64.encode(nonce),
+        });
+        if let Some(tag) = tag {
+            body["pqKeyConfirmTag"] = serde_json::Value::String(tag);
+        }
+        serde_json::from_value(body).expect("a connect response")
+    }
+
+    /// The field symptom MR-2417 is about: the server's tag is for another key
+    /// than the one this client derives (an ML-KEM or HKDF that disagrees
+    /// with the server's). The connect is aborted and no PSK comes back.
+    #[test]
+    fn a_key_confirmation_tag_that_does_not_match_aborts_with_no_psk() {
+        let session = PqSession::begin();
+        let (ct, ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let nonce = test_nonce(4);
+        let mut other = ss.clone();
+        other[0] ^= 1;
+        let resp = wire_response(&ct, &nonce, Some(server_tag(&other, &nonce)));
+        let r = crate::commands::vpn::derive_quantum_psk(&resp, Some(session));
+        assert!(
+            r.is_err(),
+            "a tag for another key must abort the connect, not hand back a PSK"
+        );
+    }
+
+    /// The tag the server really derived: the connect goes ahead with the
+    /// server's PSK.
+    #[test]
+    fn a_matching_key_confirmation_tag_connects_with_the_servers_psk() {
+        let session = PqSession::begin();
+        let (ct, ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let nonce = test_nonce(5);
+        let resp = wire_response(&ct, &nonce, Some(server_tag(&ss, &nonce)));
+        let psk = crate::commands::vpn::derive_quantum_psk(&resp, Some(session))
+            .expect("a matching tag connects")
+            .expect("with a PSK");
+        let server_psk = hkdf_to_psk(&ss, &nonce).unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(psk.as_bytes())
+                .unwrap(),
+            server_psk.as_slice()
+        );
+    }
+
+    /// An older server sends no tag: the derivation is exactly what it was
+    /// before MR-2417, so the server and the client can deploy in any order.
+    #[test]
+    fn no_key_confirmation_tag_is_the_legacy_path() {
+        let session = PqSession::begin();
+        let (ct, ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let nonce = test_nonce(6);
+        let resp = wire_response(&ct, &nonce, None);
+        let psk = crate::commands::vpn::derive_quantum_psk(&resp, Some(session))
+            .expect("no tag is not an error")
+            .expect("a PSK");
+        let server_psk = hkdf_to_psk(&ss, &nonce).unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(psk.as_bytes())
+                .unwrap(),
+            server_psk.as_slice()
+        );
+    }
+
     // ── Legacy key files ──────────────────────────────────────────────────
 
     fn legacy_in(base: &std::path::Path, name: &str) -> LegacyKeypairFile {
