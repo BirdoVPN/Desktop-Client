@@ -676,7 +676,11 @@ pub(crate) async fn start_stealth_tunnel(
 ///      app-to-API leg only, not a complete "record now, decrypt later"
 ///      defence: the relay leg is classical TLS and multi-hop's middle leg
 ///      has no PQ PSK (`vpn::birdo_pq` module docs).
-///   2. If the server enabled quantum mode but decapsulation fails, abort.
+///   2. If the server enabled quantum mode but decapsulation fails, abort
+///      (`pq_failed`). MR-2417: if the server's key-confirmation tag does not
+///      match the derived key, abort with `pq_key_mismatch` instead: an
+///      accurate error, where the mismatch used to surface as a WireGuard
+///      handshake that never completed ("try another location").
 ///   3. Server-provided classical PSK (TLS-delivered random; not HNDL-safe).
 ///   4. None — connection runs without PSK.
 ///
@@ -685,19 +689,27 @@ pub(crate) async fn start_stealth_tunnel(
 pub(crate) fn derive_quantum_psk(
     response: &ConnectResponse,
     pq_session: Option<crate::vpn::birdo_pq::PqSession>,
-) -> Result<Option<Zeroizing<String>>, String> {
+) -> Result<Option<Zeroizing<String>>, IpcError> {
     // 1) True bilateral PQ — only succeeds when server returned a ciphertext
-    //    AND we have a local keypair AND decapsulation produced a PSK.
-    if let Some(psk) = crate::vpn::birdo_pq::try_decapsulate(response, pq_session) {
-        return Ok(Some(psk));
+    //    AND we have a local keypair AND decapsulation produced a PSK (and,
+    //    when the server sent one, its key-confirmation tag matched).
+    match crate::vpn::birdo_pq::try_decapsulate(response, pq_session) {
+        Ok(Some(psk)) => return Ok(Some(psk)),
+        // MR-2417: no PSK was derived, so there is none to use; never the
+        // server's classical PSK either.
+        Err(crate::vpn::birdo_pq::KeyMismatch) => {
+            crate::vpn::birdo_pq::record_disabled();
+            return Err(IpcError::pq_key_mismatch());
+        }
+        Ok(None) => {}
     }
 
     if response.quantum_enabled.unwrap_or(false) {
         crate::vpn::birdo_pq::record_disabled();
-        return Err(
-            "Post-quantum key exchange failed after the server enabled BirdoPQ. Connection aborted to prevent a silent downgrade."
-                .to_string(),
-        );
+        return Err(IpcError::new(
+            IpcErrorCode::PqFailed,
+            "Post-quantum key exchange failed after the server enabled BirdoPQ. Connection aborted to prevent a silent downgrade.",
+        ));
     }
 
     // 2) Fall back to the server's classical preshared_key when present.
@@ -2198,6 +2210,7 @@ mod tests {
             quantum_enabled,
             rosenpass_public_key: Some("AAAA".into()),
             rosenpass_endpoint: Some("bm9uY2U=".into()),
+            pq_key_confirm_tag: None,
         }
     }
 
@@ -2206,7 +2219,9 @@ mod tests {
         let resp = withheld_psk_response(Some(true));
         let r = derive_quantum_psk(&resp, Some(crate::vpn::birdo_pq::PqSession::begin()));
         assert!(r.is_err(), "expected fail-closed Err, got {r:?}");
-        assert!(r.unwrap_err().contains("silent downgrade"));
+        let err = r.unwrap_err();
+        assert_eq!(err.code, IpcErrorCode::PqFailed);
+        assert!(err.message.contains("silent downgrade"));
     }
 
     /// Control: the same response with quantum OFF is the legacy no-PSK path
@@ -2227,7 +2242,9 @@ mod tests {
         resp.preshared_key = Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".into());
         let r = derive_quantum_psk(&resp, None);
         assert!(r.is_err(), "expected fail-closed Err, got {r:?}");
-        assert!(r.unwrap_err().contains("silent downgrade"));
+        let err = r.unwrap_err();
+        assert_eq!(err.code, IpcErrorCode::PqFailed);
+        assert!(err.message.contains("silent downgrade"));
     }
 
     /// The consequence of a BirdoPQ decapsulation that cannot happen — an
@@ -2250,7 +2267,9 @@ mod tests {
             r.is_err(),
             "a failed PQ decapsulation must abort, not take the offered classical PSK; got {r:?}"
         );
-        assert!(r.unwrap_err().contains("silent downgrade"));
+        let err = r.unwrap_err();
+        assert_eq!(err.code, IpcErrorCode::PqFailed);
+        assert!(err.message.contains("silent downgrade"));
     }
 
     /// The other direction of the same correction: with `quantum_enabled` off,

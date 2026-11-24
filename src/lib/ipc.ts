@@ -45,6 +45,7 @@ export type IpcErrorCode =
   | 'cert_pin_failed'
   | 'stealth_failed'
   | 'pq_failed'
+  | 'pq_key_mismatch'
   | 'killswitch_failed'
   | 'adapter_failed'
   | 'not_elevated'
@@ -84,6 +85,7 @@ const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
   'cert_pin_failed',
   'stealth_failed',
   'pq_failed',
+  'pq_key_mismatch',
   'killswitch_failed',
   'adapter_failed',
   'not_elevated',

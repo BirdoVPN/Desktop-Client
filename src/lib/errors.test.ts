@@ -17,6 +17,7 @@ import {
   isSilentError,
   KILLSWITCH_HOLDING_COPY,
   PQ_FAILED_COPY,
+  PQ_KEY_MISMATCH_COPY,
   QUOTA_EXCEEDED_COPY,
   REGISTRATION_NOT_ALLOWED_COPY,
   EMAIL_NOT_VERIFIED_COPY,
@@ -65,6 +66,7 @@ const ALL: IpcErrorCode[] = [
   'cert_pin_failed',
   'stealth_failed',
   'pq_failed',
+  'pq_key_mismatch',
   'killswitch_failed',
   'adapter_failed',
   'not_elevated',
@@ -339,7 +341,8 @@ describe('pq_key_mismatch: the security handshake mismatch (MR-2417)', () => {
   });
 
   it('says what happened and what helps (update, then support), and never another location', () => {
-    const copy = errorCopy(err('pq_key_mismatch' as IpcErrorCode, { retryable: false }), 'vpn');
+    const copy = errorCopy(err('pq_key_mismatch', { retryable: false }), 'vpn');
+    expect(copy.message).toBe(PQ_KEY_MISMATCH_COPY);
     expect(copy.action).toBe('update');
     expect(copy.message).toMatch(/security handshake mismatch/i);
     expect(copy.message).toMatch(/update/i);

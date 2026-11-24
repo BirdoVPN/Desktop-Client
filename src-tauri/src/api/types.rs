@@ -1626,6 +1626,12 @@ pub struct ConnectResponse {
     pub rosenpass_public_key: Option<String>,
     #[serde(default, rename = "rosenpassEndpoint")]
     pub rosenpass_endpoint: Option<String>,
+    /// MR-2417: the BirdoPQ key-confirmation tag (base64 of 32 bytes) a server
+    /// from contract 1.1.0 on sends with the two fields above.
+    /// `vpn::birdo_pq::try_decapsulate` checks it before the PSK is used; an
+    /// older server sends none, and the derivation is then what it always was.
+    #[serde(default, rename = "pqKeyConfirmTag")]
+    pub pq_key_confirm_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1776,6 +1782,10 @@ pub struct MultiHopConnectResponse {
     pub rosenpass_public_key: Option<String>,
     #[serde(default, rename = "rosenpassEndpoint")]
     pub rosenpass_endpoint: Option<String>,
+    /// MR-2417: the BirdoPQ key-confirmation tag, as on `ConnectResponse`
+    /// (the multi-hop route returns the entry connect's fields).
+    #[serde(default, rename = "pqKeyConfirmTag")]
+    pub pq_key_confirm_tag: Option<String>,
 }
 
 impl From<MultiHopConnectResponse> for ConnectResponse {
@@ -1814,6 +1824,7 @@ impl From<MultiHopConnectResponse> for ConnectResponse {
             quantum_enabled: response.quantum_enabled,
             rosenpass_public_key: response.rosenpass_public_key,
             rosenpass_endpoint: response.rosenpass_endpoint,
+            pq_key_confirm_tag: response.pq_key_confirm_tag,
         }
     }
 }

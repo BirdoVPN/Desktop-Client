@@ -72,6 +72,15 @@ pub enum IpcErrorCode {
     CertPinFailed,
     StealthFailed,
     PqFailed,
+    /// MR-2417: the server's BirdoPQ key-confirmation tag (`pqKeyConfirmTag`)
+    /// does not match the key this client derived, so client and server do
+    /// not agree on the post-quantum key. No PSK was derived and none is
+    /// used. Its own code so the UI says what happened ("security handshake
+    /// mismatch": update, then contact support) instead of `pq_failed`'s
+    /// "try again" or the "try another location" a handshake that never
+    /// completes used to show. A retry meets the same mismatch, so it is a
+    /// hard refusal and auto-reconnect stops on it.
+    PqKeyMismatch,
     KillswitchFailed,
     AdapterFailed,
     NotElevated,
@@ -132,6 +141,7 @@ impl IpcErrorCode {
                 | IpcErrorCode::HoldUnavailable
                 | IpcErrorCode::StepUpNoFactor
                 | IpcErrorCode::EmailNotVerified
+                | IpcErrorCode::PqKeyMismatch
         )
     }
 
@@ -151,6 +161,7 @@ impl IpcErrorCode {
                 | IpcErrorCode::ClientAttestationRequired
                 | IpcErrorCode::NotElevated
                 | IpcErrorCode::AccountRestricted
+                | IpcErrorCode::PqKeyMismatch
         )
     }
 }
@@ -279,6 +290,18 @@ impl IpcError {
         );
         error.stealth_not_granted = true;
         error
+    }
+
+    /// MR-2417: the server's BirdoPQ key-confirmation tag did not match
+    /// (`vpn::birdo_pq::KeyMismatch`). The sentence names no key, tag or
+    /// address; the UI shows its own copy for the code.
+    pub fn pq_key_mismatch() -> Self {
+        Self::new(
+            IpcErrorCode::PqKeyMismatch,
+            "Security handshake mismatch: this app and the server derived different \
+             quantum-protection keys, so BirdoVPN did not connect. Update BirdoVPN; if that \
+             does not help, contact support.",
+        )
     }
 
     pub fn not_elevated() -> Self {
@@ -704,6 +727,7 @@ mod tests {
             (IpcErrorCode::CertPinFailed, "cert_pin_failed"),
             (IpcErrorCode::StealthFailed, "stealth_failed"),
             (IpcErrorCode::PqFailed, "pq_failed"),
+            (IpcErrorCode::PqKeyMismatch, "pq_key_mismatch"),
             (IpcErrorCode::KillswitchFailed, "killswitch_failed"),
             (IpcErrorCode::AdapterFailed, "adapter_failed"),
             (IpcErrorCode::NotElevated, "not_elevated"),
@@ -1018,6 +1042,7 @@ mod tests {
             IpcErrorCode::UpgradeRequired,
             IpcErrorCode::ClientAttestationRequired,
             IpcErrorCode::NotElevated,
+            IpcErrorCode::PqKeyMismatch,
         ] {
             assert!(code.is_hard_refusal(), "{code:?}");
             assert!(!code.retryable(), "{code:?}");
@@ -1029,6 +1054,9 @@ mod tests {
             IpcErrorCode::StealthFailed,
             IpcErrorCode::KillswitchFailed,
             IpcErrorCode::ServerError,
+            // MR-2417: a failed decapsulation may be worth a retry; a key
+            // mismatch (above) is not.
+            IpcErrorCode::PqFailed,
         ] {
             assert!(!code.is_hard_refusal(), "{code:?}");
         }

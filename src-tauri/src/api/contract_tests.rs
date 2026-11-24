@@ -1912,3 +1912,37 @@ fn an_unverified_email_refusal_is_its_own_code_and_a_bare_403_is_not() {
     ));
     assert_ne!(other_status.code, IpcErrorCode::EmailNotVerified);
 }
+
+/// MR-2417 (birdo-web connect contract 1.1.0): `pqKeyConfirmTag` is an
+/// optional, additive response key. The copy vendored here predates it and
+/// still accepts a body that carries it (`ConnectResponse` allows unknown
+/// keys), both dial paths read it, and a body without it (an older server)
+/// decodes with no tag, which `vpn::birdo_pq` treats as before.
+#[test]
+fn the_pq_key_confirmation_tag_is_optional_and_read_on_both_dial_paths() {
+    use super::types::{ConnectResponse, MultiHopConnectResponse};
+    let tag = STANDARD.encode([0x24u8; 32]);
+    let older = json!({
+        "success": true,
+        "quantumEnabled": true,
+        "rosenpassPublicKey": "Y3Q=",
+        "rosenpassEndpoint": "bm9uY2U=",
+    });
+    let mut newer = older.clone();
+    newer["pqKeyConfirmTag"] = json!(tag);
+    assert_valid(CONNECT_RESPONSE, &older);
+    assert_valid(CONNECT_RESPONSE, &newer);
+    assert_eq!(def(CONNECT_RESPONSE)["additionalProperties"], json!(true));
+    assert!(!def_required(CONNECT_RESPONSE).contains("pqKeyConfirmTag"));
+
+    let single: ConnectResponse = serde_json::from_value(newer.clone()).unwrap();
+    let multi: MultiHopConnectResponse = serde_json::from_value(newer).unwrap();
+    assert_eq!(single.pq_key_confirm_tag.as_deref(), Some(tag.as_str()));
+    assert_eq!(
+        ConnectResponse::from(multi).pq_key_confirm_tag.as_deref(),
+        Some(tag.as_str()),
+        "multi-hop converts it"
+    );
+    let old: ConnectResponse = serde_json::from_value(older).unwrap();
+    assert!(old.pq_key_confirm_tag.is_none());
+}

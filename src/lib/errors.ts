@@ -35,6 +35,17 @@ export type ErrorContext = 'vpn' | 'sign_in' | 'anonymous_sign_in' | 'password_c
 export const PQ_FAILED_COPY =
   'Quantum-protected handshake failed. Not connecting, because continuing would fall back to ' +
   'weaker encryption. Try again, or turn off Quantum Protection in Settings to connect without it.';
+/**
+ * MR-2417: the server's BirdoPQ key-confirmation tag did not match the key this
+ * app derived, so no tunnel was set up. Before the tag this surfaced as a
+ * handshake that never completed, read as "try another location", which no
+ * other server fixes: an update (or support) does. Never "turn Quantum
+ * Protection off".
+ */
+export const PQ_KEY_MISMATCH_COPY =
+  "Security handshake mismatch: BirdoVPN and the server didn't agree on the quantum-protected " +
+  "key, so BirdoVPN didn't connect. Update BirdoVPN to the latest version. If that doesn't " +
+  'help, contact support.';
 export const STEALTH_FAILED_COPY =
   "Stealth Mode couldn't start. Not connecting, so your traffic isn't sent unprotected. " +
   'Try again, or choose another location.';
@@ -196,6 +207,7 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   },
   stealth_failed: { message: STEALTH_FAILED_COPY, action: 'retry' },
   pq_failed: { message: PQ_FAILED_COPY, action: 'open_settings' },
+  pq_key_mismatch: { message: PQ_KEY_MISMATCH_COPY, action: 'update' },
   killswitch_failed: {
     message: "The kill switch couldn't be armed, so BirdoVPN didn't connect. Try again.",
     action: 'retry',
