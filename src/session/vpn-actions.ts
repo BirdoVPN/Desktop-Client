@@ -94,13 +94,33 @@ function connectArgs(serverId: string, origin: SelectionOrigin): { serverId: str
 }
 
 /**
+ * Record where a connect to `dialledId` that SUCCEEDED really landed, under
+ * the dial's origin. MR-2514: a server that never answered its first
+ * handshake is retried once by Rust on another one, the client's pick
+ * anywhere, a user's pick only within its own country; the move keeps who
+ * chose (MR-2569), so a user's pick moved within its country stays the
+ * user's and nothing later takes it abroad. The live server is recorded even
+ * when the UI's list does not have it yet (review L1); the card follows once
+ * the list does (`useSelectionFollowsTunnel`). Never called on a failure.
+ */
+function recordConnected(dialledId: string, origin: SelectionOrigin): void {
+  const s = useAppStore.getState();
+  const landedId = s.connectionState === 'connected' && s.liveServerId ? s.liveServerId : dialledId;
+  if (landedId !== dialledId) {
+    const landed = findLiveServer(s.servers, landedId, null);
+    if (landed) s.setCurrentServer(landed);
+  }
+  s.setLastServerId(landedId, origin);
+}
+
+/**
  * `origin`: who chose `server` (MR-2492), sent to Rust with the connect
  * (MR-2390) and recorded with the server once connected.
  */
 export async function connectToServer(server: Server, origin: SelectionOrigin = 'user'): Promise<boolean> {
   useAppStore.getState().setCurrentServer(server);
   const ok = await run('connecting', 'connect_vpn', connectArgs(server.id, origin));
-  if (ok) useAppStore.getState().setLastServerId(server.id, origin);
+  if (ok) recordConnected(server.id, origin);
   return ok;
 }
 
@@ -117,7 +137,9 @@ export async function switchToServer(server: Server): Promise<boolean> {
   const ok = await run('switching', 'connect_vpn', connectArgs(server.id, 'user'));
   const s = useAppStore.getState();
   if (ok) {
-    s.setLastServerId(server.id, 'user');
+    // Rust may retry a switch within the user's country (MR-2514): record
+    // where it landed, as every connect path does (review L1b of #470).
+    recordConnected(server.id, 'user');
   } else {
     s.setCurrentServer(findLiveServer(s.servers, s.liveServerId, s.liveServerName) ?? before);
   }
@@ -200,7 +222,9 @@ export type UnattendedPlan =
  * go to the best one in any country; one the user chose stays in its country
  * (the same city first), else nothing is dialled and the user is told. It
  * used to go to the fastest server in any country either way. One move: a
- * dial that then fails shows its error, as every connect does.
+ * dial that then fails shows its error, as every connect does (a server
+ * whose first handshake never comes gets Rust's one retry on another server
+ * first, by the same rule, MR-2514).
  *
  * With no server list (the fetch failed) nothing can say the user's server
  * is gone, so it is dialled as recorded and Rust's connect answers for it,
@@ -269,7 +293,7 @@ async function connectUnattended(): Promise<boolean> {
     case 'dialRecorded': {
       // Only ever the user's server (`planUnattendedConnect`).
       const ok = await run('connecting', 'connect_vpn', connectArgs(plan.serverId, 'user'));
-      if (ok) useAppStore.getState().setLastServerId(plan.serverId, 'user');
+      if (ok) recordConnected(plan.serverId, 'user');
       return ok;
     }
     case 'quickConnect':
@@ -321,7 +345,10 @@ export const RESUME_ROUTE_GONE_COPY =
  * and a Multi-Hop route was dialled unchecked). The user is told and stays
  * disconnected. An EMPTY list (the fetch failed) cannot say a server is gone,
  * so the target is dialled as recorded and Rust's connect answers for it —
- * never `quick_connect`, which picks a server of its own.
+ * never `quick_connect`, which picks a server of its own. Once dialled, the
+ * one exception is Rust's retry when that server never answers its first
+ * handshake (MR-2514): it may move by the recorded origin, a user's pick only
+ * within its country, and what it lands on is recorded (`recordConnected`).
  */
 export async function resumeAfterUpdate(target: ResumeTarget): Promise<boolean> {
   const s = useAppStore.getState();
@@ -345,7 +372,7 @@ export async function resumeAfterUpdate(target: ResumeTarget): Promise<boolean> 
   const origin: SelectionOrigin = s.lastServerId === target.serverId ? s.lastServerOrigin : 'user';
   if (usable(server)) return connectToServer(server, origin);
   const ok = await run('connecting', 'connect_vpn', connectArgs(target.serverId, origin));
-  if (ok) useAppStore.getState().setLastServerId(target.serverId, origin);
+  if (ok) recordConnected(target.serverId, origin);
   return ok;
 }
 

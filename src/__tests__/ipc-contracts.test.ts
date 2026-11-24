@@ -56,6 +56,7 @@ const V2_STATUS_SNAKE = {
   kill_switch_blocking: true,
   error: { code: 'server_unreachable', message: 'Handshake timed out', retryable: true, retry_after_secs: null },
   server_id: 'de-fra-1',
+  server_origin: 'user',
   multi_hop: { entry_id: 'ch-1', entry_name: 'Zurich', exit_id: 'de-fra-1', exit_name: 'Frankfurt' },
   seq: 42,
   bytes_sent: 1024,
@@ -77,6 +78,7 @@ const V2_STATUS_CAMEL = {
   killSwitchBlocking: true,
   error: { code: 'server_unreachable', message: 'Handshake timed out', retryable: true, retryAfterSecs: null },
   serverId: 'de-fra-1',
+  serverOrigin: 'user',
   multiHop: { entryId: 'ch-1', entryName: 'Zurich', exitId: 'de-fra-1', exitName: 'Frankfurt' },
   seq: 42,
   bytesSent: 1024,
@@ -102,6 +104,7 @@ describe('VpnStatus (contract §1) → parseVpnStatus', () => {
       killSwitchBlocking: true,
       error: { code: 'server_unreachable', message: 'Handshake timed out', retryable: true, retry_after_secs: null },
       serverId: 'de-fra-1',
+      serverOrigin: 'user',
       multiHop: { entryId: 'ch-1', entryName: 'Zurich', exitId: 'de-fra-1', exitName: 'Frankfurt' },
       seq: 42,
       bytesSent: 1024,
@@ -113,6 +116,16 @@ describe('VpnStatus (contract §1) → parseVpnStatus', () => {
       dnsDegraded: ['Ethernet: 192.0.2.53 still set'],
       gaveUp: null,
     });
+  });
+
+  // MR-2569: who chose the live server, as Rust says; only its two words.
+  it("reads Rust's serverOrigin, and only 'user' or 'automatic'", () => {
+    const base = { state: 'connected', server_id: 'de-fra-1' };
+    expect(parseVpnStatus({ ...base, server_origin: 'automatic' })?.serverOrigin).toBe('automatic');
+    expect(parseVpnStatus({ ...base, serverOrigin: 'user' })?.serverOrigin).toBe('user');
+    for (const other of [undefined, null, '', 'Automatic', 'auto', 1]) {
+      expect(parseVpnStatus({ ...base, serverOrigin: other })?.serverOrigin).toBeNull();
+    }
   });
 
   it('reads the give-up mark Rust sets on the final error status, in both casings (REVIEW-WIN-009)', () => {

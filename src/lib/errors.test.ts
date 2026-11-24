@@ -26,6 +26,7 @@ import {
   SERVER_UNAVAILABLE_BLOCKED_COPY,
   SESSION_EXPIRED_COPY,
   STEALTH_FAILED_COPY,
+  TLS_INTERCEPTED_COPY,
   UPDATE_REQUIRED_COPY,
   vpnErrorCopy,
 } from './errors';
@@ -63,6 +64,7 @@ const ALL: IpcErrorCode[] = [
   'step_up_no_factor',
   'step_up_unavailable',
   'cert_pin_failed',
+  'tls_intercepted',
   'stealth_failed',
   'pq_failed',
   'killswitch_failed',
@@ -198,6 +200,25 @@ describe('errorCopy', () => {
     expect(update).toBeLessThan(message.indexOf('try a different network'));
     // The in-app update check is pinned as well, so no Update button.
     expect(action).toBeNull();
+  });
+
+  // MR-2548: an issuer the app does not trust (antivirus HTTPS scanning, an
+  // office proxy) has its own words: never "no internet", never the update
+  // advice of a pin failure, and it says nothing was sent.
+  it('words an intercepted connection as an interception, not as no internet (MR-2548)', () => {
+    const copy = errorCopy(err('tls_intercepted'));
+    expect(copy).toEqual({ message: TLS_INTERCEPTED_COPY, action: 'retry' });
+    // The owner's wording (2026-11-20), word for word.
+    expect(copy.message).toBe(
+      'Something on this network or computer is intercepting secure connections (often antivirus ' +
+        'HTTPS scanning or a work network), so BirdoVPN sent nothing. Turn off HTTPS scanning or try ' +
+        'a different network.',
+    );
+    expect(copy.message).toMatch(/intercepting secure connections/);
+    expect(copy.message).toMatch(/sent nothing/);
+    expect(copy.message).not.toMatch(/internet|latest version/i);
+    expect(copy.message).not.toBe(errorCopy(err('network_offline')).message);
+    expect(copy.message).not.toBe(errorCopy(err('cert_pin_failed')).message);
   });
 
   it('words invalid credentials for the place they happened', () => {
