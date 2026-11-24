@@ -43,6 +43,7 @@ export type IpcErrorCode =
   | 'step_up_no_factor'
   | 'step_up_unavailable'
   | 'cert_pin_failed'
+  | 'tls_intercepted'
   | 'stealth_failed'
   | 'pq_failed'
   | 'killswitch_failed'
@@ -82,6 +83,7 @@ const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
   'step_up_no_factor',
   'step_up_unavailable',
   'cert_pin_failed',
+  'tls_intercepted',
   'stealth_failed',
   'pq_failed',
   'killswitch_failed',

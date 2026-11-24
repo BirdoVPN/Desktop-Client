@@ -16,7 +16,8 @@
 //!   the backend's refresh route has no 403 of its own; one comes from in
 //!   front of it. The refresh is held for a capped exponential backoff with
 //!   jitter, never shorter than the server's own `Retry-After`.
-//! - **426, a TLS pin failure, an unreadable 2xx**: kept likewise, and held
+//! - **426, a TLS pin failure, an interception (MR-2548: an issuer WebPKI
+//!   does not trust), an unreadable 2xx**: kept likewise, and held
 //!   for the same backoff as a 5xx (the one timing table, lead 2026-11-19
 //!   21:39Z: Desktop's numbers, Mobile #653's hold). Unlike the answers
 //!   above, the call that met one is told it as it is ([`told`]): the
@@ -119,7 +120,10 @@ pub(crate) fn after_failure(error: &ApiError, step: u32, unit: f64) -> Next {
 pub(crate) fn told_as_it_is(error: &ApiError) -> bool {
     matches!(
         error,
-        ApiError::UpgradeRequired(_) | ApiError::CertificatePinningFailed(_) | ApiError::Parse(_)
+        ApiError::UpgradeRequired(_)
+            | ApiError::CertificatePinningFailed(_)
+            | ApiError::TlsIntercepted
+            | ApiError::Parse(_)
     )
 }
 
@@ -391,6 +395,8 @@ mod tests {
                 ),
             ),
             ("pin", ApiError::CertificatePinningFailed("x".into())),
+            // MR-2548: an interception, told as itself like the pin.
+            ("intercepted", ApiError::TlsIntercepted),
             ("unreadable 2xx", ApiError::Parse("eof".into())),
         ];
         for (case, error) in cases {
@@ -413,10 +419,12 @@ mod tests {
             let is_426 = matches!(error, ApiError::UpgradeRequired(_));
             let is_pin = matches!(error, ApiError::CertificatePinningFailed(_));
             let is_parse = matches!(error, ApiError::Parse(_));
+            let is_intercepted = matches!(error, ApiError::TlsIntercepted);
             let answer = told(error, held());
             assert!(
                 (is_426 && matches!(answer, ApiError::UpgradeRequired(_)))
                     || (is_pin && matches!(answer, ApiError::CertificatePinningFailed(_)))
+                    || (is_intercepted && matches!(answer, ApiError::TlsIntercepted))
                     || (is_parse && matches!(answer, ApiError::Parse(_))),
                 "{case}: told the hold"
             );

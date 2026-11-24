@@ -135,6 +135,7 @@ pub(crate) fn error_after_failed_refresh(refresh_error: ApiError) -> ApiError {
         | ApiError::NotAuthenticated
         | ApiError::Parse(_)
         | ApiError::CertificatePinningFailed(_)
+        | ApiError::TlsIntercepted
         | ApiError::UpgradeRequired(_) => refresh_error,
         _ => ApiError::ServerBusy {
             status: 503,
@@ -290,6 +291,11 @@ mod tests {
                 Err(ApiError::CertificatePinningFailed("x".into())),
                 IpcErrorCode::CertPinFailed,
             ),
+            (
+                "intercepted",
+                Err(ApiError::TlsIntercepted),
+                IpcErrorCode::TlsIntercepted,
+            ),
         ];
         for (case, result, code) in cases {
             assert_eq!(
@@ -384,6 +390,7 @@ mod tests {
                 ),
             ),
             ("pin", ApiError::CertificatePinningFailed("x".into())),
+            ("intercepted", ApiError::TlsIntercepted),
             ("unreadable 2xx", ApiError::Parse("eof".into())),
         ];
         for (case, error) in cases {

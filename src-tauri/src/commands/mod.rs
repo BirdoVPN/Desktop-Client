@@ -15,6 +15,7 @@ pub mod oauth;
 pub mod servers;
 pub mod session;
 pub mod settings;
+pub mod shield_gate;
 pub mod speed_test;
 pub mod split_tunnel;
 pub mod tray;
