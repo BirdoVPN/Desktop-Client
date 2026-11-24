@@ -32,7 +32,10 @@ use std::sync::OnceLock;
 use super::error::ApiError;
 
 /// What one refresh attempt says about the sign-in session (Android/iOS
-/// `RefreshOutcome {SUCCESS, UNAUTHORIZED, TRANSIENT}` parity).
+/// `RefreshOutcome {SUCCESS, UNAUTHORIZED, TRANSIENT}` parity). The tests'
+/// vocabulary since MR-2550: its last production caller, `get_auth_state`'s
+/// own refresh, is gone, and every flight decides with [`refresh_rejected`].
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefreshOutcome {
     Success,
@@ -65,6 +68,7 @@ pub fn set_handler(handler: impl Fn(StoredSession) + Send + Sync + 'static) {
 }
 
 /// Classify a refresh attempt.
+#[cfg(test)]
 pub(crate) fn refresh_outcome<T>(result: &Result<T, ApiError>) -> RefreshOutcome {
     match result {
         Ok(_) => RefreshOutcome::Success,
