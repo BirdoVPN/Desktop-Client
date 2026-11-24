@@ -26,7 +26,7 @@ import { displayableEmail, resolveAnonymousAccount } from '@/utils/helpers';
 import { anonNumberRotationEnabled } from '@/lib/features';
 import { loadSubscription } from '@/session/session-data';
 import { signOut } from '@/session/session';
-import { refreshHeldDeletionWithin, usePendingDeletion } from '@/session/held-deletion';
+import { HOLD_READ_WAIT_MS, refreshHeldDeletionWithin, usePendingDeletion } from '@/session/held-deletion';
 import { clearHeldDeletion, getHeldDeletion } from '@/lib/held-deletion';
 import { AccountNumberCard, IdentityCard, SubscriptionCard } from './profile/ProfileCards';
 import { DeleteAccountDialog } from './profile/DeleteAccountDialog';
@@ -90,7 +90,8 @@ export function Profile() {
     if (!getHeldDeletion()) {
       setCheckingHold(true);
       try {
-        answered = await refreshHeldDeletionWithin();
+        // Part of the Sign Out (MR-2532): once, never refreshed.
+        answered = await refreshHeldDeletionWithin(HOLD_READ_WAIT_MS, { signingOut: true });
       } finally {
         setCheckingHold(false);
       }

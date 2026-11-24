@@ -28,6 +28,18 @@ export const HOLD_READ_WAIT_MS = 3000;
 let newestRead: { token: number; settled: Promise<boolean> } | null = null;
 
 /**
+ * MR-2532, owner decision 2026-11-24 ("never refresh at sign-out"): a request
+ * of the Sign Out flow (the dialog's read, Profile's check before it, the
+ * cancel-first) is sent once with the access token on file, never refreshed
+ * on a 401, and not at all when that token is unusable. Such a read that did
+ * not answer leaves the "could not check" caution; such a cancel, the dialog's
+ * Retry / Sign out anyway. It never ends the session as expired either.
+ */
+export interface SignOutRequest {
+  signingOut?: boolean;
+}
+
+/**
  * Read `GET /auth/pending-changes` now. A hold that vanished (the server
  * cancels it on a sign-out everywhere, a number rotation, a password or 2FA
  * change) is simply gone; a read that FAILS keeps what is known, because an
@@ -39,9 +51,12 @@ let newestRead: { token: number; settled: Promise<boolean> } | null = null;
  * written since (a hold noted from a 202, a cancel) counts as answered: that
  * write is newer than the answer.
  */
-export function refreshHeldDeletion(): Promise<boolean> {
+export function refreshHeldDeletion({ signingOut = false }: SignOutRequest = {}): Promise<boolean> {
   const token = startHeldDeletionRead();
-  const settled = command<unknown>('list_pending_changes').then(
+  const read = signingOut
+    ? command<unknown>('list_pending_changes', { signingOut: true })
+    : command<unknown>('list_pending_changes');
+  const settled = read.then(
     (items): boolean | Promise<boolean> => {
       if (finishHeldDeletionRead(token, items)) return true;
       const newer = newestRead;
@@ -57,10 +72,13 @@ export function refreshHeldDeletion(): Promise<boolean> {
  * `refreshHeldDeletion`, waited for at most `ms`: false when the read failed
  * or is still out by then (it carries on, and still updates the state).
  */
-export function refreshHeldDeletionWithin(ms: number = HOLD_READ_WAIT_MS): Promise<boolean> {
+export function refreshHeldDeletionWithin(
+  ms: number = HOLD_READ_WAIT_MS,
+  request: SignOutRequest = {},
+): Promise<boolean> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(false), ms);
-    void refreshHeldDeletion().then((answered) => {
+    void refreshHeldDeletion(request).then((answered) => {
       clearTimeout(timer);
       resolve(answered);
     });
@@ -88,15 +106,16 @@ export function usePendingDeletion(): { hold: HeldDeletion | null; refresh: () =
  *
  * `reread: false` when the session is about to end (the cancel before a
  * sign-out): a read then could race the sign-out, come back 401 and turn a
- * deliberate sign-out into "session expired".
+ * deliberate sign-out into "session expired". `signingOut` for that same
+ * cancel ([SignOutRequest]).
  */
 export async function cancelHeldDeletion(
   id: string,
-  { reread = true }: { reread?: boolean } = {},
+  { reread = true, signingOut = false }: { reread?: boolean } & SignOutRequest = {},
 ): Promise<{ alreadyGone: boolean }> {
   const result = await command<{ cancelled?: boolean; alreadyGone?: boolean } | null>(
     'cancel_pending_change',
-    { id },
+    signingOut ? { id, signingOut: true } : { id },
   );
   clearHeldDeletion();
   if (reread) void refreshHeldDeletion();

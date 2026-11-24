@@ -91,7 +91,9 @@ function SignOutConfirm({
     const timer = setTimeout(() => {
       if (current) setRead((now) => (now === 'pending' ? 'unchecked' : now));
     }, HOLD_READ_WAIT_MS);
-    void refreshHeldDeletion().then((answered) => {
+    // Part of the Sign Out (MR-2532, owner 2026-11-24): once, never
+    // refreshed, not sent without a usable access token ("unchecked" then).
+    void refreshHeldDeletion({ signingOut: true }).then((answered) => {
       if (current) setRead(answered ? 'answered' : 'unchecked');
     });
     return () => {
@@ -132,8 +134,10 @@ function SignOutConfirm({
       setBusy(true);
       try {
         // No list read after it: the session ends next (a read could race the
-        // sign-out and end it as "session expired").
-        await cancelHeldDeletion(hold.id, { reread: false });
+        // sign-out and end it as "session expired"). Once, never refreshed,
+        // not sent without a usable access token (MR-2532): a cancel that did
+        // not go through blocks the Sign Out below.
+        await cancelHeldDeletion(hold.id, { reread: false, signingOut: true });
       } catch (e: unknown) {
         setSignOutBlocked({ reason: cancelErrorText(e), applyAfter: hold.applyAfter });
         return;

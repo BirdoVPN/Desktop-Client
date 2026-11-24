@@ -1531,7 +1531,19 @@ async fn end_the_tunnel(app: &AppHandle, reason: EndReason) {
     ) {
         if let Some(key_id) = vm.get_key_id().await {
             let api = app.state::<BirdoApi>();
-            match timeout(Duration::from_secs(3), api.disconnect_vpn(&key_id)).await {
+            // MR-2532, owner decision 2026-11-24 ("never refresh at sign-out"):
+            // a Sign Out releases the peer ONCE with the access token on file,
+            // and not at all when it is unusable (the server's sweep frees the
+            // slot). `disconnect_vpn` refreshes on a 401, and the refresh runs
+            // detached past this cap (WIN3-004).
+            let release = async {
+                if reason == EndReason::SignOut {
+                    api.release_peer_for_sign_out(&key_id).await
+                } else {
+                    api.disconnect_vpn(&key_id).await
+                }
+            };
+            match timeout(Duration::from_secs(3), release).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::info!("Backend disconnect notify failed: {}", e),
                 Err(_) => tracing::info!("Backend disconnect notify timed out"),

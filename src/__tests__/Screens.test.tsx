@@ -426,14 +426,21 @@ describe('Profile', () => {
     expect(screen.getByText('Click Connect to start')).toBeInTheDocument();
   });
 
-  it('Sign out disconnects first whatever the state — including a held block (W2-005)', async () => {
-    useAppStore.setState({ connectionState: 'error', killSwitchBlocking: true });
+  // W2-005: whatever the state, a held block included, the session ends in
+  // Rust's `logout` (contract §3.2, `end_session(SignOut)`). MR-2532, owner
+  // decision 2026-11-24 ("never refresh at sign-out"): never through
+  // `disconnect_vpn` first, whose peer release refreshes on a 401.
+  it.each<[string, Record<string, unknown>]>([
+    ['a held block', { connectionState: 'error', killSwitchBlocking: true }],
+    ['the tunnel up', { connectionState: 'connected' }],
+  ])('Sign out with %s ends the session in logout alone (W2-005, MR-2532)', async (_name, state) => {
+    useAppStore.setState(state);
     render(<Profile />);
     await userEvent.click(screen.getByRole('button', { name: /Sign out/ }));
     await waitFor(() => expect(useAppStore.getState().isAuthenticated).toBe(false));
     const order = mockedInvoke.mock.calls.map(([c]) => c);
-    expect(order.indexOf('disconnect_vpn')).toBeGreaterThan(-1);
-    expect(order.indexOf('disconnect_vpn')).toBeLessThan(order.indexOf('logout'));
+    expect(order).toContain('logout');
+    expect(order).not.toContain('disconnect_vpn');
   });
 });
 
