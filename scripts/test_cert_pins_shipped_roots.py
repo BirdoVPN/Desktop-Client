@@ -368,6 +368,49 @@ def run():
         got_failed, lines = shipped.verify(os.path.join(tmp, "missing.pem"), "api.example.test",
                                            pki.path("leafA.pem"), [pki.path("intA.pem")])
         judge("NO_BUNDLE_IS_NO_PASS", got_failed, lines, True, ["FAIL"])
+
+        # The command lines check-cert-pins.sh runs (check 3s), exit codes
+        # included: a red the shell never sees is no red.
+        print()
+        print("== check 3s as check-cert-pins.sh runs it (the command line) ==")
+        script = os.path.join(ROOT, "scripts", "cert_pins_shipped_roots.py")
+
+        def cli(*args):
+            result = subprocess.run([sys.executable, script, *args], capture_output=True,
+                                    text=True, timeout=120)
+            return result.returncode, (result.stdout + result.stderr).splitlines()
+
+        lock_path, crate_path = os.path.join(tmp, "Cargo.lock"), os.path.join(tmp, "roots.crate")
+        with open(lock_path, "w", encoding="utf-8") as f:
+            f.write(good_lock)
+        with open(crate_path, "wb") as f:
+            f.write(good)
+        out = os.path.join(tmp, "cli-roots.pem")
+        code, lines = cli("bundle", lock_path, out, crate_path)
+        judge("CLI_BUNDLE", code != 0, lines, False, ["ok    the roots the app ships"])
+        written = ""
+        if os.path.isfile(out):
+            with open(out, encoding="utf-8") as f:
+                written = f.read()
+        report("CLI_BUNDLE_WRITES_THE_BUNDLE",
+               [] if written == pem else ["the bundle on disk is not the one built"], written[:200])
+
+        with open(lock_path, "w", encoding="utf-8") as f:
+            f.write(cargo_lock("9.9.9", "f" * 64))
+        refused = os.path.join(tmp, "cli-refused.pem")
+        code, lines = cli("bundle", lock_path, refused, crate_path)
+        judge("CLI_BUNDLE_REFUSED_EXITS_1", code != 1, lines, False, ["FAIL", "refused"])
+        report("CLI_BUNDLE_REFUSED_WRITES_NOTHING",
+               ["a refused bundle was written"] if os.path.exists(refused) else [], "")
+
+        code, lines = cli("verify", out, "api.example.test", pki.path("leafA.pem"),
+                          pki.path("intA.pem"))
+        judge("CLI_VERIFY_FULL_CHAIN_EXITS_0", code != 0, lines, False, ["ok    api.example.test"])
+        code, lines = cli("verify", out, "api.example.test", pki.path("leafA.pem"))
+        judge("CLI_VERIFY_NO_INTERMEDIATE_EXITS_1", code != 1, lines, False,
+              ["FAIL  api.example.test"])
+        code, lines = cli("verify", out)
+        judge("CLI_USAGE_EXITS_2", code != 2, lines, False, ["cert_pins_shipped_roots.py verify"])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
