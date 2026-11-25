@@ -1631,6 +1631,36 @@ pub struct ConnectResponse {
     pub rosenpass_public_key: Option<String>,
     #[serde(default, rename = "rosenpassEndpoint")]
     pub rosenpass_endpoint: Option<String>,
+    /// MR-2417: the BirdoPQ key-confirmation tag (base64 of 32 bytes) a server
+    /// from contract 1.1.0 on sends with the two fields above.
+    /// `vpn::birdo_pq::try_decapsulate` checks it before the PSK is used; an
+    /// older server sends none, and the derivation is then what it always was.
+    #[serde(default, rename = "pqKeyConfirmTag")]
+    pub pq_key_confirm_tag: ConfirmTagField,
+}
+
+/// MR-2417: `pqKeyConfirmTag` as the server sent it. A missing key and JSON
+/// `null` are the same, `Absent`: an older server, so the derivation is not
+/// checked (review L2 of #476; the Mobile decoders read `null` the same way).
+/// A string is checked by `vpn::birdo_pq`. Any other JSON value is
+/// `NotAString`, a key mismatch there, never a failure to read the whole
+/// response (which would be `server_error`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ConfirmTagField {
+    #[default]
+    Absent,
+    Text(String),
+    NotAString,
+}
+
+impl<'de> Deserialize<'de> for ConfirmTagField {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Null => ConfirmTagField::Absent,
+            serde_json::Value::String(text) => ConfirmTagField::Text(text),
+            _ => ConfirmTagField::NotAString,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1781,6 +1811,10 @@ pub struct MultiHopConnectResponse {
     pub rosenpass_public_key: Option<String>,
     #[serde(default, rename = "rosenpassEndpoint")]
     pub rosenpass_endpoint: Option<String>,
+    /// MR-2417: the BirdoPQ key-confirmation tag, as on `ConnectResponse`
+    /// (the multi-hop route returns the entry connect's fields).
+    #[serde(default, rename = "pqKeyConfirmTag")]
+    pub pq_key_confirm_tag: ConfirmTagField,
 }
 
 impl From<MultiHopConnectResponse> for ConnectResponse {
@@ -1819,6 +1853,7 @@ impl From<MultiHopConnectResponse> for ConnectResponse {
             quantum_enabled: response.quantum_enabled,
             rosenpass_public_key: response.rosenpass_public_key,
             rosenpass_endpoint: response.rosenpass_endpoint,
+            pq_key_confirm_tag: response.pq_key_confirm_tag,
         }
     }
 }

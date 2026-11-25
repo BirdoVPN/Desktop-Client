@@ -64,7 +64,34 @@
 //! ```text
 //! ss = ML-KEM-1024.Decap(sk_client, ct_server)         (32 B)
 //! psk = HKDF-SHA-256(IKM = ss, salt = "BirdoPQ-v1-PSK", info = nonce)[..32]
+//! tag = HKDF-SHA-256(IKM = ss, salt = "BirdoPQ-v1-PSK",
+//!                    info = "BirdoPQ-v1-KeyConfirm" || nonce)[..32]
 //! ```
+//!
+//! ## Key confirmation (MR-2417)
+//!
+//! ML-KEM never fails on a wrong key (FIPS 203 implicit rejection): a client
+//! whose KEM or HKDF disagrees with the server's derives another PSK without
+//! any error, and before the tag the only symptom was a WireGuard handshake
+//! that never completed, shown as "try another location". A server on
+//! connect contract 1.1.0 or later also sends `tag` (`pqKeyConfirmTag`). This
+//! client derives it too and compares it in constant time BEFORE the PSK
+//! exists ([`PqSession::finish`]); a mismatch aborts the connect with
+//! `pq_key_mismatch`, an accurate error, and never with the classical PSK. A
+//! response without a tag (an older server), or with JSON `null` for it, takes
+//! the derivation above unchanged, so the server and this client can deploy
+//! in either order. Any other value that is not a 32-byte base64 tag (a
+//! number, an object, a string of another length) is a mismatch.
+//!
+//! Making the mismatch observable is not the decapsulation oracle the
+//! comment in `derive_psk` warns about: every key pair decapsulates once
+//! (per-connect keys, MR-703), so no attacker gets a second query against the
+//! same key, and the same one bit was already observable as the handshake
+//! that did or did not complete. The tag is a different HKDF output of the
+//! PSK's PRK, so sending it reveals nothing about the PSK. It is a
+//! consistency check, not authentication: whoever can rewrite the API
+//! response can rewrite the ciphertext and the tag together, which the TLS
+//! pins (`api::cert_pin`) are there to stop.
 //!
 //! ## Threat model: what BirdoPQ v1 protects, and what it does not
 //!
@@ -119,6 +146,7 @@
 
 use base64::Engine as _;
 use hkdf::Hkdf;
+use hmac::digest::{CtOutput, Output};
 use ml_kem::array::sizes::{U1568, U64};
 use ml_kem::array::Array;
 use ml_kem::{
@@ -129,7 +157,7 @@ use parking_lot::Mutex;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::api::types::ConnectResponse;
+use crate::api::types::{ConfirmTagField, ConnectResponse};
 use crate::utils::safe_fs::OwnedDir;
 
 /// FIPS 203 ML-KEM-1024 sizes: must match server + Android constants.
@@ -141,9 +169,18 @@ const SEED_BYTES: usize = 64;
 
 const PSK_LEN: usize = 32;
 const HKDF_SALT: &[u8] = b"BirdoPQ-v1-PSK";
-/// Upper bound for the server's per-connect nonce, the same as Android's
-/// `BirdoPqManager.MAX_NONCE_BYTES` (the server mints 32 bytes).
-const MAX_NONCE_BYTES: usize = 64;
+/// The server's per-connect nonce: exactly 32 bytes, what birdo-web has
+/// always minted (`PQ_NONCE_BYTES`). MR-2417 review L1 (see `server_nonce`);
+/// Android's `BirdoPqManager.MAX_NONCE_BYTES` still allows 1..=64.
+const NONCE_BYTES: usize = 32;
+/// MR-2417: the HKDF `info` prefix of the key-confirmation tag; the
+/// per-connect nonce follows it. Same IKM and salt as the PSK, so the tag is
+/// the PSK's PRK expanded under an info string the PSK's (the bare nonce)
+/// never equals. Byte-identical to birdo-web's `CONFIRM_INFO_LABEL`
+/// (`backend/src/vpn/birdo-pq.service.ts`).
+const CONFIRM_LABEL: &[u8] = b"BirdoPQ-v1-KeyConfirm";
+/// MR-2417: the key-confirmation tag's length, one SHA-256 output.
+pub const CONFIRM_TAG_BYTES: usize = 32;
 
 /// Which ML-KEM implementation is linked into this binary.
 ///
@@ -322,13 +359,36 @@ impl PqSession {
     /// handshake fails later. That is the desired behaviour: it prevents an
     /// oracle on whether decapsulation "succeeded". A ciphertext of the WRONG
     /// SIZE is not a KEM question at all and is refused outright.
+    ///
+    /// MR-2417: with `server_confirm_tag` (the server's `pqKeyConfirmTag`,
+    /// decoded) the shared secret is checked against it first, in constant
+    /// time, and a tag that does not match is [`FinishError::KeyMismatch`]: no
+    /// PSK is derived at all. `None` (an older server) derives the PSK
+    /// unchecked, exactly as before.
     pub fn finish(
         self,
         server_ciphertext: &[u8],
         server_nonce: &[u8],
-    ) -> Result<Zeroizing<[u8; PSK_LEN]>, String> {
-        derive_psk(&self.seed, server_ciphertext, server_nonce)
+        server_confirm_tag: Option<&[u8]>,
+    ) -> Result<Zeroizing<[u8; PSK_LEN]>, FinishError> {
+        derive_psk(
+            &self.seed,
+            server_ciphertext,
+            server_nonce,
+            server_confirm_tag,
+        )
     }
+}
+
+/// Why [`PqSession::finish`] derived no PSK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishError {
+    /// The server's ciphertext is the wrong size, or HKDF refused the length.
+    /// The text is a reason for the log, never key material.
+    Unusable(String),
+    /// MR-2417: the server's key-confirmation tag is not the one this client
+    /// derives from its own shared secret: the two sides disagree on the key.
+    KeyMismatch,
 }
 
 /// The decapsulation key for a seed. `DecapsulationKey` is `ZeroizeOnDrop`
@@ -342,28 +402,75 @@ fn decapsulation_key(seed_bytes: &[u8; SEED_BYTES]) -> DecapsulationKey<MlKem102
     dk
 }
 
-/// Decapsulate `server_ciphertext` with the key for `seed` and derive the PSK.
+/// Decapsulate `server_ciphertext` with the key for `seed` and derive the PSK,
+/// after checking the server's key-confirmation tag when it sent one
+/// (MR-2417).
 fn derive_psk(
     seed: &[u8; SEED_BYTES],
     server_ciphertext: &[u8],
     server_nonce: &[u8],
-) -> Result<Zeroizing<[u8; PSK_LEN]>, String> {
+    server_confirm_tag: Option<&[u8]>,
+) -> Result<Zeroizing<[u8; PSK_LEN]>, FinishError> {
     let ct: MlCiphertext<MlKem1024> =
         Array::<u8, U1568>::try_from(server_ciphertext).map_err(|_| {
-            format!(
+            FinishError::Unusable(format!(
                 "malformed server ciphertext: expected {CIPHERTEXT_BYTES} bytes, got {}",
                 server_ciphertext.len()
-            )
+            ))
         })?;
     let dk = decapsulation_key(seed);
     // Infallible by design (implicit rejection) — do NOT "improve" this into a
     // Result: turning a rejection into an observable error would build the
-    // decapsulation oracle the FIPS 203 construction exists to deny.
+    // decapsulation oracle the FIPS 203 construction exists to deny. (The
+    // key-confirmation check below does tell a mismatch apart, once per key
+    // and after the fact: see "Key confirmation" in the module docs.)
     let mut ss = dk.decapsulate(&ct);
-    let psk = hkdf_to_psk(ss.as_slice(), server_nonce);
+    // MR-2417: confirm the key BEFORE the PSK exists. A tag that does not match
+    // ends the derivation here, so there is no PSK to use or to leak.
+    let confirmed = match server_confirm_tag {
+        // An older server sends no tag: derived unchecked, as before.
+        None => true,
+        Some(theirs) => confirm_tag_matches(ss.as_slice(), server_nonce, theirs),
+    };
+    let psk = if confirmed {
+        hkdf_to_psk(ss.as_slice(), server_nonce).map_err(FinishError::Unusable)
+    } else {
+        Err(FinishError::KeyMismatch)
+    };
     // `SharedKey` is a plain array with no Drop impl of its own.
     ss.as_mut_slice().zeroize();
     psk
+}
+
+/// MR-2417: the key-confirmation tag for a shared secret and nonce,
+/// HKDF-SHA-256(IKM = ss, salt = `HKDF_SALT`, info = `CONFIRM_LABEL` || nonce,
+/// L = 32): the value the server sends as `pqKeyConfirmTag`. The PRK is wiped
+/// as in `hkdf_to_psk` (MR-2112), on the error path too.
+fn hkdf_confirm_tag(
+    shared_secret: &[u8],
+    nonce: &[u8],
+) -> Result<Zeroizing<[u8; CONFIRM_TAG_BYTES]>, String> {
+    let (mut prk, hk) = Hkdf::<Sha256>::extract(Some(HKDF_SALT), shared_secret);
+    let mut tag = Zeroizing::new([0u8; CONFIRM_TAG_BYTES]);
+    let expanded = hk.expand_multi_info(&[CONFIRM_LABEL, nonce], tag.as_mut_slice());
+    prk.as_mut_slice().zeroize();
+    expanded.map_err(|e| format!("HKDF expand failed: {e}"))?;
+    Ok(tag)
+}
+
+/// MR-2417: whether `theirs` is the key-confirmation tag for `shared_secret`
+/// and `nonce`. The comparison is constant-time: `CtOutput`'s `PartialEq`
+/// (digest's type for MAC tags, `ctutils::CtEq` over every byte), never `==`
+/// on byte slices, which returns at the first byte that differs. The length
+/// is public and is checked first: a tag of any other length does not match.
+fn confirm_tag_matches(shared_secret: &[u8], nonce: &[u8], theirs: &[u8]) -> bool {
+    let Ok(theirs) = Output::<Sha256>::try_from(theirs) else {
+        return false;
+    };
+    let Ok(ours) = hkdf_confirm_tag(shared_secret, nonce) else {
+        return false;
+    };
+    CtOutput::<Sha256>::new(Output::<Sha256>::from(*ours)) == CtOutput::<Sha256>::new(theirs)
 }
 
 fn hkdf_to_psk(shared_secret: &[u8], nonce: &[u8]) -> Result<Zeroizing<[u8; PSK_LEN]>, String> {
@@ -523,43 +630,97 @@ pub fn purge_legacy_keypair_files() {
 // ── Public API used by the connect command ────────────────────────────────
 
 /// The per-connect nonce the server sends in `rosenpassEndpoint` (base64),
-/// decoded and bounded to 1..=[`MAX_NONCE_BYTES`] bytes.
+/// decoded: exactly [`NONCE_BYTES`] bytes.
 ///
-/// Proposed row 13: the length was unbounded here while Android caps it at
-/// 64 before the nonce crosses into Rust. It is the HKDF `info`, so no length
-/// is unsafe for the KDF itself; the bound keeps a malformed or hostile
-/// response from having this process decode and hash a field of any size,
-/// and makes both clients refuse the same responses. The text is bounded
-/// before it is decoded (64 bytes are 88 characters of padded base64).
+/// Proposed row 13 bounded it (it was unbounded) the way Android does, to
+/// 1..=64 bytes: it is the HKDF `info`, so no length is unsafe for the KDF
+/// itself, and the bound keeps a hostile response from having this process
+/// decode and hash a field of any size. MR-2417 review L1 narrows it to the 32
+/// bytes the server has always minted. With the tag stripped, a nonce of
+/// `CONFIRM_LABEL || N0` (53 bytes) would make this client's PSK
+/// HKDF(ss, label || N0): the very tag the honest response published. The
+/// text is checked before it is decoded (32 bytes are 44 characters of padded
+/// base64).
 fn server_nonce(field: Option<&str>) -> Result<Vec<u8>, String> {
     let encoded = match field {
         None | Some("") => return Err("server omitted per-connect nonce".into()),
         Some(encoded) => encoded,
     };
-    if encoded.len() > MAX_NONCE_BYTES.div_ceil(3) * 4 {
+    if encoded.len() != NONCE_BYTES.div_ceil(3) * 4 {
         return Err(format!(
-            "PQ nonce out of bounds ({} base64 characters)",
-            encoded.len()
+            "PQ nonce is {} base64 characters, not {}",
+            encoded.len(),
+            NONCE_BYTES.div_ceil(3) * 4
         ));
     }
     let nonce = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|e| format!("malformed PQ nonce: {e}"))?;
-    if nonce.is_empty() || nonce.len() > MAX_NONCE_BYTES {
-        return Err(format!("PQ nonce out of bounds ({} B)", nonce.len()));
+    if nonce.len() != NONCE_BYTES {
+        return Err(format!(
+            "PQ nonce is {} bytes, not {NONCE_BYTES}",
+            nonce.len()
+        ));
     }
     Ok(nonce)
 }
 
+/// The key-confirmation tag the server sent in `pqKeyConfirmTag` (MR-2417),
+/// decoded. `Ok(None)` when it sent none, or JSON `null` (an older server;
+/// review L2: `null` is absent, as the Mobile decoders read it); `Err` when it
+/// sent anything else that is not base64 of exactly [`CONFIRM_TAG_BYTES`]
+/// bytes, a value that is not a string included. Like the nonce, the text is
+/// bounded before it is decoded (44 characters). The reason names lengths
+/// only: never the tag's text or bytes.
+fn server_confirm_tag(field: &ConfirmTagField) -> Result<Option<[u8; CONFIRM_TAG_BYTES]>, String> {
+    let encoded = match field {
+        ConfirmTagField::Absent => return Ok(None),
+        ConfirmTagField::NotAString => {
+            return Err("key-confirmation tag is not a string".to_string())
+        }
+        ConfirmTagField::Text(encoded) => encoded,
+    };
+    if encoded.len() != CONFIRM_TAG_BYTES.div_ceil(3) * 4 {
+        return Err(format!(
+            "key-confirmation tag is {} base64 characters, not {}",
+            encoded.len(),
+            CONFIRM_TAG_BYTES.div_ceil(3) * 4
+        ));
+    }
+    let tag = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "key-confirmation tag is not base64".to_string())?;
+    <[u8; CONFIRM_TAG_BYTES]>::try_from(tag.as_slice())
+        .map(Some)
+        .map_err(|_| {
+            format!(
+                "key-confirmation tag is {} bytes, not {CONFIRM_TAG_BYTES}",
+                tag.len()
+            )
+        })
+}
+
+/// MR-2417: the server's key-confirmation tag did not match the key this
+/// client derived, or could not be read as one. Either way client and server
+/// do not agree on the key. It carries nothing: no key material, no tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyMismatch;
+
 /// Try to derive a bilateral PQ PSK from the server response, with the
-/// connect's own [`PqSession`]. Returns `None` when the server did not enable
-/// BirdoPQ or include a ciphertext (legacy path), or when the response is
-/// unusable. The session is consumed (and so wiped) here either way.
+/// connect's own [`PqSession`]. Returns `Ok(None)` when the server did not
+/// enable BirdoPQ or include a ciphertext (legacy path), or when the response
+/// is unusable. The session is consumed (and so wiped) here either way.
 ///
-/// What the caller does with `None` depends entirely on `quantum_enabled`:
+/// What the caller does with `Ok(None)` depends entirely on `quantum_enabled`:
 /// with it OFF this is the legacy path and `derive_quantum_psk` takes the
-/// server-provided PSK (`record_server_provided`); with it ON the same `None`
-/// aborts the connection. `None` is therefore never a silent downgrade.
+/// server-provided PSK (`record_server_provided`); with it ON the same
+/// `Ok(None)` aborts the connection. It is therefore never a silent downgrade.
+///
+/// MR-2417: `Err(KeyMismatch)` when the server sent a key-confirmation tag
+/// (`pqKeyConfirmTag`) that does not match, or that is not a tag at all (any
+/// value but a 32-byte base64 string). No PSK was derived; the caller aborts
+/// the connect with `pq_key_mismatch`. A response with no tag, or `null` for
+/// it (an older server), is not checked, as before.
 ///
 /// On success, latches `current_mode() == Bilateral`, which `get_vpn_status`
 /// reports as `quantum_active` / `pq_mode`. That state means "this client
@@ -573,25 +734,27 @@ fn server_nonce(field: Option<&str>) -> Result<Vec<u8>, String> {
 pub fn try_decapsulate(
     response: &ConnectResponse,
     session: Option<PqSession>,
-) -> Option<Zeroizing<String>> {
+) -> Result<Option<Zeroizing<String>>, KeyMismatch> {
     if !response.quantum_enabled.unwrap_or(false) {
-        return None;
+        return Ok(None);
     }
     // Quantum is on but this connect made no keypair: it cannot decapsulate.
     // Fail closed (the caller aborts), never derive from some other key.
     let Some(session) = session else {
         tracing::error!("BirdoPQ: the server enabled BirdoPQ but this connect made no keypair");
-        return None;
+        return Ok(None);
     };
     // Field name re-use, matching the wire-format contract with Android +
     // backend: `rosenpassPublicKey` carries the ML-KEM ciphertext,
     // `rosenpassEndpoint` carries the per-connect nonce.
-    let ct_b64 = response.rosenpass_public_key.as_ref()?;
+    let Some(ct_b64) = response.rosenpass_public_key.as_ref() else {
+        return Ok(None);
+    };
     let ct = match base64::engine::general_purpose::STANDARD.decode(ct_b64) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!("BirdoPQ: malformed PQ ciphertext: {e}");
-            return None;
+            return Ok(None);
         }
     };
     if ct.len() != CIPHERTEXT_BYTES {
@@ -600,7 +763,7 @@ pub fn try_decapsulate(
             ct.len(),
             CIPHERTEXT_BYTES
         );
-        return None;
+        return Ok(None);
     }
 
     // PFA-M5: refuse to derive a PSK against a missing nonce. ML-KEM gives
@@ -614,24 +777,49 @@ pub fn try_decapsulate(
         Ok(nonce) => nonce,
         Err(e) => {
             tracing::error!("BirdoPQ: {e} — bilateral PQ aborted (PFA-M5)");
-            return None;
+            return Ok(None);
         }
     };
 
-    let psk = match session.finish(&ct, &nonce) {
+    // MR-2417: the key-confirmation tag, when this server sends one. A field
+    // that cannot be a tag is a mismatch too: the two sides do not speak the
+    // same BirdoPQ, and that is what the user must be told. Logs carry the
+    // reason only, never the tag.
+    let confirm_tag = match server_confirm_tag(&response.pq_key_confirm_tag) {
+        Ok(tag) => tag,
+        Err(reason) => {
+            tracing::error!(
+                "BirdoPQ: {reason}; key confirmation impossible, connect aborted (MR-2417)"
+            );
+            return Err(KeyMismatch);
+        }
+    };
+
+    let psk = match session.finish(&ct, &nonce, confirm_tag.as_ref().map(|t| t.as_slice())) {
         Ok(p) => p,
-        Err(e) => {
-            tracing::error!("BirdoPQ: decapsulation failed: {e}");
-            return None;
+        Err(FinishError::KeyMismatch) => {
+            tracing::error!(
+                "BirdoPQ: key confirmation FAILED: the server's tag does not match this client's key; no PSK derived, connect aborted (MR-2417)"
+            );
+            return Err(KeyMismatch);
+        }
+        Err(FinishError::Unusable(reason)) => {
+            tracing::error!("BirdoPQ: decapsulation failed: {reason}");
+            return Ok(None);
         }
     };
     set_mode(PqMode::Bilateral);
     tracing::info!(
         "BirdoPQ v1 BILATERAL — quantum-resistant PSK derived (32 B, mode=bilateral, impl={PQ_IMPL_NAME})"
     );
-    Some(Zeroizing::new(
+    if confirm_tag.is_some() {
+        tracing::info!("BirdoPQ: key confirmation verified (MR-2417)");
+    } else {
+        tracing::info!("BirdoPQ: the server sent no key-confirmation tag (an older server); PSK derived without the check");
+    }
+    Ok(Some(Zeroizing::new(
         base64::engine::general_purpose::STANDARD.encode(psk.as_slice()),
-    ))
+    )))
 }
 
 /// Latch mode for telemetry when we end up using the server's classical PSK
@@ -762,7 +950,7 @@ mod tests {
 
         // decapsulate + HKDF legs, through the real production entry point.
         let psk = session
-            .finish(&want_ct, &nonce)
+            .finish(&want_ct, &nonce, None)
             .expect("decapsulating the server's own ciphertext must succeed");
         assert_eq!(
             psk.as_slice(),
@@ -780,12 +968,12 @@ mod tests {
         let ours = PqSession::from_seed(seed_of(0x11));
         let (ct, _ss) = encapsulate_with(ours.public_key(), &[0x33; 32]);
 
-        let good = ours.finish(&ct, &test_nonce(1)).unwrap();
+        let good = ours.finish(&ct, &test_nonce(1), None).unwrap();
         let bad1 = PqSession::from_seed(seed_of(0x22))
-            .finish(&ct, &test_nonce(1))
+            .finish(&ct, &test_nonce(1), None)
             .expect("a wrong key must NOT error: that is the oracle");
         let bad2 = PqSession::from_seed(seed_of(0x22))
-            .finish(&ct, &test_nonce(1))
+            .finish(&ct, &test_nonce(1), None)
             .unwrap();
 
         assert_ne!(good.as_slice(), bad1.as_slice());
@@ -858,7 +1046,7 @@ mod tests {
         let (ct, ss_server) = encapsulate_with(session.public_key(), &[0x5A; 32]);
         let nonce = test_nonce(2);
         let server_psk = hkdf_to_psk(&ss_server, &nonce).unwrap();
-        let client_psk = session.finish(&ct, &nonce).unwrap();
+        let client_psk = session.finish(&ct, &nonce, None).unwrap();
         assert_eq!(
             client_psk.as_slice(),
             server_psk.as_slice(),
@@ -925,7 +1113,7 @@ mod tests {
         let (ct, ss_server) = encapsulate_with(session.public_key(), &[0x5A; 32]);
         let nonce = test_nonce(2);
         let server_psk = hkdf_to_psk(&ss_server, &nonce).unwrap();
-        let client_psk = session.finish(&ct, &nonce).unwrap();
+        let client_psk = session.finish(&ct, &nonce, None).unwrap();
         assert_eq!(client_psk.as_slice(), server_psk.as_slice());
     }
 
@@ -937,7 +1125,7 @@ mod tests {
         let (ct, ss_server) = encapsulate_with(old.public_key(), &[0x5A; 32]);
         let server_psk = hkdf_to_psk(&ss_server, &test_nonce(3)).unwrap();
         let new = PqSession::begin();
-        let psk = new.finish(&ct, &test_nonce(3)).unwrap();
+        let psk = new.finish(&ct, &test_nonce(3), None).unwrap();
         assert_ne!(psk.as_slice(), server_psk.as_slice());
     }
 
@@ -950,8 +1138,8 @@ mod tests {
         let nonce_a = ct[..16].to_vec();
         let mut nonce_b = nonce_a.clone();
         nonce_b[0] ^= 1;
-        let a = derive_psk(&kp.seed, &ct, &nonce_a).unwrap();
-        let b = derive_psk(&kp.seed, &ct, &nonce_b).unwrap();
+        let a = derive_psk(&kp.seed, &ct, &nonce_a, None).unwrap();
+        let b = derive_psk(&kp.seed, &ct, &nonce_b, None).unwrap();
         assert_ne!(a.as_slice(), b.as_slice());
     }
 
@@ -1020,11 +1208,400 @@ mod tests {
     #[test]
     fn malformed_inputs_error_cleanly() {
         assert!(PqSession::begin()
-            .finish(&[0u8; 16], &test_nonce(3))
+            .finish(&[0u8; 16], &test_nonce(3), None)
             .is_err());
         assert!(PqSession::begin()
-            .finish(&[0u8; CIPHERTEXT_BYTES + 1], &test_nonce(3))
+            .finish(&[0u8; CIPHERTEXT_BYTES + 1], &test_nonce(3), None)
             .is_err());
+    }
+
+    // ── Key confirmation (MR-2417) ────────────────────────────────────────
+
+    /// The key-confirmation tag as the SERVER computes it (birdo-web
+    /// `pqKeyConfirmTag`): HKDF-SHA-256(ss, salt "BirdoPQ-v1-PSK", info
+    /// "BirdoPQ-v1-KeyConfirm" || nonce, 32). Built from the hkdf crate here,
+    /// not from the production helper, so the production check is graded
+    /// against an independent derivation.
+    fn server_tag(ss: &[u8], nonce: &[u8]) -> String {
+        let mut tag = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(HKDF_SALT), ss)
+            .expand_multi_info(&[b"BirdoPQ-v1-KeyConfirm".as_slice(), nonce], &mut tag)
+            .expect("32 bytes is a valid HKDF-SHA-256 length");
+        base64::engine::general_purpose::STANDARD.encode(tag)
+    }
+
+    /// A post-quantum connect response as it arrives on the wire (through
+    /// serde, as the API client reads it), with or without the tag.
+    fn wire_response(ct: &[u8], nonce: &[u8], tag: Option<String>) -> ConnectResponse {
+        let std_b64 = base64::engine::general_purpose::STANDARD;
+        let mut body = serde_json::json!({
+            "success": true,
+            "quantumEnabled": true,
+            "rosenpassPublicKey": std_b64.encode(ct),
+            "rosenpassEndpoint": std_b64.encode(nonce),
+        });
+        if let Some(tag) = tag {
+            body["pqKeyConfirmTag"] = serde_json::Value::String(tag);
+        }
+        serde_json::from_value(body).expect("a connect response")
+    }
+
+    /// The field symptom MR-2417 is about: the server's tag is for another key
+    /// than the one this client derives (an ML-KEM or HKDF that disagrees
+    /// with the server's). The connect is aborted and no PSK comes back.
+    #[test]
+    fn a_key_confirmation_tag_that_does_not_match_aborts_with_no_psk() {
+        let session = PqSession::begin();
+        let (ct, ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let nonce = test_nonce(4);
+        let mut other = ss.clone();
+        other[0] ^= 1;
+        let mut resp = wire_response(&ct, &nonce, Some(server_tag(&other, &nonce)));
+        // Even with a classical PSK on offer: a mismatch never takes it.
+        resp.preshared_key = Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".into());
+        let r = crate::commands::vpn::derive_quantum_psk(&resp, Some(session));
+        assert!(
+            r.is_err(),
+            "a tag for another key must abort the connect, not hand back a PSK"
+        );
+        // The accurate error, not "try another location": no other server
+        // helps, an update or support does. Auto-reconnect stops on it.
+        let err = r.unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::commands::ipc_error::IpcErrorCode::PqKeyMismatch
+        );
+        assert!(!err.retryable);
+        assert!(err.code.is_hard_refusal());
+        assert!(
+            err.message.contains("Security handshake mismatch"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("another location"), "{}", err.message);
+    }
+
+    /// The same mismatch one level down: `finish` refuses before a PSK exists,
+    /// and the right tag gives exactly the server's PSK.
+    #[test]
+    fn finish_checks_the_tag_before_any_psk_exists() {
+        let std_b64 = base64::engine::general_purpose::STANDARD;
+        let tag_bytes = |b64: String| std_b64.decode(b64).unwrap();
+        let session = PqSession::from_seed(seed_of(0x31));
+        let (ct, ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let nonce = test_nonce(7);
+        let mut other = ss.clone();
+        other[31] ^= 0x80;
+        assert_eq!(
+            session.finish(
+                &ct,
+                &nonce,
+                Some(tag_bytes(server_tag(&other, &nonce)).as_slice())
+            ),
+            Err(FinishError::KeyMismatch)
+        );
+
+        let right = tag_bytes(server_tag(&ss, &nonce));
+        let psk = PqSession::from_seed(seed_of(0x31))
+            .finish(&ct, &nonce, Some(right.as_slice()))
+            .expect("the server's own tag");
+        assert_eq!(psk.as_slice(), hkdf_to_psk(&ss, &nonce).unwrap().as_slice());
+
+        // A tag of another length never matches, even when it is a prefix of
+        // the right one or the right one with a byte appended.
+        let mut long = right.clone();
+        long.push(0);
+        for wrong in [&right[..31], &long[..], &[][..]] {
+            assert_eq!(
+                PqSession::from_seed(seed_of(0x31)).finish(&ct, &nonce, Some(wrong)),
+                Err(FinishError::KeyMismatch),
+                "a {}-byte tag",
+                wrong.len()
+            );
+        }
+        // A tag computed with the right secret but another nonce: bound to
+        // this connect.
+        assert_eq!(
+            PqSession::from_seed(seed_of(0x31)).finish(
+                &ct,
+                &nonce,
+                Some(tag_bytes(server_tag(&ss, &test_nonce(8))).as_slice())
+            ),
+            Err(FinishError::KeyMismatch)
+        );
+    }
+
+    /// A `pqKeyConfirmTag` that cannot be a tag (not base64, not 32 bytes,
+    /// empty) is the same mismatch: the two sides do not speak the same
+    /// BirdoPQ. It is never ignored, which would quietly take the legacy path.
+    #[test]
+    fn a_field_that_is_not_a_tag_is_a_mismatch_too() {
+        let std_b64 = base64::engine::general_purpose::STANDARD;
+        for (what, field) in [
+            ("empty", String::new()),
+            ("not base64", "!".repeat(44)),
+            ("31 bytes", std_b64.encode([7u8; 31])),
+            ("33 bytes", std_b64.encode([7u8; 33])),
+            ("64 bytes", std_b64.encode([7u8; 64])),
+        ] {
+            let session = PqSession::begin();
+            let (ct, _ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+            let resp = wire_response(&ct, &test_nonce(9), Some(field));
+            assert_eq!(
+                try_decapsulate(&resp, Some(session)),
+                Err(KeyMismatch),
+                "{what}"
+            );
+        }
+        assert_eq!(server_confirm_tag(&ConfirmTagField::Absent), Ok(None));
+        assert!(server_confirm_tag(&ConfirmTagField::NotAString).is_err());
+        assert_eq!(
+            server_confirm_tag(&ConfirmTagField::Text(std_b64.encode([7u8; 32]))),
+            Ok(Some([7u8; 32]))
+        );
+    }
+
+    /// MR-2417 review L1: a response rewriter that strips the tag and sends
+    /// "BirdoPQ-v1-KeyConfirm" || N0 (53 bytes) as the nonce would make this
+    /// client's PSK HKDF(ss, label || N0): exactly the tag it read off the
+    /// honest response. A nonce that is not 32 bytes derives nothing, so that
+    /// response aborts the connect instead.
+    #[test]
+    fn a_nonce_rewritten_to_label_and_nonce_derives_nothing() {
+        let session = PqSession::begin();
+        let (ct, ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let n0 = test_nonce(10);
+        let published = server_tag(&ss, &n0);
+        let mut rewritten = b"BirdoPQ-v1-KeyConfirm".to_vec();
+        rewritten.extend_from_slice(&n0);
+        assert_eq!(rewritten.len(), 53);
+        let resp = wire_response(&ct, &rewritten, None);
+        let r = crate::commands::vpn::derive_quantum_psk(&resp, Some(session));
+        if let Ok(Some(psk)) = &r {
+            assert_ne!(
+                psk.as_str(),
+                published,
+                "the PSK is the tag that was on the wire"
+            );
+        }
+        assert!(r.is_err(), "a 53-byte nonce must abort the connect");
+        // Not a key mismatch: the response is unusable, as any bad nonce is.
+        assert_eq!(
+            r.unwrap_err().code,
+            crate::commands::ipc_error::IpcErrorCode::PqFailed
+        );
+    }
+
+    /// MR-2417 review L2: JSON `null` is the same as no key (an older server:
+    /// the unchanged, unchecked derivation), which is also how the Mobile
+    /// decoders read it. Any other value that is not a string is not a tag:
+    /// a mismatch, never a failure to read the whole response (which used to
+    /// surface as `server_error`).
+    #[test]
+    fn a_null_tag_is_absent_and_a_non_string_tag_is_a_mismatch() {
+        let std_b64 = base64::engine::general_purpose::STANDARD;
+        let body = |ct: &[u8], value: serde_json::Value| {
+            serde_json::json!({
+                "success": true,
+                "quantumEnabled": true,
+                "rosenpassPublicKey": std_b64.encode(ct),
+                "rosenpassEndpoint": std_b64.encode(test_nonce(11)),
+                "pqKeyConfirmTag": value,
+            })
+        };
+
+        let session = PqSession::begin();
+        let (ct, ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let resp: ConnectResponse =
+            serde_json::from_value(body(ct.as_slice(), serde_json::Value::Null))
+                .expect("null decodes");
+        let psk = try_decapsulate(&resp, Some(session))
+            .expect("null is not a mismatch")
+            .expect("the legacy path derives the PSK");
+        assert_eq!(
+            std_b64.decode(psk.as_bytes()).unwrap(),
+            hkdf_to_psk(&ss, &test_nonce(11)).unwrap().as_slice()
+        );
+
+        for (what, value) in [
+            ("a number", serde_json::json!(42)),
+            ("a bool", serde_json::json!(true)),
+            ("an object", serde_json::json!({})),
+            ("an array", serde_json::json!([])),
+        ] {
+            let session = PqSession::begin();
+            let (ct, _ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+            let resp: ConnectResponse = serde_json::from_value(body(ct.as_slice(), value))
+                .unwrap_or_else(|e| panic!("{what}: the whole response failed to decode: {e}"));
+            let err =
+                crate::commands::vpn::derive_quantum_psk(&resp, Some(session)).expect_err(what);
+            assert_eq!(
+                err.code,
+                crate::commands::ipc_error::IpcErrorCode::PqKeyMismatch,
+                "{what}"
+            );
+        }
+    }
+
+    /// The tag vectors, pinned. The SAME two hex strings are pinned in
+    /// birdo-web `backend/src/vpn/birdo-pq.service.spec.ts` against the
+    /// server's `pqKeyConfirmTag` (noble's HKDF and node:crypto's), and were
+    /// computed a third time with Python's hmac/hashlib: four HKDF
+    /// implementations, one answer.
+    #[test]
+    fn key_confirmation_tag_vectors_are_pinned() {
+        // The inputs of the BirdoPQ PSK vector in `hash_stack_outputs_are_pinned`.
+        let ss = hex::decode("42".repeat(32)).expect("hex");
+        let nonce = hex::decode("24".repeat(32)).expect("hex");
+        let tag = hkdf_confirm_tag(&ss, &nonce).expect("derive");
+        assert_eq!(
+            hex::encode(tag.as_slice()),
+            "9c97fca3dcbd9f817400a8de48aca02deffce698138a6b3d5bed63c10df2f939"
+        );
+        // Domain separation: the same ss, salt and nonce give another value
+        // than the PSK (pinned as 7b7fad70... there).
+        assert_ne!(
+            tag.as_slice(),
+            hkdf_to_psk(&ss, &nonce).expect("derive").as_slice()
+        );
+
+        // The server KAT fixture's shared secret and nonce.
+        let ss = field(KAT_JSON, "sharedSecretB64");
+        let nonce = field(KAT_JSON, "nonceB64");
+        let tag = hkdf_confirm_tag(&ss, &nonce).expect("derive");
+        assert_eq!(
+            hex::encode(tag.as_slice()),
+            "f7fb270c59761f41242c1bd5ea3d6dd04fa14e9d7b3f287202407962fdc5243d"
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.encode(tag.as_slice()),
+            server_tag(&ss, &nonce),
+            "the production helper and the independent derivation agree"
+        );
+    }
+
+    /// The tag comparison is constant-time: `CtOutput`, never `==` on bytes.
+    /// No test can time it, so the shape is pinned at the source, the way
+    /// `the_hkdf_prk_is_wiped_before_any_return` pins the PRK wipe.
+    #[test]
+    fn the_tag_is_compared_in_constant_time() {
+        let source = include_str!("birdo_pq.rs").replace('\r', "");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        let body = &production[production.find("fn confirm_tag_matches(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let compares: Vec<&str> = body.lines().filter(|l| l.contains("==")).collect();
+        assert_eq!(compares.len(), 1, "{body}");
+        assert!(
+            compares[0].contains("CtOutput::<Sha256>::new(")
+                && compares[0].matches("CtOutput::<Sha256>::new(").count() == 2,
+            "the one comparison must be CtOutput == CtOutput: {}",
+            compares[0]
+        );
+        for leak in ["iter().eq(", ".as_slice() ==", "as_ref() ==", "!="] {
+            assert!(!body.contains(leak), "{leak} in {body}");
+        }
+        // And the PRK of the tag's HKDF is wiped before any return (MR-2112).
+        let derive = &production[production.find("fn hkdf_confirm_tag(").unwrap()..];
+        let derive = &derive[..derive.find("\n}\n").unwrap()];
+        assert!(!derive.contains("Hkdf::<Sha256>::new("), "{derive}");
+        let extract = derive
+            .find("let (mut prk, hk) = Hkdf::<Sha256>::extract(")
+            .expect("the PRK is kept to be wiped");
+        let wipe = derive
+            .find("prk.as_mut_slice().zeroize();")
+            .expect("the PRK is wiped");
+        let first_return = derive.find("?;").expect("the expand error is returned");
+        assert!(extract < wipe && wipe < first_return, "{derive}");
+    }
+
+    /// The tag is checked BEFORE the PSK is derived, and a mismatch derives
+    /// none: in `derive_psk` the only `hkdf_to_psk` call is on the confirmed
+    /// branch, after `confirm_tag_matches`.
+    #[test]
+    fn the_tag_is_checked_before_the_psk_is_derived() {
+        let source = include_str!("birdo_pq.rs").replace('\r', "");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        let body = &production[production.find("fn derive_psk(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let check = body
+            .find("confirm_tag_matches(")
+            .expect("derive_psk checks the tag");
+        let gate = body
+            .find("let psk = if confirmed {")
+            .expect("the PSK is derived only when confirmed");
+        let derive = body
+            .find("hkdf_to_psk(")
+            .expect("derive_psk derives the PSK");
+        assert_eq!(body.matches("hkdf_to_psk(").count(), 1, "{body}");
+        assert!(check < gate && gate < derive, "{body}");
+        assert!(body.contains("Err(FinishError::KeyMismatch)"), "{body}");
+    }
+
+    /// Logs carry reasons, never the tag: no `tracing` call in this module
+    /// formats the tag field, the decoded tag or either side's tag bytes.
+    #[test]
+    fn no_log_line_carries_the_tag() {
+        let source = include_str!("birdo_pq.rs").replace('\r', "");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        let mut rest = production;
+        let mut calls = 0;
+        while let Some(at) = rest.find("tracing::") {
+            let call = &rest[at..];
+            let call = &call[..call.find(");").unwrap_or(call.len())];
+            for leak in [
+                "pq_key_confirm_tag",
+                "confirm_tag",
+                "theirs",
+                "ours",
+                "{tag",
+                "tag:?",
+            ] {
+                assert!(!call.contains(leak), "a log line formats {leak}: {call}");
+            }
+            calls += 1;
+            rest = &rest[at + 1..];
+        }
+        assert!(calls > 0);
+    }
+
+    /// The tag the server really derived: the connect goes ahead with the
+    /// server's PSK.
+    #[test]
+    fn a_matching_key_confirmation_tag_connects_with_the_servers_psk() {
+        let session = PqSession::begin();
+        let (ct, ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let nonce = test_nonce(5);
+        let resp = wire_response(&ct, &nonce, Some(server_tag(&ss, &nonce)));
+        let psk = crate::commands::vpn::derive_quantum_psk(&resp, Some(session))
+            .expect("a matching tag connects")
+            .expect("with a PSK");
+        let server_psk = hkdf_to_psk(&ss, &nonce).unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(psk.as_bytes())
+                .unwrap(),
+            server_psk.as_slice()
+        );
+    }
+
+    /// An older server sends no tag: the derivation is exactly what it was
+    /// before MR-2417, so the server and the client can deploy in any order.
+    #[test]
+    fn no_key_confirmation_tag_is_the_legacy_path() {
+        let session = PqSession::begin();
+        let (ct, ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let nonce = test_nonce(6);
+        let resp = wire_response(&ct, &nonce, None);
+        let psk = crate::commands::vpn::derive_quantum_psk(&resp, Some(session))
+            .expect("no tag is not an error")
+            .expect("a PSK");
+        let server_psk = hkdf_to_psk(&ss, &nonce).unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(psk.as_bytes())
+                .unwrap(),
+            server_psk.as_slice()
+        );
     }
 
     // ── Legacy key files ──────────────────────────────────────────────────
@@ -1157,13 +1734,14 @@ mod tests {
             quantum_enabled: Some(quantum),
             rosenpass_public_key: ct,
             rosenpass_endpoint: nonce,
+            pq_key_confirm_tag: ConfirmTagField::Absent,
         }
     }
 
     #[test]
     fn try_decapsulate_returns_none_when_pq_disabled() {
         let resp = response_with(Some("anything".into()), None, false);
-        assert!(try_decapsulate(&resp, Some(PqSession::begin())).is_none());
+        assert_eq!(try_decapsulate(&resp, Some(PqSession::begin())), Ok(None));
     }
 
     /// The server turned BirdoPQ on, so a response WITHOUT a usable ciphertext
@@ -1179,33 +1757,34 @@ mod tests {
 
         // A good response, but this connect made no keypair.
         let good = response_with(Some(ct_b64.clone()), Some(nonce.clone()), true);
-        assert!(try_decapsulate(&good, None).is_none());
+        assert_eq!(try_decapsulate(&good, None), Ok(None));
         // Wrong-size ciphertext, missing nonce.
         let short = response_with(Some(std_b64.encode([1u8; 16])), Some(nonce.clone()), true);
-        assert!(try_decapsulate(&short, Some(PqSession::begin())).is_none());
+        assert_eq!(try_decapsulate(&short, Some(PqSession::begin())), Ok(None));
         let no_nonce = response_with(Some(ct_b64), None, true);
-        assert!(try_decapsulate(&no_nonce, Some(PqSession::begin())).is_none());
+        assert_eq!(
+            try_decapsulate(&no_nonce, Some(PqSession::begin())),
+            Ok(None)
+        );
         // And the good one works with its own session.
-        assert!(try_decapsulate(&good, Some(session)).is_some());
+        assert!(matches!(try_decapsulate(&good, Some(session)), Ok(Some(_))));
     }
 
-    /// Proposed row 13: the server nonce is bounded like Android's
-    /// (`MAX_NONCE_BYTES = 64`). Missing, empty, oversized and malformed are
-    /// refused — an oversized text before it is decoded at all.
+    /// Proposed row 13 bounded the server nonce like Android (1..=64 bytes).
+    /// MR-2417 review L1 narrows it to exactly the 32 bytes the server has
+    /// always minted (birdo-web `PQ_NONCE_BYTES`): any other length, missing,
+    /// empty or malformed is refused, an oversized text before it is decoded.
     #[test]
-    fn the_server_nonce_is_bounded_like_android() {
+    fn the_server_nonce_is_exactly_the_32_bytes_the_server_mints() {
         let b64 = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![7u8; n]);
         assert_eq!(
             server_nonce(Some(&b64(32))).unwrap().len(),
             32,
             "what the server mints"
         );
-        assert_eq!(server_nonce(Some(&b64(1))).unwrap().len(), 1);
-        assert_eq!(server_nonce(Some(&b64(64))).unwrap().len(), 64);
-        assert!(
-            server_nonce(Some(&b64(65))).is_err(),
-            "decoded past the cap"
-        );
+        for n in [1, 16, 31, 33, 53, 64, 65] {
+            assert!(server_nonce(Some(&b64(n))).is_err(), "{n} bytes");
+        }
         assert!(
             server_nonce(Some(&b64(1 << 20))).is_err(),
             "text past the cap"

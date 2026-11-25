@@ -1205,8 +1205,9 @@ pub(crate) async fn prepare_tunnel(
     };
 
     vm.set_phase(ConnectPhase::NegotiatingPq);
-    let quantum_psk = derive_quantum_psk(&response, request.pq_session.take())
-        .map_err(|m| IpcError::new(IpcErrorCode::PqFailed, m))?;
+    // `pq_failed`, or `pq_key_mismatch` when the server's key-confirmation tag
+    // does not match (MR-2417): the code comes from `derive_quantum_psk`.
+    let quantum_psk = derive_quantum_psk(&response, request.pq_session.take())?;
 
     let (mut config, server_name) = build_vpn_config(
         response,
