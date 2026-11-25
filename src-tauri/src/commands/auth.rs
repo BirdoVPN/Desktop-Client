@@ -920,7 +920,7 @@ pub async fn get_auth_state(
                     Ok(match after_profile_failure(&e, renewed) {
                         ProfileFailure::KeepSession => {
                             tracing::warn!(
-                                "Profile fetch failed ({e}) — session kept, identity unknown                                  this cycle"
+                                "Profile fetch failed ({e}) — session kept, identity unknown this cycle"
                             );
                             AuthState::unknown_identity(true)
                         }
@@ -930,7 +930,7 @@ pub async fn get_auth_state(
                         }
                         ProfileFailure::AsMemoryHolds => {
                             tracing::info!(
-                                "The session ended while the start-up check ran — nothing                                  restored"
+                                "The session ended while the start-up check ran — nothing restored"
                             );
                             AuthState::unknown_identity(api.is_authenticated().await)
                         }

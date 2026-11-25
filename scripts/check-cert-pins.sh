@@ -64,6 +64,16 @@
 #                SSOT and fails here. It also names the declared live lineages
 #                this vantage did NOT see - one green run is evidence about one
 #                anycast edge, never about the host.
+#   3s. SHIPPED ROOTS  the same live chain must validate, as presented and for
+#                the name the app dials, against the roots the app SHIPS: the
+#                webpki-roots version src-tauri/Cargo.lock locks, and nothing
+#                else (MR-2583, review D473-I1). The app runs that WebPKI check
+#                BEFORE the pins, and since MR-2548 tells every user its
+#                failure as an interception on their network or computer. A
+#                server that stops sending its intermediate, or moves to a CA
+#                the shipped set lacks, fails here while every pin still
+#                matches. scripts/cert_pins_shipped_roots.py says how the
+#                bundle is built and checked against the crate's own anchors.
 #
 # WHY 1b EXISTS. The vendored copy WAS hand-edited: its dns.google entry was
 # trimmed while birdo-shared carried a different set, and every check reported
@@ -613,6 +623,17 @@ fi
 echo
 echo "=== 3. live chain liveness (per host, from THIS vantage only) ==="
 
+# 3s needs the roots the app ships, built once from the locked webpki-roots.
+# If they cannot be built, every host's 3s is a check that did not run: that
+# is a failure here, never a pass.
+SHIPPED_DIR=$(mktemp -d)
+SHIPPED_ROOTS="$SHIPPED_DIR/shipped-roots.pem"
+if ! "$PY" "$REPO_ROOT/scripts/cert_pins_shipped_roots.py" bundle \
+     "$REPO_ROOT/src-tauri/Cargo.lock" "$SHIPPED_ROOTS"; then
+  fail "3s: the roots the app ships could not be built, so no live chain is checked against them"
+  SHIPPED_ROOTS=""
+fi
+
 # Hosts to dial, and the SNI/connect address to reach them by. The DoH hosts
 # are dialled by a pinned IP because a hostile or captive local resolver can
 # point the name anywhere — exactly what happened on the machine this script
@@ -670,6 +691,14 @@ for host in $HOSTS; do
   if ! "$PY" "$REPO_ROOT/scripts/cert_pins_live_chain.py" "$SSOT" "$host" "$observed"; then
     FAILED=1
   fi
+  # 3s: the chain as presented (leaf first: c1.pem leads the glob), against
+  # the shipped roots alone, for the name the app dials.
+  if [ -n "$SHIPPED_ROOTS" ]; then
+    if ! "$PY" "$REPO_ROOT/scripts/cert_pins_shipped_roots.py" verify \
+         "$SHIPPED_ROOTS" "$sni" "$tmp"/c*.pem; then
+      FAILED=1
+    fi
+  fi
   rm -rf "$tmp"
 
   # Leaf expiry is informational: chain-SPKI pins survive a leaf renewal.
@@ -719,6 +748,7 @@ import json,sys;print(json.load(open(sys.argv[1], encoding='utf-8'))['hosts']['b
     fi
   fi
 done
+rm -rf "$SHIPPED_DIR"
 
 echo
 finish
