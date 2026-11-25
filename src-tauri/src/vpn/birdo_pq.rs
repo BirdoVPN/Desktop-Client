@@ -1343,6 +1343,83 @@ mod tests {
         );
     }
 
+    /// MR-2417 review L1: a response rewriter that strips the tag and sends
+    /// "BirdoPQ-v1-KeyConfirm" || N0 (53 bytes) as the nonce would make this
+    /// client's PSK HKDF(ss, label || N0): exactly the tag it read off the
+    /// honest response. A nonce that is not 32 bytes derives nothing, so that
+    /// response aborts the connect instead.
+    #[test]
+    fn a_nonce_rewritten_to_label_and_nonce_derives_nothing() {
+        let session = PqSession::begin();
+        let (ct, ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let n0 = test_nonce(10);
+        let published = server_tag(&ss, &n0);
+        let mut rewritten = b"BirdoPQ-v1-KeyConfirm".to_vec();
+        rewritten.extend_from_slice(&n0);
+        assert_eq!(rewritten.len(), 53);
+        let resp = wire_response(&ct, &rewritten, None);
+        let r = crate::commands::vpn::derive_quantum_psk(&resp, Some(session));
+        if let Ok(Some(psk)) = &r {
+            assert_ne!(
+                psk.as_str(),
+                published,
+                "the PSK is the tag that was on the wire"
+            );
+        }
+        assert!(r.is_err(), "a 53-byte nonce must abort the connect");
+    }
+
+    /// MR-2417 review L2: JSON `null` is the same as no key (an older server:
+    /// the unchanged, unchecked derivation), which is also how the Mobile
+    /// decoders read it. Any other value that is not a string is not a tag:
+    /// a mismatch, never a failure to read the whole response (which used to
+    /// surface as `server_error`).
+    #[test]
+    fn a_null_tag_is_absent_and_a_non_string_tag_is_a_mismatch() {
+        let std_b64 = base64::engine::general_purpose::STANDARD;
+        let body = |ct: &[u8], value: serde_json::Value| {
+            serde_json::json!({
+                "success": true,
+                "quantumEnabled": true,
+                "rosenpassPublicKey": std_b64.encode(ct),
+                "rosenpassEndpoint": std_b64.encode(test_nonce(11)),
+                "pqKeyConfirmTag": value,
+            })
+        };
+
+        let session = PqSession::begin();
+        let (ct, ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+        let resp: ConnectResponse =
+            serde_json::from_value(body(ct.as_slice(), serde_json::Value::Null))
+                .expect("null decodes");
+        let psk = try_decapsulate(&resp, Some(session))
+            .expect("null is not a mismatch")
+            .expect("the legacy path derives the PSK");
+        assert_eq!(
+            std_b64.decode(psk.as_bytes()).unwrap(),
+            hkdf_to_psk(&ss, &test_nonce(11)).unwrap().as_slice()
+        );
+
+        for (what, value) in [
+            ("a number", serde_json::json!(42)),
+            ("a bool", serde_json::json!(true)),
+            ("an object", serde_json::json!({})),
+            ("an array", serde_json::json!([])),
+        ] {
+            let session = PqSession::begin();
+            let (ct, _ss) = encapsulate_with(session.public_key(), &[0x5A; 32]);
+            let resp: ConnectResponse = serde_json::from_value(body(ct.as_slice(), value))
+                .unwrap_or_else(|e| panic!("{what}: the whole response failed to decode: {e}"));
+            let err =
+                crate::commands::vpn::derive_quantum_psk(&resp, Some(session)).expect_err(what);
+            assert_eq!(
+                err.code,
+                crate::commands::ipc_error::IpcErrorCode::PqKeyMismatch,
+                "{what}"
+            );
+        }
+    }
+
     /// The tag vectors, pinned. The SAME two hex strings are pinned in
     /// birdo-web `backend/src/vpn/birdo-pq.service.spec.ts` against the
     /// server's `pqKeyConfirmTag` (noble's HKDF and node:crypto's), and were
@@ -1670,23 +1747,21 @@ mod tests {
         assert!(matches!(try_decapsulate(&good, Some(session)), Ok(Some(_))));
     }
 
-    /// Proposed row 13: the server nonce is bounded like Android's
-    /// (`MAX_NONCE_BYTES = 64`). Missing, empty, oversized and malformed are
-    /// refused — an oversized text before it is decoded at all.
+    /// Proposed row 13 bounded the server nonce like Android (1..=64 bytes).
+    /// MR-2417 review L1 narrows it to exactly the 32 bytes the server has
+    /// always minted (birdo-web `PQ_NONCE_BYTES`): any other length, missing,
+    /// empty or malformed is refused, an oversized text before it is decoded.
     #[test]
-    fn the_server_nonce_is_bounded_like_android() {
+    fn the_server_nonce_is_exactly_the_32_bytes_the_server_mints() {
         let b64 = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![7u8; n]);
         assert_eq!(
             server_nonce(Some(&b64(32))).unwrap().len(),
             32,
             "what the server mints"
         );
-        assert_eq!(server_nonce(Some(&b64(1))).unwrap().len(), 1);
-        assert_eq!(server_nonce(Some(&b64(64))).unwrap().len(), 64);
-        assert!(
-            server_nonce(Some(&b64(65))).is_err(),
-            "decoded past the cap"
-        );
+        for n in [1, 16, 31, 33, 53, 64, 65] {
+            assert!(server_nonce(Some(&b64(n))).is_err(), "{n} bytes");
+        }
         assert!(
             server_nonce(Some(&b64(1 << 20))).is_err(),
             "text past the cap"
