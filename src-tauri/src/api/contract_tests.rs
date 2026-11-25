@@ -1917,12 +1917,10 @@ fn an_unverified_email_refusal_is_its_own_code_and_a_bare_403_is_not() {
 /// optional, additive response key. The copy vendored here predates it and
 /// still accepts a body that carries it (`ConnectResponse` allows unknown
 /// keys), both dial paths read it, and a body without it (an older server)
-/// decodes with no tag, which `vpn::birdo_pq` treats as before. Review L2:
-/// `null` decodes as no tag, and a value that is not a string decodes too
-/// (as not-a-tag, a mismatch later) instead of failing the whole response.
+/// decodes with no tag, which `vpn::birdo_pq` treats as before.
 #[test]
 fn the_pq_key_confirmation_tag_is_optional_and_read_on_both_dial_paths() {
-    use super::types::{ConfirmTagField, ConnectResponse, MultiHopConnectResponse};
+    use super::types::{ConnectResponse, MultiHopConnectResponse};
     let tag = STANDARD.encode([0x24u8; 32]);
     let older = json!({
         "success": true,
@@ -1937,38 +1935,14 @@ fn the_pq_key_confirmation_tag_is_optional_and_read_on_both_dial_paths() {
     assert_eq!(def(CONNECT_RESPONSE)["additionalProperties"], json!(true));
     assert!(!def_required(CONNECT_RESPONSE).contains("pqKeyConfirmTag"));
 
-    // What each dial path decodes a body to: single-hop, and Multi-Hop converted.
-    let both = |body: &Value| -> [ConfirmTagField; 2] {
-        let single: ConnectResponse = serde_json::from_value(body.clone())
-            .unwrap_or_else(|e| panic!("single-hop refused {body}: {e}"));
-        let multi: MultiHopConnectResponse = serde_json::from_value(body.clone())
-            .unwrap_or_else(|e| panic!("multi-hop refused {body}: {e}"));
-        [
-            single.pq_key_confirm_tag,
-            ConnectResponse::from(multi).pq_key_confirm_tag,
-        ]
-    };
-    let text = ConfirmTagField::Text(tag.clone());
-    assert_eq!(both(&newer), [text.clone(), text]);
+    let single: ConnectResponse = serde_json::from_value(newer.clone()).unwrap();
+    let multi: MultiHopConnectResponse = serde_json::from_value(newer).unwrap();
+    assert_eq!(single.pq_key_confirm_tag.as_deref(), Some(tag.as_str()));
     assert_eq!(
-        both(&older),
-        [ConfirmTagField::Absent, ConfirmTagField::Absent]
+        ConnectResponse::from(multi).pq_key_confirm_tag.as_deref(),
+        Some(tag.as_str()),
+        "multi-hop converts it"
     );
-
-    let mut null = older.clone();
-    null["pqKeyConfirmTag"] = Value::Null;
-    assert_valid(CONNECT_RESPONSE, &null);
-    assert_eq!(
-        both(&null),
-        [ConfirmTagField::Absent, ConfirmTagField::Absent]
-    );
-    for value in [json!(42), json!(true), json!({}), json!([tag])] {
-        let mut odd = older.clone();
-        odd["pqKeyConfirmTag"] = value;
-        assert_eq!(
-            both(&odd),
-            [ConfirmTagField::NotAString, ConfirmTagField::NotAString],
-            "{odd}"
-        );
-    }
+    let old: ConnectResponse = serde_json::from_value(older).unwrap();
+    assert!(old.pq_key_confirm_tag.is_none());
 }

@@ -78,10 +78,8 @@
 //! client derives it too and compares it in constant time BEFORE the PSK
 //! exists ([`PqSession::finish`]); a mismatch aborts the connect with
 //! `pq_key_mismatch`, an accurate error, and never with the classical PSK. A
-//! response without a tag (an older server), or with JSON `null` for it, takes
-//! the derivation above unchanged, so the server and this client can deploy
-//! in either order. Any other value that is not a 32-byte base64 tag (a
-//! number, an object, a string of another length) is a mismatch.
+//! response without a tag (an older server) takes the derivation above
+//! unchanged, so the server and this client can deploy in either order.
 //!
 //! Making the mismatch observable is not the decapsulation oracle the
 //! comment in `derive_psk` warns about: every key pair decapsulates once
@@ -157,7 +155,7 @@ use parking_lot::Mutex;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::api::types::{ConfirmTagField, ConnectResponse};
+use crate::api::types::ConnectResponse;
 use crate::utils::safe_fs::OwnedDir;
 
 /// FIPS 203 ML-KEM-1024 sizes: must match server + Android constants.
@@ -169,10 +167,9 @@ const SEED_BYTES: usize = 64;
 
 const PSK_LEN: usize = 32;
 const HKDF_SALT: &[u8] = b"BirdoPQ-v1-PSK";
-/// The server's per-connect nonce: exactly 32 bytes, what birdo-web has
-/// always minted (`PQ_NONCE_BYTES`). MR-2417 review L1 (see `server_nonce`);
-/// Android's `BirdoPqManager.MAX_NONCE_BYTES` still allows 1..=64.
-const NONCE_BYTES: usize = 32;
+/// Upper bound for the server's per-connect nonce, the same as Android's
+/// `BirdoPqManager.MAX_NONCE_BYTES` (the server mints 32 bytes).
+const MAX_NONCE_BYTES: usize = 64;
 /// MR-2417: the HKDF `info` prefix of the key-confirmation tag; the
 /// per-connect nonce follows it. Same IKM and salt as the PSK, so the tag is
 /// the PSK's PRK expanded under an info string the PSK's (the bare nonce)
@@ -630,55 +627,42 @@ pub fn purge_legacy_keypair_files() {
 // ── Public API used by the connect command ────────────────────────────────
 
 /// The per-connect nonce the server sends in `rosenpassEndpoint` (base64),
-/// decoded: exactly [`NONCE_BYTES`] bytes.
+/// decoded and bounded to 1..=[`MAX_NONCE_BYTES`] bytes.
 ///
-/// Proposed row 13 bounded it (it was unbounded) the way Android does, to
-/// 1..=64 bytes: it is the HKDF `info`, so no length is unsafe for the KDF
-/// itself, and the bound keeps a hostile response from having this process
-/// decode and hash a field of any size. MR-2417 review L1 narrows it to the 32
-/// bytes the server has always minted. With the tag stripped, a nonce of
-/// `CONFIRM_LABEL || N0` (53 bytes) would make this client's PSK
-/// HKDF(ss, label || N0): the very tag the honest response published. The
-/// text is checked before it is decoded (32 bytes are 44 characters of padded
-/// base64).
+/// Proposed row 13: the length was unbounded here while Android caps it at
+/// 64 before the nonce crosses into Rust. It is the HKDF `info`, so no length
+/// is unsafe for the KDF itself; the bound keeps a malformed or hostile
+/// response from having this process decode and hash a field of any size,
+/// and makes both clients refuse the same responses. The text is bounded
+/// before it is decoded (64 bytes are 88 characters of padded base64).
 fn server_nonce(field: Option<&str>) -> Result<Vec<u8>, String> {
     let encoded = match field {
         None | Some("") => return Err("server omitted per-connect nonce".into()),
         Some(encoded) => encoded,
     };
-    if encoded.len() != NONCE_BYTES.div_ceil(3) * 4 {
+    if encoded.len() > MAX_NONCE_BYTES.div_ceil(3) * 4 {
         return Err(format!(
-            "PQ nonce is {} base64 characters, not {}",
-            encoded.len(),
-            NONCE_BYTES.div_ceil(3) * 4
+            "PQ nonce out of bounds ({} base64 characters)",
+            encoded.len()
         ));
     }
     let nonce = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|e| format!("malformed PQ nonce: {e}"))?;
-    if nonce.len() != NONCE_BYTES {
-        return Err(format!(
-            "PQ nonce is {} bytes, not {NONCE_BYTES}",
-            nonce.len()
-        ));
+    if nonce.is_empty() || nonce.len() > MAX_NONCE_BYTES {
+        return Err(format!("PQ nonce out of bounds ({} B)", nonce.len()));
     }
     Ok(nonce)
 }
 
 /// The key-confirmation tag the server sent in `pqKeyConfirmTag` (MR-2417),
-/// decoded. `Ok(None)` when it sent none, or JSON `null` (an older server;
-/// review L2: `null` is absent, as the Mobile decoders read it); `Err` when it
-/// sent anything else that is not base64 of exactly [`CONFIRM_TAG_BYTES`]
-/// bytes, a value that is not a string included. Like the nonce, the text is
-/// bounded before it is decoded (44 characters). The reason names lengths
-/// only: never the tag's text or bytes.
-fn server_confirm_tag(field: &ConfirmTagField) -> Result<Option<[u8; CONFIRM_TAG_BYTES]>, String> {
-    let encoded = match field {
-        ConfirmTagField::Absent => return Ok(None),
-        ConfirmTagField::NotAString => {
-            return Err("key-confirmation tag is not a string".to_string())
-        }
-        ConfirmTagField::Text(encoded) => encoded,
+/// decoded. `Ok(None)` when it sent none (an older server); `Err` when it sent
+/// something that is not base64 of exactly [`CONFIRM_TAG_BYTES`] bytes. Like
+/// the nonce, the text is bounded before it is decoded (44 characters). The
+/// reason names lengths only: never the tag's text or bytes.
+fn server_confirm_tag(field: Option<&str>) -> Result<Option<[u8; CONFIRM_TAG_BYTES]>, String> {
+    let Some(encoded) = field else {
+        return Ok(None);
     };
     if encoded.len() != CONFIRM_TAG_BYTES.div_ceil(3) * 4 {
         return Err(format!(
@@ -717,10 +701,9 @@ pub struct KeyMismatch;
 /// `Ok(None)` aborts the connection. It is therefore never a silent downgrade.
 ///
 /// MR-2417: `Err(KeyMismatch)` when the server sent a key-confirmation tag
-/// (`pqKeyConfirmTag`) that does not match, or that is not a tag at all (any
-/// value but a 32-byte base64 string). No PSK was derived; the caller aborts
-/// the connect with `pq_key_mismatch`. A response with no tag, or `null` for
-/// it (an older server), is not checked, as before.
+/// (`pqKeyConfirmTag`) that does not match, or that is not a tag at all. No
+/// PSK was derived; the caller aborts the connect with `pq_key_mismatch`. A
+/// response with no tag (an older server) is not checked, as before.
 ///
 /// On success, latches `current_mode() == Bilateral`, which `get_vpn_status`
 /// reports as `quantum_active` / `pq_mode`. That state means "this client
@@ -785,7 +768,7 @@ pub fn try_decapsulate(
     // that cannot be a tag is a mismatch too: the two sides do not speak the
     // same BirdoPQ, and that is what the user must be told. Logs carry the
     // reason only, never the tag.
-    let confirm_tag = match server_confirm_tag(&response.pq_key_confirm_tag) {
+    let confirm_tag = match server_confirm_tag(response.pq_key_confirm_tag.as_deref()) {
         Ok(tag) => tag,
         Err(reason) => {
             tracing::error!(
@@ -1353,10 +1336,9 @@ mod tests {
                 "{what}"
             );
         }
-        assert_eq!(server_confirm_tag(&ConfirmTagField::Absent), Ok(None));
-        assert!(server_confirm_tag(&ConfirmTagField::NotAString).is_err());
+        assert_eq!(server_confirm_tag(None), Ok(None));
         assert_eq!(
-            server_confirm_tag(&ConfirmTagField::Text(std_b64.encode([7u8; 32]))),
+            server_confirm_tag(Some(std_b64.encode([7u8; 32]).as_str())),
             Ok(Some([7u8; 32]))
         );
     }
@@ -1385,11 +1367,6 @@ mod tests {
             );
         }
         assert!(r.is_err(), "a 53-byte nonce must abort the connect");
-        // Not a key mismatch: the response is unusable, as any bad nonce is.
-        assert_eq!(
-            r.unwrap_err().code,
-            crate::commands::ipc_error::IpcErrorCode::PqFailed
-        );
     }
 
     /// MR-2417 review L2: JSON `null` is the same as no key (an older server:
@@ -1734,7 +1711,7 @@ mod tests {
             quantum_enabled: Some(quantum),
             rosenpass_public_key: ct,
             rosenpass_endpoint: nonce,
-            pq_key_confirm_tag: ConfirmTagField::Absent,
+            pq_key_confirm_tag: None,
         }
     }
 

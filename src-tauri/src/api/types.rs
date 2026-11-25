@@ -1636,31 +1636,7 @@ pub struct ConnectResponse {
     /// `vpn::birdo_pq::try_decapsulate` checks it before the PSK is used; an
     /// older server sends none, and the derivation is then what it always was.
     #[serde(default, rename = "pqKeyConfirmTag")]
-    pub pq_key_confirm_tag: ConfirmTagField,
-}
-
-/// MR-2417: `pqKeyConfirmTag` as the server sent it. A missing key and JSON
-/// `null` are the same, `Absent`: an older server, so the derivation is not
-/// checked (review L2 of #476; the Mobile decoders read `null` the same way).
-/// A string is checked by `vpn::birdo_pq`. Any other JSON value is
-/// `NotAString`, a key mismatch there, never a failure to read the whole
-/// response (which would be `server_error`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum ConfirmTagField {
-    #[default]
-    Absent,
-    Text(String),
-    NotAString,
-}
-
-impl<'de> Deserialize<'de> for ConfirmTagField {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(match serde_json::Value::deserialize(deserializer)? {
-            serde_json::Value::Null => ConfirmTagField::Absent,
-            serde_json::Value::String(text) => ConfirmTagField::Text(text),
-            _ => ConfirmTagField::NotAString,
-        })
-    }
+    pub pq_key_confirm_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1814,7 +1790,7 @@ pub struct MultiHopConnectResponse {
     /// MR-2417: the BirdoPQ key-confirmation tag, as on `ConnectResponse`
     /// (the multi-hop route returns the entry connect's fields).
     #[serde(default, rename = "pqKeyConfirmTag")]
-    pub pq_key_confirm_tag: ConfirmTagField,
+    pub pq_key_confirm_tag: Option<String>,
 }
 
 impl From<MultiHopConnectResponse> for ConnectResponse {
