@@ -880,6 +880,95 @@ mod gdpr_request_tests {
         assert!(!api.deletion_unconfirmed(), "an expired session kept it");
     }
 
+    /// MR-2583 (review D472-L1): the password check's own 401 ("Incorrect
+    /// password", "Password confirmation is required…", birdo-web
+    /// origin/main) is asked only of an account the handler has just read,
+    /// so after an unreadable 2xx it says the account exists: the inference
+    /// ends, on a deletion and on a hold request alike. It is still the
+    /// answer the user sees, and the session stays. On main the inference
+    /// outlived it, and a refresh refused later ended the session as an
+    /// account deleted (MR-2517).
+    #[tokio::test]
+    async fn the_password_checks_401_says_the_account_is_there() {
+        const INCORRECT: &str = r#"{"statusCode":401,"message":"Incorrect password","error":"Unauthorized","details":{"stepUp":["password"]}}"#;
+        const REQUIRED: &str = r#"{"statusCode":401,"message":"Password confirmation is required to delete your account","error":"Unauthorized"}"#;
+        let unreadable = || BirdoApi::classify_gdpr_delete_response(StatusCode::OK, "");
+        for body in [INCORRECT, REQUIRED] {
+            let refusal =
+                || BirdoApi::classify_gdpr_delete_response(StatusCode::UNAUTHORIZED, body);
+            let api = BirdoApi::new();
+            api.set_tokens("access-1".into(), "refresh-1".into()).await;
+
+            let _ = api
+                .conclude_gdpr_delete(api.deletion_unconfirmed(), unreadable())
+                .await;
+            assert!(api.deletion_unconfirmed());
+            assert!(matches!(
+                api.conclude_gdpr_delete(api.deletion_unconfirmed(), refusal())
+                    .await,
+                Err(ApiError::Rejected { status: 401, .. })
+            ));
+            assert!(api.is_authenticated().await, "{body:?} signed out");
+            assert!(!api.deletion_unconfirmed(), "{body:?} kept the inference");
+
+            // A hold request's password check is the same handler's.
+            let _ = api
+                .conclude_gdpr_delete(api.deletion_unconfirmed(), unreadable())
+                .await;
+            assert!(api.deletion_unconfirmed());
+            assert!(matches!(
+                api.finish_deletion_hold(refusal()).await,
+                Err(ApiError::Rejected { status: 401, .. })
+            ));
+            assert!(api.is_authenticated().await, "{body:?} (hold) signed out");
+            assert!(
+                !api.deletion_unconfirmed(),
+                "{body:?} (hold) kept the inference"
+            );
+        }
+
+        // Nothing else says the account exists: the guard's bare 401 (decided
+        // after the refresh), the sentence in another status or in a body
+        // that is not the API's JSON, another 401 sentence, a foreign 404, a
+        // 5xx and a 429 all keep the inference.
+        let api = BirdoApi::new();
+        api.set_tokens("access-1".into(), "refresh-1".into()).await;
+        let _ = api
+            .conclude_gdpr_delete(api.deletion_unconfirmed(), unreadable())
+            .await;
+        for (status, body) in [
+            (
+                StatusCode::UNAUTHORIZED,
+                r#"{"statusCode":401,"message":"Unauthorized"}"#,
+            ),
+            (StatusCode::UNAUTHORIZED, "<html>Incorrect password</html>"),
+            (
+                StatusCode::UNAUTHORIZED,
+                r#"{"statusCode":401,"message":"Invalid two-factor code","error":"Unauthorized"}"#,
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"statusCode":403,"message":"Incorrect password","error":"Forbidden"}"#,
+            ),
+            (StatusCode::NOT_FOUND, ""),
+            (StatusCode::INTERNAL_SERVER_ERROR, ""),
+            (StatusCode::TOO_MANY_REQUESTS, ""),
+        ] {
+            let outcome = BirdoApi::classify_gdpr_delete_response(status, body);
+            let _ = api
+                .conclude_gdpr_delete(api.deletion_unconfirmed(), outcome)
+                .await;
+            assert!(api.is_authenticated().await, "{status} {body:?} signed out");
+            assert!(api.deletion_unconfirmed(), "{status} {body:?} forgot it");
+            let outcome = BirdoApi::classify_gdpr_delete_response(status, body);
+            let _ = api.finish_deletion_hold(outcome).await;
+            assert!(
+                api.deletion_unconfirmed(),
+                "{status} {body:?} (hold) forgot it"
+            );
+        }
+    }
+
     /// MR-2483, the wiring `delete_account` cannot be driven through without
     /// a server: the memory is read BEFORE the attempt, a refresh refused
     /// after it ends as `AlreadyDeleted`, any other refresh failure still

@@ -176,6 +176,19 @@ impl GdprDeleteOutcome {
     pub(crate) fn is_unconfirmed(&self) -> bool {
         matches!(self, Self::Refused(ApiError::Parse(why)) if why == UNREADABLE_DELETION)
     }
+
+    /// MR-2583 (review D472-L1): the password check's own 401,
+    /// [`INCORRECT_PASSWORD`] or [`PASSWORD_REQUIRED`]. birdo-web
+    /// `GdprController.deleteData` asks for the password only of an account
+    /// it has just read from the database (not the guard's cached user row),
+    /// so this answer says the account exists.
+    pub(crate) fn is_password_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Refused(ApiError::Rejected { status: 401, message })
+                if password_check_said(message)
+        )
+    }
 }
 
 /// MR-2370: the error a 2xx deletion answer whose body did not confirm the
@@ -187,6 +200,21 @@ pub(crate) const UNREADABLE_DELETION: &str =
 /// when it finds no account to check the request against. Its guard admitted
 /// the token, so the access token was not the problem: the account was.
 const IDENTITY_UNVERIFIED: &str = "Unable to verify identity";
+
+/// MR-2583: the two 401 sentences of the same handler's password check: a
+/// wrong password, and none sent ("Password confirmation is required to
+/// delete your account").
+const INCORRECT_PASSWORD: &str = "Incorrect password";
+const PASSWORD_REQUIRED: &str = "Password confirmation is required";
+
+/// Whether a 401's message is one of the password check's own sentences.
+fn password_check_said(message: &str) -> bool {
+    let message = message.trim();
+    message.eq_ignore_ascii_case(INCORRECT_PASSWORD)
+        || message
+            .get(..PASSWORD_REQUIRED.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(PASSWORD_REQUIRED))
+}
 
 /// MR-2483 (review L1): whether a 404's body is the API's own JSON error, the
 /// shape birdo-web's `GlobalExceptionFilter` writes for every error
@@ -886,7 +914,9 @@ impl BirdoApi {
     }
 
     /// MR-2483: whether this session's last deletion attempt was answered
-    /// with a 2xx whose body did not confirm it (MR-2370).
+    /// with a 2xx whose body did not confirm it (MR-2370), and no answer
+    /// since has said the account exists (MR-2583: a renewed refresh, the
+    /// password check's 401).
     pub(crate) fn deletion_unconfirmed(&self) -> bool {
         self.deletion_unconfirmed.load(Ordering::SeqCst)
     }
@@ -894,6 +924,9 @@ impl BirdoApi {
     /// The end of a deletion attempt, once its answer is known: read in the
     /// light of an unreadable 2xx before it ([`Self::after_unconfirmed`]),
     /// remembered when it is one itself, then finished.
+    ///
+    /// MR-2583 (review D472-L1): the password check's 401 forgets an
+    /// unreadable 2xx before it ([`Self::forget_unconfirmed_if_answered`]).
     pub(crate) async fn conclude_gdpr_delete(
         &self,
         unconfirmed_before: bool,
@@ -903,7 +936,22 @@ impl BirdoApi {
         if outcome.is_unconfirmed() {
             self.deletion_unconfirmed.store(true, Ordering::SeqCst);
         }
+        self.forget_unconfirmed_if_answered(&outcome);
         self.finish_gdpr_delete(outcome).await
+    }
+
+    /// MR-2583 (review D472-L1): the password check's 401 (a deletion's or a
+    /// hold request's; [`GdprDeleteOutcome::is_password_refusal`]) says the
+    /// account exists, so an unreadable 2xx before it was not the erasure.
+    /// Without this, its inference stayed live for the rest of the session:
+    /// a refresh refused hours later (a password change on the website, "sign
+    /// out everywhere") ended the session as an account deleted (MR-2517:
+    /// the device id rotated, the PQ state purged, Login saying "deleted").
+    /// The answer itself is unchanged: it is still the error the user sees.
+    fn forget_unconfirmed_if_answered(&self, outcome: &GdprDeleteOutcome) {
+        if outcome.is_password_refusal() {
+            self.deletion_unconfirmed.store(false, Ordering::SeqCst);
+        }
     }
 
     /// MR-2483: what a deletion answer means when this session's last attempt
@@ -1042,10 +1090,13 @@ impl BirdoApi {
     /// it ([`Self::deletion_hold_from`]) and leaves the session alone, on every
     /// answer. A method on the client, holding the session, so a test can drive
     /// a signed-in client through it and see that nothing was cleared.
+    /// MR-2583: its password check's 401 says the account exists, as a
+    /// deletion's does ([`Self::forget_unconfirmed_if_answered`]).
     pub(crate) async fn finish_deletion_hold(
         &self,
         outcome: GdprDeleteOutcome,
     ) -> Result<DeletionHold, ApiError> {
+        self.forget_unconfirmed_if_answered(&outcome);
         Self::deletion_hold_from(outcome)
     }
 
@@ -2145,6 +2196,8 @@ impl BirdoApi {
             .await
             .clone()
             .ok_or(ApiError::NotAuthenticated)?;
+        // MR-2583: an unreadable deletion 2xx this renewal may forget (below).
+        let unconfirmed_at_flight = self.deletion_unconfirmed();
 
         // MR-2500 / MR-1771: one flight under the policy (a 429 or a 5xx keeps
         // the token and sends the same one again; `refresh_policy`). Only a
@@ -2198,6 +2251,19 @@ impl BirdoApi {
         if !adopted {
             tracing::info!("The session ended while a token refresh ran — its tokens are dropped");
             return Err(ApiError::NotAuthenticated);
+        }
+        // MR-2583 (review D472-L1): a renewal says the session, and so the
+        // account, exists: the erasure deletes every session, and the refresh
+        // reads no cached user row. So an unreadable deletion 2xx (MR-2370)
+        // from before this flight was not the erasure, and its inference
+        // ends here. It used to stay live for the rest of the session: a 401
+        // hours later (a password change on the website, "sign out
+        // everywhere") ended the session as an account deleted (MR-2517: the
+        // device id rotated, the PQ state purged, Login saying "deleted").
+        // A first such 2xx that came in while this flight was out is kept:
+        // the server may have answered the refresh before that erasure.
+        if unconfirmed_at_flight {
+            self.deletion_unconfirmed.store(false, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -4590,6 +4656,106 @@ mod retry_after_tests {
                 .await
                 .as_ref()
                 .is_some_and(|t| t.as_str() == refresh)
+    }
+
+    /// MR-2583 (review D472-L1): a renewal says the account exists, so it
+    /// ends the inference an unreadable deletion 2xx left (MR-2483, MR-2517).
+    /// The session's 401 hours later (a password change on the website,
+    /// "sign out everywhere") then ends it as expired, not as an account
+    /// deleted (the device id rotated, the PQ state purged, Login saying
+    /// "deleted"). On main no renewal cleared it, and that 401 said
+    /// "deleted".
+    #[tokio::test]
+    async fn a_renewal_after_a_lost_deletion_says_the_account_is_there() {
+        use crate::api::session_gate::reported;
+        let _ = reported::take();
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let lost = BirdoApi::classify_gdpr_delete_response(StatusCode::OK, "");
+        assert!(api.conclude_gdpr_delete(false, lost).await.is_err());
+        assert!(api.deletion_unconfirmed());
+
+        let server = Arc::new(ScriptedRefresh::default());
+        let keystore = Arc::new(Keystore::default());
+        let renewal = startup_refresh(&api, &server, &keystore, renewed(), answered_now()).await;
+        assert!(renewal.is_ok(), "the renewal failed");
+        assert!(holds_in_memory(&api, "a2", "r2").await);
+        assert!(
+            !api.deletion_unconfirmed(),
+            "the renewal left the inference live"
+        );
+
+        let refused = startup_refresh(
+            &api,
+            &server,
+            &keystore,
+            refresh_refused(401, API_401),
+            answered_now(),
+        )
+        .await;
+        assert!(refused.is_err(), "the refusal was not told");
+        let reports = reported::take();
+        assert_eq!(reports.len(), 1, "one rejection, one report");
+        assert!(reports[0].expired.as_deref() == Some("a2"));
+        assert!(
+            !reports[0].account_deleted,
+            "an account the renewal proved ended as deleted"
+        );
+    }
+
+    /// MR-2583: only an unreadable 2xx from BEFORE the flight is forgotten. A
+    /// first one that comes in while the flight is out may be the erasure,
+    /// done after the server answered the refresh: it outlives the renewal,
+    /// and the next 401 still says the account went (MR-2517).
+    #[tokio::test]
+    async fn a_lost_deletion_during_a_renewal_outlives_it() {
+        use crate::api::session_gate::reported;
+        let _ = reported::take();
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let server = Arc::new(ScriptedRefresh::default());
+        let keystore = Arc::new(Keystore::default());
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let refresh = tokio::spawn(startup_refresh(
+            &api,
+            &server,
+            &keystore,
+            renewed(),
+            answered,
+        ));
+        for _ in 0..1000 {
+            if server.sent() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(server.sent(), 1, "the token never went");
+
+        let lost = BirdoApi::classify_gdpr_delete_response(StatusCode::OK, "");
+        assert!(api.conclude_gdpr_delete(false, lost).await.is_err());
+        let _ = answer.send(());
+        assert!(
+            matches!(refresh.await, Ok(Ok(()))),
+            "the renewal was not adopted"
+        );
+        assert!(holds_in_memory(&api, "a2", "r2").await);
+        assert!(
+            api.deletion_unconfirmed(),
+            "a renewal that may predate the erasure forgot it"
+        );
+
+        let refused = startup_refresh(
+            &api,
+            &server,
+            &keystore,
+            refresh_refused(401, API_401),
+            answered_now(),
+        )
+        .await;
+        assert!(refused.is_err(), "the refusal was not told");
+        let reports = reported::take();
+        assert_eq!(reports.len(), 1, "one rejection, one report");
+        assert!(reports[0].account_deleted, "the deletion was forgotten");
     }
 
     /// MR-2538 (D-L3 of the #467 review): a Sign Out that lands while the
