@@ -2308,6 +2308,34 @@ mod account_boundary_tests {
         }
     }
 
+    /// MR-2583 (review D471-L1): the start-up check logs one clean sentence
+    /// per line. Two of them carried about 34 spaces mid-sentence: a `\`
+    /// continuation lost in a rewrite made the indentation part of the
+    /// string, and rustfmt does not touch string literals. Every offline or
+    /// flaky launch wrote the padded line to birdo.log, which support reads
+    /// and log-grep tooling matches.
+    #[test]
+    fn the_startup_check_logs_clean_sentences() {
+        let state = body("get_auth_state");
+        for sentence in [
+            "\"Profile fetch failed ({e}) — session kept, identity unknown this cycle\"",
+            "\"The session ended while the start-up check ran — nothing restored\"",
+        ] {
+            assert!(state.contains(sentence), "{sentence}");
+        }
+        // No string in it carries a run of spaces (a line's code, from its
+        // first quote on; comments are not strings).
+        let run = " ".repeat(3);
+        for line in state.lines().map(str::trim_start) {
+            if line.starts_with("//") {
+                continue;
+            }
+            if let Some(quote) = line.find('"') {
+                assert!(!line[quote..].contains(&run), "{line}");
+            }
+        }
+    }
+
     /// MR-179: the proof rides the deletion call (number as digits, code
     /// trimmed), is wiped on drop, and a step-up refusal reaches the dialog by
     /// code, not as "Account deletion failed: ...".

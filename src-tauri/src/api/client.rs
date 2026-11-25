@@ -4592,6 +4592,106 @@ mod retry_after_tests {
                 .is_some_and(|t| t.as_str() == refresh)
     }
 
+    /// MR-2583 (review D472-L1): a renewal says the account exists, so it
+    /// ends the inference an unreadable deletion 2xx left (MR-2483, MR-2517).
+    /// The session's 401 hours later (a password change on the website,
+    /// "sign out everywhere") then ends it as expired, not as an account
+    /// deleted (the device id rotated, the PQ state purged, Login saying
+    /// "deleted"). On main no renewal cleared it, and that 401 said
+    /// "deleted".
+    #[tokio::test]
+    async fn a_renewal_after_a_lost_deletion_says_the_account_is_there() {
+        use crate::api::session_gate::reported;
+        let _ = reported::take();
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let lost = BirdoApi::classify_gdpr_delete_response(StatusCode::OK, "");
+        assert!(api.conclude_gdpr_delete(false, lost).await.is_err());
+        assert!(api.deletion_unconfirmed());
+
+        let server = Arc::new(ScriptedRefresh::default());
+        let keystore = Arc::new(Keystore::default());
+        let renewal = startup_refresh(&api, &server, &keystore, renewed(), answered_now()).await;
+        assert!(renewal.is_ok(), "the renewal failed");
+        assert!(holds_in_memory(&api, "a2", "r2").await);
+        assert!(
+            !api.deletion_unconfirmed(),
+            "the renewal left the inference live"
+        );
+
+        let refused = startup_refresh(
+            &api,
+            &server,
+            &keystore,
+            refresh_refused(401, API_401),
+            answered_now(),
+        )
+        .await;
+        assert!(refused.is_err(), "the refusal was not told");
+        let reports = reported::take();
+        assert_eq!(reports.len(), 1, "one rejection, one report");
+        assert!(reports[0].expired.as_deref() == Some("a2"));
+        assert!(
+            !reports[0].account_deleted,
+            "an account the renewal proved ended as deleted"
+        );
+    }
+
+    /// MR-2583: only an unreadable 2xx from BEFORE the flight is forgotten. A
+    /// first one that comes in while the flight is out may be the erasure,
+    /// done after the server answered the refresh: it outlives the renewal,
+    /// and the next 401 still says the account went (MR-2517).
+    #[tokio::test]
+    async fn a_lost_deletion_during_a_renewal_outlives_it() {
+        use crate::api::session_gate::reported;
+        let _ = reported::take();
+        let api = BirdoApi::new();
+        api.set_tokens("a1".into(), "r1".into()).await;
+        let server = Arc::new(ScriptedRefresh::default());
+        let keystore = Arc::new(Keystore::default());
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let refresh = tokio::spawn(startup_refresh(
+            &api,
+            &server,
+            &keystore,
+            renewed(),
+            answered,
+        ));
+        for _ in 0..1000 {
+            if server.sent() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(server.sent(), 1, "the token never went");
+
+        let lost = BirdoApi::classify_gdpr_delete_response(StatusCode::OK, "");
+        assert!(api.conclude_gdpr_delete(false, lost).await.is_err());
+        let _ = answer.send(());
+        assert!(
+            matches!(refresh.await, Ok(Ok(()))),
+            "the renewal was not adopted"
+        );
+        assert!(holds_in_memory(&api, "a2", "r2").await);
+        assert!(
+            api.deletion_unconfirmed(),
+            "a renewal that may predate the erasure forgot it"
+        );
+
+        let refused = startup_refresh(
+            &api,
+            &server,
+            &keystore,
+            refresh_refused(401, API_401),
+            answered_now(),
+        )
+        .await;
+        assert!(refused.is_err(), "the refusal was not told");
+        let reports = reported::take();
+        assert_eq!(reports.len(), 1, "one rejection, one report");
+        assert!(reports[0].account_deleted, "the deletion was forgotten");
+    }
+
     /// MR-2538 (D-L3 of the #467 review): a Sign Out that lands while the
     /// start-up refresh is out (`logout` clears the tokens without the
     /// refresh lock) is final. The renewal that comes back after it is

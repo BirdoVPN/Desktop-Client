@@ -9,10 +9,12 @@ name: Cert Pins
 # to 8 pins on desktop vs 3 on Android/iOS.
 #
 # Daily, the full check also fetches the LIVE chain for every pinned host and
-# fails if any host has no matching pin. This supersedes cert-pin-watchdog.yml,
-# which read only cert_pin.rs, never looked at the three DoH hosts, and failed
-# only when NONE of the pins in that one file matched — so a DoH provider that
-# had migrated CA passed clean.
+# fails if any host has no matching pin, or if the chain, as presented, does
+# not validate against the roots the app SHIPS (check 3s: the webpki-roots
+# version src-tauri/Cargo.lock locks, which the app checks before any pin).
+# This supersedes cert-pin-watchdog.yml, which read only cert_pin.rs, never
+# looked at the three DoH hosts, and failed only when NONE of the pins in that
+# one file matched — so a DoH provider that had migrated CA passed clean.
 #
 # WHAT THIS WORKFLOW STILL DOES NOT COVER — read this before trusting a green run:
 #
@@ -66,7 +68,12 @@ on:
       - 'scripts/cert_pins_lineages.py'
       - 'scripts/cert_pins_live_chain.py'
       - 'scripts/cert_pins_retired.py'
+      - 'scripts/cert_pins_shipped_roots.py'
       - 'scripts/test_check_cert_pins.py'
+      - 'scripts/test_cert_pins_shipped_roots.py'
+      # Check 3s reads the roots the app ships from the webpki-roots version
+      # this lockfile locks: a bump re-runs the bundle step below.
+      - 'src-tauri/Cargo.lock'
       - 'scripts/stamp-cert-pins-provenance.py'
       - 'src-tauri/src/api/cert_pin.rs'
       - 'src-tauri/src/vpn/doh.rs'
@@ -119,6 +126,21 @@ jobs:
       - name: test_check_cert_pins.py (the checker against known-bad fixtures)
         if: success() || failure()
         run: python3 scripts/test_check_cert_pins.py
+      # Check 3s (MR-2583, review D473-I1) against chains and crates made for
+      # it: a full chain to a shipped root passes; a missing intermediate, a
+      # root the app does not ship, another name, and a root only the runner's
+      # own store trusts all fail; so does a crate that is not the one locked,
+      # or whose written-out certificate is not its trust anchor.
+      - name: test_cert_pins_shipped_roots.py (check 3s against known-bad fixtures)
+        if: success() || failure()
+        run: python3 scripts/test_cert_pins_shipped_roots.py
+      # The roots the app ships, built as the daily check 3s builds them: the
+      # locked webpki-roots crate (its Cargo.lock checksum verified), every
+      # trust anchor read and matched to its certificate. A webpki-roots bump
+      # whose source this cannot read is red here, before the schedule meets it.
+      - name: the roots the app ships (check 3s's bundle, from src-tauri/Cargo.lock)
+        if: success() || failure()
+        run: python3 scripts/cert_pins_shipped_roots.py bundle src-tauri/Cargo.lock "$RUNNER_TEMP/shipped-roots.pem"
 
   liveness:
     name: Live chains still satisfy the pins
