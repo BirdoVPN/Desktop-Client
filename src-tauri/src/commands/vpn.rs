@@ -2278,7 +2278,7 @@ mod tests {
             quantum_enabled,
             rosenpass_public_key: Some("AAAA".into()),
             rosenpass_endpoint: Some("bm9uY2U=".into()),
-            pq_key_confirm_tag: None,
+            pq_key_confirm_tag: crate::api::types::ConfirmTagField::Absent,
         }
     }
 
