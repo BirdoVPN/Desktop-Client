@@ -47,7 +47,7 @@ png = "0.18"
 # @tauri-apps/plugin-opener, which is pinned to the same 2.7.2 (2.7.2 only moved
 # `reveal_item_in_dir` off the async runtime; the Rust scope matcher is the
 # same as 2.7.0's).
-tauri-plugin-opener = "=2.7.2"
+tauri-plugin-opener = "=2.7.3"
 tauri-plugin-notification = "2.0"
 tauri-plugin-autostart = "2.0"
 # Default features minus `zip`. That feature only extracts .zip / .tar.gz update
